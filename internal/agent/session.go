@@ -665,13 +665,20 @@ func (a *Agent) resetSaveTracking() {
 // Messages + counts under statsMu while the turn goroutine appends. Leaf
 // lock: never acquire turnMu under it.
 //
-// The token count is computed INSIDE the critical section on purpose: the
-// append and the cache extension must publish atomically, and moving the
-// encode before the lock would either waste an encode per append while the
-// cache is incomplete or reintroduce a check-then-act race on the cache
-// length. The cost is one bounded per-message encode, paid only while the
-// cache is complete; a cold cache is backfilled in one batched pass by
-// ensureTokenCounts / ContextStats instead.
+// The append and the cache extension share one critical section so a reader
+// that sees the new message also sees its count: tokenCounts is a
+// PREFIX-aligned cache that stays complete at publish time, which is what
+// lets the web probes and compaction sizing take their no-tokenization fast
+// paths (short prefixes are tolerated everywhere, but a lagging cache would
+// push the missing suffix onto the next reader). The encode runs inside the
+// lock only because the completeness check runs inside the lock first, so a
+// count is never computed for a message that will not be cached. Moving the
+// encode BEFORE the lock while keeping the check+append inside is equally
+// correct — it just wastes the encode while the cache is incomplete, and it
+// shortens the critical section. The current shape was kept because a cold
+// cache is backfilled in one batched pass (ensureTokenCounts / ContextStats),
+// so the per-append encode cost is paid only in the common complete-cache
+// case.
 func (a *Agent) appendMessage(m llm.Message) {
 	a.statsMu.Lock()
 	a.Messages = append(a.Messages, m)
