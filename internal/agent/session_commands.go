@@ -83,15 +83,14 @@ func (a *Agent) ResetSessionState() {
 func (a *Agent) resetSessionState(msgs []llm.Message) {
 	a.replaceMessages(msgs)
 	a.clearTurnUsage()
+	a.resetCompactionState()
 	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
 	a.statsMu.Unlock()
 	a.resetSaveTracking()
 	a.clearViewDriftSnapshot()
 	a.setSessionLabel("")
-	a.statsMu.Lock()
-	a.SessionOneshot = false
-	a.statsMu.Unlock()
+	a.SetSessionOneshot(false)
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
 	}
@@ -264,13 +263,16 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 		return "", SessionActionNone, fmt.Errorf("session id is required")
 	}
 	wasCurrent := id == a.SessionID
+	// Validate the replacement id BEFORE the destructive delete: returning
+	// the error afterwards would leave the agent on a session whose file is
+	// already gone, and the next flush would resurrect it.
+	if wasCurrent && strings.TrimSpace(newSessionID) == "" {
+		return "", SessionActionNone, fmt.Errorf("session id is required")
+	}
 	if err := a.SessionStore.Delete(a.WorkingDir, id); err != nil {
 		return "", SessionActionNone, err
 	}
 	if wasCurrent {
-		if strings.TrimSpace(newSessionID) == "" {
-			return "", SessionActionNone, fmt.Errorf("session id is required")
-		}
 		a.SetSessionID(newSessionID)
 		a.ResetSessionState()
 		a.FlushSession()

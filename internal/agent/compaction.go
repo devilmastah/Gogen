@@ -271,6 +271,23 @@ func (a *Agent) noteCompactSuccess() {
 	a.statsMu.Unlock()
 }
 
+// resetCompactionState clears the conversation-scoped compaction bookkeeping:
+// the failure backoff and BOTH per-tier progress guards. Called when the
+// conversation is replaced wholesale (session reset / restore): the guards
+// record a message count from the OLD conversation, and leaving them set
+// would suppress the emergency tier and last-resort condensation on the new
+// one until it grew past that stale count — while the backoff (up to 10 min)
+// would suppress the normal tier. The wire-overhead cache is deliberately
+// untouched (it tracks the system prompt / tool set, not the conversation).
+func (a *Agent) resetCompactionState() {
+	a.statsMu.Lock()
+	a.compactBackoffUntil = time.Time{}
+	a.compactBackoffDelay = 0
+	a.compactionGuards.emergency = 0
+	a.compactionGuards.lastResort = 0
+	a.statsMu.Unlock()
+}
+
 // CompactHistory manually compacts conversation history at a task boundary.
 func (a *Agent) CompactHistory(ctx context.Context) error {
 	if a.Context == nil {

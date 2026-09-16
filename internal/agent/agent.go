@@ -54,9 +54,12 @@ type Agent struct {
 	// processes a restored model so hosts can refresh their UI (the model
 	// may have been cleared or replaced by sole-model auto-select). Set at
 	// construction by the TUI/web hosts before the validation goroutine is
-	// spawned; called from that goroutine. Must not block.
-	// ValidateRestoredModelAsync is the shared install-and-spawn wiring;
-	// a nil callback there preserves a hook installed here.
+	// spawned (that direct assignment is safe: the spawn happens after it
+	// in the same goroutine); called from the validation goroutine. Must
+	// not block. ValidateRestoredModelAsync is the shared install-and-spawn
+	// wiring; a nil callback there preserves a hook installed here, and its
+	// own install is serialized with the validation read by
+	// onModelChangedMu so overlapping validations cannot race the field.
 	OnModelChanged func()
 
 	// lastTurnUsage is the provider-reported usage of the last API round

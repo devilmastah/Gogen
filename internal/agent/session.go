@@ -98,6 +98,11 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	a.SetParentID(snap.ParentID)
 	a.SetSubagentOutcome(snap.SubagentStatus, snap.SubagentSummary)
 	a.clearTurnUsage()
+	// The restored conversation replaces the in-memory one wholesale, so the
+	// previous conversation's compaction backoff/progress guards must not
+	// carry over (they are keyed on the OLD message count and would suppress
+	// emergency compaction / condensation on the restored history).
+	a.resetCompactionState()
 	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
 	a.statsMu.Unlock()
@@ -237,10 +242,20 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 		}
 	}
 	// Let hosts refresh their UI: the restored model may have been cleared
-	// or replaced by sole-model auto-select.
-	if a.OnModelChanged != nil {
-		a.OnModelChanged()
+	// or replaced by sole-model auto-select. Read under onModelChangedMu so
+	// an overlapping ValidateRestoredModelAsync install cannot race it.
+	if h := a.modelChangedHook(); h != nil {
+		h()
 	}
+}
+
+// modelChangedHook returns the installed OnModelChanged callback under
+// onModelChangedMu. The caller invokes it OUTSIDE the lock (the hook must
+// not block and may re-enter agent methods).
+func (a *Agent) modelChangedHook() func() {
+	a.onModelChangedMu.Lock()
+	defer a.onModelChangedMu.Unlock()
+	return a.OnModelChanged
 }
 
 // ValidateRestoredModelAsync is the async form of ValidateRestoredModel and
@@ -258,7 +273,12 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 // registration winner).
 func (a *Agent) ValidateRestoredModelAsync(model string, onChanged func()) {
 	if onChanged != nil {
+		// Serialized with the validation goroutine's read: two validations
+		// for one agent (e.g. a resume racing an earlier adopt) must not
+		// race the hook field.
+		a.onModelChangedMu.Lock()
 		a.OnModelChanged = onChanged
+		a.onModelChangedMu.Unlock()
 	}
 	go a.ValidateRestoredModel(context.Background(), model)
 }
@@ -330,6 +350,16 @@ func (a *Agent) SessionLabelSnapshot() string {
 	l := a.SessionLabel
 	a.statsMu.RUnlock()
 	return l
+}
+
+// SetSessionOneshot publishes the single-prompt (-p) session marker under
+// statsMu: doPersist reads SessionOneshot under the same lock (shutdown and
+// eviction flush paths run without the turn lock), so hosts must write it
+// through here rather than assigning the field directly.
+func (a *Agent) SetSessionOneshot(v bool) {
+	a.statsMu.Lock()
+	a.SessionOneshot = v
+	a.statsMu.Unlock()
 }
 
 // RenameSession sets a user-visible label for the current session and persists it.
@@ -634,6 +664,14 @@ func (a *Agent) resetSaveTracking() {
 // during a turn. Thread-safe: ContextStats and SnapshotMessages snapshot
 // Messages + counts under statsMu while the turn goroutine appends. Leaf
 // lock: never acquire turnMu under it.
+//
+// The token count is computed INSIDE the critical section on purpose: the
+// append and the cache extension must publish atomically, and moving the
+// encode before the lock would either waste an encode per append while the
+// cache is incomplete or reintroduce a check-then-act race on the cache
+// length. The cost is one bounded per-message encode, paid only while the
+// cache is complete; a cold cache is backfilled in one batched pass by
+// ensureTokenCounts / ContextStats instead.
 func (a *Agent) appendMessage(m llm.Message) {
 	a.statsMu.Lock()
 	a.Messages = append(a.Messages, m)
@@ -887,7 +925,9 @@ type sessionPersist struct {
 }
 
 // sessionMeta groups the small session-identity flags guarded by statsMu
-// (see the statsMu comment in sessionStats).
+// (see the statsMu comment in sessionStats) plus the model-change hook's
+// install/read mutex (the exported OnModelChanged field itself stays on
+// Agent).
 type sessionMeta struct {
 	// labelRenamed is true when SessionLabel was set deliberately
 	// (RenameSession / session_rename tool). Guarded by statsMu; persisted
@@ -904,4 +944,13 @@ type sessionMeta struct {
 	// still-unverified model on the first turn so a stale model from a
 	// previous provider is never sent to the endpoint. Guarded by statsMu.
 	modelUnverified bool
+
+	// onModelChangedMu serializes install (ValidateRestoredModelAsync) and
+	// read (ValidateRestoredModel) of the exported OnModelChanged hook.
+	// Hosts' direct construction-time assignments do not take it: they
+	// happen before any validation goroutine is spawned for the agent, so
+	// the spawn itself provides the happens-before edge. The lock only
+	// closes the window between overlapping validations on one agent.
+	// Leaf lock: never held while calling the hook.
+	onModelChangedMu sync.Mutex
 }

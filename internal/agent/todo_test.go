@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"gogen/internal/llm"
+	"gogen/internal/session"
 )
 
 func TestTodoManagerSessionIsolation(t *testing.T) {
@@ -170,5 +171,54 @@ func TestTodoManagerConcurrentAccess(t *testing.T) {
 
 	if m.Empty() {
 		t.Fatalf("expected todos to survive concurrent access")
+	}
+}
+
+// TestImportLegacyTodosPersistsFreshSession pins the migrated-todos
+// persistence: the legacy import adopts .gogen/todos.json into a FRESH
+// session (0 messages, no label) and renames the source file away. Skip's
+// empty-session rule used to swallow the import's flush, so quitting before
+// the first turn lost the imported list permanently. The session must now
+// own the todos on disk right after the import.
+func TestImportLegacyTodosPersistsFreshSession(t *testing.T) {
+	dir := t.TempDir()
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
+	a := &Agent{
+		Provider:     &statsStubProvider{},
+		WorkingDir:   dir,
+		SessionStore: store,
+		SessionID:    "fresh-session",
+		TodoManager:  NewTodoManager(dir),
+	}
+
+	legacy := session.TodoList{
+		Items:  []session.TodoItem{{ID: 1, Text: "legacy task", Status: "pending"}},
+		NextID: 2,
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".gogen", "todos.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !a.ImportLegacyTodos() {
+		t.Fatal("legacy todos were not imported")
+	}
+	// The quit sweep (FlushPending) cannot save a clean todos-only session —
+	// the import's own flush must have already written it.
+	a.FlushPending()
+
+	loaded, err := store.LoadInWorkingDir(dir, "fresh-session")
+	if err != nil {
+		t.Fatalf("todos-only session must be persisted after the import: %v", err)
+	}
+	if loaded.Todos == nil || len(loaded.Todos.Items) != 1 || loaded.Todos.Items[0].Text != "legacy task" {
+		t.Fatalf("persisted todos=%+v, want the imported item", loaded.Todos)
 	}
 }

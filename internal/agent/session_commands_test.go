@@ -538,3 +538,42 @@ func TestForkLastNoVisibleAssistant(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestDeleteCurrentSessionRequiresNewIDBeforeDelete pins the guard order in
+// deleteSessionByID: with an empty replacement id the current session must
+// NOT be deleted — the error is returned before the destructive call, so the
+// agent never keeps a SessionID whose file is already gone (the next flush
+// would resurrect it).
+func TestDeleteCurrentSessionRequiresNewIDBeforeDelete(t *testing.T) {
+	store := &stubSessionStore{sessions: map[string]SessionSnapshot{
+		"current": {Messages: []llm.Message{{Role: "user", Content: "active"}}},
+	}}
+	store.order = []string{"current"}
+	a := &Agent{WorkingDir: "/tmp", SessionStore: store, SessionID: "current"}
+
+	_, _, err := a.HandleSessionCommand(context.Background(), "resume del current", "")
+	if err == nil {
+		t.Fatal("expected error for an empty replacement session id")
+	}
+	if _, ok := store.sessions["current"]; !ok {
+		t.Fatal("current session was deleted before the replacement-id check")
+	}
+	if a.SessionID != "current" {
+		t.Fatalf("SessionID = %q, want the (undeleted) current session", a.SessionID)
+	}
+}
+
+// TestSetSessionOneshotRoundTrip pins the locked setter wiring: the -p marker
+// set through SetSessionOneshot is visible to doPersist readers and cleared
+// by a wholesale session reset.
+func TestSetSessionOneshotRoundTrip(t *testing.T) {
+	a := &Agent{Provider: &statsStubProvider{}, WorkingDir: "/tmp", SessionID: "s"}
+	a.SetSessionOneshot(true)
+	if !a.SessionOneshot {
+		t.Fatal("SetSessionOneshot(true) did not publish")
+	}
+	a.ResetSessionState()
+	if a.SessionOneshot {
+		t.Fatal("ResetSessionState must clear the oneshot marker")
+	}
+}

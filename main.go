@@ -286,7 +286,7 @@ func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *co
 	// Start a fresh session: clear any restored conversation state.
 	a.ResetSessionState()
 	a.SetSessionID(session.NewID())
-	a.SessionOneshot = true
+	a.SetSessionOneshot(true)
 	a.FlushSession()
 
 	// Automation runs report their session id through this file so the
