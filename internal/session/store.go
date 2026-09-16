@@ -152,6 +152,14 @@ func validateSessionID(id string) error {
 	if id == "" {
 		return fmt.Errorf("session id is required")
 	}
+	// "index" is the metadata index file's name (index.json): a session with
+	// that id would overwrite (Save) or remove (Delete) the index, and it is
+	// skipped by the file scans, so it can never round-trip. Reject it
+	// case-insensitively: on case-insensitive filesystems (Windows, macOS)
+	// "INDEX" collides with index.json too.
+	if strings.EqualFold(id, "index") {
+		return fmt.Errorf("invalid session id: %q is reserved", id)
+	}
 	if strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
 		return fmt.Errorf("invalid session id")
 	}

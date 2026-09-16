@@ -161,3 +161,47 @@ func TestSaveReleasesStoreMutexDuringPayloadWrite(t *testing.T) {
 		t.Fatal("savePayloadHook did not run; test seam wired wrong")
 	}
 }
+
+// TestLoadDecodesOutsideStoreMutex pins LoadInWorkingDir's lock contract: the
+// store-wide mutex is released before the (potentially large) session JSON is
+// decoded, so attaching a big session cannot block List/Info/LatestID — the
+// web sidebar, served synchronously on the WS read loop. The seam re-enters
+// the store (Info takes s.mu unconditionally); a regression that holds s.mu
+// across the decode deadlocks here and is caught by the timeout.
+func TestLoadDecodesOutsideStoreMutex(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	store.SetAutoPrune(false)
+	if err := store.Save("big", SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: strings.Repeat("x", 1<<20)}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var fired atomic.Bool
+	loadDecodeHook = func() {
+		fired.Store(true)
+		// If LoadInWorkingDir still held s.mu here, this re-entrant call
+		// blocks forever.
+		store.Info(dir, "big")
+	}
+	t.Cleanup(func() { loadDecodeHook = nil })
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.LoadInWorkingDir(dir, "big")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("LoadInWorkingDir: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LoadInWorkingDir hung — store mutex held across the decode?")
+	}
+	if !fired.Load() {
+		t.Fatal("loadDecodeHook did not run; test seam wired wrong")
+	}
+}

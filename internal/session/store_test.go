@@ -541,3 +541,143 @@ func TestDeleteRemovesDelta(t *testing.T) {
 		t.Fatalf("expected delta file removed, err=%v", err)
 	}
 }
+
+// TestReservedIndexIDRejected pins the reserved-name guard: "index" maps to
+// the metadata index file (index.json), so every store operation must reject
+// it (case-insensitively — "INDEX" collides on case-insensitive filesystems)
+// instead of overwriting or deleting the index. Before the guard, Save
+// clobbered index.json with the session payload and its index rewrite then
+// replaced that payload, hiding every other session from listings.
+func TestReservedIndexIDRejected(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	if err := store.Save("real", SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "keep me"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := store.indexFile(dir)
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []string{"index", "INDEX"} {
+		if err := store.Save(id, SessionSnapshot{
+			WorkingDir: dir,
+			Messages:   []llm.Message{{Role: "user", Content: "overwrite attempt"}},
+		}); err == nil {
+			t.Fatalf("Save(%q) must fail (reserved id)", id)
+		}
+		if _, err := store.LoadInWorkingDir(dir, id); err == nil {
+			t.Fatalf("LoadInWorkingDir(%q) must fail (reserved id)", id)
+		}
+		if err := store.Delete(dir, id); err == nil {
+			t.Fatalf("Delete(%q) must fail (reserved id)", id)
+		}
+		if err := store.AppendMessages(id, SessionSnapshot{
+			WorkingDir: dir,
+			Messages:   []llm.Message{{Role: "user", Content: "delta attempt"}},
+		}, 1); err == nil {
+			t.Fatalf("AppendMessages(%q) must fail (reserved id)", id)
+		}
+	}
+
+	after, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("index file must survive the reserved-id attempts: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("index.json was modified by a reserved-id operation:\nbefore %s\nafter %s", before, after)
+	}
+	if _, err := store.LoadInWorkingDir(dir, "real"); err != nil {
+		t.Fatalf("real session no longer loads: %v", err)
+	}
+}
+
+// TestSavePersistsTodosOnlySession pins the todos exception in Save's
+// empty-session skip: the legacy-todos migration imports a project-level
+// list into a fresh session before the first turn (renaming the source
+// away), so a 0-message session carrying todos must be persisted —
+// otherwise the import is lost on quit. An empty-todos session must still
+// be skipped like every other anonymous empty session.
+func TestSavePersistsTodosOnlySession(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+
+	if err := store.Save("todos-only", SessionSnapshot{
+		WorkingDir: dir,
+		Todos: &TodoList{
+			Items:  []TodoItem{{ID: 1, Text: "migrated", Status: "pending"}},
+			NextID: 2,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadInWorkingDir(dir, "todos-only")
+	if err != nil {
+		t.Fatalf("todos-only session must be persisted: %v", err)
+	}
+	if loaded.Todos == nil || len(loaded.Todos.Items) != 1 || loaded.Todos.Items[0].Text != "migrated" {
+		t.Fatalf("todos=%+v, want the migrated item", loaded.Todos)
+	}
+
+	// Empty todos are still "no content".
+	if err := store.Save("empty-todos", SessionSnapshot{
+		WorkingDir: dir,
+		Todos:      &TodoList{Items: []TodoItem{}, NextID: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadInWorkingDir(dir, "empty-todos"); err == nil {
+		t.Fatal("empty-todos session should not be persisted")
+	}
+}
+
+// TestLoadRejectsMismatchedFileID pins the loader's identity check: a
+// session file copied/renamed to another id must not load as that id.
+func TestLoadRejectsMismatchedFileID(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	if err := store.Save("orig", SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "secret"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessDir := filepath.Join(dir, ".gogen", "sessions")
+	data, err := os.ReadFile(filepath.Join(sessDir, "orig.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "copy.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadInWorkingDir(dir, "copy"); err == nil {
+		t.Fatal("LoadInWorkingDir(copy) must reject a file whose id is orig")
+	}
+}
+
+// TestAppendMessagesWithoutSnapshotIsNoop pins the orphan-delta guard: a
+// delta appended after the session file is gone (a late turn flush racing a
+// delete/eviction) is unloadable — LoadInWorkingDir fails on the missing
+// main file before it looks at the delta — so AppendMessages must not create
+// one.
+func TestAppendMessagesWithoutSnapshotIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+
+	if err := store.AppendMessages("gone", SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "late"}},
+	}, 1); err != nil {
+		t.Fatalf("AppendMessages on a missing session: %v", err)
+	}
+	if _, err := os.Stat(store.deltaPath(dir, "gone")); !os.IsNotExist(err) {
+		t.Fatalf("orphan delta was created (stat err=%v)", err)
+	}
+	if _, err := os.Stat(store.path(dir, "gone")); !os.IsNotExist(err) {
+		t.Fatalf("session file should not be created by AppendMessages (stat err=%v)", err)
+	}
+}

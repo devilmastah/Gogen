@@ -1,6 +1,7 @@
 package session
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -179,5 +180,128 @@ func TestSaveLoadKeepsRenameMarkerAcrossRestart(t *testing.T) {
 	}
 	if len(list) != 1 || list[0].Label != rename {
 		t.Fatalf("list label=%+v, want the rename kept", list)
+	}
+}
+
+// TestListRebuildKeepsRenamedMarker pins the legacy-scan index rebuild: when
+// index.json is missing, the rebuilt entry must carry the session file's
+// LabelRenamed marker — otherwise the NEXT List (index path) applies the
+// legacy 50-char migration and silently replaces a deliberate rename.
+func TestListRebuildKeepsRenamedMarker(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	msgs := []llm.Message{
+		{Role: "user", Content: "implement session commands with labels and keep going"},
+		{Role: "assistant", Content: "ok"},
+	}
+	derived := llm.SessionLabel(msgs)
+	rename := derived[:legacyLabelMaxLen]
+	if err := store.Save("sess-renamed", SessionSnapshot{
+		WorkingDir:   dir,
+		Messages:     msgs,
+		Label:        rename,
+		LabelRenamed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate index loss (deleted/corrupt index, legacy directory).
+	if err := os.Remove(store.indexFile(dir)); err != nil {
+		t.Fatal(err)
+	}
+	store.invalidateListCache(dir)
+
+	// First List: legacy scan + index rebuild. The returned label is already
+	// correct (sessionLabel honors the marker at scan time).
+	list, err := store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Label != rename {
+		t.Fatalf("first list label=%+v, want the rename kept", list)
+	}
+
+	// The rebuilt index must carry the marker...
+	idx := store.readIndex(dir)
+	if idx == nil || len(idx.Entries) != 1 {
+		t.Fatalf("rebuilt index = %+v, want one entry", idx)
+	}
+	if !idx.Entries[0].LabelRenamed {
+		t.Fatalf("rebuilt index lost LabelRenamed: %+v", idx.Entries[0])
+	}
+
+	// ...so the second List (index path, migration loop) keeps the rename.
+	store.invalidateListCache(dir)
+	list, err = store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Label != rename {
+		t.Fatalf("second list label=%+v, want the rename kept (marker dropped?)", list)
+	}
+}
+
+// TestListRebuildKeepsNonPrefixFiftyCharLabel pins the migration loop's
+// prefix rule: a 50-char stored label that is NOT a prefix of the derived
+// first-user-message text is not the legacy-truncation shape and must be
+// kept even without the rename marker (the marker-less-rename case).
+func TestListRebuildKeepsNonPrefixFiftyCharLabel(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	msgs := []llm.Message{{Role: "user", Content: strings.Repeat("a", 80)}}
+	stored := strings.Repeat("b", legacyLabelMaxLen)
+	if err := store.Save("sess-nonprefix", SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   msgs,
+		Label:      stored,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.indexFile(dir)); err != nil {
+		t.Fatal(err)
+	}
+	store.invalidateListCache(dir)
+	if _, err := store.List(dir); err != nil { // legacy scan + rebuild
+		t.Fatal(err)
+	}
+	store.invalidateListCache(dir)
+	list, err := store.List(dir) // index path + migration loop
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Label != stored {
+		t.Fatalf("label=%+v, want the non-prefix 50-char label kept", list)
+	}
+}
+
+// TestListRebuildStillMigratesLegacyTruncatedLabel pins the other half of the
+// trade-off: a stored label that IS the legacy truncation (50-char prefix of
+// the derived text) still migrates on the index path after a rebuild.
+func TestListRebuildStillMigratesLegacyTruncatedLabel(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	msgs := []llm.Message{{Role: "user", Content: "implement session commands with labels and keep going"}}
+	derived := llm.SessionLabel(msgs)
+	legacy := derived[:legacyLabelMaxLen]
+	if err := store.Save("sess-legacy", SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   msgs,
+		Label:      legacy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.indexFile(dir)); err != nil {
+		t.Fatal(err)
+	}
+	store.invalidateListCache(dir)
+	if _, err := store.List(dir); err != nil { // legacy scan + rebuild
+		t.Fatal(err)
+	}
+	store.invalidateListCache(dir)
+	list, err := store.List(dir) // index path + migration loop
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Label != derived {
+		t.Fatalf("label=%+v, want migrated to %q", list, derived)
 	}
 }

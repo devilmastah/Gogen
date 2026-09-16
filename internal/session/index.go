@@ -199,7 +199,12 @@ func (s *Store) List(workingDir string) ([]SessionInfo, error) {
 				continue
 			}
 			if len(e.Label) == legacyLabelMaxLen {
-				if raw := s.loadRawLabel(workingDir, e.ID); raw != "" && raw != e.Label {
+				// Only a stored label that is a PREFIX of the derived text
+				// is the legacy-truncation shape that must migrate.
+				// Anything else at this length is a deliberate name (e.g. a
+				// rename from before the marker existed) and must be kept —
+				// mirrors sessionLabel's migration rule.
+				if raw := s.loadRawLabel(workingDir, e.ID); raw != "" && raw != e.Label && strings.HasPrefix(raw, e.Label) {
 					idx.Entries[i].Label = raw
 					needsRewrite = true
 				}
@@ -268,7 +273,7 @@ func (s *Store) List(workingDir string) ([]SessionInfo, error) {
 			updated: updated,
 		})
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl, ParentID: f.ParentID,
+			ID: id, Created: f.Created, Updated: updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl, LabelRenamed: f.LabelRenamed, ParentID: f.ParentID,
 			SubagentStatus: f.SubagentStatus, SubagentSummary: f.SubagentSummary,
 		})
 	}

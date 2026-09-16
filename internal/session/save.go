@@ -24,6 +24,13 @@ const maxCreatedCacheEntries = 200
 // Production leaves it nil.
 var savePayloadHook func()
 
+// loadDecodeHook, when non-nil, runs inside LoadInWorkingDir at the boundary
+// between the locked raw-file capture and the lock-free JSON decode. It is a
+// test-only seam for Load's lock contract, mirroring savePayloadHook: the
+// store mutex must be free when it runs, so the hook may re-enter the store.
+// Production leaves it nil.
+var loadDecodeHook func()
+
 // setCreatedCache adds an entry to the created-timestamp cache, evicting the
 // entry with the oldest Created timestamp if the cache exceeds
 // maxCreatedCacheEntries to prevent unbounded memory growth on long-running
@@ -181,15 +188,23 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 // omitempty, so zero is absent from the payload). A session that WAS saved
 // before and was rolled back to empty must still update its file — the old
 // content was deliberately dropped — so the skip applies only when neither
-// the snapshot nor a pending delta exists on disk. A label is the one
-// exception: it can only be set deliberately (RenameSession / the
-// session_rename tool), so an empty session that was explicitly named must
-// be persisted — otherwise the rename is silently dropped. (Oneshot
-// single-prompt sessions are NOT an exception: their pre-prompt flush must
-// stay skipped or every `-p` run would leave an empty session entry
-// behind.) Caller must hold s.mu.
+// the snapshot nor a pending delta exists on disk. Two kinds of content are
+// exceptions because they can exist without any message:
+//   - A label: it can only be set deliberately (RenameSession / the
+//     session_rename tool), so an empty session that was explicitly named
+//     must be persisted — otherwise the rename is silently dropped.
+//   - Non-empty todos: the legacy-todos migration adopts a project-level
+//     todos.json into a fresh session before the first turn, and the source
+//     file is renamed away — skipping the write would lose the imported
+//     list permanently if the user quits before sending a message.
+//
+// (Oneshot single-prompt sessions are NOT an exception: their pre-prompt
+// flush must stay skipped or every `-p` run would leave an empty session
+// entry behind. ParentID/outcome-only children are not exceptions either: a
+// refused spawn must not leave a failed session file.) Caller must hold
+// s.mu.
 func (s *Store) skipEmptySave(id string, snap SessionSnapshot, path string) bool {
-	if len(snap.Messages) == 0 && snap.Label == "" {
+	if len(snap.Messages) == 0 && snap.Label == "" && !snapshotHasTodos(snap) {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			if _, err := os.Stat(s.deltaPath(snap.WorkingDir, id)); os.IsNotExist(err) {
 				return true
@@ -197,6 +212,14 @@ func (s *Store) skipEmptySave(id string, snap SessionSnapshot, path string) bool
 		}
 	}
 	return false
+}
+
+// snapshotHasTodos reports whether the snapshot carries session-scoped todo
+// content. The agent always passes a non-nil (possibly empty) list via
+// todoSnapshot, so the item count is what distinguishes "nothing to persist"
+// from a todos-only session.
+func snapshotHasTodos(snap SessionSnapshot) bool {
+	return snap.Todos != nil && len(snap.Todos.Items) > 0
 }
 
 // recoverCreated returns the immutable Created timestamp for a session,
@@ -311,27 +334,75 @@ func (s *Store) SetUpdatedAt(workingDir, id string, updated time.Time) error {
 }
 
 // LoadInWorkingDir loads a session from a working directory.
+//
+// The main file's JSON decode runs OUTSIDE the store-wide mutex: a first
+// critical section validates, resolves the paths, and captures the raw file
+// state (main bytes, delta bytes, the delta's mtime/existence); the
+// potentially multi-MB decode then happens lock-free; a second critical
+// section merges the captured delta (same decisions and cleanups as before)
+// and publishes the Created cache entry. Holding s.mu across the whole
+// decode blocked List/Info/LatestID/Save for every session — the web sidebar
+// is served synchronously on the WS read loop, and attach/resume loads run
+// there too. The captured (bytes, mtime) pair is consistent: the merge sees
+// exactly the file state read under the lock.
 func (s *Store) LoadInWorkingDir(workingDir, id string) (SessionSnapshot, error) {
 	if !s.enabled {
 		return SessionSnapshot{}, fmt.Errorf("session persistence disabled")
 	}
+	// First critical section: validate, resolve paths, capture raw file
+	// state. The delta is read here too so the main/delta pair is captured
+	// consistently and the merge's mtime comparison sees the same file.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
+		s.mu.Unlock()
 		return SessionSnapshot{}, err
 	}
 	path := s.path(workingDir, id)
 	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+		s.mu.Unlock()
 		return SessionSnapshot{}, err
 	}
 	data, err := ioutil.ReadFileRetry(path)
 	if err != nil {
+		s.mu.Unlock()
 		return SessionSnapshot{}, err
+	}
+	var deltaData []byte
+	var deltaMod time.Time
+	deltaFound := false
+	if fi, statErr := os.Stat(s.deltaPath(workingDir, id)); statErr == nil {
+		deltaFound = true
+		deltaMod = fi.ModTime().UTC()
+		// ReadFileRetry: this read must not lose a Windows replace window —
+		// a transient sharing violation here reads as "no delta" and
+		// silently drops the messages that exist only in the delta file.
+		if raw, readErr := ioutil.ReadFileRetry(s.deltaPath(workingDir, id)); readErr == nil {
+			deltaData = raw
+		}
+	}
+	s.mu.Unlock()
+
+	// Lock-free: decode the session file (the dominant cost on large
+	// sessions). Test seam for the lock contract, mirroring savePayloadHook.
+	if loadDecodeHook != nil {
+		loadDecodeHook()
 	}
 	var f file
 	if err := json.Unmarshal(data, &f); err != nil {
 		return SessionSnapshot{}, err
 	}
+	// Identity check: a renamed/copied file must not be loaded under a
+	// different id (the copied index.json case that validateSessionID now
+	// rejects is also caught here). Legacy files without an id field load
+	// under the requested id, as before.
+	if f.ID != "" && f.ID != id {
+		return SessionSnapshot{}, fmt.Errorf("session file %s contains id %q", id, f.ID)
+	}
+
+	// Second critical section: merge the captured delta and publish the
+	// Created cache entry, matching a single-lock load exactly.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !f.Created.IsZero() {
 		s.setCreatedCache(id, f.Created)
 	}
@@ -343,75 +414,77 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (SessionSnapshot, error)
 	// delta. The baseCount check below also detects stale deltas (the
 	// snapshot already contains them) and truncated sessions (the delta's
 	// messages were deliberately dropped).
-	snap, deltaErr := s.loadDelta(workingDir, id)
-	if deltaErr == nil && snap.Messages != nil {
-		// mergeFrom is the index into snap.Messages where the merge starts:
-		// 0 merges the whole delta, k>0 merges only the delta tail (the
-		// snapshot already absorbed the delta's first k messages), and -1
-		// drops the delta entirely.
-		mergeFrom := -1
-		switch {
-		case snap.BaseCount == 0:
-			// Legacy delta written before baseCount was recorded. Merging
-			// unconditionally (the historic behavior) double-appends when a
-			// later full save already included the delta's messages — the
-			// crash window Save has between the snapshot write and the delta
-			// unlink, which baseCount deltas survive but legacy deltas do
-			// not. The snapshot's Updated timestamp versus the delta file's
-			// mtime disambiguates: a snapshot saved AFTER the delta was
-			// written already contains its messages. When the timestamps
-			// are ambiguous (coarse filesystems), prefer merging — the
-			// historic behavior — rather than risk dropping real messages.
-			if fi, err := os.Stat(s.deltaPath(workingDir, id)); err == nil && f.Updated.After(fi.ModTime()) {
-				_ = s.clearDeltaFile(workingDir, id)
-			} else {
-				mergeFrom = 0
-			}
-		case len(f.Messages) == snap.BaseCount:
-			// Snapshot is exactly the base the delta was written against:
-			// the delta extends it.
-			mergeFrom = 0
-		case len(f.Messages) >= snap.BaseCount+len(snap.Messages):
-			// Snapshot already contains the delta's messages (a full save
-			// wrote the snapshot but crashed before removing the delta).
-			_ = s.clearDeltaFile(workingDir, id)
-		case len(f.Messages) > snap.BaseCount:
-			// Snapshot is LONGER than the delta's base but shorter than
-			// base+delta. This is the two-writer race shape: a concurrent
-			// full save (another process, or an attach whose restore flush
-			// landed while the registered agent still appends deltas against
-			// its older base) absorbed a PREFIX of the delta into the
-			// snapshot. When the snapshot's extra messages are exactly the
-			// delta's leading messages, the delta's TAIL is real history
-			// that exists nowhere else — merge just the tail instead of
-			// dropping the delta (which previously lost those messages). A
-			// content mismatch means the snapshot diverged (another writer
-			// truncated/rolled back) — keep the snapshot and drop the delta,
-			// the same conservative choice as the truncation case below.
-			overlap := len(f.Messages) - snap.BaseCount
-			if deltaPrefixMatches(f.Messages[snap.BaseCount:], snap.Messages[:overlap]) {
-				mergeFrom = overlap
-			} else {
-				_ = s.clearDeltaFile(workingDir, id)
-			}
-		default:
-			// Snapshot is shorter than the delta's base: the conversation
-			// was truncated (compaction/rollback) and re-saved, so the
-			// delta's messages were deliberately dropped.
-			_ = s.clearDeltaFile(workingDir, id)
-		}
-		if mergeFrom >= 0 {
-			if mergeFrom > 0 {
-				// The snapshot already contains the delta's first
-				// mergeFrom messages; append only the tail.
-				f.Messages = append(f.Messages, snap.Messages[mergeFrom:]...)
-				if len(snap.TokenCounts) > 0 {
-					f.TokenCounts = append(f.TokenCounts, snap.TokenCounts[mergeFrom:]...)
+	if deltaData != nil {
+		snap, deltaErr := decodeDeltaFile(deltaData)
+		if deltaErr == nil && snap.Messages != nil {
+			// mergeFrom is the index into snap.Messages where the merge starts:
+			// 0 merges the whole delta, k>0 merges only the delta tail (the
+			// snapshot already absorbed the delta's first k messages), and -1
+			// drops the delta entirely.
+			mergeFrom := -1
+			switch {
+			case snap.BaseCount == 0:
+				// Legacy delta written before baseCount was recorded. Merging
+				// unconditionally (the historic behavior) double-appends when a
+				// later full save already included the delta's messages — the
+				// crash window Save has between the snapshot write and the delta
+				// unlink, which baseCount deltas survive but legacy deltas do
+				// not. The snapshot's Updated timestamp versus the delta file's
+				// mtime disambiguates: a snapshot saved AFTER the delta was
+				// written already contains its messages. When the timestamps
+				// are ambiguous (coarse filesystems), prefer merging — the
+				// historic behavior — rather than risk dropping real messages.
+				if deltaFound && f.Updated.After(deltaMod) {
+					_ = s.clearDeltaFile(workingDir, id)
+				} else {
+					mergeFrom = 0
 				}
-			} else {
-				f.Messages = append(f.Messages, snap.Messages...)
-				if len(snap.TokenCounts) > 0 {
-					f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+			case len(f.Messages) == snap.BaseCount:
+				// Snapshot is exactly the base the delta was written against:
+				// the delta extends it.
+				mergeFrom = 0
+			case len(f.Messages) >= snap.BaseCount+len(snap.Messages):
+				// Snapshot already contains the delta's messages (a full save
+				// wrote the snapshot but crashed before removing the delta).
+				_ = s.clearDeltaFile(workingDir, id)
+			case len(f.Messages) > snap.BaseCount:
+				// Snapshot is LONGER than the delta's base but shorter than
+				// base+delta. This is the two-writer race shape: a concurrent
+				// full save (another process, or an attach whose restore flush
+				// landed while the registered agent still appends deltas against
+				// its older base) absorbed a PREFIX of the delta into the
+				// snapshot. When the snapshot's extra messages are exactly the
+				// delta's leading messages, the delta's TAIL is real history
+				// that exists nowhere else — merge just the tail instead of
+				// dropping the delta (which previously lost those messages). A
+				// content mismatch means the snapshot diverged (another writer
+				// truncated/rolled back) — keep the snapshot and drop the delta,
+				// the same conservative choice as the truncation case below.
+				overlap := len(f.Messages) - snap.BaseCount
+				if deltaPrefixMatches(f.Messages[snap.BaseCount:], snap.Messages[:overlap]) {
+					mergeFrom = overlap
+				} else {
+					_ = s.clearDeltaFile(workingDir, id)
+				}
+			default:
+				// Snapshot is shorter than the delta's base: the conversation
+				// was truncated (compaction/rollback) and re-saved, so the
+				// delta's messages were deliberately dropped.
+				_ = s.clearDeltaFile(workingDir, id)
+			}
+			if mergeFrom >= 0 {
+				if mergeFrom > 0 {
+					// The snapshot already contains the delta's first
+					// mergeFrom messages; append only the tail.
+					f.Messages = append(f.Messages, snap.Messages[mergeFrom:]...)
+					if len(snap.TokenCounts) > 0 {
+						f.TokenCounts = append(f.TokenCounts, snap.TokenCounts[mergeFrom:]...)
+					}
+				} else {
+					f.Messages = append(f.Messages, snap.Messages...)
+					if len(snap.TokenCounts) > 0 {
+						f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+					}
 				}
 			}
 		}
@@ -453,6 +526,16 @@ func (s *Store) AppendMessages(id string, snap SessionSnapshot, totalMsgCount in
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
+	// A delta without its base snapshot is unloadable: LoadInWorkingDir
+	// fails on the missing main file before it ever looks at the delta, so
+	// writing one would only leave an orphan sidecar behind (the accepted
+	// window after a delete/eviction, where a late turn flush races the
+	// file removal). No-op — including the directory creation — when the
+	// session file is gone.
+	mainPath := s.path(snap.WorkingDir, id)
+	if _, err := os.Stat(mainPath); os.IsNotExist(err) {
+		return nil
+	}
 	dir := s.dir(snap.WorkingDir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -479,7 +562,6 @@ func (s *Store) AppendMessages(id string, snap SessionSnapshot, totalMsgCount in
 	}
 
 	// Update the main file's mtime so the session appears recent in listings.
-	mainPath := s.path(snap.WorkingDir, id)
 	_ = os.Chtimes(mainPath, time.Now(), time.Now())
 
 	// Update the index so the session appears recent in listings. The delta
