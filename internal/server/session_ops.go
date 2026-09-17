@@ -299,19 +299,37 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 	return rt
 }
 
-// sessionResume handles "resume <id>" and "resume latest".
+// sessionCommandFocusPane is the response action for a resume that resolved to
+// a session already open as a background pane of the requesting connection:
+// the server does not re-key the pane; the client focuses the pane that
+// already shows the session (its re-attach re-syncs the connection's pane
+// pointer). Server-local: the value has no meaning to the TUI/agent hosts.
+const sessionCommandFocusPane agent.SessionCommandAction = "focus_pane"
+
+// sessionResume handles "resume <id>" and "resume latest". A successful
+// switch ships the ATTACH sequence — session_state and the history snapshot in
+// this read-loop turn (see the ordering note below), then the config pair
+// asynchronously — with no response/clear_chat placeholder frames; a resume of
+// the connection's current session is a no-op acknowledgement, and a target
+// already open as a pane of this connection resolves to a focus-pane reply
+// without switching.
 func (s *Server) sessionResume(ctx context.Context, ws *wsConn, pane **sessionRuntime, args string) (agent.SessionCommandResult, bool, error) {
 	if s.ws.Store == nil {
 		return agent.SessionCommandResult{}, true, fmt.Errorf("session persistence disabled")
 	}
 	id := strings.TrimSpace(args)
 	if id == "latest" {
-		latest, err := s.ws.Store.LatestID(s.ws.GetWorkingDir())
+		// The same rule as the TUI/CLI and the README: the newest saved
+		// top-level session OTHER than the current one (nested children are
+		// excluded — they are reachable only through their parent). The
+		// agent's resolver owns that rule, so the web cannot drift from its
+		// hosts. Store.LatestID would pick the CURRENT session whenever it
+		// is the newest, turning "resume latest" into a pointless
+		// wipe-and-replay of the on-screen transcript (an explicit
+		// "/resume <current-id>" is the no-op ack below).
+		latest, err := (*pane).agent.ResolveResumeTarget("latest")
 		if err != nil {
 			return agent.SessionCommandResult{}, true, err
-		}
-		if latest == "" {
-			return agent.SessionCommandResult{}, true, fmt.Errorf("no saved sessions to resume")
 		}
 		id = latest
 	}
@@ -322,23 +340,72 @@ func (s *Server) sessionResume(ctx context.Context, ws *wsConn, pane **sessionRu
 	if err != nil {
 		return agent.SessionCommandResult{}, true, err
 	}
+	// Resuming the connection's CURRENT session is a no-op acknowledgement:
+	// the pane already shows this session, live — the generic reply's
+	// clear_chat + full history snapshot would only wipe and replay the
+	// very transcript on screen (losing the reading position). Clients
+	// reach this for an explicit current-id resume ("/resume <current-id>"
+	// typed into the composer, or a client sending session_resume for it);
+	// "resume latest" never lands here — the resolver above excludes the
+	// current session. The idempotent switchPane keeps the re-attach
+	// bookkeeping and its refused-attach guard; when it refuses (the
+	// runtime is leaving memory) the switch below reports the same error
+	// as any other resume.
+	if *pane != nil && *pane == rt && s.switchPane(ws, pane, rt) {
+		s.registry.setDefault(id)
+		return agent.SessionCommandResult{
+			Output: fmt.Sprintf("Already on session %s.", id),
+		}, true, nil
+	}
+	// The target is already open as a background pane of THIS connection:
+	// re-keying the current pane onto it would put one session in two panes
+	// (each desyncs the other's transcript and event routing). Leave the pane
+	// pointer alone and point the client at the pane it already has — the
+	// focus that follows re-attaches the session, which re-syncs the
+	// connection's pane pointer server-side. Passive (approval-only)
+	// attachments are not panes and fall through to the normal switch.
+	if *pane != nil && *pane != rt && rt.viewedBy(ws) {
+		_ = ws.writeJSON(WSMessage{
+			Type:          "response",
+			Content:       fmt.Sprintf("Session %s is already open in another pane.", id),
+			SessionID:     id,
+			SessionAction: string(sessionCommandFocusPane),
+		})
+		return agent.SessionCommandResult{}, true, nil
+	}
+	if !s.switchPane(ws, pane, rt) {
+		// The pane pointer must not move to a runtime that is leaving memory
+		// (a claimed session_close raced this resume). Report the failure so
+		// the client stays on its current session and clears its pending
+		// change; a session_detached would name an id the client's pane does
+		// not hold and strand the pending flag.
+		return agent.SessionCommandResult{}, true, fmt.Errorf("session %s is closing", id)
+	}
 	s.registry.setDefault(id)
-	s.switchPane(ws, pane, rt)
-	// session_state so the client can latch the turn-end convergence refetch
-	// when the resumed session has a RUNNING (headless) turn: the reply's
-	// history snapshot cannot contain the in-flight reply, and the client
-	// only re-attaches on turn_end when session_state reported turnActive
-	// (the attach path already sends it; the resume path must too, or the
-	// resumed transcript never converges).
+	// The resume reply IS the attach sequence: session_state (the client's
+	// re-key frame and, for a RUNNING headless turn, the convergence latch —
+	// the history snapshot cannot contain the in-flight reply, so the client
+	// re-attaches on turn_end), then the history snapshot, then the config
+	// pair. Byte-identical to session_attach, so a pane re-derives its
+	// transcript through exactly one code path. The empty result tells
+	// writeSessionCommandResult the reply was already sent (no
+	// response/clear_chat placeholder frames).
+	//
+	// The history is built and enqueued in THIS read-loop turn rather than in
+	// the payload goroutine (which still ships the configs): the client
+	// reacts to session_state IMMEDIATELY — it releases the left-behind
+	// session (session_detach, whose orphan eviction broadcasts
+	// session_detached) and refreshes the sidebar (list_sessions) — and those
+	// reactions and their replies would otherwise be written AHEAD of a
+	// goroutine-built history on the same socket, leaving the pane on its
+	// empty state for the whole snapshot build. It is the frame that swaps
+	// the transcript, so it must be back-to-back with the re-key frame. The
+	// clone here is the same read-loop work the pre-unification reply did
+	// (minus its second clone and context brief).
 	s.sendSessionState(ws, rt)
-
-	a := rt.agent
-	out := agent.AppendContextBrief(ctx, a, agent.ResumeOutputMessage(id, a.SnapshotMessages()))
-	return agent.SessionCommandResult{
-		Output:  out,
-		Action:  agent.SessionActionClearChat,
-		History: a.SnapshotMessages(),
-	}, true, nil
+	s.sendAttachHistory(ws, rt, nil)
+	s.sendAttachPayload(ctx, ws, rt, false, nil)
+	return agent.SessionCommandResult{}, true, nil
 }
 
 // sessionFork forks the pane's session into a NEW agent (the source session

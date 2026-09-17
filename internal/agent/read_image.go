@@ -92,12 +92,34 @@ func handleReadImage(ctx context.Context, a *Agent, args map[string]any) (string
 	if displayDetail == "" {
 		displayDetail = "auto"
 	}
-	caption := fmt.Sprintf("[read_image] %s — %s, %s", path, mime, formatByteSize(size))
-	sink.Add(llm.ImageInput{
+	original := llm.ImageInput{
 		DataURL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data),
 		Detail:  detail,
-	}, caption)
-	return fmt.Sprintf("Image attached to context: %s (%s, %s, detail=%s)", path, mime, formatByteSize(size), displayDetail), nil
+	}
+	// Downscale before the image becomes part of the transcript: every
+	// subsequent request re-uploads it, so the bytes attached here are paid
+	// again on every round (see image_scale.go).
+	attached := normalizeImage(original)
+	attachedSize := formatByteSize(size)
+	if attached.DataURL != original.DataURL {
+		attachedSize = formatByteSize(int64(dataURLRawBytes(attached.DataURL)))
+	}
+	sink.Add(attached, fmt.Sprintf("[read_image] %s — %s, %s", path, mime, attachedSize))
+	if attached.DataURL != original.DataURL {
+		return fmt.Sprintf("Image attached to context: %s (%s, %s downscaled from %s, detail=%s)",
+			path, mime, attachedSize, formatByteSize(size), displayDetail), nil
+	}
+	return fmt.Sprintf("Image attached to context: %s (%s, %s, detail=%s)", path, mime, attachedSize, displayDetail), nil
+}
+
+// dataURLRawBytes returns the decoded payload size of a base64 data URL: every
+// four encoded characters carry three bytes (padding included).
+func dataURLRawBytes(url string) int {
+	i := strings.IndexByte(url, ',')
+	if i < 0 {
+		return 0
+	}
+	return (len(url) - i - 1) / 4 * 3
 }
 
 // countImages returns the number of read_image attachments across msgs.

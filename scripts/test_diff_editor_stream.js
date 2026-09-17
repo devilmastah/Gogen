@@ -406,6 +406,52 @@ console.log('incomplete trailing line then completion (held-back scan state)');
   check(ed.getModel().setValueCalls.length === 0, 'whole sequence stayed append-only');
 }
 
+console.log('scanDiffValueIncremental matches extractDiffValue at every prefix');
+{
+  // The streaming card updater decodes the diff value incrementally (only the
+  // new tail per frame — re-decoding the whole value was O(args²) over a
+  // streamed patch). It must agree with the batch extractor at EVERY prefix,
+  // including a backslash escape split across two deltas.
+  const { scanDiffValueIncremental, extractDiffValue } = window;
+  const cases = [
+    JSON.stringify({ path: 'a.go', diff: '--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new' }),
+    JSON.stringify({ diff: 'line1\nline2\t"quoted"\\backslash\r\nend' }),
+    JSON.stringify({ diff: '', path: 'x' }),
+  ];
+  for (const args of cases) {
+    const scan = { keyed: false, complete: false, pos: 0, valueStart: -1, out: '' };
+    let mismatch = null;
+    for (let n = 1; n <= args.length; n++) {
+      const prefix = args.slice(0, n);
+      const inc = scanDiffValueIncremental(scan, prefix);
+      const batch = extractDiffValue(prefix);
+      // One allowed difference: when the prefix ends on a lone backslash (an
+      // escape split across deltas), the batch extractor emits the raw '\'
+      // for that frame while the incremental scanner holds it back until the
+      // escaped character arrives — it must never surface a half-decoded
+      // escape.
+      const heldBackEscape = !batch.complete && batch.value.endsWith('\\')
+        && inc.value === batch.value.slice(0, -1);
+      if (inc.ok !== batch.ok || inc.complete !== batch.complete
+        || (inc.value !== batch.value && !heldBackEscape)) {
+        mismatch = { n, inc, batch };
+        break;
+      }
+    }
+    check(!mismatch, 'incremental scan matches at every prefix (' + JSON.stringify(args.slice(0, 24)) + '\u2026)'
+      + (mismatch ? ' — first mismatch at ' + mismatch.n + ': inc=' + JSON.stringify(mismatch.inc) + ' batch=' + JSON.stringify(mismatch.batch) : ''));
+  }
+  // Once complete, later calls keep returning the finished value without
+  // rescanning.
+  const full = JSON.stringify({ diff: 'abc' });
+  const scan = { keyed: false, complete: false, pos: 0, valueStart: -1, out: '' };
+  scanDiffValueIncremental(scan, full.slice(0, 9));
+  let out = null;
+  for (let n = 10; n <= full.length; n++) out = scanDiffValueIncremental(scan, full.slice(0, n));
+  check(out && out.complete && out.value === 'abc', 'value completed across deltas decodes exactly');
+  check(scanDiffValueIncremental(scan, full) === out || (out.complete && scan.complete), 'repeat call after completion stays complete');
+}
+
 console.log('mountDiffEditor seeds the streaming state (source contract — mount needs real monaco)');
 {
   check(src.includes('ed.__gogenDiffValue = value || \'\';'), 'mountDiffEditor seeds __gogenDiffValue');

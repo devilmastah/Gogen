@@ -445,3 +445,45 @@ func TestTerminalUnknownSession(t *testing.T) {
 		t.Fatal("unknown job status must fail")
 	}
 }
+
+// TestTerminalBackgroundWait covers the background_job wait action on a
+// terminal send: shell jobs and terminal sends share the job-id space, so a
+// wait must resolve a tjob- id and the list must show it.
+func TestTerminalBackgroundWait(t *testing.T) {
+	a := newTerminalTestAgent(t)
+	defer a.Close()
+
+	id := openTestTerminal(t, a)
+	sendText(t, a, id, "stty -echo")
+
+	out, err := handleTerminal(context.Background(), a, map[string]any{
+		"action":            "send",
+		"session_id":        id,
+		"text":              "printf WAITED",
+		"run_in_background": true,
+		"timeout_ms":        8000,
+	})
+	if err != nil {
+		t.Fatalf("background send: %v", err)
+	}
+	a.termMu.Lock()
+	var jobID string
+	for jid := range a.termJobs {
+		jobID = jid
+	}
+	a.termMu.Unlock()
+	if jobID == "" || !strings.Contains(out, jobID) {
+		t.Fatalf("send result %q does not mention a registered job id", out)
+	}
+
+	status, err := a.BackgroundJobWait(context.Background(), jobID, 15*time.Second)
+	if err != nil {
+		t.Fatalf("wait on terminal job: %v", err)
+	}
+	if !strings.Contains(status, "FINISHED") || !strings.Contains(status, "WAITED") {
+		t.Fatalf("wait status = %q, want FINISHED with WAITED", status)
+	}
+	if list := a.BackgroundJobsList(); !strings.Contains(list, jobID) {
+		t.Fatalf("list missing terminal job %s:\n%s", jobID, list)
+	}
+}

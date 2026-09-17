@@ -16,7 +16,7 @@
 //                                        with the sessions export/resend)
 import { marked } from '/vendor/marked.esm.js';
 import DOMPurify from '/vendor/dompurify.esm.js';
-import { colorizeNode, openFileAtLine } from '/editor.js';
+import { colorizeNode, openFileAtLine, sealStreamColorize } from '/editor.js';
 
 let deps = null;
 
@@ -24,9 +24,23 @@ export function initMarkdown(d) {
     deps = d;
 }
 
-function renderMarkdownHTML(text) {
-    const raw = marked.parse(text || '', { async: false });
+// Raw marked parse (no sanitization). The promotion-time reconciliation
+// compares RAW output: DOMPurify sanitization is by far the dominant cost of
+// that pass (an order of magnitude above the parse) and is only needed for
+// HTML that actually lands in the DOM. Sanitization is deterministic, so
+// equal raw output implies equal sanitized output — a raw comparison can
+// only err toward an unnecessary repaint, which is correct anyway (the
+// repaint renders exactly what the final single-shot render would).
+function renderMarkdownRaw(text) {
+    return marked.parse(text || '', { async: false });
+}
+
+function sanitizeMarkdownHTML(raw) {
     return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
+}
+
+function renderMarkdownHTML(text) {
+    return sanitizeMarkdownHTML(renderMarkdownRaw(text));
 }
 
 // Whitespace-normalized form of a rendered HTML string, used to compare
@@ -93,25 +107,183 @@ function enhanceCodeBlocksWithCopy(root) {
     });
 }
 
-// Shared post-render pipeline for a markdown node: the (sanitized)
-// HTML, copy buttons, and Monaco colorize. Cached tokenized blocks
-// inline synchronously (one DOM write, no async); uncached ones
-// colorize in the background (colorizeNode). `linkify` is enabled
-// only for full single-shot renders — the streaming path linkifies
-// once at stream end via setMessageMarkdown. `streamingTail` marks
-// the in-flight tail render (content still growing, node re-rendered
-// every flush): uncached code still tokenizes in the background so
-// the block stays colorized as it streams (the pre-optimization
-// behavior), but in the no-cache mode — no LRU writes for a source
-// that is still growing, stale results dropped by element identity
-// and text match.
-function renderBlockNode(node, blockText, opts) {
+// Shared post-render pipeline for a markdown node: the (sanitized) HTML,
+// the copy buttons, and the per-code-element plain-text bookkeeping the
+// colorize paths rely on. Deliberately no colorize here — renderBlockNode
+// owns that split, so the streaming tail can arm its code patch in between.
+function renderBlockHtml(node, blockText, opts) {
     // Callers that already hold the rendered HTML (the reconciliation
     // path renders the prefix once and reuses it) skip the re-parse.
     node.innerHTML = opts && opts.html !== undefined ? opts.html : renderMarkdownHTML(blockText);
     enhanceCodeBlocksWithCopy(node);
+    // Authoritative plain text per code element. Monaco's colorize replaces
+    // the element's content with <br/>-separated spans, so textContent is no
+    // longer a plain-text source afterwards; every writer (the colorizer,
+    // the streaming patch renderer) updates this instead.
+    for (const code of node.querySelectorAll('pre code')) {
+        code.__gogenPlain = code.textContent || '';
+    }
+}
+
+// Shared post-render pipeline for a markdown node: the HTML, copy buttons,
+// and Monaco colorize. Cached tokenized blocks inline synchronously (one
+// DOM write, no async); uncached ones colorize in the background
+// (colorizeNode). `linkify` is enabled only for full single-shot renders —
+// the streaming path linkifies once at stream end via setMessageMarkdown.
+// `streamingTail` marks the in-flight tail render (content still growing,
+// node patched or re-rendered every flush; colorizeNode's governor paces
+// the tokenization).
+function renderBlockNode(node, blockText, opts) {
+    renderBlockHtml(node, blockText, opts);
     colorizeNode(node, { streamingTail: !!(opts && opts.streamingTail) });
     if (opts && opts.linkify) linkifyMessageRefs(node);
+}
+
+// ── Streaming tail: single fenced code block patching ──
+// A tail whose markdown is exactly one fenced code block is updated by
+// appending only the grown text to its <code> element instead of re-parsing
+// and re-swapping the whole block on every flush. That keeps the colorized
+// spans alive, costs O(delta) per flush instead of O(block), and lets the
+// colorize governor amortize its tokenizes. Any other shape (another block
+// kind, a rewrite, a non-append delta, a structural surprise) falls back to
+// the full renderer, which is always correct.
+
+function firstFenceWord(info) {
+    const w = String(info || '').trim().split(/\s+/)[0];
+    return w || '';
+}
+
+// The code content of `raw` when raw is EXACTLY one fenced code block (the
+// opener is the first line; a closer, when present, is the last line with
+// nothing after it): { lang, codeText } or null. Mirrors marked's fence
+// shape rules for the cases this patch can preserve.
+function fenceCodeInfo(raw) {
+    const open = /^ {0,3}(`{3,}|~{3,})([^\n]*)\n/.exec(raw);
+    if (!open) return null;
+    const closeRe = new RegExp('^ {0,3}' + open[1][0] + '{' + open[1].length + ',}[ \\t]*$');
+    const codeStart = open[0].length;
+    const rest = raw.slice(codeStart);
+    const lines = rest.split('\n');
+    // A trailing '' element is the artifact of a final newline, not a line.
+    const lineCount = lines.length - (lines[lines.length - 1] === '' ? 1 : 0);
+    let lineStart = codeStart;
+    for (let i = 0; i < lineCount; i++) {
+        if (closeRe.test(lines[i])) {
+            // The closer ends the block: only a closer that is the LAST line
+            // keeps the block patchable (content after it makes the block
+            // fence + more, which needs the full renderer).
+            if (i !== lineCount - 1) return null;
+            return { lang: firstFenceWord(open[2]), codeText: raw.slice(codeStart, lineStart) };
+        }
+        lineStart += lines[i].length + 1;
+    }
+    return { lang: firstFenceWord(open[2]), codeText: rest };
+}
+
+// marked normalizes a fenced code block's content to end with a newline, so
+// the rendered code text is the raw content plus one newline unless it
+// already ends with one (or is empty). Keep the display in exactly that
+// shape so live and single-shot renders stay identical.
+function fenceDisplayText(codeText) {
+    if (codeText === '' || codeText.endsWith('\n')) return codeText;
+    return codeText + '\n';
+}
+
+function appendCodeText(code, delta) {
+    if (!delta) return;
+    const last = code.lastChild;
+    if (last && last.nodeType === 3) last.data += delta;
+    else code.appendChild(document.createTextNode(delta));
+}
+
+// Remove the trailing newline the display carries for an incomplete last
+// line (the plain tail's last character). Returns false when it is not in a
+// plain text node (the colored prefix covers it) — the caller then falls
+// back to a full render.
+function trimCodeTrailingNewline(code) {
+    const last = code.lastChild;
+    if (!last || last.nodeType !== 3 || !last.data.endsWith('\n')) return false;
+    last.data = last.data.slice(0, -1);
+    if (last.data === '') last.remove();
+    return true;
+}
+
+// Update the tail's code block in place. Returns true when the DOM is (or
+// needs no) update; false when the caller must fall back to a full render.
+function patchTailCodeBlock(node, blockText) {
+    const patch = node._gogenTail;
+    // Containment (not document connectivity): the invariant is that this
+    // code element is still the one inside our tail node — a full re-render
+    // replaces it. Works for offscreen/detached containers too.
+    if (!patch || !node.contains(patch.code)) return false;
+    if (!blockText.endsWith('\n')) return false;
+    // CRLF is excluded: the patch appends bytes verbatim, while marked
+    // normalizes CRLF to LF on a full render — patching would make a live
+    // block diverge from its own final rendering (until the closed fence
+    // re-renders it). Fall back to the full renderer.
+    if (blockText.includes('\r')) return false;
+    // splitStreamBlocks appends exactly one '\n' to the raw in-flight text.
+    const raw = blockText.slice(0, -1);
+    if (!raw.startsWith(patch.rawText)) return false;
+    const info = fenceCodeInfo(raw);
+    if (!info || info.lang !== patch.lang) return false;
+    if (!info.codeText.startsWith(patch.codeText)) return false;
+    const displayNow = fenceDisplayText(info.codeText);
+    const displayWas = patch.code.__gogenPlain !== undefined ? patch.code.__gogenPlain : '';
+    if (displayNow !== displayWas) {
+        if (displayNow.startsWith(displayWas)) {
+            appendCodeText(patch.code, displayNow.slice(displayWas.length));
+        } else if (displayWas.endsWith('\n') && displayNow.startsWith(displayWas.slice(0, -1))) {
+            // The trailing newline was the normalized blank line of an
+            // incomplete last line: it moves as the line grows. Drop it from
+            // the DOM and append from there.
+            if (!trimCodeTrailingNewline(patch.code)) return false;
+            appendCodeText(patch.code, displayNow.slice(displayWas.length - 1));
+        } else {
+            return false;
+        }
+        patch.code.__gogenPlain = displayNow;
+    }
+    patch.code.__gogenRaw = info.codeText;
+    patch.rawText = raw;
+    patch.codeText = info.codeText;
+    return true;
+}
+
+// After a full render of the tail, remember how to patch it when it is a
+// single fenced code block.
+function armTailCodePatch(node, blockText) {
+    node._gogenTail = null;
+    if (!blockText.endsWith('\n')) return;
+    // CRLF streams take the full renderer every flush (see patchTailCodeBlock).
+    if (blockText.includes('\r')) return;
+    const raw = blockText.slice(0, -1);
+    const info = fenceCodeInfo(raw);
+    if (!info) return;
+    const codes = node.querySelectorAll('pre code');
+    if (codes.length !== 1) return;
+    const code = codes[0];
+    if (info.lang) {
+        const want = ('language-' + info.lang).toLowerCase();
+        if (!code.className.split(/\s+/).some((c) => c.toLowerCase() === want)) return;
+    }
+    const display = fenceDisplayText(info.codeText);
+    const current = code.__gogenPlain !== undefined ? code.__gogenPlain : code.textContent;
+    if (current !== display) return;
+    code.__gogenPlain = display;
+    code.__gogenRaw = info.codeText;
+    node._gogenTail = { code, lang: info.lang, rawText: raw, codeText: info.codeText };
+}
+
+// The streaming tail renderer: a single fenced code block that only grew is
+// patched in place; anything else takes the full block render. Either way
+// the tail is handed to the colorize governor.
+function renderStreamTail(node, blockText) {
+    if (!patchTailCodeBlock(node, blockText)) {
+        renderBlockHtml(node, blockText);
+        armTailCodePatch(node, blockText);
+    }
+    colorizeNode(node, { streamingTail: true });
 }
 
 // Returns the .message-body wrapper that holds a bubble's flow
@@ -147,6 +319,13 @@ export function msgBody(el) {
 // index-based reconciliation would otherwise trust stale entries.
 export function setMessageMarkdown(el, text) {
     el.classList.add('md');
+    // Publish the streaming colorization before the re-render replaces it:
+    // a code block that was colored through the streaming governor (which
+    // never writes the LRU) would otherwise be recreated plain and flash
+    // "colored → plain → colored" while an async tokenize re-runs for text
+    // that was already colored. The entry makes this render a synchronous
+    // cache hit (see sealStreamColorize in editor.js).
+    sealStreamColorize(el);
     // Wrap rendered content in a child element so edit-resend can
     // hide/show it without touching appended buttons.
     let textWrap = el.querySelector('.msg-text');
@@ -351,7 +530,7 @@ export function renderStreamMarkdown(el, text) {
     const st = el._gogenBlocks || (el._gogenBlocks = {
         done: [],        // per-block frozen nodes painted since the last repaint
         mergedNode: null, // one node holding the whole frozen prefix after a repaint (null in per-block mode)
-        prefixHTML: '',  // rendered HTML of the frozen prefix (per-block concats, or the repaint's joint parse)
+        rawPrefixHTML: '', // RAW marked HTML of the frozen prefix (per-block concats, or the repaint's joint parse) — the reconcile compare accumulator
         tailNode: null,
         processedLen: 0,
         lastText: null,
@@ -395,8 +574,11 @@ export function renderStreamMarkdown(el, text) {
         if (st.mergedNode) st.mergedNode.remove();
         st.done = [];
         st.mergedNode = null;
-        st.prefixHTML = '';
+        st.rawPrefixHTML = '';
         st.processedLen = 0;
+        // A rewrite (shrink / boundary change) invalidates the tail's code
+        // patch; the next render re-arms it from scratch.
+        if (st.tailNode) st.tailNode._gogenTail = null;
     }
 
     const tail = text.slice(st.processedLen);
@@ -422,12 +604,33 @@ export function renderStreamMarkdown(el, text) {
     // boundary, not per flush), so the hot path stays O(tail): two
     // O(prefix) parses per promotion, never per token flush.
     if (newDone.length) {
+        // The blocks being promoted are about to be recreated from HTML —
+        // which starts plain — and their colorized DOM lives in the TAIL node
+        // right now. Seal exactly that node: sealing the whole message would
+        // re-serialize every colorized block in it at every block boundary
+        // (Monaco's span-heavy HTML makes that O(prefix) per promotion, felt
+        // as the stream slowing down as the answer grows). The reconcile
+        // repaint below seals the frozen nodes it is about to replace.
+        sealStreamColorize(st.tailNode);
         const prefixText = text.slice(0, st.processedLen + tailLastStart);
         if (prefixText.length <= RECONCILE_MAX_PREFIX) {
-            const newHTMLs = newDone.map((block) => renderMarkdownHTML(block));
-            const perBlockHTML = st.prefixHTML + newHTMLs.join('');
-            const prefixHTML = renderMarkdownHTML(prefixText);
-            if (normalizeBlockHTML(perBlockHTML) !== normalizeBlockHTML(prefixHTML)) {
+            // Compare on RAW marked output (see renderMarkdownRaw): the
+            // DOMPurify sanitize that used to run on the joint parse is the
+            // dominant cost of this pass and is only needed for HTML that
+            // actually lands in the DOM. One raw parse per new block, one for
+            // the joint prefix — the sanitize now happens only where the
+            // result is rendered.
+            const newRaw = newDone.map((block) => renderMarkdownRaw(block));
+            const rawPerBlock = st.rawPrefixHTML + newRaw.join('');
+            const rawPrefix = renderMarkdownRaw(prefixText);
+            if (normalizeBlockHTML(rawPerBlock) !== normalizeBlockHTML(rawPrefix)) {
+                // Repaint: every frozen node (and the merged node) is about
+                // to be replaced — seal their colorized blocks first so the
+                // repaint paints them from the cache instead of flashing
+                // plain. This is the rare divergence path, already O(prefix)
+                // for the parse above.
+                for (const entry of st.done) sealStreamColorize(entry.node);
+                sealStreamColorize(st.mergedNode);
                 // Divergence: repaint the whole frozen prefix from the
                 // joint parse, collapsing it into one node. Order is
                 // preserved: the merged node takes the place of every
@@ -443,14 +646,16 @@ export function renderStreamMarkdown(el, text) {
                         textWrap.appendChild(st.mergedNode);
                     }
                 }
-                renderBlockNode(st.mergedNode, prefixText, { linkify: false, html: prefixHTML });
-                st.prefixHTML = prefixHTML;
+                renderBlockNode(st.mergedNode, prefixText, { linkify: false, html: sanitizeMarkdownHTML(rawPrefix) });
+                st.rawPrefixHTML = rawPrefix;
             } else {
-                // Match: freeze per-block as before.
+                // Match: freeze per-block as before (each block's raw is
+                // sanitized for the DOM; the raw stays the compare
+                // accumulator).
                 for (let i = 0; i < newDone.length; i++) {
                     const node = document.createElement('div');
                     node.className = 'md-block';
-                    renderBlockNode(node, newDone[i], { linkify: false, html: newHTMLs[i] });
+                    renderBlockNode(node, newDone[i], { linkify: false, html: sanitizeMarkdownHTML(newRaw[i]) });
                     if (st.tailNode) {
                         textWrap.insertBefore(node, st.tailNode);
                     } else {
@@ -458,12 +663,12 @@ export function renderStreamMarkdown(el, text) {
                     }
                     st.done.push({ text: newDone[i], node });
                 }
-                st.prefixHTML += newHTMLs.join('');
+                st.rawPrefixHTML += newRaw.join('');
             }
         } else {
             // Oversized prefix: freeze unreconciled (once over the cap
             // every later promotion would pay the same parse; the final
-            // full render corrects any divergence). st.prefixHTML is
+            // full render corrects any divergence). st.rawPrefixHTML is
             // intentionally left behind: it is only read by the compare
             // above, which can no longer be reached.
             for (const block of newDone) {
@@ -480,17 +685,17 @@ export function renderStreamMarkdown(el, text) {
         }
     }
 
-    // Tail: one stable node, re-rendered every flush. Markdown and
-    // copy buttons re-run here; colorize re-tokenizes the tail's
-    // uncached code every flush (streamingTail mode: no LRU writes,
-    // stale results dropped) so streaming code stays colorized as it
-    // grows — the UX the pre-optimization code provided.
+    // Tail: one stable node. A single fenced code block that only grew is
+    // PATCHED in place (append only the delta, keep the colorized spans);
+    // any other shape takes the full block render. Either way the node is
+    // handed to the colorize governor, which paces the tokenization
+    // (streamingTail mode: no LRU writes, size cap, one job in flight).
     if (!st.tailNode) {
         st.tailNode = document.createElement('div');
         st.tailNode.className = 'md-block md-tail';
         textWrap.appendChild(st.tailNode);
     }
-    renderBlockNode(st.tailNode, inFlight, { linkify: false, streamingTail: true });
+    renderStreamTail(st.tailNode, inFlight);
 
     // Advance the boundary to the start of the in-flight block; it is
     // the only part re-split next flush. (When the tail is all blank

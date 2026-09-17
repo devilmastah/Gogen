@@ -65,7 +65,7 @@ func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool
 	gen := p.profilesGen
 	p.modelsMu.Unlock()
 
-	models, profileFor, perProfile, err := p.fetchModelsWithProfiles(ctx)
+	models, profileFor, perProfile, err := p.fetchModelsWithProfiles(ctx, armBackoff)
 
 	p.modelsMu.Lock()
 	f.models, f.err = models, err
@@ -110,6 +110,20 @@ func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool
 		return nil, err
 	}
 	return append([]openai.Model(nil), models...), nil
+}
+
+// fetchEndpointModels returns one endpoint's catalog, sharing the download with
+// every other provider in the process that talks to the same endpoint (see
+// EndpointCatalog). Providers built without a shared catalog (tests, direct
+// construction) fetch directly, exactly as before.
+func (p *OpenAIProvider) fetchEndpointModels(ctx context.Context, key string, armBackoff bool, fetch func(context.Context) ([]openai.Model, error)) ([]openai.Model, error) {
+	p.modelsMu.RLock()
+	c := p.endpointCatalog
+	p.modelsMu.RUnlock()
+	if c == nil {
+		return fetch(ctx)
+	}
+	return c.Models(ctx, key, armBackoff, fetch)
 }
 
 // catalogFetchOnBackoff reports whether a failed catalog fetch is still in
@@ -158,30 +172,38 @@ type profileFetchResult struct {
 // picker grouping and per-endpoint models.dev / props resolution, and the
 // perProfile slice carries every profile's own outcome (including failures)
 // for the sticky-ownership merge.
-func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.Model, map[string]modelProfileInfo, []profileFetchResult, error) {
+func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context, armBackoff bool) ([]openai.Model, map[string]modelProfileInfo, []profileFetchResult, error) {
 	type result struct {
 		models  []openai.Model
 		routing map[string]*openai.Client
 		err     error
 	}
-	query := func(qctx context.Context, catalog, stream *openai.Client) result {
+	// query lists one endpoint. The download itself is shared process-wide
+	// (see EndpointCatalog): every session otherwise re-fetched the same
+	// endpoint's /v1/models. Only the model → stream-client routing is built
+	// here, because client pointers are per provider.
+	query := func(qctx context.Context, key string, catalog, stream *openai.Client) result {
 		if catalog == nil {
 			catalog = stream
 		}
-		var models []openai.Model
-		routing := make(map[string]*openai.Client)
-		pager := catalog.Models.ListAutoPaging(qctx)
-		for pager.Next() {
-			if qctx.Err() != nil {
-				return result{models: models, routing: routing, err: qctx.Err()}
+		models, err := p.fetchEndpointModels(qctx, key, armBackoff, func(fctx context.Context) ([]openai.Model, error) {
+			var listed []openai.Model
+			pager := catalog.Models.ListAutoPaging(fctx)
+			for pager.Next() {
+				if fctx.Err() != nil {
+					return listed, fctx.Err()
+				}
+				listed = append(listed, pager.Current())
 			}
-			m := pager.Current()
-			models = append(models, m)
-			if stream != nil {
-				routing[m.ID] = stream
+			return listed, pager.Err()
+		})
+		routing := make(map[string]*openai.Client, len(models))
+		if stream != nil {
+			for i := range models {
+				routing[models[i].ID] = stream
 			}
 		}
-		return result{models: models, routing: routing, err: pager.Err()}
+		return result{models: models, routing: routing, err: err}
 	}
 
 	// queryProfile fetches one profile's endpoint set. An OpenCode profile
@@ -190,18 +212,18 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 	// endpoint, which rejects it as unsupported).
 	queryProfile := func(qctx context.Context, prof *providerProfile) result {
 		if prof.zenStream == nil || prof.goStream == nil {
-			return query(qctx, prof.catalog, prof.stream)
+			return query(qctx, CatalogKey(prof.baseURL, prof.apiKey), prof.catalog, prof.stream)
 		}
 		var zenRes, goRes result
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			zenRes = query(qctx, prof.zenCatalog, prof.zenStream)
+			zenRes = query(qctx, CatalogKey(openCodeZenBaseURL, prof.apiKey), prof.zenCatalog, prof.zenStream)
 		}()
 		go func() {
 			defer wg.Done()
-			goRes = query(qctx, prof.goCatalog, prof.goStream)
+			goRes = query(qctx, CatalogKey(openCodeGoBaseURL, prof.apiKey), prof.goCatalog, prof.goStream)
 		}()
 		// Join both queries before reading their results. Each query observes
 		// qctx cancellation and its catalog client carries its own timeout,

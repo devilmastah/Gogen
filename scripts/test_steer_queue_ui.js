@@ -157,6 +157,76 @@ async function main() {
   check('refocus rendered the queued item from the mirror', refocused.length === 1);
   check('refocus rendered exactly one queued bubble', queuedBubbles().length === 1);
 
+  // 5. Queued bubbles stay at the TRANSCRIPT TAIL. A queued item has no
+  //    canonical position yet (the server appends it only when its turn
+  //    runs), so it must not be interleaved into the in-flight turn's later
+  //    rounds and tool cards — the next content lands ABOVE it, and the live
+  //    order stays identical to the rebuilt one.
+  window.openSessionPane('C');
+  await sleep(20);
+  recv({ type: 'stream', sessionId: 'C', content: 'C round one', contentPos: 11 });
+  send('C queued one');
+  const cq1 = lastSentMessage();
+  recv({ type: 'queue_update', sessionId: 'C', queue: [{ id: cq1.queueId, text: 'C queued one' }] });
+  send('C queued two');
+  const cq2 = lastSentMessage();
+  recv({
+    type: 'queue_update', sessionId: 'C',
+    queue: [{ id: cq1.queueId, text: 'C queued one' }, { id: cq2.queueId, text: 'C queued two' }],
+  });
+  check('C: both queued bubbles rendered, in order',
+    queuedBubbles().length === 2
+      && queuedBubbles()[0].dataset.queueId === cq1.queueId
+      && queuedBubbles()[1].dataset.queueId === cq2.queueId);
+
+  // The turn continues: round one ends, a tool runs, round two streams.
+  recv({ type: 'stream_end', sessionId: 'C' });
+  recv({ type: 'tool_call_start', sessionId: 'C', index: 0, tool: 'read_file', toolCallId: 'c9' });
+  recv({ type: 'tool_call', sessionId: 'C', index: 0, tool: 'read_file', toolCallId: 'c9', args: { path: 'x' } });
+  recv({ type: 'tool_result', sessionId: 'C', toolCallId: 'c9', result: 'body', success: true });
+  recv({ type: 'stream', sessionId: 'C', content: 'C round two', contentPos: 11 });
+  recv({ type: 'stream_end', sessionId: 'C' }); // renders round two's text
+
+  const kids = [...messagesDiv.children];
+  const r2Idx = kids.findIndex((el) => el.textContent.includes('C round two'));
+  const cardIdx = kids.findIndex((el) => el.classList.contains('tool-card'));
+  const q1Idx = kids.findIndex((el) => el.dataset.queueId === cq1.queueId);
+  const q2Idx = kids.findIndex((el) => el.dataset.queueId === cq2.queueId);
+  check('C: the later round renders above the queued bubbles', r2Idx >= 0 && q1Idx > r2Idx,
+    JSON.stringify({ r2Idx, q1Idx, q2Idx, cardIdx }));
+  check('C: the tool card renders above the queued bubbles', cardIdx >= 0 && q1Idx > cardIdx,
+    JSON.stringify({ cardIdx, q1Idx }));
+  check('C: the queued bubbles close the transcript, in order',
+    q1Idx >= 0 && q2Idx === q1Idx + 1 && kids.length === q2Idx + 1 && kids[q1Idx].classList.contains('queued'),
+    JSON.stringify({ q1Idx, q2Idx, len: kids.length }));
+
+  // A rebuild (clear_chat + mirror re-render) must reproduce that same order.
+  // Each bubble's append-time anchor runs before it is registered in the
+  // mirror, so without the post-loop re-anchor a multi-item queue rebuilds
+  // REVERSED.
+  recv({ type: 'clear_chat', sessionId: 'C' });
+  const rebuilt = [...messagesDiv.children];
+  const rq1 = rebuilt.findIndex((el) => el.dataset.queueId === cq1.queueId);
+  const rq2 = rebuilt.findIndex((el) => el.dataset.queueId === cq2.queueId);
+  check('C: rebuild keeps both queued bubbles, in queue order, at the tail',
+    rq1 >= 0 && rq2 === rq1 + 1 && rebuilt.length === rq2 + 1
+      && rebuilt[rq1].classList.contains('queued') && rebuilt[rq2].classList.contains('queued'),
+    JSON.stringify({ rq1, rq2, len: rebuilt.length }));
+  check('C: rebuild kept the queued chips',
+    !!rebuilt[rq1].querySelector('.queued-chip') && !!rebuilt[rq2].querySelector('.queued-chip'));
+
+  // Draining the first item must not disturb the order: its chip clears in
+  // place, the still-queued one stays last.
+  recv({
+    type: 'queue_update', sessionId: 'C',
+    queue: [{ id: cq2.queueId, text: 'C queued two' }], queueLeft: [cq1.queueId],
+  });
+  const afterLeft = [...messagesDiv.children];
+  check('C: the drained bubble cleared its chip in place',
+    afterLeft[rq1].dataset.queueId === undefined && !afterLeft[rq1].classList.contains('queued'));
+  check('C: the remaining queued bubble is still last',
+    afterLeft[afterLeft.length - 1].dataset.queueId === cq2.queueId);
+
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

@@ -136,6 +136,15 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 	clearChat := false
 	if err != nil {
 		resp.Content = fmt.Sprintf("Error: %v", err)
+	} else if result.Output == "" && result.Action == "" && len(result.History) == 0 && len(result.Sessions) == 0 {
+		// The command already shipped its own payload: a successful resume
+		// writes the ATTACH sequence itself (session_state → history →
+		// config; see sessionResume/sendAttachPayload), so there is nothing
+		// left to reply here. An empty response frame is meaningless to
+		// clients; errors never take this path (they must still be
+		// reported). Every other session command (new/fork/sessions/delete)
+		// returns a non-empty result.
+		return
 	} else {
 		resp.Content = result.Output
 		if result.Action == agent.SessionActionClearChat {

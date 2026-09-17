@@ -7,6 +7,7 @@ import (
 	"io"
 	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -304,6 +305,70 @@ func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
 	return fmt.Sprintf("Job %s FINISHED in %s with exit code %d.\nCommand: %s\n%s", job.ID, elapsed, exitCode, job.Command, formatJobOutput(job, false)), nil
 }
 
+// backgroundWaitDefaultTimeout is how long action=wait blocks for a job to
+// exit when the caller does not pass timeout_ms.
+const backgroundWaitDefaultTimeout = 60 * time.Second
+
+// backgroundWaitMaxTimeout caps a caller-supplied wait so one tool call can
+// never park the model loop for an unbounded wall time. A job that outlives
+// the cap keeps running and can be waited on again.
+const backgroundWaitMaxTimeout = 10 * time.Minute
+
+// jobDone returns the channel closed when jobID exits, reporting false when
+// no live job carries the id. Shell jobs and background terminal sends share
+// the job-id space (status and cancel dispatch on it), so a wait must resolve
+// both registries.
+func (a *Agent) jobDone(jobID string) (<-chan struct{}, bool) {
+	if tj := a.terminalJob(jobID); tj != nil {
+		return tj.done, true
+	}
+	if job := a.backgroundJob(jobID); job != nil {
+		return job.done, true
+	}
+	return nil, false
+}
+
+// BackgroundJobWait blocks until the job exits or timeout elapses, then
+// reports the same status action=status would. A timeout is deliberately not
+// an error: the report says the job is still running, so the caller waits
+// again or cancels. ctx aborts the wait (a cancelled turn must not park the
+// loop); the job itself keeps running either way. Waiting never consumes the
+// job's result — the retention window still holds the output and exit code
+// for a later status.
+func (a *Agent) BackgroundJobWait(ctx context.Context, jobID string, timeout time.Duration) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done, ok := a.jobDone(jobID)
+	if !ok {
+		return "", fmt.Errorf("unknown background job %q (jobs are scoped to this session; the session may have been closed)", jobID)
+	}
+	// A nil timer channel blocks forever, so timeout <= 0 waits until the
+	// job exits or ctx is cancelled.
+	var timer <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		timer = t.C
+	}
+	timedOut := false
+	select {
+	case <-done:
+	case <-timer:
+		timedOut = true
+	case <-ctx.Done():
+		return "", fmt.Errorf("waiting for background job %s interrupted: %w (the job keeps running; poll it with action=status or cancel it with action=cancel)", jobID, ctx.Err())
+	}
+	status, err := a.BackgroundJobStatus(jobID)
+	if err != nil {
+		return "", err
+	}
+	if timedOut {
+		return fmt.Sprintf("%s\nWait timed out after %s; the job is still running. Wait again (action=wait) or cancel it (action=cancel).", status, timeout), nil
+	}
+	return status, nil
+}
+
 // formatJobOutput returns the job's retained output tail, trimmed and
 // labelled, or a note when the job produced none. running distinguishes the
 // note text: "so far" only makes sense while the job can still produce
@@ -326,6 +391,86 @@ func formatJobOutput(job *BackgroundJob, running bool) string {
 		return fmt.Sprintf("Output (last %d bytes of %d):\n%s", len(tail), len(out), tail)
 	}
 	return "Output:\n" + out
+}
+
+// maxListCommandLen caps the command (or terminal input) echoed per job in
+// the list view, so a job started with a very long command cannot bloat the
+// transcript.
+const maxListCommandLen = 80
+
+// BackgroundJobsList renders every job owned by this session — shell commands
+// started with execute_command background=true and background terminal sends
+// — oldest first, with state, elapsed time, exit code and a truncated
+// command. It answers "what is still running?" in one call instead of a poll
+// per known id, which also lets a resumed turn recover job ids it no longer
+// holds. A reaped job is gone for good (retention window elapsed,
+// finished-job cap, or session close).
+func (a *Agent) BackgroundJobsList() string {
+	a.bgMu.Lock()
+	jobs := make([]*BackgroundJob, 0, len(a.bgJobs))
+	for _, job := range a.bgJobs {
+		jobs = append(jobs, job)
+	}
+	a.bgMu.Unlock()
+	a.termMu.Lock()
+	termJobs := make([]*terminalJob, 0, len(a.termJobs))
+	for _, job := range a.termJobs {
+		termJobs = append(termJobs, job)
+	}
+	a.termMu.Unlock()
+
+	type entry struct {
+		start time.Time
+		line  string
+	}
+	entries := make([]entry, 0, len(jobs)+len(termJobs))
+	for _, job := range jobs {
+		entries = append(entries, entry{
+			start: job.Start,
+			line: fmt.Sprintf("- %s %s (%s): %s", job.ID, backgroundJobState(job),
+				time.Since(job.Start).Round(time.Millisecond),
+				contextmgr.Truncate(job.Command, maxListCommandLen, contextmgr.TruncateOptions{Marker: "…"})),
+		})
+	}
+	for _, job := range termJobs {
+		entries = append(entries, entry{
+			start: job.Start,
+			line: fmt.Sprintf("- %s %s (%s, terminal %s): %s", job.ID, terminalJobState(job),
+				time.Since(job.Start).Round(time.Millisecond), job.SessionID,
+				contextmgr.Truncate(job.Text, maxListCommandLen, contextmgr.TruncateOptions{Marker: "…"})),
+		})
+	}
+	if len(entries) == 0 {
+		return "No background jobs in this session."
+	}
+	// Oldest first: the long-running job a caller is looking for is the one
+	// that started earliest.
+	slices.SortFunc(entries, func(a, b entry) int { return a.start.Compare(b.start) })
+	var b strings.Builder
+	fmt.Fprintf(&b, "Background jobs (%d, oldest first):", len(entries))
+	for _, e := range entries {
+		b.WriteString("\n")
+		b.WriteString(e.line)
+	}
+	return b.String()
+}
+
+// backgroundJobState renders a shell job's one-word state for the list view:
+// RUNNING, CANCELLED, or FINISHED with the exit code (-1 for a signal kill
+// or an unusual failure).
+func backgroundJobState(job *BackgroundJob) string {
+	select {
+	case <-job.done:
+		if job.cancelled.Load() {
+			return "CANCELLED"
+		}
+		job.mu.Lock()
+		err := job.exitErr
+		job.mu.Unlock()
+		return fmt.Sprintf("FINISHED exit %d", exitCodeOf(err, -1))
+	default:
+		return "RUNNING"
+	}
 }
 
 // CancelBackgroundJob cancels a running background job, killing its process

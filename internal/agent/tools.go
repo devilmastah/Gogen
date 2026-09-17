@@ -356,13 +356,14 @@ var builtinToolDefs = []ToolDef{
 		PlanAllowed: true,
 	},
 	{
-		Definition: toolDef("background_job", "Inspect or feed a background job (execute_command background=true): action=status (full output tail), cancel, or input (write to the job's stdin; returns output produced since the last input).",
+		Definition: toolDef("background_job", "Manage background jobs (execute_command background=true): action=status (output tail), wait (block until the job exits; on timeout the job keeps running), cancel, input (write to the job's stdin; returns output since the last input), or list (every live job in this session).",
 			toolSchema(map[string]any{
-				"action":         toolPropEnum("string", []string{"status", "cancel", "input"}, ""),
-				"job_id":         toolProp("string", "Job id returned by execute_command background=true"),
+				"action":         toolPropEnum("string", []string{"status", "wait", "cancel", "input", "list"}, ""),
+				"job_id":         toolProp("string", "Job id returned by execute_command background=true (required for status/wait/cancel/input; omit for list)"),
 				"input":          toolProp("string", "Text to write to the job's stdin (action=input)"),
 				"append_newline": toolProp("boolean", "Append a newline to the input (default true)"),
-			}, "action", "job_id")),
+				"timeout_ms":     toolProp("integer", "Max block for action=wait (default 60000, max 600000)"),
+			}, "action")),
 		Handler: handleBackgroundJob,
 	},
 	{

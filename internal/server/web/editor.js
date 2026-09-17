@@ -288,6 +288,13 @@ function wsRequest(type, payload = {}, timeoutMs = WS_REQUEST_TIMEOUT_MS) {
 
 export async function initMonaco() {
   if (monacoReady) return monaco;
+  // Never start the (multi-MB) import in the middle of a history replay: the
+  // transcript paints first, colors follow (see the colorize scheduler).
+  // Gating initMonaco itself — not just the colorize jobs — means no caller
+  // (a diff viewer, the editor pane, a colorize job) can jump the queue.
+  const gate = colorizeDeferralGate();
+  if (gate) await gate;
+  if (monacoReady) return monaco;
   if (monacoInitPromise) return monacoInitPromise;
 
   // Dynamic import: avoids blocking the WebSocket connection on a 3.8 MB download.
@@ -593,12 +600,199 @@ function cachedColorize(m, source, lang) {
   });
 }
 
+// ── Colorize scheduling: replay deferral + viewport gate ──
+// Tokenizing pulls in the ~4.5MB Monaco bundle, so WHEN colorize work runs
+// matters as much as how fast it is:
+//
+//   - beginColorizeDeferral()/endColorizeDeferral() bracket a history replay
+//     (app.js). While a deferral is active, jobs queue and initMonaco itself
+//     waits, so no caller can start the import mid-replay: a restored
+//     session paints first, colors follow.
+//   - a shared IntersectionObserver parks each job until its element is near
+//     the viewport (COLORIZE_MARGIN_PX), so a restored session tokenizes only
+//     what the user can see or is about to scroll to. A detached subtree — a
+//     cached pane's transcript — stays parked until it is restored to the
+//     document; releaseColorizeTargets drops the parked work when the chat
+//     DOM is discarded (clearChat).
+//   - queued jobs drain in ~12ms idle slices, the same discipline the
+//     tool-result colorize queue uses.
+const COLORIZE_MARGIN_PX = 800;
+const COLORIZE_SLICE_MS = 12;
+// Safety valve for the parked set: past this many distinct elements, jobs run
+// eagerly (drain-queued) instead of parking, so a very large session cannot
+// leave code permanently plain while the observer's retained set stays
+// bounded. Far beyond any ordinary transcript's uncolorized code-block count.
+// A job whose element is DETACHED is parked regardless of the cap (it cannot
+// run now, and only the observer can wake it when its subtree is restored);
+// the map shrinks again as soon as those elements reconnect.
+const COLORIZE_PARK_MAX = 400;
+
+// Active deferrals, oldest first. They are TOKENS, not a counter: a replay
+// that overran the watchdog is ended by the watchdog (newest token popped),
+// and its own finally must not end a NEWER replay's deferral when it
+// eventually runs — endColorizeDeferral ignores a token that is no longer
+// active.
+let colorizeDeferralTokens = [];
+let colorizeDeferralSeq = 0;
+let colorizeDeferralWaiters = [];
+let colorizeJobs = [];            // ready to run: [{ el, job }]
+let colorizeDrainScheduled = false;
+const colorizeParked = new Map(); // Element -> [job, …] waiting on the observer
+let colorizeObserver = null;
+
+function scheduleColorizeIdle(fn, timeout) {
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(fn, { timeout });
+  else setTimeout(fn, 0);
+}
+
+// Promise that resolves when the active deferral ends (null when none is
+// active). initMonaco awaits it; the colorize queue refuses to drain.
+function colorizeDeferralGate() {
+  if (!colorizeDeferralTokens.length) return null;
+  return new Promise((resolve) => colorizeDeferralWaiters.push(resolve));
+}
+
+/** Bracket a batch of transcript rendering (a history replay) so no Monaco
+ * import or tokenization starts while it builds the DOM. Returns the token to
+ * pass back to endColorizeDeferral, so a replay that overran the watchdog
+ * cannot end a newer replay's deferral when its finally eventually runs. */
+export function beginColorizeDeferral() {
+  const token = ++colorizeDeferralSeq;
+  colorizeDeferralTokens.push(token);
+  return token;
+}
+
+/** End a deferral; the last one releases initMonaco's waiters and drains the
+ * queued jobs in idle slices. tokenEnd identifies the caller's own deferral (a
+ * token that is no longer active — the watchdog already ended it — is
+ * ignored); no token ends the newest active deferral (the watchdog path).
+ * Idempotent when no deferral is active. */
+export function endColorizeDeferral(tokenEnd) {
+  if (!colorizeDeferralTokens.length) return;
+  if (tokenEnd === undefined) {
+    colorizeDeferralTokens.pop();
+  } else {
+    const i = colorizeDeferralTokens.lastIndexOf(tokenEnd);
+    if (i < 0) return;
+    colorizeDeferralTokens.splice(i, 1);
+  }
+  if (colorizeDeferralTokens.length) return;
+  const waiters = colorizeDeferralWaiters;
+  colorizeDeferralWaiters = [];
+  for (const resolve of waiters) resolve();
+  drainColorizeJobs();
+}
+
+/** Drop parked jobs and stop observing their elements: the transcript DOM
+ * they belong to is going away (clearChat), so they can never become
+ * visible work. */
+function releaseColorizeTargets() {
+  colorizeParked.clear();
+  colorizeJobs = [];
+  if (colorizeObserver) {
+    colorizeObserver.disconnect();
+    colorizeObserver = null;
+  }
+}
+
+function ensureColorizeObserver() {
+  if (!colorizeObserver) {
+    colorizeObserver = new IntersectionObserver((entries) => {
+      let queued = false;
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const jobs = colorizeParked.get(entry.target);
+        if (!jobs) continue;
+        colorizeParked.delete(entry.target);
+        colorizeObserver.unobserve(entry.target);
+        for (const job of jobs) colorizeJobs.push({ el: entry.target, job });
+        queued = true;
+      }
+      if (queued) drainColorizeJobs();
+    }, { rootMargin: COLORIZE_MARGIN_PX + 'px 0px' });
+  }
+  return colorizeObserver;
+}
+
+// Queue one colorize job. Without IntersectionObserver support (older
+// browsers, the standalone node tests) the queue runs immediately — the
+// pre-viewport-gate behavior.
+// Park one job on the observer, ignoring the cap. Used for work that has
+// nowhere else to go: the cap exists to stop READY jobs from accumulating,
+// not to drop a job whose element is detached — and re-entering
+// scheduleColorizeJob from the drain (park → overflow → queue → drain →
+// detached → park) loops forever once the cap is reached.
+function parkColorizeJob(el, job) {
+  let jobs = colorizeParked.get(el);
+  if (!jobs) {
+    jobs = [];
+    colorizeParked.set(el, jobs);
+    ensureColorizeObserver().observe(el);
+  }
+  jobs.push(job);
+}
+
+function scheduleColorizeJob(el, job) {
+  if (el && typeof IntersectionObserver === 'function') {
+    if (colorizeParked.size >= COLORIZE_PARK_MAX && !colorizeParked.has(el)) {
+      // Overflow: run it through the queue (the pre-viewport-gate behavior)
+      // rather than leaving the block permanently plain.
+      colorizeJobs.push({ el, job });
+      drainColorizeJobs();
+      return;
+    }
+    parkColorizeJob(el, job);
+    return;
+  }
+  colorizeJobs.push({ el: el || null, job });
+  drainColorizeJobs();
+}
+
+function drainColorizeJobs() {
+  if (colorizeDrainScheduled || colorizeDeferralTokens.length || !colorizeJobs.length) return;
+  colorizeDrainScheduled = true;
+  const runSlice = async () => {
+    colorizeDrainScheduled = false;
+    const deadline = performance.now() + COLORIZE_SLICE_MS;
+    while (colorizeJobs.length && performance.now() < deadline) {
+      const { el, job } = colorizeJobs.shift();
+      if (el && !el.isConnected) {
+        // Its subtree was detached mid-drain (a pane cache): park it again so
+        // it colorizes when the transcript is restored. Unconditional parking
+        // (not scheduleColorizeJob) is required: at the park cap that path
+        // would re-queue the job and loop drain → detached → queue forever.
+        if (typeof IntersectionObserver === 'function') parkColorizeJob(el, job);
+        continue;
+      }
+      try {
+        await job();
+      } catch (_) {
+        // Keep going: one failed tokenize must not strand the rest.
+      }
+    }
+    if (colorizeJobs.length) {
+      colorizeDrainScheduled = true;
+      scheduleColorizeIdle(runSlice, 100);
+    }
+  };
+  scheduleColorizeIdle(runSlice, 400);
+}
+
 /**
  * Colorize a single element's textContent with Monaco.
  * langHint may be a language id or a file path.
+ *
+ * Routed through the scheduler: deferred during a history replay and parked
+ * until the element is near the viewport.
  */
 export async function colorizeElement(el, langHint) {
   if (!el) return;
+  scheduleColorizeJob(el, () => runColorizeElement(el, langHint));
+}
+
+// The colorize body proper: generation-stamped and applied only while the
+// element is still current and connected.
+async function runColorizeElement(el, langHint) {
   const gen = (el._gogenHlGen = (el._gogenHlGen || 0) + 1);
   let m;
   try {
@@ -659,21 +853,46 @@ function applyColorized(code, html) {
   window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
 }
 
-// Background tokenize for one code element. The result is applied only if
-// the element is still in the document — a re-rendered block's code
-// elements are replaced every flush, so element identity is the staleness
-// signal (no generation counter needed).
-//
-// opts.cache (default true) stores the sanitized HTML in the shared LRU.
-// The streaming tail passes false: its source is still growing, so the key
-// can never be hit again and would only evict a useful entry. opts.
-// requireTextMatch (streaming tail) additionally drops the result when the
-// element's current text no longer equals the tokenized source — a flush
-// that re-rendered new content while the tokenize was in flight.
-function enqueueColorize(code, source, lang, opts) {
-  const cache = !opts || opts.cache !== false;
-  const requireTextMatch = !!(opts && opts.requireTextMatch);
-  (async () => {
+/**
+ * Publish every colorized code block under `root` to the shared LRU, keyed by
+ * the text it currently displays. The streaming governor deliberately never
+ * writes the LRU (its source grows, so every write would be a one-shot key
+ * evicting useful entries) — but an element's current content IS a valid
+ * rendering of its displayed text, so sealing it lets the render that
+ * REPLACES the streaming DOM (a block promotion, the end-of-stream full
+ * render, thinking finalize, edit restore) paint from a synchronous cache hit
+ * instead of flashing plain while a tokenize re-runs for text that was
+ * already colored.
+ *
+ * Callers: markdown.js seals the message before promoting completed blocks
+ * and before setMessageMarkdown wipes it.
+ */
+export function sealStreamColorize(root) {
+  if (!root || !root.querySelectorAll) return;
+  for (const code of root.querySelectorAll('pre code')) {
+    if (!code.dataset || code.dataset.monacoColorized !== '1') continue;
+    const display = code.__gogenPlain !== undefined ? code.__gogenPlain : (code.textContent || '');
+    if (!display) continue;
+    const lang = langIdFromClass(code);
+    if (!lang || lang === 'plaintext') continue;
+    // Already published (an earlier promotion or full render): the recreated
+    // element will hit that entry, so re-serializing this element's
+    // span-heavy HTML would be pure cost. Map.has, not colorizeCacheGet —
+    // this must not disturb LRU order.
+    if (colorizeCache.has(lang + '\u0000' + display)) continue;
+    colorizeCachePut(lang + '\u0000' + display, code.innerHTML);
+  }
+}
+
+// Background tokenize for one code element whose content is FINAL (a
+// completed block or a single-shot render). The result is applied only if
+// the element is still in the document — a re-rendered block replaces its
+// code elements, so element identity is the staleness signal (no
+// generation counter needed). The sanitized result goes into the shared
+// LRU (the key is the exact source, so only an identical completed block
+// can ever hit it).
+function enqueueColorize(code, source, lang) {
+  return (async () => {
     try {
       const m = await initMonaco();
       if (!code.isConnected) return;
@@ -688,12 +907,11 @@ function enqueueColorize(code, source, lang, opts) {
       if (!resolved || resolved === 'plaintext') return;
       const raw = await m.editor.colorize(source, resolved, {});
       if (!code.isConnected) return;
-      // Single-threaded: nothing can mutate the element between this check
-      // and applyColorized below, so one text comparison after the last
-      // await is enough.
-      if (requireTextMatch && code.textContent !== source) return;
+      // The element's plain text must still be the tokenized source (an
+      // in-place patch/colorize that changed it invalidates the result).
+      if (code.__gogenPlain !== undefined && code.__gogenPlain !== source) return;
       const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
-      if (cache) colorizeCachePut(resolved + '\u0000' + source, html);
+      colorizeCachePut(resolved + '\u0000' + source, html);
       applyColorized(code, html);
     } catch (_) {
       // Unknown / unloaded language or init failure — leave plain text.
@@ -701,45 +919,215 @@ function enqueueColorize(code, source, lang, opts) {
   })();
 }
 
+// ── Streaming-tail colorize governor ──
+// A streaming code block is re-rendered or patched every ~32ms flush, and
+// tokenizing the whole (growing) block per flush is quadratic in its
+// length — with most old results thrown away, because the flush replaced
+// the very element the tokenize was for. The governor bounds that work:
+//
+//   - ONE tokenize per tail node in flight; a request that arrives while
+//     one runs is coalesced into a single trailing retry that reads the
+//     element's text at retry time (always the newest content),
+//   - at most one START per interval, stretched to 4x the previous
+//     tokenize's duration, so colorize can never saturate the main thread,
+//   - sources past STREAM_COLORIZE_MAX_BYTES stay plain until the block is
+//     completed or finalized (those paths colorize once, cached),
+//   - the last applied (lang, source) result is remembered per node, so a
+//     block re-materialized by a full render with unchanged text is
+//     repainted synchronously without tokenizing again.
+//
+// The result is applied as a colored PREFIX plus the untouched plain
+// suffix: the tokenize may finish after more text arrived, so the element's
+// current text is preserved verbatim (re-appended as a text node) instead
+// of discarding the result — every paid tokenize becomes visible.
+const STREAM_COLORIZE_INTERVAL_MS = 250;
+const STREAM_COLORIZE_SLOWDOWN = 4;
+const STREAM_COLORIZE_MAX_BYTES = 32 * 1024;
+
+const streamColorize = new WeakMap(); // host node -> governor state
+
+function streamGovernor(node) {
+  let st = streamColorize.get(node);
+  if (!st) {
+    st = { inFlight: false, pending: false, lastAt: 0, lastCost: 0, timer: 0, memo: null };
+    streamColorize.set(node, st);
+  }
+  return st;
+}
+
+// The text a streaming code element should be tokenized from: the markdown
+// source in `__gogenRaw` when the streaming patch renderer maintains it
+// (the raw fence content, without marked's normalized trailing newline),
+// else the element's displayed plain text.
+function streamColorizeSource(code) {
+  if (code.__gogenRaw !== undefined) return code.__gogenRaw;
+  if (code.__gogenPlain !== undefined) return code.__gogenPlain;
+  return code.textContent || '';
+}
+
+// Apply a streaming colorize result: the colored HTML covers `source` (a
+// prefix of the element's current plain text), and any grown remainder is
+// re-appended as plain text, so the element's text is preserved exactly —
+// never a gap, never a duplicate. Returns false (nothing applied) when the
+// element's text no longer extends `source` (a rewrite/replacement).
+function applyStreamColored(code, html, source) {
+  const display = code.__gogenPlain !== undefined ? code.__gogenPlain : (code.textContent || '');
+  if (display !== source && !display.startsWith(source)) return false;
+  applyColorized(code, html);
+  const tail = display.slice(source.length);
+  if (tail) code.appendChild(document.createTextNode(tail));
+  return true;
+}
+
+function armStreamColorizeRetry(node, gov, wait) {
+  if (gov.timer) return;
+  gov.timer = setTimeout(() => {
+    gov.timer = 0;
+    colorizeNode(node, { streamingTail: true });
+  }, wait);
+}
+
+function startStreamColorize(node, gov, code, lang, source) {
+  gov.inFlight = true;
+  gov.pending = false;
+  gov.lastAt = Date.now();
+  const started = gov.lastAt;
+  (async () => {
+    try {
+      const m = await initMonaco();
+      if (!code.isConnected) return;
+      const resolved = resolveMonacoLanguage(lang);
+      if (!resolved || resolved === 'plaintext') return;
+      const raw = await m.editor.colorize(source, resolved, {});
+      if (!code.isConnected) return;
+      const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
+      if (applyStreamColored(code, html, source)) {
+        gov.memo = { lang, source, html };
+      }
+    } catch (_) {
+      // Unknown / unloaded language or init failure — leave plain text.
+    } finally {
+      gov.lastCost = Date.now() - started;
+      gov.inFlight = false;
+      if (gov.pending) {
+        // A flush arrived while this tokenize ran: re-gate immediately for
+        // the newest text (the pacing gate still applies, so this can only
+        // arm a retry, never start back-to-back tokenizes).
+        gov.pending = false;
+        colorizeNode(node, { streamingTail: true });
+      }
+    }
+  })();
+}
+
 /**
- * Syntax-highlight fenced code blocks under `node` (a freshly rendered
- * markdown block: a completed .md-block, the streaming tail, or a full
- * .msg-text render). Runs synchronously: already-tokenized (lang, source)
- * pairs are inlined immediately — a single DOM write, no async — and only
- * uncached blocks tokenize in the background. Callers pass only nodes
- * whose content is final (completed blocks) or re-rendered every flush
- * (the streaming tail), so no skip bookkeeping is needed.
+ * Syntax-highlight fenced code blocks under `node` (a completed .md-block,
+ * the streaming tail, or a full .msg-text render). Runs synchronously:
+ * already-cached (lang, source) pairs are inlined immediately — a single
+ * DOM write, no async — and only uncached blocks tokenize in the
+ * background.
  *
- * opts.streamingTail (used for streaming-tail renders): uncached code still
- * tokenizes in the background — the per-flush streaming colorization the
- * pre-optimization code provided, so a code block keeps its colors as it
- * grows — but the tokenize skips the shared LRU cache (the tail source is
- * still growing, so the key can never be hit again and would only evict a
- * useful entry) and applies only while the element's text still matches the
- * tokenized source (a flush that re-rendered new content invalidates the
- * result; the next flush's tokenize covers it). Sync cache hits still apply
- * instantly.
+ * For stable nodes (completed blocks, single-shot renders) the content is
+ * final and the shared LRU cache applies as before.
+ *
+ * opts.streamingTail (the in-flight tail, re-rendered or patched every
+ * flush): unbounded per-flush tokenization is exactly what the governor
+ * above exists to prevent. Uncached code tokenizes through it — paced,
+ * coalesced, size-capped, memoized — and each result is applied as a
+ * colored prefix with the grown suffix preserved (applyStreamColored). The
+ * shared LRU is never written from here: a still-growing source can never
+ * be hit again and would only evict useful entries.
  */
 export function colorizeNode(node, opts) {
   if (!node || !node.querySelectorAll) return;
   const codes = node.querySelectorAll('pre code');
   if (!codes.length) return;
   const streamingTail = !!(opts && opts.streamingTail);
+  const gov = streamingTail ? streamGovernor(node) : null;
 
   for (const code of codes) {
+    // Authoritative plain text for the element. Monaco's <br/> line
+    // separators make textContent unusable as a source after a result has
+    // been applied, and the streaming patch renderer keeps this in step
+    // with the DOM it appends to.
+    if (code.__gogenPlain === undefined) code.__gogenPlain = code.textContent || '';
     const lang = langIdFromClass(code);
     if (!lang || lang === 'plaintext') continue;
 
-    const source = code.textContent || '';
-    if (!source.trim()) continue;
-
-    const key = lang + '\u0000' + source;
-    const hit = colorizeCacheGet(key);
-    if (hit !== undefined) {
-      applyColorized(code, hit);
-    } else {
-      enqueueColorize(code, source, lang, streamingTail ? { cache: false, requireTextMatch: true } : undefined);
+    if (!streamingTail) {
+      const source = code.__gogenPlain;
+      if (!source.trim()) continue;
+      const key = lang + '\u0000' + source;
+      const hit = colorizeCacheGet(key);
+      if (hit !== undefined) {
+        applyColorized(code, hit);
+      } else {
+        // Queued through the scheduler: no Monaco import mid-replay, and
+        // no tokenize for code that is not near the viewport.
+        scheduleColorizeJob(code, () => enqueueColorize(code, source, lang));
+      }
+      continue;
     }
+
+    const source = streamColorizeSource(code);
+    if (!source.trim()) continue;
+    // A closed fence's text is FINAL: publish the element's current colored
+    // content under its displayed text, so a handoff that re-renders the
+    // block (a burst promotion, the end-of-stream full render) paints from a
+    // synchronous cache hit instead of flashing plain while an async
+    // tokenize re-runs for text that was already colored. `raw === plain`
+    // means the fence closed (the raw code text then carries the newline
+    // before the closer); an open fence is still growing, and publishing each
+    // of its prefixes would only evict useful entries.
+    if (code.dataset.monacoColorized === '1' && code.__gogenRaw !== undefined
+        && code.__gogenRaw === code.__gogenPlain
+        && !colorizeCache.has(lang + '\u0000' + code.__gogenPlain)) {
+      // Map.has guard: a closed fence can sit in the tail across several
+      // flushes, and re-serializing its span-heavy innerHTML every flush
+      // would be pure cost once published.
+      colorizeCachePut(lang + '\u0000' + code.__gogenPlain, code.innerHTML);
+    }
+    // Re-apply the governor's last result whenever its source still covers
+    // the element's text — equal, or a PREFIX of it (the element grew since
+    // that tokenize). This is what keeps a full re-render of the tail from
+    // wiping the colors: the patcher cannot handle every fenced shape (a
+    // fence preceded by text, an indented fence, CRLF), and those shapes
+    // rebuild the whole tail element on every flush. Without the prefix
+    // re-apply the fresh element started plain and only the next PACED
+    // tokenize (>=250ms) colored it again — the "colored → plain → colored"
+    // flash. The grown remainder re-appends as plain text, exactly the state
+    // the patch path maintains.
+    const memo = gov.memo;
+    let applied = false;
+    if (memo && memo.lang === lang && (memo.source === source || source.startsWith(memo.source))) {
+      if (applyStreamColored(code, memo.html, memo.source)) {
+        applied = true;
+        if (memo.source === source) continue; // unchanged: nothing new to tokenize
+      }
+    }
+    if (!applied) {
+      // Sync cache hits still apply instantly (a closed fence's source can
+      // match a cached completed block); the governor only owns the tokenize
+      // path. Never a cache WRITE from here: the source is still growing, so
+      // the key would only evict useful entries.
+      const hit = colorizeCacheGet(lang + '\u0000' + source);
+      if (hit !== undefined) {
+        applyStreamColored(code, hit, source);
+        continue;
+      }
+    }
+    if (source.length > STREAM_COLORIZE_MAX_BYTES) continue;
+    if (gov.inFlight) {
+      gov.pending = true;
+      continue;
+    }
+    const gap = Math.max(STREAM_COLORIZE_INTERVAL_MS, gov.lastCost * STREAM_COLORIZE_SLOWDOWN);
+    const wait = gap - (Date.now() - gov.lastAt);
+    if (wait > 0) {
+      armStreamColorizeRetry(node, gov, wait);
+      continue;
+    }
+    startStreamColorize(node, gov, code, lang, source);
   }
 }
 
@@ -2999,6 +3387,70 @@ export function extractDiffValue(rawJSON) {
   return { ok: out.length > 0, value: out, complete: false };
 }
 
+/**
+ * Incremental twin of extractDiffValue for the streaming tool-card updater:
+ * the accumulated rawArgs only ever grows, so the state carries the decoded
+ * value and the scan position and each call processes only the newly appended
+ * text. Re-decoding the whole value on every frame was O(args²) over a
+ * streamed patch — hundreds of ms of main-thread work for a large diff.
+ *
+ * State (create it once per card and reuse):
+ *   keyed      — the `"diff": "` prefix was found; valueStart is set
+ *   valueStart — absolute offset of the value's first character
+ *   pos        — next offset to decode
+ *   out        — the decoded value so far
+ *   complete   — the closing quote was seen; scanning stops forever
+ *
+ * Returns { ok, value, complete } exactly like extractDiffValue. A trailing
+ * lone backslash (an escape split across deltas) is left unconsumed so the
+ * next call can finish it.
+ */
+export function scanDiffValueIncremental(state, rawJSON) {
+  if (!state || typeof state !== 'object') return { ok: false, value: '', complete: false };
+  if (state.complete) return { ok: true, value: state.out || '', complete: true };
+  if (!state.keyed) {
+    const idx = rawJSON.indexOf('"diff"');
+    if (idx < 0) return { ok: false, value: '', complete: false };
+    let rest = rawJSON.slice(idx + 6).replace(/^[ \t]+/, '');
+    if (!rest.startsWith(':')) return { ok: false, value: '', complete: false };
+    rest = rest.slice(1).replace(/^[ \t]+/, '');
+    if (!rest.startsWith('"')) return { ok: false, value: '', complete: false };
+    state.keyed = true;
+    state.valueStart = rawJSON.length - rest.length + 1; // past the opening quote
+    state.pos = state.valueStart;
+    state.out = '';
+  }
+  let out = state.out;
+  let i = state.pos;
+  for (; i < rawJSON.length; i++) {
+    const ch = rawJSON[i];
+    if (ch === '\\') {
+      if (i + 1 >= rawJSON.length) break; // escape split across deltas: retry later
+      const n = rawJSON[i + 1];
+      if (n === 'n') out += '\n';
+      else if (n === 't') out += '\t';
+      else if (n === '"') out += '"';
+      else if (n === '\\') out += '\\';
+      else if (n === 'r') { /* skip */ }
+      else {
+        out += ch;
+        out += n;
+      }
+      i++;
+    } else if (ch === '"') {
+      state.out = out;
+      state.pos = i + 1;
+      state.complete = true;
+      return { ok: true, value: out, complete: true };
+    } else {
+      out += ch;
+    }
+  }
+  state.out = out;
+  state.pos = i;
+  return { ok: out.length > 0, value: out, complete: false };
+}
+
 const DIFF_MIN_HEIGHT = 80;
 const DIFF_MAX_HEIGHT = 400;
 
@@ -3500,6 +3952,9 @@ export function disposeChatEditors() {
     } catch (_) { /* ignore */ }
   }
   chatEditors.clear();
+  // The transcript DOM these parked colorize jobs target is being discarded
+  // (clearChat): drop them and stop observing their elements.
+  releaseColorizeTargets();
 }
 
 export { monaco };

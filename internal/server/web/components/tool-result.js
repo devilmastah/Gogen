@@ -84,8 +84,10 @@ function scheduleResultColorize(el, language) {
 
 // Run deferred tool-result colorizes after the replay finishes, in
 // ~12ms idle slices so a session with many large results doesn't jank
-// the main thread in one block. Each job is awaited so the slice
-// deadline actually bounds the synchronous tokenization work.
+// the main thread in one block. A job only ENQUEUES colorize work now:
+// colorizeElement hands off to the editor scheduler, which owns the
+// pacing and the work bound (the replay deferral + viewport gate), so
+// awaiting it here merely keeps the enqueue order deterministic.
 export function flushDeferredResultColorize() {
     if (!deferredResultColorize.length) return;
     const jobs = deferredResultColorize;

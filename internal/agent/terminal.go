@@ -232,6 +232,26 @@ func (a *Agent) terminalJobStatus(jobID string) (string, error) {
 	return fmt.Sprintf("Job %s FINISHED in %s.\nTerminal: %s\nOutput:\n%s", job.ID, elapsed, job.SessionID, renderTerminalDelta(res)), nil
 }
 
+// terminalJobState renders a background terminal send's one-word state for
+// the background_job list view: RUNNING, CANCELLED, FAILED, or FINISHED.
+func terminalJobState(job *terminalJob) string {
+	select {
+	case <-job.done:
+	default:
+		return "RUNNING"
+	}
+	if job.cancelled.Load() {
+		return "CANCELLED"
+	}
+	job.sendMu.Lock()
+	err := job.err
+	job.sendMu.Unlock()
+	if err != nil {
+		return "FAILED"
+	}
+	return "FINISHED"
+}
+
 // cancelTerminalJob interrupts a background terminal send with SIGINT.
 func (a *Agent) cancelTerminalJob(jobID string) (string, error) {
 	job := a.terminalJob(jobID)
@@ -326,7 +346,7 @@ func handleTerminalSend(_ context.Context, a *Agent, args map[string]any) (strin
 	}
 	if runInBackground {
 		jobID := a.startTerminalSendBackground(ts, text, submit, timeout)
-		return fmt.Sprintf("Started background terminal send %s on terminal %s.\nPoll with background_job (action=status, job_id: %q) or cancel with action=cancel.", jobID, id, jobID), nil
+		return fmt.Sprintf("Started background terminal send %s on terminal %s.\nWait for it with background_job (action=wait, job_id: %q), poll with action=status, or cancel with action=cancel.", jobID, id, jobID), nil
 	}
 	res, err := ts.Session.Send(text, submit, timeout)
 	if err != nil {

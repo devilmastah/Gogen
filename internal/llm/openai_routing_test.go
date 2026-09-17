@@ -66,7 +66,7 @@ func TestFetchModelsGoTakesPrecedenceOverZen(t *testing.T) {
 		modelClient: make(map[string]*openai.Client),
 	}
 
-	models, _, perProfile, err := p.fetchModelsWithProfiles(context.Background())
+	models, _, perProfile, err := p.fetchModelsWithProfiles(context.Background(), true)
 	if err != nil {
 		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}
@@ -389,7 +389,7 @@ func TestFetchModelsOpenCodeKeepsSurvivingTwinWhenPeerHangs(t *testing.T) {
 	}
 
 	start := time.Now()
-	models, _, _, err := p.fetchModelsWithProfiles(context.Background())
+	models, _, _, err := p.fetchModelsWithProfiles(context.Background(), true)
 	if err != nil {
 		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}

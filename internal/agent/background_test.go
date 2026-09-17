@@ -606,3 +606,179 @@ func TestBackgroundJobToolInput(t *testing.T) {
 		t.Fatalf("expected missing-input error, got %v", err)
 	}
 }
+
+// TestBackgroundJobWait covers the wait action: it returns the final status
+// once the job exits, reports the still-running status (not an error) on
+// timeout, fails fast for unknown ids, and aborts on a cancelled turn while
+// leaving the job alive.
+func TestBackgroundJobWait(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	t.Run("returns final status", func(t *testing.T) {
+		id, err := a.StartBackgroundCommand(context.Background(), "echo waited")
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		status, err := a.BackgroundJobWait(context.Background(), id, 10*time.Second)
+		if err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+		if !strings.Contains(status, "FINISHED") || !strings.Contains(status, "exit code 0") || !strings.Contains(status, "waited") {
+			t.Fatalf("wait status = %q", status)
+		}
+	})
+
+	t.Run("timeout keeps the job running", func(t *testing.T) {
+		id, err := a.StartBackgroundCommand(context.Background(), "sleep 60")
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		status, err := a.BackgroundJobWait(context.Background(), id, 100*time.Millisecond)
+		if err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+		if !strings.Contains(status, "RUNNING") || !strings.Contains(status, "timed out") {
+			t.Fatalf("wait status after timeout = %q", status)
+		}
+		// A timed-out wait must not kill or consume the job.
+		if _, err := a.CancelBackgroundJob(id); err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+	})
+
+	t.Run("unknown job", func(t *testing.T) {
+		if _, err := a.BackgroundJobWait(context.Background(), "job-nope", time.Second); err == nil || !strings.Contains(err.Error(), "unknown background job") {
+			t.Fatalf("expected unknown-job error, got %v", err)
+		}
+	})
+
+	t.Run("cancelled context aborts the wait", func(t *testing.T) {
+		id, err := a.StartBackgroundCommand(context.Background(), "sleep 60")
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		defer func() { _, _ = a.CancelBackgroundJob(id) }()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		start := time.Now()
+		if _, err := a.BackgroundJobWait(ctx, id, 10*time.Second); err == nil || !strings.Contains(err.Error(), "interrupted") {
+			t.Fatalf("expected interrupted wait, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("cancelled wait took %s, want a prompt return", elapsed)
+		}
+	})
+}
+
+// TestBackgroundJobsList covers the list action: the header carries the
+// count, every live job appears with its state (a finished echo, a running
+// sleep), oldest first, and an empty session reports none.
+func TestBackgroundJobsList(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	if got := a.BackgroundJobsList(); !strings.Contains(got, "No background jobs") {
+		t.Fatalf("empty list = %q", got)
+	}
+	finished, err := a.StartBackgroundCommand(context.Background(), "echo listed")
+	if err != nil {
+		t.Fatalf("start finished job: %v", err)
+	}
+	if _, err := a.BackgroundJobWait(context.Background(), finished, 10*time.Second); err != nil {
+		t.Fatalf("wait for finished job: %v", err)
+	}
+	running, err := a.StartBackgroundCommand(context.Background(), "sleep 60")
+	if err != nil {
+		t.Fatalf("start running job: %v", err)
+	}
+	defer func() { _, _ = a.CancelBackgroundJob(running) }()
+
+	list := a.BackgroundJobsList()
+	for _, want := range []string{"Background jobs (2, oldest first):", finished, running, "RUNNING", "FINISHED exit 0", "echo listed", "sleep 60"} {
+		if !strings.Contains(list, want) {
+			t.Fatalf("list missing %q:\n%s", want, list)
+		}
+	}
+	if strings.Index(list, finished) > strings.Index(list, running) {
+		t.Fatalf("list is not oldest first:\n%s", list)
+	}
+}
+
+// TestBackgroundJobToolWaitAndList routes the new actions through the
+// handler: wait honors timeout_ms, list works without a job_id, and the
+// per-job actions still require one.
+func TestBackgroundJobToolWaitAndList(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	id, err := a.StartBackgroundCommand(context.Background(), "sleep 60")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _, _ = a.CancelBackgroundJob(id) }()
+
+	out, err := handleBackgroundJob(context.Background(), a, map[string]any{
+		"action": "wait", "job_id": id, "timeout_ms": 150,
+	})
+	if err != nil {
+		t.Fatalf("wait action: %v", err)
+	}
+	if !strings.Contains(out, "RUNNING") || !strings.Contains(out, "timed out") {
+		t.Fatalf("wait action output = %q", out)
+	}
+
+	out, err = handleBackgroundJob(context.Background(), a, map[string]any{"action": "list"})
+	if err != nil {
+		t.Fatalf("list action: %v", err)
+	}
+	if !strings.Contains(out, id) || !strings.Contains(out, "RUNNING") {
+		t.Fatalf("list action output = %q", out)
+	}
+
+	if _, err := handleBackgroundJob(context.Background(), a, map[string]any{"action": "wait"}); err == nil || !strings.Contains(err.Error(), "missing required argument") {
+		t.Fatalf("expected missing job_id error, got %v", err)
+	}
+}
+
+// TestBackgroundJobSchemaCoversWaitAndList pins the tool schema: both new
+// actions are in the enum, timeout_ms is offered for wait, and only action
+// is required (list addresses no job).
+func TestBackgroundJobSchemaCoversWaitAndList(t *testing.T) {
+	var params map[string]any
+	for _, d := range builtinToolDefs {
+		if d.Definition.Name == "background_job" {
+			params = d.Definition.Parameters
+		}
+	}
+	if params == nil {
+		t.Fatal("background_job tool not registered")
+	}
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("background_job has no properties")
+	}
+	action, ok := props["action"].(map[string]any)
+	if !ok {
+		t.Fatal("background_job has no action property")
+	}
+	enum, ok := action["enum"].([]string)
+	if !ok {
+		t.Fatalf("action enum is %T, want []string", action["enum"])
+	}
+	for _, want := range []string{"status", "wait", "cancel", "input", "list"} {
+		if !slices.Contains(enum, want) {
+			t.Fatalf("action enum %v missing %q", enum, want)
+		}
+	}
+	if _, ok := props["timeout_ms"]; !ok {
+		t.Fatal("background_job has no timeout_ms property")
+	}
+	req, ok := params["required"].([]string)
+	if !ok || !slices.Equal(req, []string{"action"}) {
+		t.Fatalf("required = %v, want [action]", params["required"])
+	}
+}

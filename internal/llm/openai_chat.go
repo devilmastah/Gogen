@@ -6,13 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"gogen/internal/debuglog"
 
 	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/shared"
 )
@@ -200,6 +203,9 @@ func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompl
 
 func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatCompletionMessageParamUnion {
 	chatMessages := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
+	// Resolved once per conversion rather than per message; off drops the
+	// historical reasoning echo (see reasoningEchoEnabled).
+	echoReasoning := reasoningEchoEnabled()
 	for _, m := range messages {
 		switch m.Role {
 		case "system":
@@ -249,7 +255,7 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 			if m.Refusal != "" {
 				asst.Refusal = param.NewOpt(m.Refusal)
 			}
-			if m.Reasoning != "" {
+			if m.Reasoning != "" && echoReasoning {
 				asst.SetExtraFields(map[string]any{
 					"reasoning_content": m.Reasoning,
 				})
@@ -358,20 +364,146 @@ func StabilizeToolCallArgs(tc *ToolCall) {
 	tc.ArgsJSONValid = s != "" && json.Valid([]byte(s))
 }
 
-func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {
-	chatMessages := p.messagesToChat(messages)
-	model := p.currentModel()
+// roundRequest is one agent round's wire request: the history and tool
+// definitions converted once, and each wire variant's JSON body serialized at
+// most once.
+//
+// The stream recovery ladder (a muted streaming retry, then a non-streaming
+// fallback) re-requests the IDENTICAL turn. Building the request inside the
+// attempt functions meant the whole conversation was converted and
+// re-serialized on every attempt — for a large session that is megabytes of
+// garbage per attempt, multiplied by the ladder, which is exactly the load
+// that compounds when several agents share one process. Serialization goes
+// through ChatCompletionNewParams.MarshalJSON, the same call the SDK's request
+// builder makes (requestconfig.NewRequestConfig serializes a json.Marshaler
+// body directly), so the bytes on the wire are unchanged.
+type roundRequest struct {
+	// client is the streaming client resolved for the round's model.
+	client *openai.Client
+	// base carries everything the wire body needs except the per-variant
+	// StreamOptions: the converted messages, the tool definitions, the model,
+	// the prompt cache key, and the extras/thinking-level fields.
+	base openai.ChatCompletionNewParams
+
+	// The two variants are memoized: the "stream" flag is added by the SDK
+	// (NewStreaming sets it on the serialized body), so the cached streaming
+	// body does not carry it. sync.Once because the first attempt and the
+	// fallback may each be the first to need their variant.
+	streamOnce sync.Once
+	streamBody []byte
+	streamErr  error
+
+	fallbackOnce sync.Once
+	fallbackBody []byte
+	fallbackErr  error
+
+	// bytes is the round's upload breakdown (zero unless debug logging is
+	// enabled — see wireBytes); the encoded size completes it at serialization
+	// time. logBody is installed with it so each serialized variant reports
+	// once, without holding the provider through the request path.
+	bytes   wireBytes
+	logBody func(w wireBytes, variant string)
+}
+
+// newRoundRequest converts the turn's messages and tools once and applies the
+// per-request extras (llama.cpp kwargs, reasoning effort), resolving the
+// client the attempts will use. Everything that does not depend on the wire
+// variant is shared by both serialized bodies.
+func (p *OpenAIProvider) newRoundRequest(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) *roundRequest {
 	params := openai.ChatCompletionNewParams{
-		Messages: chatMessages,
+		Messages: p.messagesToChat(messages),
 		Tools:    toolsToOpenAI(tools, allowedTools),
-		Model:    model,
+		Model:    p.currentModel(),
 	}
 	if p.promptCacheKey.Valid() {
 		params.PromptCacheKey = p.promptCacheKey
 	}
 	p.applyChatCompletionExtras(ctx, &params)
 	p.applyThinkingLevel(ctx, &params)
-	resp, err := p.clientForModel(ctx).Chat.Completions.New(ctx, params)
+	req := &roundRequest{client: p.clientForModel(ctx), base: params}
+	// Wire-byte accounting is diagnostic only: measured once per round, and
+	// only when someone is actually reading the debug log.
+	if debuglog.Enabled() {
+		req.bytes = measureWireBytes(messages, tools)
+		req.logBody = p.logWireBytes
+	}
+	return req
+}
+
+// reportWireBytes completes the round's breakdown with the exact encoded body
+// size and logs it. No-op unless debug logging is enabled (logBody is nil).
+func (r *roundRequest) reportWireBytes(size int, variant string) {
+	if r.logBody == nil {
+		return
+	}
+	r.bytes.Framing = size - (r.bytes.System + r.bytes.History + r.bytes.Reasoning + r.bytes.Images + r.bytes.Tools)
+	r.bytes.Total = size
+	r.logBody(r.bytes, variant)
+}
+
+// streaming returns the serialized body for a streaming attempt (the SDK adds
+// "stream": true itself). Serialized once per round: the muted retry reuses
+// these bytes instead of re-encoding the whole conversation.
+func (r *roundRequest) streaming() ([]byte, error) {
+	r.streamOnce.Do(func() {
+		params := r.base
+		params.StreamOptions = openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		}
+		r.streamBody, r.streamErr = params.MarshalJSON()
+		if r.streamErr == nil {
+			r.reportWireBytes(len(r.streamBody), "stream")
+		}
+	})
+	return r.streamBody, r.streamErr
+}
+
+// nonStreaming returns the serialized body for the non-streaming fallback: the
+// same params without StreamOptions, matching what GenerateResponse sends.
+func (r *roundRequest) nonStreaming() ([]byte, error) {
+	r.fallbackOnce.Do(func() {
+		r.fallbackBody, r.fallbackErr = r.base.MarshalJSON()
+		if r.fallbackErr == nil {
+			r.reportWireBytes(len(r.fallbackBody), "non-stream")
+		}
+	})
+	return r.fallbackBody, r.fallbackErr
+}
+
+// newChatRequest builds the request options for one call from an
+// already-serialized body. The placeholder params exist only so the SDK's
+// request builder has a body to serialize before option.WithRequestBody
+// replaces it with the round's bytes — passing the real params would
+// re-serialize the whole conversation, which is what roundRequest avoids. The
+// placeholder carries the model so a dropped option fails loudly at the
+// endpoint (empty messages) instead of silently sending the wrong request.
+func newChatRequest(body []byte, model string) (openai.ChatCompletionNewParams, []option.RequestOption) {
+	return openai.ChatCompletionNewParams{Model: model},
+		[]option.RequestOption{option.WithRequestBody("application/json", body)}
+}
+
+func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {
+	return p.nonStreamingTurn(ctx, p.newRoundRequest(ctx, messages, allowedTools, tools))
+}
+
+// nonStreamingTurn performs the round's non-streaming request (the fallback
+// body variant), translating a serialization failure into the same error shape
+// as a failed request.
+func (p *OpenAIProvider) nonStreamingTurn(ctx context.Context, req *roundRequest) (Response, error) {
+	body, err := req.nonStreaming()
+	if err != nil {
+		return Response{}, fmt.Errorf("serialize chat request: %w", err)
+	}
+	return p.generateResponseBody(ctx, req.client, req.base.Model, body)
+}
+
+// generateResponseBody performs one non-streaming chat request for an
+// already-serialized body and parses the reply. Shared by GenerateResponse and
+// the stream fallback, which reuses the round's prebuilt body instead of
+// converting and re-encoding the conversation a third time.
+func (p *OpenAIProvider) generateResponseBody(ctx context.Context, client *openai.Client, model string, body []byte) (Response, error) {
+	params, opts := newChatRequest(body, model)
+	resp, err := client.Chat.Completions.New(ctx, params, opts...)
 
 	if err != nil {
 		// wrapContextWindowError classifies a context-window refusal so the
@@ -471,7 +603,13 @@ func streamRetryLabel(stage string, acc *streamAccumulator, err error) string {
 func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers) (*StreamResult, error) {
 	h = ensureStreamCallbacks(h)
 
-	at := p.streamChatAttempt(ctx, messages, allowedTools, tools, h)
+	// Convert and serialize the turn ONCE. Every attempt below — the first
+	// stream, the muted retry, and the non-streaming fallback — re-requests
+	// the identical conversation, so re-building it per attempt was pure
+	// duplicated work (see roundRequest).
+	req := p.newRoundRequest(ctx, messages, allowedTools, tools)
+
+	at := p.streamChatAttempt(ctx, req, h)
 	if at.err == nil {
 		return at.result, nil
 	}
@@ -495,6 +633,10 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	// (see trimRecoveredText): attempt 1's partial output normally, or —
 	// when the retry delivered live — the retry's own partial output.
 	trimAcc := at.acc
+	// rateLimited tracks whether ANY attempt in the ladder hit a provider
+	// rate limit: that changes the recovery policy below (pace to Retry-After,
+	// and do not spend a non-streaming regeneration on a limit).
+	rateLimited := isRateLimited(streamErr)
 	if retryableStreamError(streamErr) {
 		// Hosts must know so the UI can leave the bare-spinner state; the
 		// reason carries how far the attempt got and the underlying cause,
@@ -504,8 +646,9 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		// Let a briefly-persistent failure condition (router re-dialing a
 		// dead upstream, a LAN blip) clear before re-requesting: an
 		// immediate retry lands in the same dead window and burns the
-		// ladder's only streaming attempt.
-		if waitErr := waitStreamBackoff(ctx, streamRetryBackoff(0)); waitErr != nil {
+		// ladder's only streaming attempt. A provider that told us how long
+		// to wait (Retry-After) is obeyed instead of guessing.
+		if waitErr := waitStreamBackoff(ctx, recoveryDelay(streamErr, 0)); waitErr != nil {
 			return nil, waitErr
 		}
 		if at.acc.renderedOutput() {
@@ -513,10 +656,11 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			// prefix only until it diverges, and the trim contract forbids
 			// splicing two divergent generations into one bubble — so
 			// delivery is buffered and suffix-only.
-			if res, retryErr := p.retryStreamChat(ctx, messages, allowedTools, tools, h, at.acc); retryErr == nil {
+			if res, retryErr := p.retryStreamChat(ctx, req, h, at.acc); retryErr == nil {
 				debuglog.Write("llm/stream_recovery", "muted streaming retry recovered the round", "", nil)
 				return res, nil
 			} else {
+				rateLimited = rateLimited || isRateLimited(retryErr)
 				debuglog.Write("llm/stream_retry", "streaming retry failed; using non-streaming fallback", "", map[string]any{
 					"streamError": clipErrForLog(streamErr),
 					"retryError":  clipErrForLog(retryErr),
@@ -528,7 +672,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			// there is no rendered prefix to diverge from, so muting serves
 			// no purpose — the retry delivers live, exactly like a normal
 			// stream, instead of a silent end-of-retry batch.
-			live := p.streamChatAttempt(ctx, messages, allowedTools, tools, h)
+			live := p.streamChatAttempt(ctx, req, h)
 			if live.err == nil {
 				if live.result.Model == "" {
 					live.result.Model = at.acc.model
@@ -536,6 +680,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 				debuglog.Write("llm/stream_recovery", "live streaming retry recovered the round", "", nil)
 				return live.result, nil
 			}
+			rateLimited = rateLimited || isRateLimited(live.err)
 			debuglog.Write("llm/stream_retry", "streaming retry failed; using non-streaming fallback", "", map[string]any{
 				"streamError": clipErrForLog(streamErr),
 				"retryError":  clipErrForLog(live.err),
@@ -544,6 +689,18 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			trimAcc = live.acc
 		}
 	}
+	// A rate-limited round must NOT spend a non-streaming regeneration. The
+	// fallback uploads the entire conversation a third time, and a rate limit
+	// is not a transport failure that a re-request can fix — re-requesting
+	// only deepens the queue the request is already waiting on. The provider's
+	// own transport retry (with Retry-After honored) and the streaming retry
+	// above are the recovery budget for this condition.
+	if rateLimited {
+		debuglog.Write("llm/stream_recovery", "rate limited: skipping the non-streaming fallback", "", map[string]any{
+			"streamError": clipErrForLog(streamErr),
+		})
+		return nil, fmt.Errorf("stream error: %w", wrapContextWindowError(streamErr))
+	}
 	// The fallback re-requests the turn non-streaming (llama.cpp delivers
 	// nothing until the whole completion is done); hosts must know the
 	// spinner now covers a full silent regeneration.
@@ -551,10 +708,10 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	// Longer wait than the streaming retry: the fallback re-requests the
 	// whole turn, so it is worth giving the upstream a bigger window to
 	// recover before spending a full silent regeneration on it.
-	if waitErr := waitStreamBackoff(ctx, streamRetryBackoff(1)); waitErr != nil {
+	if waitErr := waitStreamBackoff(ctx, recoveryDelay(streamErr, 1)); waitErr != nil {
 		return nil, waitErr
 	}
-	return p.handleStreamFallback(ctx, messages, allowedTools, tools, h, streamErr, trimAcc)
+	return p.handleStreamFallback(ctx, req, h, streamErr, trimAcc)
 }
 
 // streamAttempt is the outcome of one streaming request. acc is always
@@ -602,6 +759,56 @@ func retryableStreamError(err error) bool {
 	return true
 }
 
+// retryAfterMax caps how long a provider-requested Retry-After may park the
+// recovery ladder. A hostile or mistaken value must not stall a turn for
+// minutes; the SDK's own transport retry already honors the header within its
+// own bounds, so this cap only bounds gogen's extra layer.
+const retryAfterMax = 60 * time.Second
+
+// retryAfterDelay returns the wait a provider explicitly asked for in its
+// Retry-After header (delta-seconds or HTTP-date), or 0 when the failure
+// carries none. The header is a provider telling a client how to pace itself;
+// ignoring it while re-uploading the whole conversation is what turns a rate
+// limit into congestion.
+func retryAfterDelay(err error) time.Duration {
+	var oerr *openai.Error
+	if !errors.As(err, &oerr) || oerr.Response == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(oerr.Response.Header.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if secs, convErr := strconv.Atoi(raw); convErr == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return min(time.Duration(secs)*time.Second, retryAfterMax)
+	}
+	if when, parseErr := http.ParseTime(raw); parseErr == nil {
+		if d := time.Until(when); d > 0 {
+			return min(d, retryAfterMax)
+		}
+	}
+	return 0
+}
+
+// recoveryDelay is the wait before a recovery re-request: the configured ladder
+// backoff, extended to the provider's own Retry-After when it asks for longer.
+func recoveryDelay(err error, stage int) time.Duration {
+	d := streamRetryBackoff(stage)
+	if ra := retryAfterDelay(err); ra > d {
+		return ra
+	}
+	return d
+}
+
+// isRateLimited reports whether err is a provider rate limit (HTTP 429).
+func isRateLimited(err error) bool {
+	var oerr *openai.Error
+	return errors.As(err, &oerr) && oerr.StatusCode == http.StatusTooManyRequests
+}
+
 // retryableHTTPStatus reports whether an HTTP status from the streaming
 // endpoint is worth one streaming retry: rate limits and server-side
 // failures are usually transient; client errors are not.
@@ -623,9 +830,9 @@ func retryableHTTPStatus(code int) bool {
 // Tool-call UI callbacks stay muted too: partial chips from the dead attempt
 // are left as rendered, like the non-streaming fallback, and the round-end
 // callbacks remain with the agent loop.
-func (p *OpenAIProvider) retryStreamChat(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers, first *streamAccumulator) (*StreamResult, error) {
+func (p *OpenAIProvider) retryStreamChat(ctx context.Context, req *roundRequest, h *StreamHandlers, first *streamAccumulator) (*StreamResult, error) {
 	quiet := ensureStreamCallbacks(&StreamHandlers{})
-	at := p.streamChatAttempt(ctx, messages, allowedTools, tools, quiet)
+	at := p.streamChatAttempt(ctx, req, quiet)
 	if at.err != nil {
 		return nil, at.err
 	}
@@ -652,26 +859,18 @@ func (p *OpenAIProvider) retryStreamChat(ctx context.Context, messages []Message
 // forwarding live delivery callbacks (OnToken/OnThinkingToken/tool-call
 // deltas) as chunks arrive. It never recovers: failures come back in
 // streamAttempt for GenerateResponseStream to run the retry/fallback ladder.
-func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers) streamAttempt {
+// req is the round's request, already converted and serialized once by
+// GenerateResponseStream (the retry path re-enters here with the same req).
+func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, req *roundRequest, h *StreamHandlers) streamAttempt {
 	onToken := h.OnToken
 	onThinking := h.OnThinkingToken
 
-	chatMessages := p.messagesToChat(messages)
-	model := p.currentModel()
-	params := openai.ChatCompletionNewParams{
-		Messages: chatMessages,
-		Tools:    toolsToOpenAI(tools, allowedTools),
-		Model:    model,
-		StreamOptions: openai.ChatCompletionStreamOptionsParam{
-			IncludeUsage: openai.Bool(true),
-		},
+	body, err := req.streaming()
+	if err != nil {
+		return streamAttempt{acc: newStreamAccumulator(), err: fmt.Errorf("serialize chat request: %w", err)}
 	}
-	if p.promptCacheKey.Valid() {
-		params.PromptCacheKey = p.promptCacheKey
-	}
-	p.applyChatCompletionExtras(ctx, &params)
-	p.applyThinkingLevel(ctx, &params)
-	stream := p.clientForModel(ctx).Chat.Completions.NewStreaming(ctx, params)
+	params, opts := newChatRequest(body, req.base.Model)
+	stream := req.client.Chat.Completions.NewStreaming(ctx, params, opts...)
 	defer stream.Close()
 
 	// stream.Next() can block on the response body even after ctx cancel if
@@ -822,7 +1021,7 @@ func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, messages []Messa
 // handleStreamFallback is the last stage of the stream recovery ladder: the
 // streaming attempt AND the muted streaming retry both failed, so it attempts
 // a non-streaming request to recover partial results.
-func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers, streamErr error, acc *streamAccumulator) (*StreamResult, error) {
+func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, req *roundRequest, h *StreamHandlers, streamErr error, acc *streamAccumulator) (*StreamResult, error) {
 	// Deliberately NOT firing OnStreamEnd / OnRecoverPartialStream here: the
 	// agent loop owns those and fires them exactly once when it finalizes the
 	// round (finishStreamUI on the content path, the tool-call branch + the
@@ -831,7 +1030,11 @@ func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Me
 	// failure; the error path that runs when the fallback also fails already
 	// finalizes the round itself. h came from GenerateResponseStream, which
 	// ran ensureStreamCallbacks, so the callbacks used below are non-nil.
-	resp, fbErr := p.GenerateResponse(ctx, messages, allowedTools, tools)
+	//
+	// The body is the round's own non-streaming variant: the conversation was
+	// converted once by GenerateResponseStream, so the ladder's third attempt
+	// (after the first stream and the muted retry) does not re-encode it.
+	resp, fbErr := p.nonStreamingTurn(ctx, req)
 	if fbErr != nil {
 		debuglog.Write("llm/stream_recovery", "non-streaming fallback failed", "", map[string]any{
 			"streamError":   clipErrForLog(streamErr),

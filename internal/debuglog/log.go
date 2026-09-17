@@ -74,6 +74,13 @@ func sessionID() string {
 	return os.Getenv("GOGEN_DEBUG_SESSION")
 }
 
+// Enabled reports whether Write would emit an entry — i.e. a debug log path is
+// configured. Callers use it to skip diagnostic accounting that exists only to
+// be logged, so the measurement costs nothing when debugging is off.
+func Enabled() bool {
+	return logPath() != ""
+}
+
 // Write appends a JSON debug entry when debug logging is configured.
 func Write(location, message, hypothesisID string, data map[string]any) {
 	logPath := logPath()

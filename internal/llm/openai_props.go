@@ -133,6 +133,14 @@ func (p *OpenAIProvider) acceptedReasoningEfforts() []string {
 // handshake per agent-loop round (F1).
 func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) bool {
 	baseURL := p.propsBaseURLForCurrentModel()
+	// Process-shared memo first (see PropsCapsCache): the capability belongs
+	// to the endpoint (+model), so a sibling session's probe answers for this
+	// one — no re-dial, no second fresh connection.
+	shared := p.propsCapsCache()
+	sharedKey := propsCapsKey(baseURL, p.currentModel())
+	if v, known := shared.Lookup(sharedKey); known {
+		return v
+	}
 	p.propsMu.Lock()
 	if p.propsChecked && p.propsBaseURL == baseURL {
 		v := p.propsPreserveReasoning
@@ -150,11 +158,14 @@ func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) 
 	supported, ok := p.probePreserveReasoning(ctx, baseURL, p.currentModel())
 	if !ok {
 		// Incomplete probe: don't pin the negative as a value, but remember
-		// the attempt so rounds within propsProbeRetryTTL skip re-probing.
+		// the attempt so rounds within propsProbeRetryTTL skip re-probing —
+		// locally and process-wide (the shared record is what stops the
+		// other sessions from re-dialing the same endpoint).
 		p.propsMu.Lock()
 		p.propsNegBaseURL = baseURL
 		p.propsNegAt = time.Now()
 		p.propsMu.Unlock()
+		shared.RecordFailure(sharedKey)
 		return false
 	}
 
@@ -172,7 +183,18 @@ func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) 
 	}
 	v := p.propsPreserveReasoning
 	p.propsMu.Unlock()
+	// Publish the completed answer: every sibling session's provider serves it
+	// from here without dialing the endpoint.
+	shared.RecordSuccess(sharedKey, v)
 	return v
+}
+
+// propsCapsCache returns the process-shared capability cache (nil when none was
+// installed — the provider then relies on its own memo).
+func (p *OpenAIProvider) propsCapsCache() *PropsCapsCache {
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	return p.propsCaps
 }
 
 // propsBaseURLForModel returns the base URL of the endpoint that serves
@@ -202,6 +224,10 @@ func (p *OpenAIProvider) invalidatePropsCaps() {
 	p.propsNegBaseURL = ""
 	p.propsNegAt = time.Time{}
 	p.propsMu.Unlock()
+	// Same invalidation in the shared record: a model switch can change the
+	// template a router host reports for the model now selected, and an
+	// endpoint-set change can re-point the base URL.
+	p.propsCapsCache().Invalidate(propsCapsKey(p.propsBaseURLForCurrentModel(), p.currentModel()))
 }
 
 // probePreserveReasoning GETs /props on baseURL and reads

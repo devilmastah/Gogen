@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"gogen/internal/llm"
 	"gogen/internal/spill"
@@ -157,38 +158,53 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	if tc.ArgsError != "" {
 		return "", fmt.Errorf("invalid tool arguments: %s", tc.ArgsError)
 	}
-	if err := a.checkPlanMode(tc.Name); err != nil {
-		return "", err
+	// Self-healing (healToolCall): normalize known model naming slips
+	// (misspelled tool/parameter names) before any plan-mode gating or
+	// routing, so a healed call is checked and dispatched exactly as if
+	// the canonical form had been emitted.
+	healedName, healedArgs, healNote := healToolCall(tc.Name, tc.Args)
+	tc.Name, tc.Args = healedName, healedArgs
+	run := func() (string, error) {
+		if err := a.checkPlanMode(tc.Name); err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		ctx = a.toolContext(ctx)
+		// Feature-gated tools are routed explicitly (MCP-style) through the
+		// single gating policy (featureTools): the same conditions that decide
+		// the model-facing definitions (llmTools) decide what runs here, so
+		// what the model sees and what executes always agree. When a feature
+		// is off, the name falls through to the handler map and returns
+		// "unknown tool" naturally — a stale mid-turn call after a live toggle
+		// sees exactly that. A registry tool with the same name wins (explicit
+		// user configuration), as it does in the definition list.
+		if ft, ok := a.featureToolFor(tc.Name); ok {
+			return ft.Handler(ctx, a, tc.Args)
+		}
+		if a.mcpRegistryHas(tc.Name) {
+			return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
+		}
+		a.toolMu.RLock()
+		handlers := a.toolHandlers
+		a.toolMu.RUnlock()
+		if handlers == nil {
+			handlers = BuiltinToolHandlers()
+		}
+		h, ok := handlers[tc.Name]
+		if !ok {
+			return "", fmt.Errorf("unknown tool: %s", tc.Name)
+		}
+		return h(ctx, a, tc.Args)
 	}
-	if err := ctx.Err(); err != nil {
-		return "", err
+	result, err := run()
+	if err == nil && healNote != "" {
+		// Surface the healing as an event on the tool result so the model
+		// sees the canonical name and stops slipping.
+		result = healNote + result
 	}
-	ctx = a.toolContext(ctx)
-	// Feature-gated tools are routed explicitly (MCP-style) through the
-	// single gating policy (featureTools): the same conditions that decide
-	// the model-facing definitions (llmTools) decide what runs here, so
-	// what the model sees and what executes always agree. When a feature
-	// is off, the name falls through to the handler map and returns
-	// "unknown tool" naturally — a stale mid-turn call after a live toggle
-	// sees exactly that. A registry tool with the same name wins (explicit
-	// user configuration), as it does in the definition list.
-	if ft, ok := a.featureToolFor(tc.Name); ok {
-		return ft.Handler(ctx, a, tc.Args)
-	}
-	if a.mcpRegistryHas(tc.Name) {
-		return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
-	}
-	a.toolMu.RLock()
-	handlers := a.toolHandlers
-	a.toolMu.RUnlock()
-	if handlers == nil {
-		handlers = BuiltinToolHandlers()
-	}
-	h, ok := handlers[tc.Name]
-	if !ok {
-		return "", fmt.Errorf("unknown tool: %s", tc.Name)
-	}
-	return h(ctx, a, tc.Args)
+	return result, err
 }
 
 func handleListFiles(ctx context.Context, a *Agent, args map[string]any) (string, error) {
@@ -286,7 +302,7 @@ func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]any) (s
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Started background job %s.\nCommand: %s\nPoll with background_job (action=status, job_id: %q) or cancel with action=cancel.", id, command, id), nil
+		return fmt.Sprintf("Started background job %s.\nCommand: %s\nWait for it with background_job (action=wait, job_id: %q), poll with action=status, list all with action=list, or cancel with action=cancel.", id, command, id), nil
 	}
 	// Spill target: the executor tees any output past the in-memory cap to
 	// the session's spill dir and reports a head/tail preview + locator
@@ -299,18 +315,30 @@ func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]any) (s
 	return a.Executor.ExecuteCommand(ctx, command)
 }
 
-func handleBackgroundJob(_ context.Context, a *Agent, args map[string]any) (string, error) {
+func handleBackgroundJob(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	action, err := stringArg(args, "action")
 	if err != nil {
 		return "", err
 	}
+	// list is the only action that does not address one job, so job_id is
+	// resolved lazily (the schema only requires action) and a missing id
+	// fails with the action that needed it.
+	if action == "list" {
+		return a.BackgroundJobsList(), nil
+	}
 	jobID, err := stringArg(args, "job_id")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("background_job action=%s: %w", action, err)
 	}
 	switch action {
 	case "status":
 		return a.BackgroundJobStatus(jobID)
+	case "wait":
+		timeout, err := backgroundWaitTimeout(args)
+		if err != nil {
+			return "", err
+		}
+		return a.BackgroundJobWait(ctx, jobID, timeout)
 	case "cancel":
 		return a.CancelBackgroundJob(jobID)
 	case "input":
@@ -324,8 +352,26 @@ func handleBackgroundJob(_ context.Context, a *Agent, args map[string]any) (stri
 		}
 		return a.BackgroundJobInput(jobID, input, appendNewline)
 	default:
-		return "", fmt.Errorf("unknown background_job action %q (want status, cancel, or input)", action)
+		return "", fmt.Errorf("unknown background_job action %q (want status, wait, cancel, input, or list)", action)
 	}
+}
+
+// backgroundWaitTimeout resolves the optional timeout_ms argument for
+// action=wait (terminalSendTimeout's sibling): absent or non-positive picks
+// the default, and an oversized value is clamped to the cap.
+func backgroundWaitTimeout(args map[string]any) (time.Duration, error) {
+	ms, err := intArgOptional(args, "timeout_ms")
+	if err != nil {
+		return 0, err
+	}
+	if ms <= 0 {
+		return backgroundWaitDefaultTimeout, nil
+	}
+	d := time.Duration(ms) * time.Millisecond
+	if d > backgroundWaitMaxTimeout {
+		d = backgroundWaitMaxTimeout
+	}
+	return d, nil
 }
 
 func handleReplaceInFile(_ context.Context, a *Agent, args map[string]any) (string, error) {

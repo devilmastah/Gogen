@@ -236,6 +236,19 @@
         #messages.no-anchor {
             overflow-anchor: none;
         }
+        /* History-rebuild blur. A chunked replay appends 12 entries per frame
+           and pins to the bottom each frame, so the partial build visibly
+           flies past the viewport. A temporary blur (plus the delayed
+           progress-strip label app.js sets) softens that motion WITHOUT
+           hiding anything: the transcript stays on screen, so the pane never
+           looks blank/crashed. The class is removed when the replay settles
+           and the transition below turns the lift into a soft unblur. Layout
+           is untouched (filter is paint-only), so the settle's scroll math and
+           the paint-skip measurements are unchanged. */
+        #messages.restoring {
+            filter: blur(3px);
+            transition: filter 140ms linear;
+        }
         #messages > * { flex-shrink: 0; }
         /* ===== Chat reading width (Settings → Appearance) =====
            Full width by default. "Comfortable" (settings.js toggles
@@ -1197,7 +1210,15 @@
         }
         .tool-result-content.error-content { color: var(--error-fg); }
         .tool-result-content.monaco-colorized {
-            white-space: normal;
+            /* Keep the plain state's white-space. Monaco's colorize output
+               breaks lines with <br/> and emits no newline characters (the
+               colorizer joins lines with "<br/>"), so pre-wrap reproduces the
+               plain textContent's line structure exactly. `normal` collapsed
+               runs of spaces and leading indentation the moment the colors
+               landed, so the block visibly reflowed when colored (and again
+               on expand/collapse, which toggles this class) — the same
+               height-parity rule the markdown code blocks follow. */
+            white-space: pre-wrap;
         }
         .tool-result-content.monaco-colorized span {
             font-family: var(--mono);

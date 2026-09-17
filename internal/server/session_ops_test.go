@@ -71,13 +71,22 @@ func TestSessionResumeDedupesAndLoads(t *testing.T) {
 		Messages:   []llm.Message{{Role: "user", Content: "saved"}},
 	})
 
-	// Resume the active default → dedupe: no new runtime.
+	// Resume the active default → no-op ack: dedupe (no new runtime) and
+	// NO clear_chat/history. The pane already shows this session, so the
+	// generic clear-and-replay reply would only flash a wipe/rebuild of
+	// the on-screen transcript (an explicit "/resume <current-id>").
 	res, handled, err := s.runSessionCommand(context.Background(), nil, &pane, "resume "+origID)
 	if err != nil || !handled {
 		t.Fatalf("resume active: handled=%v err=%v", handled, err)
 	}
-	if res.Action != agent.SessionActionClearChat {
-		t.Fatalf("resume active action = %q, want clear_chat", res.Action)
+	if res.Action != "" {
+		t.Fatalf("resume active action = %q, want none (no clear_chat)", res.Action)
+	}
+	if len(res.History) != 0 {
+		t.Fatalf("resume active history = %d messages, want none (no replay)", len(res.History))
+	}
+	if want := "Already on session " + origID + "."; res.Output != want {
+		t.Fatalf("resume active output = %q, want %q", res.Output, want)
 	}
 	if len(s.registry.activeIDs()) != 1 {
 		t.Fatalf("resume of active session created a duplicate: %v", s.registry.activeIDs())
@@ -87,6 +96,9 @@ func TestSessionResumeDedupesAndLoads(t *testing.T) {
 	}
 
 	// Resume an inactive session → loaded from the store via the factory.
+	// The successful result is EMPTY: the resume ships the attach sequence
+	// (session_state + history + config) itself (see sessionResume), so no
+	// response/clear_chat result is left for writeSessionCommandResult.
 	res, handled, err = s.runSessionCommand(context.Background(), nil, &pane, "resume disk-session")
 	if err != nil || !handled {
 		t.Fatalf("resume inactive: handled=%v err=%v", handled, err)
@@ -100,21 +112,77 @@ func TestSessionResumeDedupesAndLoads(t *testing.T) {
 	if len(s.registry.activeIDs()) != 2 {
 		t.Fatalf("active sessions = %v, want [orig disk-session]", s.registry.activeIDs())
 	}
-	if len(res.History) != 1 {
-		t.Fatalf("resume history = %d messages, want 1", len(res.History))
+	if res.Output != "" || res.Action != "" || len(res.History) != 0 {
+		t.Fatalf("resume result = %+v, want empty (the attach payload was already sent)", res)
 	}
 
-	// resume latest picks the most recently updated session.
-	latest, err := store.LatestID(s.ws.WorkingDir)
-	if err != nil || latest == "" {
-		t.Fatalf("LatestID: %v", err)
+	// "resume latest" follows the agent/TUI/README rule — the newest saved
+	// top-level session OTHER than the current one — even when the CURRENT
+	// session is the newest on disk (an explicit "/resume <current-id>" is
+	// the no-op ack asserted above).
+	store.Save("newer-session", agent.SessionSnapshot{
+		WorkingDir: s.ws.WorkingDir,
+		Messages:   []llm.Message{{Role: "user", Content: "newer"}},
+	})
+	// Flush the current session (disk-session) so it becomes the strictly
+	// newest on disk: "latest" must still skip it.
+	time.Sleep(10 * time.Millisecond)
+	pane.agent.FlushSession()
+	if latest, err := store.LatestID(s.ws.WorkingDir); err != nil || latest != "disk-session" {
+		t.Fatalf("precondition: LatestID = %q (err=%v), want the current disk-session", latest, err)
 	}
 	res, handled, err = s.runSessionCommand(context.Background(), nil, &pane, "resume latest")
 	if err != nil || !handled {
 		t.Fatalf("resume latest: handled=%v err=%v", handled, err)
 	}
-	if pane.agent.SessionID != latest {
-		t.Fatalf("resume latest = %q, want %q", pane.agent.SessionID, latest)
+	if pane.agent.SessionID != "newer-session" {
+		t.Fatalf("resume latest = %q, want newer-session (the current session must be excluded)", pane.agent.SessionID)
+	}
+	if res.Output != "" || res.Action != "" || len(res.History) != 0 {
+		t.Fatalf("resume latest result = %+v, want empty (the attach payload was already sent)", res)
+	}
+}
+
+// TestSessionResumeOfOpenPaneDoesNotSwitch pins the multi-pane rule enforced
+// server-side: a resume resolving to a session already open as a background
+// pane of the SAME connection must not re-key the current pane onto it (one
+// session in two panes desyncs both). The connection's pane stays put and the
+// reply points at the pane that already owns the session. A passive
+// (approval-only) attachment is not a pane and still takes the normal switch.
+func TestSessionResumeOfOpenPaneDoesNotSwitch(t *testing.T) {
+	s, a, _ := newLifecycleServer(t)
+	sidA := a.SessionID
+	pane := s.registry.first()
+	ws := &wsConn{} // stand-in socket: writes are no-ops (nil conn)
+
+	rtB, _ := s.registerSeededSession(nil, "")
+	sidB := rtB.agent.SessionID
+	if !rtB.attach(ws) {
+		t.Fatal("attach B as a viewer")
+	}
+	res, handled, err := s.runSessionCommand(context.Background(), ws, &pane, "resume "+sidB)
+	if err != nil || !handled {
+		t.Fatalf("resume open pane: handled=%v err=%v", handled, err)
+	}
+	if pane.agent.SessionID != sidA {
+		t.Fatalf("resume re-keyed the pane onto an already-open session: %q (want %q)", pane.agent.SessionID, sidA)
+	}
+	if res.Output != "" || res.Action != "" || len(res.History) != 0 {
+		t.Fatalf("open-pane resume result = %+v, want empty (the focus-pane reply was written directly)", res)
+	}
+	if !rtB.viewedBy(ws) {
+		t.Fatal("open-pane resume detached the target pane")
+	}
+
+	rtC, _ := s.registerSeededSession(nil, "")
+	if !rtC.attachPassive(ws) {
+		t.Fatal("attach C passively")
+	}
+	if _, handled, err := s.runSessionCommand(context.Background(), ws, &pane, "resume "+rtC.agent.SessionID); err != nil || !handled {
+		t.Fatalf("resume passive: handled=%v err=%v", handled, err)
+	}
+	if pane.agent.SessionID != rtC.agent.SessionID {
+		t.Fatalf("resume of a passively-attached session did not switch: pane=%q want %q", pane.agent.SessionID, rtC.agent.SessionID)
 	}
 }
 

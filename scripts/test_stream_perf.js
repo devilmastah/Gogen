@@ -54,6 +54,9 @@ async function main() {
   window.colorizeNode = (node, opts) => {
     colorizeCalls.push({ node, streamingTail: !!(opts && opts.streamingTail) });
   };
+  // markdown.js seals the streaming DOM before recreating elements; this
+  // test's oracle is the colorizeNode recorder, so the seal is a no-op.
+  window.sealStreamColorize = () => {};
 
   const sockets = [];
   class FakeWS {

@@ -95,17 +95,19 @@ export function updateTocActive(d) {
     const messagesDiv = deps.getMessages();
     const dots = tocDots ? tocDots.children : null;
     if (!dots || !dots.length) return;
+    if (deps.isPinned() && d === undefined) {
+        // Pinned at the bottom: the active dot is unconditionally the last
+        // prompt, and dots are 1:1 with the user messages — the dot count
+        // answers without getUserMsgs (a transcript-wide querySelectorAll
+        // that a history rebuild would otherwise pay once per chunk) and
+        // without getDistanceFromBottom (a forced layout).
+        const active = dots.length - 1;
+        if (active !== lastTocActive) setActiveDot(dots, active);
+        return;
+    }
     const users = getUserMsgs(messagesDiv);
     if (!users.length) return;
-    if (deps.isPinned() && d === undefined) {
-        // Pinned at the bottom: the active dot is unconditionally the
-        // last prompt, so the distance value is never used below. Skip
-        // getDistanceFromBottom() (a forced layout) entirely and bail
-        // out before any layout read when nothing changed.
-        if (users.length - 1 === lastTocActive) return;
-    } else if (d === undefined) {
-        d = deps.getDistanceFromBottom();
-    }
+    if (d === undefined) d = deps.getDistanceFromBottom();
     let active = users.length - 1;
     if (!deps.isPinned() && d > deps.getNearBottomPx()) {
         const viewTop = messagesDiv.getBoundingClientRect().top;
@@ -121,25 +123,35 @@ export function updateTocActive(d) {
     // Nothing changed — skip the class pass and rail auto-scroll so
     // streaming never churns the DOM (active stays put while pinned).
     if (active === lastTocActive) return;
-    const n = Math.min(dots.length, users.length);
-    for (let i = 0; i < n; i++) {
-        const on = i === active;
-        dots[i].classList.toggle('active', on);
-        if (on) dots[i].setAttribute('data-toc-active', '');
-        else dots[i].removeAttribute('data-toc-active');
+    setActiveDot(dots, active);
+}
+
+// Move the active dot: only the PREVIOUS and the NEW dot change. The old
+// pass re-toggled every dot on every call, which made a growing session
+// O(prompts) per pin — and pins are frequent (the history rebuild pins once
+// per chunk, streaming pins on every colorize/resize event). When the target
+// index is past the rail's dots (dots lag the messages), the previous dot is
+// still cleared and lastTocActive is left alone, exactly like the old pass.
+function setActiveDot(dots, active) {
+    const prev = lastTocActive;
+    if (prev >= 0 && prev < dots.length && prev !== active) {
+        dots[prev].classList.remove('active');
+        dots[prev].removeAttribute('data-toc-active');
     }
-    if (active !== lastTocActive && active < dots.length) {
-        lastTocActive = active;
-        const dot = dots[active];
-        // offsetTop is relative to the nearest positioned ancestor;
-        // dot and column share it, so the difference is the dot's
-        // offset within the column.
-        const relTop = dot.offsetTop - tocDots.offsetTop;
-        if (relTop < tocDots.scrollTop) {
-            tocDots.scrollTop = relTop;
-        } else if (relTop + dot.offsetHeight > tocDots.scrollTop + tocDots.clientHeight) {
-            tocDots.scrollTop = relTop + dot.offsetHeight - tocDots.clientHeight;
-        }
+    if (active < 0 || active >= dots.length) return;
+    dots[active].classList.add('active');
+    dots[active].setAttribute('data-toc-active', '');
+    lastTocActive = active;
+    // offsetTop is relative to the nearest positioned ancestor; dot and
+    // column share it, so the difference is the dot's offset within the
+    // column. Minimal scroll: only when the active dot would fall outside
+    // the rail's viewport.
+    const dot = dots[active];
+    const relTop = dot.offsetTop - tocDots.offsetTop;
+    if (relTop < tocDots.scrollTop) {
+        tocDots.scrollTop = relTop;
+    } else if (relTop + dot.offsetHeight > tocDots.scrollTop + tocDots.clientHeight) {
+        tocDots.scrollTop = relTop + dot.offsetHeight - tocDots.clientHeight;
     }
 }
 

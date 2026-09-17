@@ -283,10 +283,13 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 // StreamProcessInputWithImages is StreamProcessInput with optional
 // user-attached images (vision input). images is nil for text-only prompts.
 func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, images []llm.ImageInput, h *llm.StreamHandlers) (string, error) {
+	// Downscale user-attached images before they join the transcript: a
+	// pasted screenshot is re-uploaded on every subsequent request, so the
+	// attached size is paid once per round (see image_scale.go).
 	a.appendMessage(llm.Message{
 		Role:      "user",
 		Content:   input,
-		Images:    images,
+		Images:    normalizeImages(images),
 		CreatedAt: time.Now().Truncate(time.Millisecond),
 	})
 	// If the session doesn't have a label yet, derive one from the first user message.

@@ -363,6 +363,22 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 		return false
 	}
 	s.sendSessionState(ws, rt)
+	s.sendAttachPayload(r.Context(), ws, rt, sendHistory, known)
+	return true
+}
+
+// sendAttachPayload ships the attach sequence's second half — the history
+// snapshot (full or conditional), the config pair, and the reasoning-effort
+// probe — ASYNCHRONOUSLY, so a running turn (which holds the session turn
+// lock for its whole duration) can never delay the handshake or a pane
+// switch. Callers send session_state first (sendSessionState) and are
+// responsible for the attach bookkeeping (rt.attach/switchPane).
+//
+// Shared by the socket handshake (attachSession) and sessionResume: a
+// resume's reply IS the attach sequence (the pane re-keys off session_state
+// and the history/config frames re-derive its transcript), so the two must
+// stay byte-identical — one code path, no drift.
+func (s *Server) sendAttachPayload(ctx context.Context, ws *wsConn, rt *sessionRuntime, sendHistory bool, known *attachKnown) {
 	go func() {
 		if sendHistory {
 			s.sendAttachHistory(ws, rt, known)
@@ -376,7 +392,7 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 		// told the client whether the session is mid-turn; these frames just
 		// refresh the pane's toolbar/context mirrors.
 		basic := agentConfigMsgBasic(rt.agent)
-		full := agentConfigMsg(r.Context(), rt)
+		full := agentConfigMsg(ctx, rt)
 		s.decorateConfig(&basic)
 		s.decorateConfig(&full)
 		_ = ws.writeJSON(basic)
@@ -384,9 +400,8 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 		// Derive llama.cpp reasoning-effort options for the (possibly
 		// restored) model and push a correction when they differ from the
 		// fallback set the configs above carried.
-		s.maybeProbeReasoningEfforts(r.Context(), rt.agent)
+		s.maybeProbeReasoningEfforts(ctx, rt.agent)
 	}()
-	return true
 }
 
 // sendAttachHistory writes the history part of an attach payload: the full

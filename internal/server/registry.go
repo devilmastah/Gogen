@@ -433,6 +433,25 @@ func (rt *sessionRuntime) viewerCount() int {
 	return len(rt.clients) - len(rt.passive)
 }
 
+// viewedBy reports whether ws is attached to this runtime as a genuine
+// viewer (a pane open on that connection), as opposed to a passive
+// approval-only attachment. sessionResume uses it to distinguish "resume
+// a session this tab does not show" (switch) from "resume a session this
+// tab already shows as a background pane" (do not duplicate it across
+// panes — tell the client to focus the pane it already has).
+func (rt *sessionRuntime) viewedBy(ws *wsConn) bool {
+	if ws == nil {
+		return false
+	}
+	rt.clientsMu.Lock()
+	defer rt.clientsMu.Unlock()
+	if _, ok := rt.clients[ws]; !ok {
+		return false
+	}
+	_, passive := rt.passive[ws]
+	return !passive
+}
+
 // claimClose atomically decides whether an explicit session_close may
 // proceed: it returns true only when the runtime has no attached clients,
 // and latches closing so a viewer attach that races the close is refused

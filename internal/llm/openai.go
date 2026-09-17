@@ -217,6 +217,24 @@ type OpenAIProvider struct {
 	// round-trippers and the /props probe; nil for direct-constructed
 	// providers (tests) that only exercise pure methods.
 	sessionHdr *sessionHeaderState
+
+	// wire accumulates this session's upload (bytes by contributor) for the
+	// debug-log wire-byte diagnostic. Untouched unless debug logging is
+	// enabled.
+	wire wireCounters
+
+	// endpointCatalog is the process-shared catalog cache (see
+	// EndpointCatalog): every session's provider otherwise downloaded the
+	// same endpoint's /v1/models independently. Nil for direct-constructed
+	// providers, which then fetch directly. Set at construction time via
+	// SetEndpointCatalog, before the provider serves requests.
+	endpointCatalog *EndpointCatalog
+
+	// propsCaps is the process-shared /props capability cache (see
+	// PropsCapsCache): every session's provider otherwise re-probed the same
+	// endpoint's capability for itself. Nil for direct-constructed providers,
+	// which keep their own per-provider memo instead.
+	propsCaps *PropsCapsCache
 }
 
 // ProviderProfiles builds the registered OpenAI-compatible endpoint list for
@@ -425,6 +443,47 @@ func ProjectPromptCacheKey(workingDir string) string {
 	return hex.EncodeToString(b[:])
 }
 
+// SetEndpointCatalog installs the process-shared catalog cache (see
+// EndpointCatalog) so every provider in a workspace shares one /v1/models
+// download per endpoint instead of one per session. Construction-time setter,
+// like SetPromptCacheKey: call it before the provider serves requests. A nil
+// argument detaches the provider (it fetches directly, as before).
+func (p *OpenAIProvider) SetEndpointCatalog(c *EndpointCatalog) {
+	if p == nil {
+		return
+	}
+	p.modelsMu.Lock()
+	p.endpointCatalog = c
+	p.modelsMu.Unlock()
+}
+
+// SetPropsCapsCache installs the process-shared /props capability cache (see
+// PropsCapsCache) so every provider in a workspace dials an endpoint's
+// capability once instead of once per session. Construction-time setter, like
+// SetPromptCacheKey. A nil argument detaches the provider (its own per-provider
+// memo applies, as before).
+func (p *OpenAIProvider) SetPropsCapsCache(c *PropsCapsCache) {
+	if p == nil {
+		return
+	}
+	p.modelsMu.Lock()
+	p.propsCaps = c
+	p.modelsMu.Unlock()
+}
+
+// PropsCapsCache returns the shared capability cache installed by
+// SetPropsCapsCache (nil for standalone providers). Hosts that build a child
+// provider themselves (the TUI subagent spawner) share the parent's cache with
+// it.
+func (p *OpenAIProvider) PropsCapsCache() *PropsCapsCache {
+	if p == nil {
+		return nil
+	}
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	return p.propsCaps
+}
+
 // SetOwnerRegistry installs the process-shared model→profile owner record
 // (see OwnerRegistry). Construction-time setter, like SetPromptCacheKey:
 // call it before the provider serves requests. A nil argument detaches the
@@ -436,6 +495,19 @@ func (p *OpenAIProvider) SetOwnerRegistry(r *OwnerRegistry) {
 	p.modelsMu.Lock()
 	p.ownerRegistry = r
 	p.modelsMu.Unlock()
+}
+
+// EndpointCatalog returns the shared catalog cache installed by
+// SetEndpointCatalog (nil for standalone providers). Hosts that build a
+// child provider themselves (the TUI subagent spawner) share the parent's
+// cache with it, so a child does not re-download the endpoint's catalog.
+func (p *OpenAIProvider) EndpointCatalog() *EndpointCatalog {
+	if p == nil {
+		return nil
+	}
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	return p.endpointCatalog
 }
 
 // OwnerRegistry returns the shared owner record installed by

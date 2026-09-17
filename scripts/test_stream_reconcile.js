@@ -81,6 +81,7 @@ async function main() {
   window.marked = marked;
   window.DOMPurify = DOMPurify;
   window.colorizeNode = () => {};
+  window.sealStreamColorize = () => {};
   window.openFileAtLine = async () => {};
   window.eval(stripModuleSyntax(fs.readFileSync(MARKDOWN_JS, 'utf8')));
 
@@ -166,6 +167,41 @@ async function main() {
       'merged=' + String(el._gogenBlocks.mergedNode !== null) + ' done=' + el._gogenBlocks.done.length);
     check('plain paragraphs: live render equals one-shot before finalize',
       norm(onScreen(el)) === norm(oneShot(text)), onScreen(el));
+  }
+
+  // Case 6: sanitize budget. The promotion compare must run on RAW marked
+  // output — DOMPurify sanitization is the dominant cost of the reconcile
+  // pass (an order of magnitude above the parse), and sanitizing the joint
+  // prefix at every promotion made long code-heavy streams slow down as they
+  // grew. Sanitize must only ever see ONE BLOCK (the HTML that lands in the
+  // DOM), never the accumulated prefix.
+  {
+    const el = window.document.createElement('div');
+    const origSanitize = DOMPurify.sanitize;
+    let sanitizeCalls = 0;
+    let maxInput = 0;
+    DOMPurify.sanitize = function (raw, ...rest) {
+      sanitizeCalls++;
+      maxInput = Math.max(maxInput, String(raw).length);
+      return origSanitize.call(DOMPurify, raw, ...rest);
+    };
+    const lines = (i) => Array.from({ length: 50 }, (_, j) => 'const v' + i + '_' + j + ' = compute(' + j + ');').join('\n');
+    let text = '';
+    try {
+      for (let i = 0; i < 4; i++) {
+        text += 'Paragraph ' + i + '.\n\n```js\n' + lines(i) + '\n```\n\n';
+        render(el, text);
+      }
+      // The tail render (a plain paragraph) is inside the budget too.
+      render(el, text + 'tail');
+    } finally {
+      DOMPurify.sanitize = origSanitize;
+    }
+    // Each block's HTML is ~2.3KB; the accumulated prefix is ~9KB by the
+    // last promotion. The old code sanitized the joint prefix on EVERY
+    // promotion, so maxInput would be ≈ prefix length.
+    check('sanitize budget: never sanitizes the joint prefix (max input = one block)',
+      maxInput < 3000, 'maxInput=' + maxInput + ' calls=' + sanitizeCalls);
   }
 
   // Case 5: a rewind (text shrink) resets the state, merged node included,

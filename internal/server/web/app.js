@@ -8,9 +8,12 @@
             updateDiffFallback,
             chatDiffWheelEdge,
             extractDiffValue,
+            scanDiffValueIncremental,
             initMonaco,
             colorizeNode,
             colorizeElement,
+            beginColorizeDeferral,
+            endColorizeDeferral,
             languageFromPath,
             setToastHandler,
             focusFindInFiles,
@@ -994,13 +997,26 @@
             updateScrollBottomBtn();
         }
 
+        // O(1) empty-state probes: while the placeholder is shown it is the
+        // transcript's only (first) child, and messages are appended after it
+        // only once it has been removed. The previous
+        // messagesDiv.querySelector('.empty-state') — run for every appended
+        // message — scanned every node in the transcript, which made a
+        // history replay O(n²) (measured: ~60% of the replay time for a
+        // 400-message session). Checking the live DOM per pane also keeps the
+        // per-pane transcript cache correct: a tracked element reference
+        // would dangle across pane switches.
+        function hasEmptyState() {
+            const first = messagesDiv.firstElementChild;
+            return !!first && first.classList.contains('empty-state');
+        }
+
         // Show the empty-state placeholder only while the transcript is
         // truly empty.
         function ensureEmptyState() {
-            if (!messagesDiv.querySelector('.message, .thought-card, .tool-card')
-                && !messagesDiv.querySelector('.empty-state')) {
-                messagesDiv.appendChild(buildEmptyState());
-            }
+            if (hasEmptyState()) return;
+            if (messagesDiv.querySelector('.message, .thought-card, .tool-card')) return;
+            messagesDiv.appendChild(buildEmptyState());
         }
 
         function clearChat() {
@@ -1203,8 +1219,47 @@
         }
 
         function removeEmptyState() {
-            const el = messagesDiv.querySelector('.empty-state');
-            if (el) el.remove();
+            const first = messagesDiv.firstElementChild;
+            if (first && first.classList.contains('empty-state')) first.remove();
+        }
+
+        // ── History-rebuild blur ──
+        // See the #messages.restoring CSS rule: the chunked replay builds the
+        // transcript while it is softly blurred, so the 12-entries-per-frame
+        // motion never flies past legibly — but nothing is hidden, so the pane
+        // never looks blank (the blank veil read as a crash). The composer
+        // strip's "Restoring session…" label is delayed a moment so a fast
+        // rebuild (the common case now) cannot flash it for a single frame,
+        // and it only claims the strip when no turn phase already owns it.
+        const RESTORING_LABEL_DELAY_MS = 120;
+        let restoringLabelTimer = null;
+        let restoringLabelShown = false;
+        const RESTORING_LABEL = 'Restoring session\u2026';
+
+        function beginRestoring() {
+            messagesDiv.classList.add('restoring');
+            if (restoringLabelTimer) return;
+            restoringLabelTimer = setTimeout(() => {
+                restoringLabelTimer = null;
+                if (!messagesDiv.classList.contains('restoring')) return;
+                if (currentProgressPhase) return; // a turn phase owns the strip
+                setInputProgress('thinking', RESTORING_LABEL);
+                restoringLabelShown = true;
+            }, RESTORING_LABEL_DELAY_MS);
+        }
+
+        function endRestoring() {
+            if (restoringLabelTimer) {
+                clearTimeout(restoringLabelTimer);
+                restoringLabelTimer = null;
+            }
+            messagesDiv.classList.remove('restoring');
+            // Clear only the label we set: a live event (or afterHistory's
+            // turn-active branch) may have replaced it meanwhile.
+            if (restoringLabelShown) {
+                restoringLabelShown = false;
+                if (progressLabelText === RESTORING_LABEL) setInputProgress(null);
+            }
         }
 
         let pendingSessionResponse = false;
@@ -1486,6 +1541,27 @@
         // ordering the old single-task synchronous replay had, when no event
         // could run until the whole rebuild finished.
         let replayEventBuffer = [];
+        // Connection-scoped frames whose handlers never touch the transcript
+        // (the sidebar's session list, toasts, the board/automations panes,
+        // settings-modal probe results). They must NOT wait for the replay:
+        // the sidebar payload for a refresh arrives while the restored
+        // transcript is still replaying, and buffering it left the sidebar
+        // empty for the whole rebuild (the "sidebar loads slow on refresh"
+        // symptom). Everything transcript-bearing (stream/thinking/tool/
+        // history/response/clear_chat/config/context/session_state/…) stays
+        // buffered.
+        const REPLAY_IMMEDIATE_TYPES = new Set([
+            'sessions', 'notice',
+            'board_state', 'automations_state', 'automations_runs',
+            'provider_test', 'mcp_test',
+        ]);
+        // A catalog reply (list_models, no content) is toolbar state for the
+        // model picker and may render immediately; a /models list reply
+        // WITH content is a transcript line and stays buffered.
+        function replayImmediate(data) {
+            if (REPLAY_IMMEDIATE_TYPES.has(data.type)) return true;
+            return data.type === 'models' && !data.content;
+        }
         // Monotonic counter for message positions (used for forking)
         let msgIdxCounter = 0;
 
@@ -1839,6 +1915,29 @@
             }
         }
 
+        // A pending session change's reply names `id`: adopt it on the
+        // initiator pane — drop the outgoing session's transcript cache and
+        // epoch (they describe a different history) and release its
+        // attachment. Returns true when the id was adopted; false when the
+        // pane already holds it or another pane owns it (that reply resolves
+        // through the focus-pane path instead). Shared by the active and
+        // background handlers: a resume whose pane goes to the background
+        // mid-flight must still re-key, or its pending flag would strand and
+        // block every later session change.
+        function adoptPendingSession(pane, id) {
+            if (!pane || !id || pane.id === id) return false;
+            const other = findPaneBySession(id);
+            if (other && other !== pane) return false;
+            const oldId = pane.id;
+            pane.id = id;
+            pane.domCache = null;
+            pane.histEpoch = undefined;
+            pane.ignoreTurnEndsFor = null;
+            if (pane === activePane() && sessionInfoDiv) sessionInfoDiv.textContent = id;
+            sendSessionDetach(oldId);
+            return true;
+        }
+
         // Sidebar open-pane ordering is by OUTPUT recency: a pane climbs
         // only when it produced newer output than the rest. Focus is NOT
         // activity — clicking a row highlights it without reordering — so
@@ -1895,6 +1994,26 @@
                     if (pane.suppressTurnEnds > 0) pane.suppressTurnEnds--;
                     break;
                 case 'session_state':
+                    // A resume reply can land on this pane while it is in the
+                    // background (the user switched away mid-flight): adopt
+                    // the target id exactly like the active handler — the
+                    // transcript re-derives when the pane is focused — and
+                    // settle the pending change, or the pane's flag would
+                    // strand and block every later session change.
+                    if (data.sessionId && pane.pendingSessionResponse) {
+                        if (pane.id !== null) adoptPendingSession(pane, data.sessionId);
+                        pane.pendingSessionResponse = false;
+                        pane.ignoreTurnEndsFor = null;
+                    }
+                    // An id-less pane (the command was issued before this
+                    // pane ever adopted a session) has no old id to release
+                    // and no cache to drop: adopt the id directly, exactly
+                    // like the active handler's fallback — otherwise the
+                    // history/config frames that follow route to no pane and
+                    // the transcript never re-derives.
+                    if (data.sessionId && pane.id === null) {
+                        pane.id = data.sessionId;
+                    }
                     pane.turnActive = !!data.turnActive;
                     // Keep the convergence latch in sync with the active
                     // pane's handler: an idle attach means the snapshot is
@@ -2107,6 +2226,22 @@
             // came from a UI action): hand it back to the composer so the
             // user can type without re-clicking the input.
             inputArea.focus();
+        }
+
+        // A session command named a session another pane already holds:
+        // focus that pane instead of re-keying this one onto a duplicate
+        // (two panes for one session desync each other's transcript and
+        // event routing). Shared by the typed /resume interception and the
+        // session-change reply handler (the palette's "resume latest" can
+        // resolve server-side to a session already open here). Focusing
+        // also re-attaches the session, which re-syncs the connection's
+        // current pane with the server. Returns true when it switched.
+        function focusSessionInOtherPane(id) {
+            const other = findPaneBySession(id);
+            if (!other || other === activePane()) return false;
+            showToast('Session already open in another pane — switched to it', 'info');
+            focusPane(other.key);
+            return true;
         }
 
         // Create a fresh active pane: the sidebar "New" / /new / session
@@ -2603,7 +2738,7 @@
                 msgDiv.dataset.rawContent = text;
                 ensureUserResendActions(msgDiv);
             }
-            messagesDiv.appendChild(msgDiv);
+            appendTranscriptChild(msgDiv);
             // Every user bubble is created here (live sends, resend, history
             // replay, attach fallback), so this single hook keeps the TOC
             // rail in sync with the transcript.
@@ -2654,7 +2789,7 @@
                 label.className = 'waiting-placeholder-label';
                 waitingPlaceholder.appendChild(spin);
                 waitingPlaceholder.appendChild(label);
-                messagesDiv.appendChild(waitingPlaceholder);
+                appendTranscriptChild(waitingPlaceholder);
                 waitingPlaceholderStart = Date.now();
                 waitingPlaceholderTimer = setInterval(tickWaitingPlaceholder, 1000);
                 smartScroll();
@@ -2699,7 +2834,7 @@
             // Content wrapper up front: the fork button appended in
             // endStream must land on msgDiv, outside the contained body.
             msgBody(msgDiv);
-            messagesDiv.appendChild(msgDiv);
+            appendTranscriptChild(msgDiv);
             smartScroll();
             currentStreamDiv = msgDiv;
             lastStreamDiv = msgDiv;
@@ -2777,7 +2912,7 @@
             finalizeThinking();
             thinkingContentPos = 0;
             const { card: div, body } = createThoughtCard();
-            messagesDiv.appendChild(div);
+            appendTranscriptChild(div);
 
             smartScroll();
             currentThinkingRaw = '';
@@ -3040,6 +3175,25 @@
             return frag;
         }
 
+        // Cap for the "does an unknown tool's args carry a diff key?" probe:
+        // the key can only appear near the start of the JSON, so scanning the
+        // growing args beyond this is pure cost for a viewer that cannot
+        // upgrade (see appendStreamingToolArgs).
+        const MAX_DIFF_KEY_PROBE = 8192;
+
+        // Cheap completeness probe for the streaming args JSON: true when the
+        // last non-whitespace character is a closing brace. A truncated JSON
+        // body can never end in '}' for the tools we stream diffs for, so
+        // this avoids a failed JSON.parse of the whole args string per frame.
+        function argsLookComplete(raw) {
+            for (let i = raw.length - 1; i >= 0; i--) {
+                const c = raw[i];
+                if (c === ' ' || c === '\n' || c === '\t' || c === '\r') continue;
+                return c === '}';
+            }
+            return false;
+        }
+
         function createToolCard(name, args, options = {}) {
             toolCallCounter++;
             const cardId = `tool-card-${toolCallCounter}`;
@@ -3056,7 +3210,7 @@
             card.appendChild(header);
             const { waiting, argsStream, monacoHost } = buildToolCardBody(card, name, args, streaming);
 
-            messagesDiv.appendChild(card);
+            appendTranscriptChild(card);
             smartScroll();
 
             header.addEventListener('click', () => {
@@ -3089,6 +3243,8 @@
                 rawArgs: '',
                 pendingDiff: '',
                 diffComplete: false,
+                diffScan: null,
+                argsCompacted: false,
                 finalized: false,
                 rafScheduled: false,
                 lastFallbackText: '',
@@ -3108,7 +3264,13 @@
                                 // was seen; don't re-extract it every frame.
                                 text = this.pendingDiff || '';
                             } else {
-                                const extracted = extractDiffValue(this.rawArgs);
+                                // Incremental scan: rawArgs only grows, so
+                                // each frame decodes just the new tail. The
+                                // old whole-value re-extract was O(args²)
+                                // over the stream (hundreds of ms for a
+                                // large diff).
+                                const scan = this.diffScan || (this.diffScan = { keyed: false, complete: false, pos: 0, valueStart: -1, out: '' });
+                                const extracted = scanDiffValueIncremental(scan, this.rawArgs);
                                 if (extracted.complete) {
                                     this.diffComplete = true;
                                     this.pendingDiff = extracted.value;
@@ -3130,13 +3292,20 @@
                         } else if (this.argsStream) {
                             this.argsStream.textContent = this.rawArgs;
                         }
-                        // Compact the header once the JSON is parseable enough.
-                        const compact = formatArgsCompact(this.rawArgs);
-                        if (compact && this.toolArgs && this.toolArgs.textContent !== compact) {
-                            this.toolArgs.textContent = compact;
-                            if (this.argsStream) {
-                                this.argsStream.remove();
-                                this.argsStream = null;
+                        // Compact the header once the JSON is parseable. Two
+                        // cheap gates first: the JSON can only parse once its
+                        // closing brace arrived (a failed JSON.parse of the
+                        // whole args string every frame was O(args²) over a
+                        // stream), and once compacted there is nothing to do.
+                        if (!this.argsCompacted && argsLookComplete(this.rawArgs)) {
+                            const compact = formatArgsCompact(this.rawArgs);
+                            if (compact && this.toolArgs && this.toolArgs.textContent !== compact) {
+                                this.toolArgs.textContent = compact;
+                                this.argsCompacted = true;
+                                if (this.argsStream) {
+                                    this.argsStream.remove();
+                                    this.argsStream = null;
+                                }
                             }
                         }
                         smartScroll();
@@ -3364,9 +3533,15 @@
                 // start): all per-delta work is coalesced into one rAF pass.
                 cardInfo.toolName = 'patch_file';
             } else {
-                // Not a patch viewer yet. Pre-upgrade args are short, so a
-                // precise "diff" key check per delta is cheap.
-                const extracted = extractDiffValue(cardInfo.rawArgs);
+                // Not a patch viewer yet. A patch tool always upgrades; any
+                // other tool only when a "diff" key shows up in the
+                // still-short args prefix (the key can only appear near the
+                // start of the JSON). Scanning the whole accumulated args per
+                // delta was O(args²) on a large stream — e.g. write_file's
+                // content field — for a viewer it can never upgrade.
+                const extracted = tool === 'patch_file' || cardInfo.rawArgs.length <= MAX_DIFF_KEY_PROBE
+                    ? extractDiffValue(cardInfo.rawArgs)
+                    : { ok: false, value: '' };
                 if (tool === 'patch_file' || extracted.ok) {
                     cardInfo.toolName = 'patch_file';
                     ensurePatchViewer(cardInfo, extracted.ok ? extracted.value : (cardInfo.pendingDiff || '')).catch(() => {});
@@ -3529,6 +3704,14 @@
                 if (!replayInProgress) return;
                 console.warn('history replay watchdog fired; re-enabling scroll follow');
                 replayInProgress = false;
+                // Lift the rebuild blur too: a wedged replay must not leave
+                // the transcript blurred (or the strip labelled) forever.
+                endRestoring();
+                // The replay is considered stuck: release the colorize gate
+                // too (replayHistory's finally is a no-op once its token is
+                // gone) so a wedged rebuild can never block colorization
+                // forever. Ends the newest active deferral.
+                endColorizeDeferral();
                 flushDeferredResultColorize();
                 flushReplayEventBuffer();
                 pinToBottom();
@@ -3587,6 +3770,25 @@
             // forced layouts. The history handler's error fallback also resets
             // this so a failed replay still scrolls while re-appending.
             replayInProgress = true;
+            // No Monaco import or code tokenization while the replay builds
+            // the transcript (see the colorize scheduler in editor.js): the
+            // restored session paints first, colors follow on idle slices.
+            // The token is this replay's own: if the watchdog ends it first
+            // and a NEW replay starts, this replay's finally must not end the
+            // new deferral.
+            const replayDeferral = beginColorizeDeferral();
+            // Follow the rebuild as it grows when the pane will land at the
+            // bottom anyway (no reading anchor to restore). Every per-message
+            // smartScroll stays suppressed below — the final settle is still
+            // the single correctness pass — but without this the viewport sat
+            // wherever it was while the whole transcript painted BELOW the
+            // fold, and only jumped to the bottom at the very end: the render
+            // looked finished long before the scroll arrived. pinToBottom is
+            // one scrollTo (no scrollHeight read, no forced layout), so once
+            // per chunk — not per message — is cheap. A reading anchor
+            // (settleScroll) must not be touched, and a user who scrolls up
+            // mid-rebuild un-pins, so the isPinned() check stops following.
+            const followWhileReplaying = !settleScroll;
             armReplayWatchdog(history.length);
             function msgDate(createdAt) {
                 return createdAt ? new Date(createdAt) : new Date();
@@ -3604,7 +3806,7 @@
                             div.title = formatExactTime(msgDate(h.createdAt));
                             div.dataset.createdAt = h.createdAt;
                         }
-                        messagesDiv.appendChild(div);
+                        appendTranscriptChild(div);
                         // Replayed reasoning is final; allow the paint skip.
                         enablePaintSkip(div);
                         smartScroll();
@@ -3660,19 +3862,30 @@
             // are buffered in ws.onmessage and flushed in arrival order
             // after the replay (flushReplayEventBuffer), so they can't
             // interleave mid-rebuild.
-            for (let i = 0; i < history.length; i += REPLAY_CHUNK_SIZE) {
-                const end = Math.min(i + REPLAY_CHUNK_SIZE, history.length);
-                for (let j = i; j < end; j++) renderHistoryEntry(history[j]);
-                if (end < history.length) {
-                    // rAF aligns each batch with a paint; the timeout keeps
-                    // the replay moving when rAF is throttled (hidden tab),
-                    // where the old synchronous loop would have completed
-                    // anyway.
-                    await new Promise((r) => {
-                        requestAnimationFrame(r);
-                        setTimeout(r, 50);
-                    });
+            try {
+                for (let i = 0; i < history.length; i += REPLAY_CHUNK_SIZE) {
+                    const end = Math.min(i + REPLAY_CHUNK_SIZE, history.length);
+                    for (let j = i; j < end; j++) renderHistoryEntry(history[j]);
+                    if (end < history.length) {
+                        // Keep a following viewport at the bottom as the
+                        // rebuild grows (see followWhileReplaying above).
+                        if (followWhileReplaying && isPinned()) pinToBottom();
+                        // rAF aligns each batch with a paint; the timeout keeps
+                        // the replay moving when rAF is throttled (hidden tab),
+                        // where the old synchronous loop would have completed
+                        // anyway.
+                        await new Promise((r) => {
+                            requestAnimationFrame(r);
+                            setTimeout(r, 50);
+                        });
+                    }
                 }
+
+            } finally {
+                // Whatever happens (including a thrown render), the deferral
+                // must end or every later colorize job would queue forever.
+                // A stale token (watchdog already ended it) is a no-op.
+                endColorizeDeferral(replayDeferral);
             }
             replayInProgress = false;
             disarmReplayWatchdog();
@@ -3784,13 +3997,22 @@
             // In-progress tool calls: waiting cards continued by live events.
             if (rewind.toolCalls && rewind.toolCalls.length) {
                 for (const tc of rewind.toolCalls) {
-                    startStreamingToolCard(tc.index, tc.name || 'tool');
+                    const cardInfo = startStreamingToolCard(tc.index, tc.name || 'tool');
                     if (tc.args) appendStreamingToolArgs(tc.index, tc.args, tc.argsPos);
                     const cap = captured.toolCards && captured.toolCards[tc.index];
                     if (cap && cap.rawArgs) {
                         const tail = trimToEnd(cap.rawArgs, cap.argsPos || 0, tc.argsPos || 0);
                         if (tail) appendStreamingToolArgs(tc.index, tail, Math.max(tc.argsPos || 0, cap.argsPos || 0));
                     }
+                    // Register the card under the call's id: the call is
+                    // still running, and the client MISSED its live
+                    // tool_call frame (that is why it is in the rewind), so
+                    // nothing else would match the tool_result frame to this
+                    // card — it would fall through to the raw
+                    // "[tool] <result>" system blob. The live tool_call
+                    // frame (when it still arrives) re-registers the same
+                    // card, which is a no-op.
+                    if (tc.id) pendingToolCards[tc.id] = cardInfo;
                 }
                 rendered = true;
             }
@@ -3934,11 +4156,13 @@
                 }
                 const handler = WS_HANDLERS[data.type];
                 if (!handler) return;
-                if (replayInProgress) {
+                if (replayInProgress && !replayImmediate(data)) {
                     // The chunked replay yields to rAF between batches:
                     // buffer the event and flush it in arrival order after
                     // the replay (and its rewind merge) completes, so live
-                    // stream events can't interleave mid-rebuild.
+                    // stream events can't interleave mid-rebuild. Frames that
+                    // never touch the transcript render immediately (see
+                    // REPLAY_IMMEDIATE_TYPES).
                     replayEventBuffer.push(data);
                     return;
                 }
@@ -4283,7 +4507,22 @@
                     bgTermCards[data.toolCallId] = cardInfo;
                 }
             } else {
-                appendMessage('system', `[${data.tool}] ${data.result}`);
+                // No card matched this result (the call was announced to a
+                // different client, or before this pane attached). Render a
+                // minimal card exactly like the history replay's orphan tool
+                // result — a raw "[tool] <result>" text blob in the
+                // transcript reads as corruption (and is what an uncarded
+                // result used to look like).
+                const orphan = createToolCard(data.tool || 'tool', {});
+                orphan.toolName = data.tool || 'tool';
+                orphan.args = {};
+                updateToolCardWithResult(
+                    orphan,
+                    data.result || '',
+                    data.success === true,
+                    data.resultTruncated,
+                    orphan.toolName
+                );
             }
 
         }
@@ -4468,6 +4707,52 @@
                 if (local.has(it.id)) rearmPendingAck(el);
                 bubbles.set(it.id, el);
             }
+            // Each bubble was appended (and anchored) before it was registered
+            // in the map, so the rebuild could land them in reverse order:
+            // re-anchor the completed map once, in queue order.
+            anchorQueuedBubbles();
+        }
+
+        /**
+         * Keep queued (steering) bubbles at the TAIL of the transcript.
+         *
+         * A queued item has no canonical position yet: the server appends it
+         * to the conversation only when its turn runs — after every round of
+         * the in-flight turn. Rendering it where the user typed it left it
+         * inside the reply being written (the next round's bubble and its
+         * tool cards landed BELOW it), and a rebuild then moved it to the
+         * tail: the message visibly jumped, and the live order disagreed
+         * with the rebuilt one. Anchoring it after every transcript append
+         * keeps both orders identical.
+         */
+        function anchorQueuedBubbles() {
+            const pane = activePane();
+            const bubbles = pane && pane.queuedBubbles;
+            if (!bubbles || !bubbles.size) return;
+            const els = [];
+            for (const el of bubbles.values()) {
+                if (el && el.isConnected) els.push(el);
+            }
+            if (!els.length) return;
+            const children = messagesDiv.children;
+            const start = children.length - els.length;
+            let anchored = start >= 0;
+            for (let i = 0; anchored && i < els.length; i++) {
+                if (children[start + i] !== els[i]) anchored = false;
+            }
+            if (anchored) return;
+            // Re-append in queue order (insertion order), moving every queued
+            // bubble behind whatever was appended after them.
+            for (const el of els) messagesDiv.appendChild(el);
+        }
+
+        // Append a transcript element, keeping the queued bubbles behind it.
+        // Every transcript append goes through here (message bubbles, stream
+        // rounds, waiting placeholders, thought cards, tool cards, replayed
+        // history entries) so the tail invariant cannot be missed.
+        function appendTranscriptChild(el) {
+            messagesDiv.appendChild(el);
+            anchorQueuedBubbles();
         }
 
         function handleClearChat(data) {
@@ -4568,6 +4853,10 @@
                     markQueuedBubble(el, it.id);
                     bubbles.set(it.id, el);
                 }
+                // Adopted and newly appended bubbles were marked after their
+                // append-time anchor ran: re-anchor the completed set in
+                // queue order.
+                anchorQueuedBubbles();
             }
             pane.queueItems = items;
             if (pane === activePane()) updateQueuedProgressLabel();
@@ -4612,6 +4901,32 @@
             // turn keeps the config echo — which normally adopts the
             // id — pending until the turn ends.
             const pane = activePane();
+            // A session change in flight (typed /resume or the palette's
+            // "resume latest"): the resume reply IS the attach sequence, so
+            // session_state is the re-key frame — adopt the target id here
+            // (mirroring the config adoption) so the follow-up history and
+            // configs route by id and the pane is usable immediately.
+            // The outgoing session's rendered transcript and its cache/epoch
+            // describe a different history: wipe them (the moment the
+            // resume's clear_chat frame used to) and let the history frame
+            // replay the target's. The wipe also resets the live-stream
+            // state, so the in-flight rewind merge cannot splice the two
+            // sessions' partial output together.
+            let rekeyed = false;
+            if (data.sessionId && pendingSessionResponse) {
+                // Adopt the target id before clearing the DOM, so the history
+                // and configs that follow route by id (the helper also drops
+                // the outgoing session's cache/epoch and releases it).
+                if (pane.id !== null) rekeyed = adoptPendingSession(pane, data.sessionId);
+                if (rekeyed) clearChat();
+                // The change settles here whether or not this pane adopted
+                // the id: a session another pane already owns leaves this
+                // pane on its current session, and a pane that already holds
+                // the target just settles. The pending flag can never
+                // strand and block every later session change.
+                pendingSessionResponse = false;
+                pane.ignoreTurnEndsFor = null;
+            }
             if (data.sessionId && pane.id === null) {
                 pane.id = data.sessionId;
             }
@@ -4622,6 +4937,13 @@
             // precedes the history payload on attach; afterHistory re-renders
             // them from this mirror).
             applyQueueUpdate(pane, data, false);
+            if (rekeyed) {
+                // The re-key wiped the DOM: re-derive the target session's
+                // queued steering bubbles from the mirror just seeded. The
+                // history replay's afterHistory does the same; an empty
+                // target session never reaches it.
+                rerenderQueuedBubbles(pane);
+            }
             if (pane.turnActive) {
                 setInputProgress('thinking', 'Resuming\u2026');
                 // Attached to a running turn: the history snapshot
@@ -4639,6 +4961,13 @@
             // Reflect the busy/resuming state in the sidebar session
             // row (same staleness class: the row shows turn state).
             refreshSidebarSessions();
+            if (rekeyed) {
+                // The re-key released the left-behind session (detach above):
+                // fetch a fresh list so its row drops any stale "resume to
+                // continue" state — the response-based switch refreshed the
+                // list here too.
+                requestSessionList();
+            }
 
         }
 
@@ -4752,6 +5081,12 @@
             // and go through this same path.
             const rp = activePane();
             let rekeySkipped = false;
+            // The pane already showing the reply's session, when the
+            // re-key is refused because ANOTHER pane owns it ("resume
+            // latest" resolving to an open session). The pending branch
+            // below focuses it so the command lands on the session the
+            // user asked for instead of dead-ending on a toast.
+            let rekeyExistingPane = null;
             if (rp && data.sessionId && rp.id !== data.sessionId) {
                 // A session change (typed /new, /resume, /fork,
                 // resend, delete-of-current) is the only legitimate
@@ -4765,7 +5100,14 @@
                 // elsewhere): that would create a duplicate pane for
                 // one session and desync one of the two.
                 const other = findPaneBySession(data.sessionId);
-                if ((rp.id === null || data.sessionAction) && (!other || other === rp)) {
+                // The server's focus-pane reply (a resume that resolved to
+                // a session this connection already shows as a pane): never
+                // re-key onto it — the pane that owns the session is the one
+                // to focus, and the server deliberately did not switch.
+                // The literal must match sessionCommandFocusPane in
+                // session_ops.go.
+                const focusOpen = data.sessionAction === 'focus_pane';
+                if (!focusOpen && (rp.id === null || data.sessionAction) && (!other || other === rp)) {
                     const oldId = rp.id;
                     rp.id = data.sessionId;
                     refreshSidebarSessions();
@@ -4776,6 +5118,7 @@
                     sendSessionDetach(oldId);
                 } else {
                     rekeySkipped = true;
+                    if (other && other !== rp) rekeyExistingPane = other;
                 }
             }
             // Whether the change succeeded or failed, the pane is (or
@@ -4813,7 +5156,18 @@
                 if (rekeySkipped) {
                     // The reply named a session another pane already
                     // owns: this pane stays on its current session.
-                    showToast('Session already open in another pane', 'info');
+                    // Focus that pane so the command lands on the
+                    // session the user asked for (the same switch the
+                    // typed /resume interception performs); the focus
+                    // re-attaches it and re-syncs the connection's
+                    // current pane server-side.
+                    if (rekeyExistingPane) {
+                        focusSessionInOtherPane(rekeyExistingPane.id);
+                    } else {
+                        // No pane holds the id (a stale/id-less reply):
+                        // nothing to switch to, just report it.
+                        showToast('Session already open in another pane', 'info');
+                    }
                     requestSessionList();
                 } else if (String(data.content || '').startsWith('Error:')) {
                     clearPendingResend();
@@ -4963,7 +5317,17 @@
             // duplicating or dropping a character.
             const captured = captureLiveStreamState();
             let rewindRendered = false;
+            // A rebuild that replaces content this pane ALREADY shows (the
+            // turn-end convergence refetch — a bare re-attach after a
+            // mid-turn attach — or a stale-pane re-attach of the same
+            // session) must not blur: nothing is being restored, and the blur
+            // flashed whenever a turn completed. Only a rebuild that
+            // introduces content the user has not seen gets the restoring
+            // treatment: a cold pane, or a different session's history.
+            const hadTranscript = !!messagesDiv.firstElementChild && !hasEmptyState();
+            const sameSession = histPane.id === data.sessionId;
             clearChat();
+            if (!hadTranscript || !sameSession) beginRestoring();
             // 0 (never reshaped) is omitted by the wire's omitempty: store a
             // NUMBER so the stale-skip epoch comparison works for sessions
             // that were never compacted/rolled back either.
@@ -4973,6 +5337,10 @@
             // snapshot (null settle → the replay's default pin-to-bottom).
             const scrollSettle = paneScrollRestoreSettle(histPane, data.sessionId, data.historyEpoch || 0);
             const afterHistory = () => {
+                // The rebuild is settled (scrolled to the bottom or restored
+                // to the reading anchor): lift the blur so the transcript
+                // unblurs in place.
+                endRestoring();
                 // Render the in-flight partial (the server's live-turn
                 // buffer) through the normal stream machinery, then
                 // merge any content the client had already rendered
@@ -5367,18 +5735,21 @@
             // A typed /resume of a session already open in another pane
             // would create a duplicate pane for one session (the re-key
             // reply and the follow-up detach would desync one of the two
-            // panes). Block it like the sidebar does (openSessionPane
-            // focuses the existing pane). "resume del" targets a session
-            // for deletion and "resume latest" resolves server-side, so
-            // both pass through.
+            // panes). Switch to the existing pane instead (the same
+            // focusSessionInOtherPane the reply handler runs when "resume
+            // latest" resolves to an open session). "resume del" targets a
+            // session for deletion and "resume latest" resolves
+            // server-side, so both pass through.
             if (/^\/resume(?:\s|$)/.test(text.trim())) {
                 const target = text.trim().replace(/^\/resume\s+/, '').trim();
                 if (target && target !== 'del' && !target.startsWith('del ')) {
                     const other = findPaneBySession(target);
                     if (other && other !== activePane()) {
+                        // Clear before focusing: the helper hands focus
+                        // back to the composer, and the command text must
+                        // not survive into the switched pane's input.
                         inputArea.value = '';
-                        showToast('Session already open in another pane — switched to it', 'info');
-                        focusPane(other.key);
+                        focusSessionInOtherPane(target);
                         return;
                     }
                 }
@@ -5418,11 +5789,26 @@
             const content = composeMessageContent(text);
             const el = appendMessage('user', content, undefined, undefined, images);
             markPendingAck(el);
-            streamingToolCards = {};
-            pendingToolCards = {};
-            bgTermCards = {};
-            toolsStartedThisTurn = false;
-            contextEstAdded = 0;
+            // Reset the per-turn card state ONLY when this send starts a
+            // new turn. While a turn is running the message is QUEUED
+            // (steering) and the in-flight turn keeps going: wiping the
+            // maps here (the old cancel-then-send reset) orphaned every
+            // tool call that was already announced — the next tool_result
+            // found no pending card and fell through to the raw
+            // "[tool] <result>" system blob, the live terminal mirror lost
+            // its card, and a still-streaming call's arg deltas opened a
+            // SECOND card beside the orphaned one. hasLiveInFlight() is
+            // checked as well as the turnActive mirror: its live-render
+            // state is what makes the clobber dangerous, and the mirror can
+            // lag the server's busy state (the same race the queueId
+            // adoption below covers).
+            if (!activePane().turnActive && !hasLiveInFlight()) {
+                streamingToolCards = {};
+                pendingToolCards = {};
+                bgTermCards = {};
+                toolsStartedThisTurn = false;
+                contextEstAdded = 0;
+            }
             const payload = { type: 'message', content, sessionId: activePane().id };
             if (images.length > 0) payload.images = images;
             // Correlation id: when the pane's turn is active the message is
@@ -5444,6 +5830,11 @@
                 markQueuedBubble(el, qid);
                 queuedBubblesFor(activePane()).set(qid, el);
                 activePane().queueItems = (activePane().queueItems || []).concat([{ id: qid, text }]);
+                // The bubble was appended before it was known to be queued
+                // (the anchor in appendTranscriptChild runs at append time):
+                // re-anchor now so an older queued bubble cannot end up
+                // behind this one.
+                anchorQueuedBubbles();
                 updateQueuedProgressLabel();
             }
             inputArea.value = '';

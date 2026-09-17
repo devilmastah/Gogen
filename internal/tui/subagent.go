@@ -59,6 +59,10 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 		// owner is unreachable).
 		if pp, ok := parent.Provider.(*llm.OpenAIProvider); ok {
 			openaiProv.SetOwnerRegistry(pp.OwnerRegistry())
+			// Share the parent's per-endpoint catalog cache too: a child
+			// must not re-download the catalog the parent already holds.
+			openaiProv.SetEndpointCatalog(pp.EndpointCatalog())
+			openaiProv.SetPropsCapsCache(pp.PropsCapsCache())
 		}
 		prov = openaiProv
 	}

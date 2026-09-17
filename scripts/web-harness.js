@@ -23,13 +23,22 @@ const path = require('path');
 const EDITOR_STUBS = [
   'connectEditorSocket', 'setupEditorUI', 'refreshExplorer', 'disposeChatEditors',
   'mountDiffEditor', 'updateDiffEditor', 'updateDiffFallback', 'chatDiffWheelEdge',
-  'extractDiffValue', 'initMonaco', 'colorizeNode', 'colorizeElement',
+  'extractDiffValue', 'scanDiffValueIncremental', 'initMonaco', 'colorizeNode', 'colorizeElement', 'sealStreamColorize',
+  'beginColorizeDeferral', 'endColorizeDeferral',
   'languageFromPath', 'setToastHandler', 'focusFindInFiles', 'editorUndo',
   'editorRedo', 'saveAll', 'saveActive', 'openFileAtLine', 'setMonacoTheme',
-  'applyEditorPrefs', 'applyPatchFromDiff', 'openModal', 'closeModal',
+  'applyEditorPrefs', 'applyPatchFromDiff', 'openModal', 'closeModal', 'escapeHtml',
 ];
 
 function installEditorStubs(window, names = EDITOR_STUBS) {
+  // escapeHtml returns a STRING, not a promise: app.js feeds the result
+  // straight into setMessageMarkdown, so it needs a string-passthrough stub
+  // (set before the generic promise default below).
+  window.escapeHtml = window.escapeHtml || ((s) => String(s == null ? '' : s));
+  // scanDiffValueIncremental returns the {ok, value, complete} shape app.js
+  // reads synchronously — not a promise.
+  window.scanDiffValueIncremental = window.scanDiffValueIncremental
+    || (() => ({ ok: false, value: '', complete: false }));
   for (const name of names) {
     window[name] = window[name] || (() => Promise.resolve());
   }
