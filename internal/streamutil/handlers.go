@@ -44,6 +44,12 @@ type Sink interface {
 	OnToolOutput(id, name, command, chunk string)
 	OnToolOutputEnd(id string, success bool)
 	OnToolResult(id, name, result string, success bool)
+	// OnMessageAppended reports the index in the agent's message list of the
+	// assistant message each round just appended. Hosts that render live
+	// turns track a rendered-index mark from it, so a later conditional
+	// attach can prove the transcript is current without a history refetch.
+	// Hosts without such a model (the TUI) treat it as a no-op.
+	OnMessageAppended(index int, role string)
 	// OnStreamStats reports the SpeedMeter's smoothed token rate
 	// (tokens/sec over content, thinking, and tool-args deltas). Unlike
 	// the other methods it is not a 1:1 mapping of an llm.StreamHandlers
@@ -203,6 +209,9 @@ func BuildStreamHandlers(s Sink, cfg HandlersConfig) *llm.StreamHandlers {
 		},
 		OnToolResult: func(id, name, result string, success bool) {
 			s.OnToolResult(id, name, result, success)
+		},
+		OnMessageAppended: func(index int, role string) {
+			s.OnMessageAppended(index, role)
 		},
 	}
 }

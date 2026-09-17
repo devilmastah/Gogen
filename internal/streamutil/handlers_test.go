@@ -76,6 +76,9 @@ func (r *recordingSink) OnToolOutputEnd(id string, success bool) { r.record("OnT
 func (r *recordingSink) OnToolResult(id, name, result string, success bool) {
 	r.record("OnToolResult")
 }
+func (r *recordingSink) OnMessageAppended(index int, role string) {
+	r.record("OnMessageAppended")
+}
 func (r *recordingSink) OnStreamStats(toksPerSec float64) { r.record("OnStreamStats") }
 
 var _ Sink = (*recordingSink)(nil)
@@ -125,6 +128,8 @@ func TestBuildStreamHandlersWiresEveryCallback(t *testing.T) {
 			fn("s")
 		case llm.StreamCallback:
 			fn("s")
+		case func(int, string):
+			fn(0, "assistant")
 		case func(int, string, string):
 			fn(0, "id", "name")
 		case func(int, string, string, string):

@@ -66,7 +66,26 @@ func (a *Agent) deliverToolResult(h *llm.StreamHandlers, tc llm.ToolCall, res st
 		h.OnToolResult(tc.ID, tc.Name, res, success)
 	}
 	a.appendToolResult(tc, res)
+	// Tool messages are deliberately NOT reported: they render no bubble of
+	// their own, and a completed turn always ends with an assistant message,
+	// so the client's rendered-index mark still reaches the transcript's last
+	// index without them. A turn that ends on a tool message (stop/error)
+	// leaves the mark one behind — a conditional attach then falls back to
+	// the snapshot, which is correct, just not optimized.
 	a.appendImageMessages(sink)
+}
+
+// notifyMessageAppended tells the host the index of a message the turn just
+// appended (StreamHandlers.OnMessageAppended): hosts that render live turns
+// track a rendered-index mark, so a later conditional attach can prove the
+// transcript is current and skip the history snapshot. Reads the index here
+// so every call site stays a one-liner; the turn goroutine is the only
+// appender, so MessageCount()-1 is the message just appended.
+func (a *Agent) notifyMessageAppended(h *llm.StreamHandlers, role string) {
+	if h == nil || h.OnMessageAppended == nil {
+		return
+	}
+	h.OnMessageAppended(a.MessageCount()-1, role)
 }
 
 // runTurn executes one model round: it checks the context, prepares the
@@ -401,6 +420,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 				CreatedAt: time.Now().Truncate(time.Millisecond),
 				Model:     result.Model,
 			})
+			a.notifyMessageAppended(h, "assistant")
 			a.FlushSession()
 			if result.Content != "" {
 				return result.Content, nil
@@ -437,6 +457,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			CreatedAt: time.Now().Truncate(time.Millisecond),
 			Model:     result.Model,
 		})
+		a.notifyMessageAppended(h, "assistant")
 
 		switch outcome, stopMsg := a.runToolRound(ctx, h, result.ToolCalls); outcome {
 		case toolRoundStopped:

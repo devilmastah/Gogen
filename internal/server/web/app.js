@@ -1717,6 +1717,17 @@
                 // skip the history snapshot entirely when the pane is
                 // already current (conditional attach).
                 histEpoch: undefined,
+                // Highest server message index this pane has APPLIED to its
+                // transcript (-1 = none yet): advanced by history replays,
+                // user_acked, and the hist_index frames the server sends for
+                // each appended assistant/tool message. It is the pane's own
+                // lower bound of what is rendered, so the turn-end
+                // convergence attach can prove the transcript is current and
+                // skip the history snapshot. Only the pane that is actively
+                // rendering the turn advances it (a background pane's DOM is
+                // stale until focused), and a mismatch still falls back to
+                // the full snapshot.
+                renderedHistIdx: -1,
                 // Offscreen transcript cache captured when this pane was
                 // switched away from while settled: { container, sessionId,
                 // scrollTop, pinned, msgIdxCounter, historyToolCallArgs }.
@@ -1932,6 +1943,7 @@
             pane.id = id;
             pane.domCache = null;
             pane.histEpoch = undefined;
+            pane.renderedHistIdx = -1;
             pane.ignoreTurnEndsFor = null;
             if (pane === activePane() && sessionInfoDiv) sessionInfoDiv.textContent = id;
             sendSessionDetach(oldId);
@@ -2099,6 +2111,7 @@
                             // transcript cache / epoch describe the old one.
                             pane.domCache = null;
                             pane.histEpoch = undefined;
+                            pane.renderedHistIdx = -1;
                             sendSessionDetach(oldId);
                         }
                     }
@@ -3755,6 +3768,10 @@
         // restores the reader's scroll anchor when one is valid (see
         // paneScrollRestoreSettle).
         async function replayHistory(history, settleScroll) {
+            // The replay always rebuilds the ACTIVE pane's transcript
+            // (handleHistory resolves it): track how far that pane's
+            // rendered-index mark advances as entries are applied.
+            const replayedPane = activePane();
             // Session/history loads should always land at the bottom.
             enableFollow();
             historyToolCallArgs = {};
@@ -3865,7 +3882,17 @@
             try {
                 for (let i = 0; i < history.length; i += REPLAY_CHUNK_SIZE) {
                     const end = Math.min(i + REPLAY_CHUNK_SIZE, history.length);
-                    for (let j = i; j < end; j++) renderHistoryEntry(history[j]);
+                    for (let j = i; j < end; j++) {
+                        const entry = history[j];
+                        // Every applied entry — tool entries included, which
+                        // render no bubble of their own — advances the pane's
+                        // rendered-index mark, so a later conditional attach
+                        // can prove the transcript is current.
+                        if (replayedPane && typeof entry.index === 'number' && entry.index > replayedPane.renderedHistIdx) {
+                            replayedPane.renderedHistIdx = entry.index;
+                        }
+                        renderHistoryEntry(entry);
+                    }
                     if (end < history.length) {
                         // Keep a following viewport at the bottom as the
                         // rebuild grows (see followWhileReplaying above).
@@ -4227,6 +4254,7 @@
             model_used: handleModelUsed,
             tool_call_start: handleToolCallStart,
             tool_call_delta: handleToolCallDelta,
+            hist_index: handleHistIndex,
             tool_call: handleToolCall,
             tool_execute: handleToolExecute,
             tool_result: handleToolResult,
@@ -4665,7 +4693,25 @@
             if (tp && tp.needsFreshHistory) {
                 tp.needsFreshHistory = false;
                 if (tp.id && ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'session_attach', sessionId: tp.id }));
+                    const attachMsg = { type: 'session_attach', sessionId: tp.id };
+                    // Conditional attach: this pane rendered the turn LIVE
+                    // (tokens, tool cards, or the attach rewind) and the
+                    // server stamped every appended message with hist_index,
+                    // so claim the fingerprint and let the server answer
+                    // "already current" — the turn-end convergence refetch
+                    // used to rebuild the whole transcript here. Both bounds
+                    // are things this pane actually applied; if either trails
+                    // (a missed frame, a backgrounded stretch), the server
+                    // falls back to the full snapshot exactly as before.
+                    const newest = Math.max(
+                        Number.isFinite(tp.renderedHistIdx) ? tp.renderedHistIdx : -1,
+                        newestDomHistIdx()
+                    );
+                    if (tp.histEpoch !== undefined && newest >= 0) {
+                        attachMsg.knownHistoryEpoch = tp.histEpoch;
+                        attachMsg.knownHistoryIndex = newest;
+                    }
+                    ws.send(JSON.stringify(attachMsg));
                 }
             }
             refreshSidebarSessions();
@@ -4786,6 +4832,10 @@
                 dropPendingAck(el);
                 el.dataset.histIdx = String(idx);
                 ensureUserResendActions(el);
+                // The user message is applied: advance the pane's
+                // rendered-index mark (see hist_index for the rest).
+                const ackPane = activePane();
+                if (ackPane && idx > ackPane.renderedHistIdx) ackPane.renderedHistIdx = idx;
                 // A queued steering message just became a real user turn:
                 // its chip clears (the pending-ack FIFO still held — drains
                 // are FIFO, so acks resolve in send order).
@@ -4805,6 +4855,37 @@
                         }
                     }
                 }
+            }
+
+        }
+
+        function handleHistIndex(data) {
+
+            // Server-stamped index of a message the turn just appended
+            // (assistant rounds and tool results — see the server's
+            // OnMessageAppended). Only the pane that is ACTIVELY rendering
+            // the turn advances its rendered-index mark: a background pane's
+            // DOM is stale until focused, and background frames never reach
+            // here anyway (they route to handleBackgroundMessage). A mark
+            // that trails — a missed frame, a backgrounded stretch — only
+            // costs the full history snapshot the conditional attach would
+            // otherwise skip, never correctness. The index is in Content
+            // because WSMessage.Index has omitempty and index 0 is valid
+            // (the same convention as user_acked).
+            const idx = parseInt(data.content, 10);
+            if (!Number.isFinite(idx) || idx < 0) return;
+            const pane = activePane();
+            if (!pane) return;
+            if (idx > pane.renderedHistIdx) pane.renderedHistIdx = idx;
+            // Stamp the assistant bubble this round finalized, so
+            // edit/resend/fork work on live messages without waiting for any
+            // refetch. A tool-result index is harmless here: the round's
+            // bubble (if any) either already carries an index or the stale
+            // last bubble does — stamped once, never re-stamped.
+            const el = lastStreamDiv;
+            if (el && el.isConnected && el.classList && el.classList.contains('message')
+                && el.dataset.histIdx === undefined) {
+                el.dataset.histIdx = String(idx);
             }
 
         }
@@ -5332,6 +5413,11 @@
             // NUMBER so the stale-skip epoch comparison works for sessions
             // that were never compacted/rolled back either.
             histPane.histEpoch = data.historyEpoch || 0;
+            // The rebuild replaces the whole transcript: the rendered-index
+            // mark restarts empty and is re-advanced by the replay below (the
+            // rewind-only and stale-skip paths return before this, keeping
+            // the mark they already earned).
+            histPane.renderedHistIdx = -1;
             // The rebuild wipes the reading position; restore it from the
             // per-session scroll anchor when one is valid for this
             // snapshot (null settle → the replay's default pin-to-bottom).
@@ -5435,6 +5521,7 @@
                     // must not survive the re-key.
                     pane.domCache = null;
                     pane.histEpoch = undefined;
+                    pane.renderedHistIdx = -1;
                     refreshSidebarSessions();
                     // The pane's session changed (typed /new, /resume,
                     // fork, resend): release the old session's

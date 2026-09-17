@@ -162,6 +162,38 @@ async function main() {
   check('clearChat twice does not stack placeholders',
     messagesDiv.querySelectorAll('.empty-state').length === 1);
 
+  // ── Live-turn index tracking + the conditional convergence attach ──
+  // The server stamps every message it appends with a hist_index frame; the
+  // client advances the pane's rendered-index mark, and the turn-end
+  // convergence attach claims that fingerprint so the server can answer
+  // "already current" (no snapshot, no rebuild) instead of shipping the full
+  // history. A mark that trails still falls back to the snapshot.
+  {
+    // Rebuild a pane transcript to track: reuse the replayed history.
+    recv({ type: 'history', sessionId: 'A', history, historyEpoch: 1 });
+    const deadlineMark = Date.now() + 30000;
+    while (Date.now() < deadlineMark) {
+      await new Promise((r) => setTimeout(r, 5));
+      if (messagesDiv.querySelectorAll('.message').length >= expected) break;
+    }
+    recv({ type: 'session_state', sessionId: 'A', turnActive: true }); // latches needsFreshHistory
+    const markBefore = window.eval('activePane().renderedHistIdx');
+    recv({ type: 'hist_index', sessionId: 'A', content: String(expected + 2) });
+    const markAfter = window.eval('activePane().renderedHistIdx');
+    check('hist_index advances the pane rendered-index mark',
+      markBefore <= expected && markAfter === expected + 2,
+      'before=' + markBefore + ' after=' + markAfter);
+
+    const sentBefore = ws.sent.length;
+    recv({ type: 'turn_end', sessionId: 'A' });
+    const attach = ws.sent.slice(sentBefore).reverse().find((m) => m.type === 'session_attach');
+    check('turn-end convergence attach claims the history fingerprint',
+      !!attach && attach.knownHistoryEpoch === 1 && attach.knownHistoryIndex === expected + 2,
+      JSON.stringify(attach || null));
+    check('a skipped refetch leaves the transcript untouched',
+      messagesDiv.querySelectorAll('.message').length >= expected);
+  }
+
   window.close();
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

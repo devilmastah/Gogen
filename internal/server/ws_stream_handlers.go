@@ -243,6 +243,25 @@ func (sk *wsStreamSink) OnToolOutputEnd(id string, success bool) {
 	}
 }
 
+// OnMessageAppended reports the index of a message the turn just appended
+// (assistant rounds and tool results). The web client stamps the live
+// bubble/card and advances its per-pane rendered-index mark, so a later
+// conditional attach can prove the transcript is current and skip the
+// history snapshot — the turn-end convergence refetch used to rebuild the
+// whole transcript because live messages carried no index at all. The index
+// goes in Content because WSMessage.Index has omitempty and message index 0
+// is valid (the same convention as user_acked); role is informational.
+func (sk *wsStreamSink) OnMessageAppended(index int, role string) {
+	if index < 0 {
+		return
+	}
+	sk.write(WSMessage{
+		Type:      "hist_index",
+		SessionID: sk.rt.agent.SessionID,
+		Content:   fmt.Sprintf("%d", index),
+	})
+}
+
 func (sk *wsStreamSink) OnToolResult(id, name, result string, success bool) {
 	// The terminal is closed by OnToolOutputEnd, not here: for
 	// background jobs (execute_command background=true) the

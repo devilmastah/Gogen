@@ -95,6 +95,14 @@ type StreamHandlers struct {
 	OnToolOutput           func(id, name, command, chunk string)       // live combined stdout/stderr chunks from shell tools while they run
 	OnToolOutputEnd        func(id string, success bool)               // the tool call's live output stream terminated (foreground: when the command finishes; background job: when the job exits, possibly long after the turn ended)
 	OnToolResult           func(id, name, result string, success bool) // called after a tool executes
+	// OnMessageAppended reports the index in the agent's message list of the
+	// assistant message each ROUND just appended. Hosts use it to track how
+	// far their rendered transcript has advanced, so a later conditional
+	// attach can prove the transcript is current instead of re-fetching the
+	// history. Messages the host does not render (tool results, the synthetic
+	// image user message) are deliberately not reported: a trailing mark
+	// stays conservative and only costs the unoptimized fallback.
+	OnMessageAppended func(index int, role string)
 }
 
 // StreamResult holds the final accumulated response from a streamed call.

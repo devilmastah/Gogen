@@ -425,6 +425,15 @@ func (s *Server) sendAttachHistory(ws *wsConn, rt *sessionRuntime, known *attach
 		// the snapshot at all; with round output, ship ONLY the rewind so
 		// the client merges it onto its cached transcript instead of
 		// clearing and replaying everything.
+		//
+		// The rewind is only meaningful while a round is IN FLIGHT: an idle
+		// session's round buffer still holds the LAST round's output (it is
+		// cleared at the next turn's start), and shipping it to a client
+		// whose fingerprint says it is current would make that client merge
+		// output it already rendered. Idle + current → nothing to send.
+		if active, _ := rt.turnState(); !active {
+			return
+		}
 		rewind := rt.live.Snapshot()
 		if rewind != nil {
 			_ = ws.writeJSON(WSMessage{
@@ -434,9 +443,6 @@ func (s *Server) sendAttachHistory(ws *wsConn, rt *sessionRuntime, known *attach
 				Rewind:       rewind,
 				SessionID:    rt.agent.SessionID,
 			})
-			return
-		}
-		if active, _ := rt.turnState(); !active {
 			return
 		}
 		// Mid-turn with an empty round buffer: either between rounds or

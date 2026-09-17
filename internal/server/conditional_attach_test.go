@@ -101,7 +101,7 @@ func (s *conditionalStub) ListModels(_ context.Context) ([]llm.ModelInfo, error)
 func (s *conditionalStub) SetModel(string) error { return nil }
 func (s *conditionalStub) ModelName() string     { return "conditional-model" }
 
-func newConditionalServer(t *testing.T, stub *conditionalStub) (*Server, *agent.Agent) {
+func newConditionalServer(t *testing.T, stub llm.LLMProvider) (*Server, *agent.Agent) {
 	t.Helper()
 	dir := t.TempDir()
 	exec := agent.NewExecutor(dir)
@@ -313,6 +313,81 @@ func TestConditionalAttachRewindOnlyWhenMidTurn(t *testing.T) {
 	if len(m.History) == 0 {
 		t.Fatal("full history frame must carry entries")
 	}
+}
+
+// streamingTurnStub streams one token and completes immediately, so a
+// finished turn leaves its output in the runtime's round buffer (that buffer
+// is only cleared when the NEXT turn starts).
+type streamingTurnStub struct{ conditionalStub }
+
+func (s *streamingTurnStub) GenerateResponseStream(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool, h *llm.StreamHandlers) (*llm.StreamResult, error) {
+	if h.OnStart != nil {
+		h.OnStart()
+	}
+	if h.OnStreamOpened != nil {
+		h.OnStreamOpened()
+	}
+	if h.OnToken != nil {
+		h.OnToken("the quick ")
+	}
+	return &llm.StreamResult{Content: "the quick brown fox"}, nil
+}
+
+// TestConditionalAttachIdleSkipsLeftoverRewind pins the idle half of the
+// rewind branch: a turn that STREAMED output leaves that output in the round
+// buffer until the next turn starts, so an idle session still holds a rewind
+// snapshot. A client whose fingerprint says it is current already rendered
+// that output (it streamed it live, or merged the attach rewind) — shipping
+// it again as rewind-only would make the client merge content it already
+// shows. Idle + current therefore sends nothing at all.
+func TestConditionalAttachIdleSkipsLeftoverRewind(t *testing.T) {
+	stub := &streamingTurnStub{conditionalStub: *newConditionalStub(0)}
+	s, a := newConditionalServer(t, stub)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	drainHandshakePayloads(t, conn)
+	sid := a.SessionID
+
+	// One completed streaming turn: the session is idle.
+	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "q1", SessionID: sid}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	readUntil(t, conn, 10*time.Second, func(m WSMessage) bool { return m.Type == "turn_end" && m.SessionID == sid })
+	rt, ok := s.registry.get(sid)
+	if !ok {
+		t.Fatalf("runtime for %s missing", sid)
+	}
+	// Each ROUND's stream end resets the round buffer, so a finished turn
+	// normally leaves it empty and the old rewind branch fell through to the
+	// idle return anyway. Pin the gating itself: with leftover output
+	// present, an idle current client must still get NOTHING rather than a
+	// rewind-only frame it would merge over content it already shows.
+	rt.live.AppendContent("leftover round output")
+	if rt.live.Snapshot() == nil {
+		t.Fatal("precondition: injected round output must be visible to Snapshot")
+	}
+
+	epoch, lastShipped := a.HistoryFingerprint()
+	if err := conn.WriteJSON(WSMessage{
+		Type:              "session_attach",
+		SessionID:         sid,
+		KnownHistoryEpoch: &epoch,
+		KnownHistoryIndex: &lastShipped,
+	}); err != nil {
+		t.Fatalf("conditional attach: %v", err)
+	}
+	if h := collectAttachPayload(t, conn, sid); h != nil {
+		t.Fatalf("idle current client must not receive a history frame (rewindOnly=%v, %d entries)",
+			h.RewindOnly, len(h.History))
+	}
+	if err := conn.WriteJSON(WSMessage{Type: "list_sessions"}); err != nil {
+		t.Fatalf("list_sessions: %v", err)
+	}
+	assertNoHistoryUntilPayloadDone(t, conn, sid)
 }
 
 func TestConditionalAttachFullOnEpochMismatch(t *testing.T) {

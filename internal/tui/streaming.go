@@ -397,6 +397,12 @@ func (s *StreamAdapter) OnToolOutput(id, name, command, chunk string) {}
 
 func (s *StreamAdapter) OnToolOutputEnd(id string, success bool) {}
 
+// OnMessageAppended is unused: the TUI owns the whole transcript in-process
+// (no attach/fingerprint round-trips), so there is no rendered-index mark to
+// keep for a conditional history skip. Explicit no-op, like the live-output
+// pair above.
+func (s *StreamAdapter) OnMessageAppended(index int, role string) {}
+
 func (s *StreamAdapter) OnToolResult(id, name, result string, success bool) {
 	s.send(streamToolResultMsg{id: id, name: name, result: result, success: success, sid: s.owner, seq: s.seq})
 }

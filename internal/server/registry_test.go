@@ -26,10 +26,18 @@ func newTestRuntime(t *testing.T) *sessionRuntime {
 // queue, open quit/done channels) so broadcast can deliver to it without
 // triggering the write-failure detach path — tests can then assert both what
 // was broadcast and whether the socket stayed attached.
+//
+// The queue must absorb everything a scenario writes BEFORE the test reads
+// anything: a real client drains continuously, this fake one only drains when
+// a helper reads. The attach payload alone is session_state + history + two
+// configs (+ the reasoning probe), and a turn adds its own frames on top, so
+// the buffer has to cover a full attach + turn with margin — a tight size
+// silently drops the frames a later assertion waits for ("websocket send
+// queue full").
 func newFakeWSConn() *wsConn {
 	return &wsConn{
 		conn:  &websocket.Conn{},
-		sendQ: make(chan WSMessage, 8),
+		sendQ: make(chan WSMessage, 64),
 		quit:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
