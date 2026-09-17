@@ -243,14 +243,19 @@ func (sk *wsStreamSink) OnToolOutputEnd(id string, success bool) {
 	}
 }
 
-// OnMessageAppended reports the index of a message the turn just appended
-// (assistant rounds and tool results). The web client stamps the live
-// bubble/card and advances its per-pane rendered-index mark, so a later
-// conditional attach can prove the transcript is current and skip the
-// history snapshot — the turn-end convergence refetch used to rebuild the
-// whole transcript because live messages carried no index at all. The index
-// goes in Content because WSMessage.Index has omitempty and message index 0
-// is valid (the same convention as user_acked); role is informational.
+// OnMessageAppended reports the index of a message the turn just appended.
+// The agent fires it for ASSISTANT rounds only (see Agent.notifyMessageAppended):
+// reporting tool results (or the synthetic image messages) could advance the
+// client's rendered-index mark past the transcript's last shippable message
+// on a turn that ends on a tool message, so those deliberately stay silent
+// and the mark trails — a conditional attach then falls back to the full
+// snapshot, correct but unoptimized. The web client stamps the live bubble
+// and advances its per-pane rendered-index mark, so a later conditional
+// attach can prove the transcript is current and skip the history snapshot —
+// the turn-end convergence refetch used to rebuild the whole transcript
+// because live messages carried no index at all. The index goes in Content
+// because WSMessage.Index has omitempty and message index 0 is valid (the
+// same convention as user_acked); role is informational.
 func (sk *wsStreamSink) OnMessageAppended(index int, role string) {
 	if index < 0 {
 		return

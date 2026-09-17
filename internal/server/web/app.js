@@ -1022,6 +1022,18 @@
         function clearChat() {
             disposeChatEditors();
             messagesDiv.innerHTML = '';
+            // The DOM no longer reflects any history payload: void the active
+            // pane's rendered-index claim with it. Otherwise a wipe whose
+            // rebuild snapshot never arrives (a reconnect whose attach
+            // snapshot write hit the server's 5s send-queue timeout and was
+            // dropped) would let later hist_index frames re-advance the mark
+            // to "current" — and the turn-end convergence attach would then
+            // skip the very rebuild that restores the missing transcript.
+            const wiped = activePane();
+            if (wiped) {
+                wiped.histEpoch = undefined;
+                wiped.renderedHistIdx = -1;
+            }
             resetChatTranscriptState();
             ensureEmptyState();
         }
@@ -2871,8 +2883,32 @@
             return text.slice(cut);
         }
 
+        // Void the active pane's rendered-index claim: the transcript no
+        // longer provably matches what the pane rendered, so every
+        // conditional attach (turn-end convergence, focus) must fall back to
+        // a full snapshot until a history payload re-earns it. Both claim
+        // sites require histEpoch to be defined and renderedHistIdx to be
+        // advanced, so clearing them withholds the claim.
+        function voidTranscriptClaim() {
+            const pane = activePane();
+            if (!pane) return;
+            pane.histEpoch = undefined;
+            pane.renderedHistIdx = -1;
+        }
+
+        // True when a position-stamped chunk starts PAST the position the
+        // client has rendered: a frame was lost in between (the server's
+        // send-queue timeout can drop one), and trimToEnd below can only
+        // skip the hole, never fill it. The caller voids the pane's claim so
+        // the next attach takes the full snapshot that heals it.
+        function streamGap(text, endPos, cur) {
+            if (!text || endPos === undefined || endPos === null) return false;
+            return endPos - text.length > (cur || 0);
+        }
+
         function appendStreamToken(token, endPos) {
             if (!currentStreamDiv) return;
+            if (streamGap(token, endPos, streamContentPos)) voidTranscriptClaim();
             const keep = trimToEnd(token, endPos, streamContentPos);
             if (!keep) return;
             currentStreamRaw += keep;
@@ -2937,6 +2973,7 @@
             // Match TUI: ignore thinking after tool calls start in this round.
             // Cleared again on the next round's "thinking" (OnRoundStart).
             if (toolsStartedThisTurn) return;
+            if (streamGap(token, endPos, thinkingContentPos)) voidTranscriptClaim();
             const keep = trimToEnd(token, endPos, thinkingContentPos);
             if (!keep) return;
             if (!currentThinkingSpan) {
@@ -3534,6 +3571,7 @@
         function appendStreamingToolArgs(index, argsDelta, endPos) {
             const cardInfo = streamingToolCards[index];
             if (!cardInfo) return;
+            if (streamGap(argsDelta, endPos, cardInfo.argsPos || 0)) voidTranscriptClaim();
             const keep = trimToEnd(argsDelta, endPos, cardInfo.argsPos || 0);
             if (!keep) return;
             cardInfo.rawArgs = (cardInfo.rawArgs || '') + keep;

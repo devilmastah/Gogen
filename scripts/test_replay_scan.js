@@ -194,6 +194,77 @@ async function main() {
       messagesDiv.querySelectorAll('.message').length >= expected);
   }
 
+  // ── A dropped frame / wiped DOM must void the pane's claim ──
+  // The mark may only prove what the pane actually RENDERED. Two ways it can
+  // stop being a lower bound of that: the DOM is wiped (clearChat) while the
+  // epoch/mark survive, and a position-stamped chunk arrives with a hole
+  // before it (a frame dropped by the server's 5s send-queue timeout). Both
+  // must void the claim, so the next attach takes the full snapshot instead
+  // of proving "current" over a transcript with a hole.
+  {
+    // Re-establish a claimed, current pane.
+    recv({ type: 'history', sessionId: 'A', history, historyEpoch: 1 });
+    const deadlineClaim = Date.now() + 30000;
+    while (Date.now() < deadlineClaim) {
+      await new Promise((r) => setTimeout(r, 5));
+      if (window.eval('activePane().histEpoch') === 1
+        && messagesDiv.querySelectorAll('.message').length >= expected) break;
+    }
+    check('pane re-established with a history epoch',
+      window.eval('activePane().histEpoch') === 1);
+
+    // A wipe with no replay (a reconnect whose attach snapshot write was
+    // dropped): clearChat must void the epoch + mark with the DOM.
+    recv({ type: 'clear_chat' });
+    check('clearChat voids the pane history epoch',
+      window.eval('activePane().histEpoch') === undefined);
+    check('clearChat resets the pane rendered-index mark',
+      window.eval('activePane().renderedHistIdx') === -1);
+
+    // Re-establish, latch the convergence refetch, then drop a stream frame:
+    // the chunk after the hole starts past the rendered position.
+    recv({ type: 'history', sessionId: 'A', history, historyEpoch: 1 });
+    const deadlineAgain = Date.now() + 30000;
+    while (Date.now() < deadlineAgain) {
+      await new Promise((r) => setTimeout(r, 5));
+      // Wait for the REPLAY to finish, not just its epoch stamp: live frames
+      // arriving mid-replay are buffered and dispatched after it.
+      if (window.eval('activePane().histEpoch') === 1
+        && messagesDiv.querySelectorAll('.message').length >= expected) break;
+    }
+    recv({ type: 'session_state', sessionId: 'A', turnActive: true }); // latch the refetch
+    recv({ type: 'stream', sessionId: 'A', content: 'abc', contentPos: 3 });
+    recv({ type: 'stream', sessionId: 'A', content: 'zz', contentPos: 9 }); // 4 chars lost
+    check('a position gap voids the pane history epoch',
+      window.eval('activePane().histEpoch') === undefined);
+    const sentGap = ws.sent.length;
+    recv({ type: 'turn_end', sessionId: 'A' });
+    const gapAttach = ws.sent.slice(sentGap).reverse().find((m) => m.type === 'session_attach');
+    check('convergence attach after a gap does NOT claim the fingerprint',
+      !!gapAttach && !gapAttach.knownHistoryEpoch && !gapAttach.knownHistoryIndex,
+      JSON.stringify(gapAttach || null));
+
+    // Contiguous chunks must NOT void anything (the rewind merge and the live
+    // tail are exact by construction): a false positive here would cost a
+    // full rebuild on every in-flight attach.
+    recv({ type: 'history', sessionId: 'A', history, historyEpoch: 1 });
+    const deadlineOk = Date.now() + 30000;
+    while (Date.now() < deadlineOk) {
+      await new Promise((r) => setTimeout(r, 5));
+      if (window.eval('activePane().histEpoch') === 1
+        && messagesDiv.querySelectorAll('.message').length >= expected) break;
+    }
+    recv({ type: 'session_state', sessionId: 'A', turnActive: true });
+    recv({
+      type: 'history', sessionId: 'A', rewindOnly: true, historyEpoch: 1,
+      rewind: { content: 'abc', contentPos: 3 },
+    });
+    recv({ type: 'stream', sessionId: 'A', content: 'def', contentPos: 6 });
+    check('contiguous rewind + live chunks keep the claim (no false gap)',
+      window.eval('activePane().histEpoch') === 1,
+      'epoch=' + window.eval('activePane().histEpoch'));
+  }
+
   window.close();
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
