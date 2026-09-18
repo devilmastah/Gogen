@@ -110,6 +110,7 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 		Updated:         time.Now().UTC(),
 		WorkingDir:      snap.WorkingDir,
 		Model:           snap.Model,
+		ModelProvider:   snap.ModelProvider,
 		Mode:            snap.Mode,
 		ThinkingLevel:   snap.ThinkingLevel,
 		Label:           snap.Label,
@@ -493,6 +494,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (SessionSnapshot, error)
 	return SessionSnapshot{
 		WorkingDir:      f.WorkingDir,
 		Model:           f.Model,
+		ModelProvider:   f.ModelProvider,
 		Mode:            f.Mode,
 		ThinkingLevel:   f.ThinkingLevel,
 		Oneshot:         f.Oneshot,

@@ -161,17 +161,27 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 		seedThinking = string(l)
 	}
 	a.lastMeta = persistMeta{
-		label:    snap.Label,
-		mode:     seedMode,
-		model:    snap.Model,
-		thinking: seedThinking,
-		oneshot:  snap.Oneshot,
-		profile:  snap.ProjectProfile,
-		todos:    todoSnapshot(a.TodoManager),
+		label:         snap.Label,
+		mode:          seedMode,
+		model:         snap.Model,
+		modelProvider: snap.ModelProvider,
+		thinking:      seedThinking,
+		oneshot:       snap.Oneshot,
+		profile:       snap.ProjectProfile,
+		todos:         todoSnapshot(a.TodoManager),
 	}
 	a.persistMu.Unlock()
 	if snap.Model != "" {
-		_ = a.Provider.SetModel(snap.Model)
+		// The routing key (owning profile) and the wire ID are restored
+		// together; a legacy snapshot (empty ModelProvider) restores as a
+		// default-profile model — ValidateRestoredModel re-resolves the
+		// owner against the live catalog.
+		ref := llm.ModelRef{Profile: snap.ModelProvider, ID: snap.Model}
+		if p, ok := a.Provider.(llm.ModelRefProvider); ok {
+			_ = p.SetModelRef(ref)
+		} else {
+			_ = a.Provider.SetModel(ref.WireID())
+		}
 		// The restored model is unverified until ValidateRestoredModel (or
 		// the first turn's re-check) confirms it still exists at the
 		// provider; until then it must not be blindly sent to the endpoint.
@@ -460,12 +470,17 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	st := a.capturePersistState()
 	count := len(st.msgs)
 	st.profile = a.ensureProjectProfile()
-	st.model = a.CurrentModel()
+	// The routing key and the wire ID are read as one ref so they cannot
+	// drift apart in the persisted snapshot.
+	ref := a.CurrentModelRef()
+	st.model = ref.WireID()
+	st.modelProvider = ref.ProfileName()
 	subagentStatus, subagentSummary := a.SubagentOutcome()
 	st.meta = persistMeta{
 		label:           st.label,
 		mode:            st.mode,
 		model:           st.model,
+		modelProvider:   st.modelProvider,
 		thinking:        st.thinking,
 		oneshot:         st.oneshot,
 		profile:         st.profile,
@@ -531,7 +546,10 @@ type persistState struct {
 	workingDir   string
 	profile      string
 	model        string
-	meta         persistMeta
+	// modelProvider is the provider profile owning model (the ModelRef
+	// routing key persisted alongside it).
+	modelProvider string
+	meta          persistMeta
 }
 
 // capturePersistState snapshots the conversation and metadata under statsMu:
@@ -570,6 +588,7 @@ func (a *Agent) persistFullSnapshot(st persistState, count int, skipTokenCounts 
 	snap := SessionSnapshot{
 		WorkingDir:      st.workingDir,
 		Model:           st.model,
+		ModelProvider:   st.modelProvider,
 		Mode:            st.mode,
 		ThinkingLevel:   st.thinking,
 		Oneshot:         st.oneshot,
@@ -843,13 +862,16 @@ const persistMinInterval = 5 * time.Second
 // ignore). Comparing the current values against the last full save detects
 // changes that must force a full save — see lastMeta.
 type persistMeta struct {
-	label    string
-	mode     string
-	model    string
-	thinking string
-	oneshot  bool
-	profile  string
-	todos    *TodoList
+	label string
+	mode  string
+	model string
+	// modelProvider is the provider profile owning model; changes to it
+	// force a full save like changes to model.
+	modelProvider string
+	thinking      string
+	oneshot       bool
+	profile       string
+	todos         *TodoList
 	// subagentStatus/subagentSummary mirror the recorded subagent outcome:
 	// writing it right after a turn's full save must force ANOTHER full
 	// save (deltas do not carry the outcome to the index).

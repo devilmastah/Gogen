@@ -536,38 +536,63 @@ func TestParentEvictionCancelsChildren(t *testing.T) {
 	})
 }
 
-// TestChildReportDeliversToParent drives the child-scoped report tool end
-// to end: the child's model calls report during its main turn and the
-// progress message lands in the parent conversation.
-func TestChildReportDeliversToParent(t *testing.T) {
+// TestChildProgressNeverPushesToParent pins the one-channel return contract:
+// a child cannot push interim messages into the parent conversation — the
+// parent gets exactly the completion notice (state + bounded outcome), and
+// progress is available via list_agents (pull). The child here ATTEMPTS a
+// report tool call mid-turn: the tool no longer exists for children, so the
+// attempt is rejected as an unknown tool inside the child, and nothing
+// reaches the parent.
+func TestChildProgressNeverPushesToParent(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
 		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{
-			{ToolCalls: []llm.ToolCall{{
-				ID: "c1", Name: "report", Args: map[string]any{"message": "progress from child"},
+			{Content: "checking the parser now", ToolCalls: []llm.ToolCall{{
+				ID: "t1", Name: "report", Args: map[string]any{"message": "should not be pushed"},
 			}}},
-			{Content: "done"},
+			{Content: "final outcome text"},
 		}
 		return p
 	})
-	// Children inherit the subagent feature flag from the workspace.
 	s.ws.SetSubagentEnabled(true)
 	sp := continuableSpawner(t, s)
 	sp.retain = time.Hour
 
-	if _, err := sp.SpawnBackground(context.Background(), a, "report as you go", "", 0); err != nil {
+	id, err := sp.SpawnBackground(context.Background(), a, "check the parser", "", 0)
+	if err != nil {
 		t.Fatal(err)
 	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+	waitForParentDeliveriesSettled(t, s, a)
 	waitFor(t, 5*time.Second, func() bool {
-		return deliveredMessages(a, "progress from child")
+		return deliveredMessages(a, "finished: final outcome text")
 	})
-	// The report lands mid-turn, so the child's turn (and its final
-	// flush) is still in flight when the parent sees it. The completion
-	// notice is delivered only after that flush lands — wait for it so no
-	// session write outlives the test's temp dir.
-	waitFor(t, 5*time.Second, func() bool {
-		return deliveredMessages(a, "finished: done")
-	})
+	// The report tool is gone for children: the attempt is an unknown tool
+	// (visible in the child's own transcript), and the parent receives
+	// exactly one message for the run — the completion notice.
+	rejected := false
+	for _, m := range child.rt.agent.SnapshotMessages() {
+		if m.Role == "tool" && strings.Contains(m.Content, "unknown tool: report") {
+			rejected = true
+		}
+	}
+	if !rejected {
+		t.Fatal("a child's report attempt must be rejected as an unknown tool")
+	}
+	if deliveredMessages(a, "should not be pushed") {
+		t.Fatal("a child must not be able to push interim messages into the parent conversation")
+	}
+	if n := deliveredCount(a, "[subagent"); n != 1 {
+		t.Fatalf("parent received %d child messages, want exactly 1 (the completion notice)", n)
+	}
+	out, err := sp.ListAgents(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "final outcome text") {
+		t.Fatalf("list_agents must expose the child's latest progress: %q", out)
+	}
 }
 
 // TestChildCapReleasesOldest pins the per-parent finished cap: spawning
@@ -1224,4 +1249,230 @@ func TestBackgroundSpawnCompletionQueuedUntilParentLive(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		return deliveredMessages(a, "[subagent") && deliveredMessages(a, "gated report")
 	})
+}
+
+// --- subagent return-path fixes ---
+
+// keepParentPaneAttached starts a WS server and dials a client, waiting for
+// the attach sequence. The parent runtime then has a viewer and cannot be
+// orphan-evicted while a test asserts on its transcript.
+func keepParentPaneAttached(t *testing.T, s *Server) {
+	t.Helper()
+	srv := startWSServer(t, s)
+	t.Cleanup(srv.Close)
+	conn := dialWS(t, srv, "/ws") // its own cleanup closes the conn
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+}
+
+// TestChildSystemNoticeDoesNotArmReplyCapture pins the reply-capture source
+// gate end to end: a system delivery into a background child that is NOT a
+// send_message (here the child's own job-notice shape — job_notices: on)
+// must not have the child's reaction injected into the parent as a reply.
+// The child still runs the turn; only the capture is withheld.
+func TestChildSystemNoticeDoesNotArmReplyCapture(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{
+			{Content: "main job report"},     // the main job
+			{Content: "reaction to notice"},  // the child's turn on the job notice
+			{Content: "reaction to message"}, // the send_message control case
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+
+	// A plain system delivery (the job notice shape; the real producer is
+	// the registry-backed jobNoticeDeliverer) runs a turn on the child — but
+	// its reaction must NOT be injected into the parent.
+	if !child.rt.deliverToSession("[job] job-1 exited with code 0 — echo hi") {
+		t.Fatal("system delivery refused")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		for _, m := range child.rt.agent.SnapshotMessages() {
+			if m.Role == "assistant" && strings.Contains(m.Content, "reaction to notice") {
+				return true
+			}
+		}
+		return false
+	})
+	waitForParentDeliveriesSettled(t, s, a)
+	if deliveredMessages(a, "reaction to notice") {
+		t.Fatal("a non-send_message system delivery must not arm the reply capture")
+	}
+
+	// Control: a send_message still captures the child's reply.
+	if err := sp.SendMessage(a, id, "please elaborate"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "reaction to message") })
+}
+
+// TestListAgentsProgressLineBounded pins the pull-side progress view: each
+// child row carries a one-line, bounded snippet of its latest assistant
+// output (the full transcript stays in the child's pane), and a finished
+// child stays listed with its outcome.
+func TestListAgentsProgressLineBounded(t *testing.T) {
+	long := strings.Repeat("x", 400) + "\nsecond line"
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: long}}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	// Keep the parent pane attached: the second spawn below needs the parent
+	// runtime live (deliveries would otherwise orphan-evict it).
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+
+	out, err := sp.ListAgents(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, id) || !strings.Contains(out, "finished") {
+		t.Fatalf("listing must name the child and its status: %q", out)
+	}
+	if !strings.Contains(out, "last: ") {
+		t.Fatalf("listing must carry a progress line: %q", out)
+	}
+	// Bounded and single-line: neither the full body nor the embedded
+	// newline survives.
+	if strings.Contains(out, strings.Repeat("x", 161)) {
+		t.Fatal("progress line is not bounded")
+	}
+	if strings.Contains(out, "second line") {
+		t.Fatal("progress line must collapse to one line")
+	}
+
+	// A second, running child is listed alongside (newest last).
+	blocking := make(chan struct{})
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.OnStream = func(ctx context.Context, _ []llm.Message, h *llm.StreamHandlers) (*llm.StreamResult, error) {
+			if h != nil && h.OnStreamOpened != nil {
+				h.OnStreamOpened()
+			}
+			select {
+			case <-blocking:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return &llm.StreamResult{Content: "late"}, nil
+		}
+		return p
+	}
+	id2, err := sp.SpawnBackground(context.Background(), a, "second job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id2).statusOf() == "running" })
+	out, err = sp.ListAgents(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, id) || !strings.Contains(out, id2) {
+		t.Fatalf("both children must be listed: %q", out)
+	}
+	close(blocking)
+	sp.cancelAll(a.SessionID)
+	waitFor(t, 5*time.Second, func() bool { return len(sp.children.childrenOf(a.SessionID)) == 0 })
+}
+
+// TestEvictedChildWithArmedCaptureReleases pins the release predicate: an
+// evicted runtime is never "busy" — a capture armed by a delivery whose turn
+// never started (the evicted early return in runTurnBody skips the turn-end
+// hook that consumes pendingReply) must not pin the child record and re-arm
+// its retention timer forever.
+func TestEvictedChildWithArmedCaptureReleases(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+
+	id, err := sp.SpawnBackground(context.Background(), a, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+
+	// Simulate the evicted early return: the start hook armed the capture
+	// but the turn never ran, so the turn-end hook never consumed it.
+	child.mu.Lock()
+	child.pendingReply = true
+	child.mu.Unlock()
+	s.registry.evictRuntime(child.rt)
+
+	if child.busy() {
+		t.Fatal("an evicted child must not read busy (armed capture or not)")
+	}
+	sp.maybeReleaseChild(child)
+	if sp.children.get(id) != nil {
+		t.Fatal("an evicted child must be released, not pinned by the armed capture")
+	}
+}
+
+// TestOnTurnEndCompactionFallback pins the timestamp fallback: when the
+// delivered turn's auto-compaction renumbered the history below the
+// replyBase baseline, the reply is still found via its CreatedAt — and a
+// pre-turn assistant message is never re-delivered as the reply.
+func TestOnTurnEndCompactionFallback(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+
+	stub := newBlockingStub()
+	dir := t.TempDir()
+	childAgent := agent.NewAgent(stub, agent.NewExecutor(dir),
+		contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000}))
+	turnStart := time.Now().Truncate(time.Millisecond)
+	old := turnStart.Add(-time.Minute)
+	childAgent.Messages = []llm.Message{
+		{Role: "user", Content: "job", CreatedAt: old},
+		{Role: "assistant", Content: "old report", CreatedAt: old},
+		// The delivered turn's messages, renumbered below the baseline by
+		// the compaction the turn triggered.
+		{Role: "user", Content: "steer", CreatedAt: turnStart},
+		{Role: "assistant", Content: "new reply", CreatedAt: turnStart},
+	}
+	c := &backgroundChild{
+		id:       "child-1",
+		parentID: a.SessionID,
+		label:    "subagent: test",
+		depth:    1,
+		rt:       newSessionRuntime(childAgent),
+		sp:       sp,
+		status:   "idle",
+		// Stale baseline: len(msgs) < replyBase, so the index scan finds
+		// nothing and only the timestamp floor can locate the reply.
+		pendingReply: true,
+		replyBase:    4,
+		turnStart:    turnStart,
+	}
+	c.onTurnEnd()
+	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "new reply") })
+	if deliveredMessages(a, "old report") {
+		t.Fatal("a pre-turn assistant message must not be re-delivered")
+	}
 }

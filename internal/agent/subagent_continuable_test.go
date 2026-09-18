@@ -36,7 +36,7 @@ func subagentToolNames(a *Agent) map[string]bool {
 	out := map[string]bool{}
 	for _, def := range a.llmTools() {
 		switch def.Name {
-		case "subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent", "report":
+		case "subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent":
 			out[def.Name] = true
 		}
 	}
@@ -46,7 +46,9 @@ func subagentToolNames(a *Agent) map[string]bool {
 // TestContinuableToolGating pins the continuable surface: with a plain
 // spawner the subagent tool stays foreground-only and none of the
 // continuable tools exist; with a continuable spawner the parameter and the
-// control tools appear; report appears only for children with a hook.
+// control tools appear. There is no child-scoped progress tool: a child's
+// one return channel is its final message (the parent pulls progress via
+// list_agents).
 func TestContinuableToolGating(t *testing.T) {
 	a := newSubagentTestAgent(t)
 	a.SetSubagentsEnabled(true)
@@ -54,7 +56,7 @@ func TestContinuableToolGating(t *testing.T) {
 	// Plain spawner: foreground schema only.
 	a.SetSubagentSpawner(&fakeSpawner{report: "r"})
 	defs := subagentToolNames(a)
-	if !defs["subagent"] || defs["subagent_fork"] || defs["list_agents"] || defs["send_message"] || defs["interrupt_agent"] || defs["report"] {
+	if !defs["subagent"] || defs["subagent_fork"] || defs["list_agents"] || defs["send_message"] || defs["interrupt_agent"] {
 		t.Fatalf("plain spawner surface = %v", defs)
 	}
 	for _, def := range a.llmTools() {
@@ -65,8 +67,7 @@ func TestContinuableToolGating(t *testing.T) {
 		}
 	}
 
-	// Continuable spawner: parameter + control tools; report still absent
-	// (not a child).
+	// Continuable spawner: parameter + control tools.
 	cs := &fakeContinuableSpawner{fakeSpawner: fakeSpawner{report: "r"}}
 	a.SetSubagentSpawner(cs)
 	defs = subagentToolNames(a)
@@ -74,9 +75,6 @@ func TestContinuableToolGating(t *testing.T) {
 		if !defs[name] {
 			t.Fatalf("continuable surface missing %s: %v", name, defs)
 		}
-	}
-	if defs["report"] {
-		t.Fatal("report must not appear for a non-child")
 	}
 	seen := false
 	for _, def := range a.llmTools() {
@@ -90,17 +88,6 @@ func TestContinuableToolGating(t *testing.T) {
 	}
 	if !seen {
 		t.Fatal("subagent tool missing")
-	}
-
-	// Child with a report hook: report appears.
-	a.SetParentID("parent-1")
-	a.SetReportHook(func(text string) error { return nil })
-	if !subagentToolNames(a)["report"] {
-		t.Fatal("report must appear for a child with a hook")
-	}
-	a.SetParentID("")
-	if subagentToolNames(a)["report"] {
-		t.Fatal("report must disappear for a non-child")
 	}
 }
 
@@ -158,20 +145,9 @@ func TestContinuableToolExecution(t *testing.T) {
 		t.Fatalf("interrupt output = %q", out)
 	}
 
-	// report: works for a child with a hook.
-	called := false
-	a.SetParentID("parent-1")
-	a.SetReportHook(func(text string) error { called = true; return nil })
-	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "report", Args: map[string]any{"message": "progress"}}); err != nil {
-		t.Fatal(err)
-	}
-	if !called || !strings.Contains(out, "Reported") {
-		t.Fatalf("report output = %q, called=%v", out, called)
-	}
-
 	// Continuable family is act-only.
 	a.SetMode(ModePlan)
-	for _, name := range []string{"subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent", "report"} {
+	for _, name := range []string{"subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent"} {
 		if _, ok := a.AllowedToolNames()[name]; ok {
 			t.Fatalf("%s must be blocked in plan mode", name)
 		}

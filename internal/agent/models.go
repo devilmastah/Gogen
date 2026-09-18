@@ -41,6 +41,16 @@ func (a *Agent) CurrentModel() string {
 	return a.Provider.ModelName()
 }
 
+// CurrentModelRef returns the current model's routing key (owning provider
+// profile + bare wire ID) from the session's provider. Providers without
+// the ModelRefProvider capability (test stubs) report the default profile.
+func (a *Agent) CurrentModelRef() llm.ModelRef {
+	if p, ok := a.Provider.(llm.ModelRefProvider); ok {
+		return p.CurrentModelRef()
+	}
+	return llm.ModelRef{ID: a.Provider.ModelName()}
+}
+
 func (a *Agent) requireModelSelected(ctx context.Context) error {
 	if a.Provider.ModelName() != "" && !a.isModelUnverified() {
 		return nil
@@ -116,9 +126,12 @@ func (a *Agent) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	current := a.Provider.ModelName()
+	// The current flag is per (profile, ID): the same model ID listed by
+	// several providers marks only the copy the session actually runs on.
+	ref := a.CurrentModelRef()
 	for i := range models {
-		models[i].Current = models[i].ID == current
+		models[i].Current = ref.Valid() && models[i].ID == ref.ID &&
+			(models[i].Provider == "" || models[i].Provider == ref.ProfileName())
 	}
 	return models, nil
 }
@@ -137,23 +150,42 @@ func (a *Agent) SelectModel(ctx context.Context, selector string) error {
 		return fmt.Errorf("no models available from the endpoint")
 	}
 
-	var modelID string
+	// The selection resolves to a (profile, ID) pair: model IDs are not
+	// unique across registered providers, so the owning profile travels
+	// with the selection (the picker sends "profile/id" qualified
+	// selectors for non-default groups; bare selectors resolve to the
+	// first catalog entry that matches, profile order).
+	var modelID, profile string
 	if n, err := strconv.Atoi(selector); err == nil {
 		if n < 1 || n > len(models) {
 			return fmt.Errorf("invalid model number %d (1-%d)", n, len(models))
 		}
 		modelID = models[n-1].ID
+		profile = models[n-1].Provider
 	} else {
+		// Qualified selector first: an entry whose own "provider/id" form
+		// equals the selector (no splitting — model IDs may contain "/").
 		for _, m := range models {
-			if m.ID == selector {
+			if m.Provider != "" && m.Provider != llm.DefaultProfileName && m.Provider+"/"+m.ID == selector {
 				modelID = m.ID
+				profile = m.Provider
 				break
+			}
+		}
+		if modelID == "" {
+			for _, m := range models {
+				if m.ID == selector {
+					modelID = m.ID
+					profile = m.Provider
+					break
+				}
 			}
 		}
 		if modelID == "" {
 			for _, m := range models {
 				if strings.Contains(m.ID, selector) {
 					modelID = m.ID
+					profile = m.Provider
 					break
 				}
 			}
@@ -163,7 +195,14 @@ func (a *Agent) SelectModel(ctx context.Context, selector string) error {
 		}
 	}
 
-	if err := a.Provider.SetModel(modelID); err != nil {
+	// SetModelRef sets the routing key (profile + wire ID) in one step so
+	// they cannot drift; providers without the capability (test stubs)
+	// treat every model as belonging to the default profile.
+	if p, ok := a.Provider.(llm.ModelRefProvider); ok {
+		if err := p.SetModelRef(llm.ModelRef{Profile: profile, ID: modelID}); err != nil {
+			return err
+		}
+	} else if err := a.Provider.SetModel(modelID); err != nil {
 		return err
 	}
 	// A selection always comes from the provider's own model list, so it is

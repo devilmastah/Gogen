@@ -129,16 +129,6 @@ type Workspace struct {
 	// Resolver.
 	PropsCapsCache *llm.PropsCapsCache
 
-	// OwnerRegistry is the shared model→profile owner record (see
-	// llm.OwnerRegistry). One per workspace: every session provider
-	// publishes the owners it learns from successful catalog fetches and
-	// consults the record when its own routing for a model is unknown (a
-	// fresh session whose owning endpoint is down), so a model keeps
-	// routing to the endpoint that last served it instead of falling back
-	// to the default profile. Set once at construction; read at provider
-	// construction — plain field, like Resolver.
-	OwnerRegistry *llm.OwnerRegistry
-
 	// wdMu guards WorkingDir. The field is written by handleWSConfig on one
 	// connection's WS read loop (working-dir change) and read concurrently
 	// from other connections' read loops (session ops, NewSessionAgent) and
@@ -622,10 +612,9 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		// ALL registered OpenAI-compatible profiles (the legacy fields form
 		// the implicit default), so every model in the picker routes to its
 		// owning endpoint.
-		ws.OwnerRegistry = llm.NewOwnerRegistry()
 		// One shared catalog cache per workspace: the endpoint's /v1/models
 		// is a property of the endpoint, so N sessions must not download it
-		// N times (E6 sibling of Resolver/OwnerRegistry).
+		// N times (E6 sibling of Resolver).
 		ws.EndpointCatalog = llm.NewEndpointCatalog()
 		// ...and for the /props capability probe: one dial per endpoint+model
 		// per process, not per session.
@@ -634,7 +623,6 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 			wd := ws.GetWorkingDir()
 			r := ws.GetRuntimeConfig()
 			p := llm.NewOpenAIProviderWithProfiles(ws.providerProfiles(), r.OpenAIModel, wd, ws.Resolver)
-			p.SetOwnerRegistry(ws.OwnerRegistry)
 			p.SetEndpointCatalog(ws.EndpointCatalog)
 			p.SetPropsCapsCache(ws.PropsCapsCache)
 			p.SetPromptCacheKey(llm.ProjectPromptCacheKey(wd))
@@ -645,13 +633,10 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 			p.SetThinkingLevel(ws.ThinkingLevel)
 			return p
 		}
-		// The default session's provider joins the same record so the owners
-		// it learns (startup validation, /models) are visible to every later
-		// session — replacing the per-process registry setup.go installed.
-		// It joins the shared catalog cache too: the session hosting the
-		// workspace must not download the catalog its siblings will reuse.
+		// The default session's provider joins the shared catalog cache too:
+		// the session hosting the workspace must not download the catalog
+		// its siblings will reuse.
 		if p, ok := a.Provider.(*llm.OpenAIProvider); ok {
-			p.SetOwnerRegistry(ws.OwnerRegistry)
 			p.SetEndpointCatalog(ws.EndpointCatalog)
 			p.SetPropsCapsCache(ws.PropsCapsCache)
 		}

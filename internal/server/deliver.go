@@ -10,7 +10,8 @@ import (
 
 // deliverKind distinguishes the two producers sharing one FIFO queue per
 // runtime: system-generated messages (job notices, scheduled reminders,
-// subagent reports — rendered as notices) and user steering messages (typed
+// subagent completion notices, captured send_message replies — rendered as
+// notices) and user steering messages (typed
 // into a busy session — rendered as the user's own message). One queue, one
 // drain path; the kind only changes presentation and policy.
 type deliverKind int
@@ -18,6 +19,29 @@ type deliverKind int
 const (
 	deliverSystem deliverKind = iota
 	deliverUser
+)
+
+// deliverSource records WHY a SYSTEM item was enqueued. Only a direct
+// send_message delivery (deliverFromChildMessage) arms the receiving
+// session's delivery-start hook — the continuable-subagent reply capture.
+// Every other machine message (job notices, completion notices,
+// queued-parent deliveries) must NOT be mistaken for a message
+// whose answer belongs to the parent: a child's reaction to an unrelated
+// notice would otherwise be injected into ITS parent as an unsolicited
+// "reply" (and another parent turn).
+type deliverSource uint8
+
+const (
+	// deliverFromSystem is every machine-generated delivery except a
+	// direct send_message: job completion notices, scheduled reminders,
+	// subagent completion notices, and notices flushed from the
+	// registry's per-parent queue. Never arms the start hook. Zero value.
+	deliverFromSystem deliverSource = iota
+	// deliverFromChildMessage is a send_message delivery into a child's
+	// runtime: the delivered turn's final assistant message is the reply
+	// the parent asked for, so this source arms the start hook
+	// (backgroundChild.onTurnEnd captures the reply).
+	deliverFromChildMessage
 )
 
 // deliverItem is one queued turn waiting for the session to go idle.
@@ -29,6 +53,10 @@ type deliverItem struct {
 	ID   string
 	Text string
 	Kind deliverKind
+	// Source is why a SYSTEM item was enqueued (deliverFromSystem /
+	// deliverFromChildMessage); meaningless for user items. Only
+	// deliverFromChildMessage arms the delivery-start hook.
+	Source deliverSource
 	// Images carries user-attached images (nil for system items).
 	Images []llm.ImageInput
 }
@@ -200,7 +228,8 @@ func (rt *sessionRuntime) removeQueuedItem(id string) bool {
 // clearUserQueue drops every USER queue item (the interrupt semantic:
 // "stop what you're doing" removes the user's own queued text) and returns
 // how many were removed. SYSTEM deliveries are deliberately kept — they are
-// machine bookkeeping (job notices, subagent reports, reply capture) whose
+// machine bookkeeping (job notices, subagent completion notices, reply
+// capture) whose
 // loss strands the delivery machinery. Caller broadcasts the new state when
 // the count is non-zero.
 func (rt *sessionRuntime) clearUserQueue() int {
@@ -226,10 +255,12 @@ func (rt *sessionRuntime) clearUserQueue() int {
 // user message and runs a turn on it at the next idle boundary. It never
 // blocks: the message is queued and a per-runtime worker delivers it.
 //
-// Producers (job completion notices, scheduled reminders, subagent reports)
-// call this from arbitrary goroutines; the worker owns all interaction with
+// Producers (job completion notices, scheduled reminders, subagent
+// completion notices) call this from arbitrary goroutines; the worker owns
+// all interaction with
 // the turn machinery, so the "Messages are owned by the turn goroutine"
-// invariant holds by construction.
+// invariant holds by construction. The item's source is deliverFromSystem:
+// it never arms the delivery-start hook (see deliverChildMessage).
 //
 // Delivery is at-most-once: the item is popped BEFORE the turn starts, so a
 // crash between pop and start loses one message rather than duplicating one.
@@ -239,6 +270,23 @@ func (rt *sessionRuntime) clearUserQueue() int {
 // that must not lose the message can fall back to deliverToParent, which
 // queues it for the session's next registration.
 func (rt *sessionRuntime) deliverToSession(text string) bool {
+	return rt.enqueueSystem(text, deliverFromSystem)
+}
+
+// deliverChildMessage delivers a parent's send_message into a child's
+// runtime. It is deliverToSession with the deliverFromChildMessage source:
+// the delivered turn's final assistant message is the reply the parent
+// asked for, so starting it arms the child's delivery-start hook (the
+// reply capture). This is the ONLY producer allowed to arm that capture —
+// see deliverSource.
+func (rt *sessionRuntime) deliverChildMessage(text string) bool {
+	return rt.enqueueSystem(text, deliverFromChildMessage)
+}
+
+// enqueueSystem is the shared system-delivery enqueue used by
+// deliverToSession (source = deliverFromSystem) and deliverChildMessage
+// (source = deliverFromChildMessage).
+func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) bool {
 	if rt == nil || rt.evicted.Load() {
 		return false
 	}
@@ -261,7 +309,7 @@ func (rt *sessionRuntime) deliverToSession(text string) bool {
 			}
 		}
 	}
-	rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: text, Kind: deliverSystem})
+	rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: text, Kind: deliverSystem, Source: src})
 	if !rt.deliverWorker.Swap(true) {
 		go rt.deliverLoop()
 	}
@@ -288,7 +336,7 @@ func (rt *sessionRuntime) deliverToSession(text string) bool {
 // it in the registry so it is delivered when the session is next registered
 // (reopened from the store). Never blocks; at-most-once per queue entry.
 // Used by the continuable-subagent machinery, whose producers must not lose
-// a completion notice or report to a parent that merely went idle with no
+// a completion notice or reply to a parent that merely went idle with no
 // viewers.
 func (r *sessionRegistry) deliverToParent(parentID, text string) {
 	if rt, ok := r.get(parentID); ok {
@@ -448,7 +496,13 @@ func (rt *sessionRuntime) deliverLoop() {
 		if item.Kind == deliverUser {
 			rt.broadcastQueueState(item.ID)
 		}
-		if item.Kind == deliverSystem && rt.deliverStartHook != nil {
+		// The delivery-start hook arms per-delivery state exactly when the
+		// delivered turn begins — and ONLY for a send_message delivery
+		// (deliverFromChildMessage): the hook arms the continuable-
+		// subagent reply capture, and a child's reaction to any other
+		// machine message (job notice, subagent completion notice) must
+		// never be injected into its parent as a reply.
+		if item.Kind == deliverSystem && item.Source == deliverFromChildMessage && rt.deliverStartHook != nil {
 			rt.deliverStartHook()
 		}
 		// The drain pops ONE item per turn: the turn-end signal wakes the

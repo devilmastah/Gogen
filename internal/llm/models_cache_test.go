@@ -38,7 +38,7 @@ func TestListModelsCachesSuccessfulFetch(t *testing.T) {
 	)
 	p := &OpenAIProvider{
 		profiles:    []*providerProfile{{name: "default", stream: &client}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
 	ctx := context.Background()
@@ -46,7 +46,7 @@ func TestListModelsCachesSuccessfulFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first listModels: %v", err)
 	}
-	if len(first) != 1 || first[0].ID != "model-a" {
+	if len(first) != 1 || first[0].model.ID != "model-a" {
 		t.Fatalf("unexpected first result: %+v", first)
 	}
 	if got := hits.Load(); got != 1 {
@@ -57,7 +57,7 @@ func TestListModelsCachesSuccessfulFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second listModels: %v", err)
 	}
-	if len(second) != 1 || second[0].ID != "model-a" {
+	if len(second) != 1 || second[0].model.ID != "model-a" {
 		t.Fatalf("unexpected second result: %+v", second)
 	}
 	if got := hits.Load(); got != 1 {
@@ -108,14 +108,14 @@ func TestFetchModelsQueriesOpenCodeEndpointsInParallel(t *testing.T) {
 			zenStream: &zenClient,
 			goStream:  &goClient,
 		}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
 	errCh := make(chan error, 1)
-	var models []openai.Model
+	var models []catalogModel
 	go func() {
 		var err error
-		models, _, _, err = p.fetchModelsWithProfiles(context.Background(), true)
+		models, _, err = p.fetchModelsWithProfiles(context.Background(), true)
 		errCh <- err
 	}()
 
@@ -159,7 +159,7 @@ func TestListModelsHonorsCallerDeadline(t *testing.T) {
 	)
 	p := &OpenAIProvider{
 		profiles:    []*providerProfile{{name: "default", stream: &client}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -205,7 +205,7 @@ func TestCatalogProbeFailureDoesNotArmBackoff(t *testing.T) {
 	)
 	p := &OpenAIProvider{
 		profiles:    []*providerProfile{{name: "default", stream: &client}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
 	probeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -253,7 +253,7 @@ func TestModelContextLimitProbeDoesNotArmBackoff(t *testing.T) {
 	)
 	p := &OpenAIProvider{
 		profiles:    []*providerProfile{{name: "default", stream: &client}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 		model:       "unknown-model",
 	}
 

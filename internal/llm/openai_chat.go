@@ -21,163 +21,99 @@ import (
 )
 
 // clientForModel returns the openai.Client that should serve the currently
-// selected model.  When modelClient has been populated by a ListModels call
-// the lookup is cheap; otherwise it does a one-time catalog fetch to
-// populate the cache.
+// selected model (its ModelRef routing key: owning profile + bare wire ID).
+//
+//   - A non-OpenCode profile serves every model picked under it: the
+//     profile's stream client directly, no discovery.
+//   - An OpenCode profile fronts two catalogs (zen + go) behind one profile:
+//     the modelClient twin routing (built by applyRouting from the last
+//     successful catalog fetch — Go takes precedence on overlap) decides
+//     which twin serves the model. A miss triggers a bounded catalog fetch
+//     (single-flight, backoff-gated), then the models.dev inference
+//     (inferOpenCodeEndpoint), then the profile's configured endpoint.
 //
 // OpenCode note: the gateways do not implement GET /models/{model}, so a
 // per-model probe can never tell the Zen endpoint from the Go endpoint —
-// discovery must build routing from the full /models lists instead. Go
-// models take precedence over Zen models (see fetchModels).
+// discovery must build routing from the full /models lists instead.
 func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 	p.modelsMu.RLock()
-	if p.modelClient != nil {
-		if c, ok := p.modelClient[p.model]; ok {
-			p.modelsMu.RUnlock()
-			return c
+	ref := ModelRef{Profile: p.currentModelProfile, ID: p.model}.Normalized()
+	var prof *providerProfile
+	for _, pr := range p.profiles {
+		if pr.name == ref.ProfileName() {
+			prof = pr
+			break
 		}
 	}
-	model := p.model
-	p.modelsMu.RUnlock()
-
-	// Catalog-based discovery (OpenCode, or multi-profile providers): a
-	// bounded listModels fetch populates modelClient with the exact model →
-	// endpoint mapping. The modelsCache TTL and the modelsFetch single-flight
-	// make repeat misses cheap, and the failure backoff (modelsFetchFailedAt)
-	// stops a dead endpoint from being re-probed on every request. Do not
-	// hold modelsMu across network I/O; bound the fetch so a hung endpoint
-	// cannot stall the first chat request indefinitely. The caller's context
-	// is threaded through so Ctrl+C aborts an in-flight catalog fetch instead
-	// of waiting out the timeout. OpenCode is detected from the CURRENT
-	// profile set (hasOpenCodeProfile), so discovery stays live-correct
-	// after SetProfiles.
-	if p.hasMultipleProfiles() || p.hasOpenCodeProfile() {
-		if !p.catalogFetchOnBackoff() {
-			fetchCtx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
-			_, _ = p.listModels(fetchCtx)
-			cancel()
+	if prof == nil {
+		// The owning profile is not registered (direct-constructed provider,
+		// or a routing key SetProfiles has not yet reset): the default
+		// profile serves.
+		if len(p.profiles) > 0 {
+			prof = p.profiles[0]
 		}
-		p.modelsMu.RLock()
-		c, ok := p.modelClient[model]
+	}
+	if prof == nil {
 		p.modelsMu.RUnlock()
-		if ok {
-			return c
-		}
-		// Model is not listed on any endpoint — fall through to the
-		// last-known owner, then the deterministic fallback (models.dev,
-		// then the default client).
+		return p.fallbackClient()
 	}
-
-	chosen, ownerName := p.ownerClientForModel(model)
-	if chosen == nil {
-		chosen = p.inferOpenCodeEndpoint(model)
-	}
-	if chosen == nil {
-		chosen = p.fallbackClient()
-	}
-
-	p.modelsMu.Lock()
-	if p.modelClient == nil {
-		p.modelClient = make(map[string]*openai.Client)
-	}
-	// Another goroutine may have filled this in while we were discovering.
-	if c, ok := p.modelClient[model]; ok {
-		p.modelsMu.Unlock()
+	if prof.zenStream == nil || prof.goStream == nil {
+		c := prof.stream
+		p.modelsMu.RUnlock()
 		return c
 	}
-	p.modelClient[model] = chosen
-	// Record the owner for a fallback resolved through the ownership record
-	// (it may have come from the shared registry, not this provider's own
-	// record): the next catalog merge must apply the sticky-ownership rule
-	// to this model instead of treating it as ownerless and letting a
-	// surviving endpoint's same-ID model steal it.
-	if ownerName != "" {
-		p.modelOwner[model] = ownerName
+	if c, ok := p.modelClient[ref]; ok {
+		p.modelsMu.RUnlock()
+		return c
 	}
-	p.modelsMu.Unlock()
-	return chosen
+	p.modelsMu.RUnlock()
+
+	// Catalog-based discovery (OpenCode twins): a bounded listModels fetch
+	// populates modelClient with the exact model → twin mapping. The
+	// modelsCache TTL and the modelsFetch single-flight make repeat misses
+	// cheap, and the failure backoff (modelsFetchFailedAt) stops a dead
+	// endpoint from being re-probed on every request. Do not hold modelsMu
+	// across network I/O; bound the fetch so a hung endpoint cannot stall
+	// the first chat request indefinitely. The caller's context is threaded
+	// through so Ctrl+C aborts an in-flight catalog fetch instead of
+	// waiting out the timeout.
+	if !p.catalogFetchOnBackoff() {
+		fetchCtx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
+		_, _ = p.listModels(fetchCtx)
+		cancel()
+	}
+	p.modelsMu.RLock()
+	if c, ok := p.modelClient[ref]; ok {
+		p.modelsMu.RUnlock()
+		return c
+	}
+	p.modelsMu.RUnlock()
+	// The model is not in the catalog — models.dev inference (Go over Zen),
+	// then the profile's configured endpoint.
+	if c := p.inferOpenCodeEndpoint(prof, ref.ID); c != nil {
+		return c
+	}
+	return prof.stream
 }
 
-// inferOpenCodeEndpoint picks the client that should serve model on OpenCode
-// without a catalog fetch, using the models.dev registry (in-memory/disk
-// cached; never blocks on the network). Go takes precedence: a model listed
-// on both the Go and Zen catalogs routes to the Go endpoint. Resolution is
-// profile-derived: the CURRENT registered OpenCode profiles' zen/go clients
-// are used, so SetProfiles swapping the endpoint set never routes through
-// stale construction-time clients. Returns nil when nothing can be
-// determined (cold registry, model unknown, or no OpenCode profile is
-// registered), in which case the caller falls back to the default client.
-func (p *OpenAIProvider) inferOpenCodeEndpoint(model string) *openai.Client {
-	if p.modelInfo == nil || model == "" {
+// inferOpenCodeEndpoint picks the twin client that should serve model on the
+// OpenCode profile prof without a catalog fetch, using the models.dev
+// registry (in-memory/disk cached; never blocks on the network). Go takes
+// precedence: a model listed on both the Go and Zen catalogs routes to the
+// Go endpoint. Returns nil when nothing can be determined (cold registry,
+// model unknown), in which case the caller falls back to the profile's
+// configured endpoint.
+func (p *OpenAIProvider) inferOpenCodeEndpoint(prof *providerProfile, model string) *openai.Client {
+	if p.modelInfo == nil || model == "" || prof == nil {
 		return nil
 	}
-	p.modelsMu.RLock()
-	profiles := p.profiles
-	p.modelsMu.RUnlock()
-	for _, prof := range profiles {
-		if prof.zenStream == nil || prof.goStream == nil {
-			continue // not an OpenCode profile
-		}
-		if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
-			return prof.goStream
-		}
-		if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
-			return prof.zenStream
-		}
+	if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
+		return prof.goStream
+	}
+	if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
+		return prof.zenStream
 	}
 	return nil
-}
-
-// ownerClientForModel returns the stream client of the profile that last
-// served model (and that profile's name), when the profile is still
-// registered: the provider's own sticky-ownership record (modelOwner, from
-// its successful catalog fetches) first, then the process-shared
-// OwnerRegistry (owners learned by sibling providers — a fresh session or
-// subagent provider inherits routing knowledge it cannot gain itself while
-// its owning endpoint is down). This runs BEFORE the models.dev inference
-// and the default-client fallback: a model the user's local endpoint served
-// must keep going there while that endpoint is unreachable, not be re-homed
-// to the default profile (which may be a remote gateway that does not serve
-// it). Returns a nil client when no owner is known or the owner profile is
-// no longer registered, in which case the caller falls through to the
-// deterministic fallback.
-func (p *OpenAIProvider) ownerClientForModel(model string) (*openai.Client, string) {
-	if model == "" {
-		return nil, ""
-	}
-	p.modelsMu.RLock()
-	name, ok := p.modelOwner[model]
-	profiles := p.profiles
-	reg := p.ownerRegistry
-	p.modelsMu.RUnlock()
-	if !ok && reg != nil {
-		name, ok = reg.Owner(model)
-	}
-	if !ok {
-		return nil, ""
-	}
-	for _, prof := range profiles {
-		if prof.name != name {
-			continue
-		}
-		if prof.zenStream != nil && prof.goStream != nil {
-			// OpenCode profile: pick the twin the registry says serves the
-			// model (a Go-subscription model must not hit the Zen endpoint);
-			// a cold registry falls back to the profile's configured
-			// endpoint.
-			if p.modelInfo != nil {
-				if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
-					return prof.goStream, name
-				}
-				if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
-					return prof.zenStream, name
-				}
-			}
-			return prof.stream, name
-		}
-		return prof.stream, name
-	}
-	return nil, ""
 }
 
 func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolUnionParam {

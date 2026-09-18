@@ -433,7 +433,8 @@ mode it is fixed to the project directory and the input is hidden.
   in-flight turn is cancelled and the session's live runtime is released, but
   it stays saved and can be resumed later. Deleting a saved session (✕, with
   confirmation) removes it permanently. Typed `/new`, `/resume <id>`, and
-  `/fork N` replace the *current* pane's session.
+  `/fork N` replace the *current* pane's session — a `/resume` of a session
+  already open as a pane focuses that pane instead.
 - **Background panes keep running**: a turn in a non-focused pane continues
   server-side (amber "responding" indicator in the sidebar) and notifies once
   when it starts. Focus the pane to see it.
@@ -530,9 +531,14 @@ mode it is fixed to the project directory and the input is hidden.
 - **TUI subagents are foreground-only in v1**: the TUI's `subagent` tool runs
   the child to completion inline and returns the final report, but
   `run_in_background` and the control tools (`subagent_fork`, `list_agents`,
-  `send_message`, `interrupt_agent`, `report`) are web-only — they depend on
-  the web server's session registry and delivery worker, which the TUI does
-  not host.
+  `send_message`, `interrupt_agent`) are web-only — they depend on the web
+  server's session registry and delivery worker, which the TUI does not host.
+- **A child has one return channel** (web, like the other agent harnesses):
+  the run's final message — the `subagent` tool result for a foreground
+  child, or the completion notice for a background one — plus one captured
+  reply per `send_message`. Children never push interim messages into the
+  parent conversation as turns; the parent checks `list_agents` (which lists
+  each child's latest progress line) and the user watches the child pane.
 - **Max concurrent subagents** (`subagent_max_concurrent`, default `4`): caps
   how many subagents may run at the same time for one session (web mode). The
   Agent tab's numeric input live-toggles it like the depth field; spawning
@@ -571,6 +577,8 @@ mode it is fixed to the project directory and the input is hidden.
 | `GOGEN_STREAM_RETRY_BACKOFF` | `1s` | Delay before the stream recovery ladder re-requests after a failed stream attempt; doubles per stage (`1s` before the muted streaming retry, `2s` before the non-streaming fallback). An immediate re-request hammers an endpoint that is often busy — the very condition that broke the stream. `0` or `off` retries immediately |
 | `GOGEN_STREAM_STALL` | `10s` | How long a streaming round may see no SSE chunk before the UI switches from "thinking" to a "still waiting on model" label (long prefill or a stalled upstream; informational only — it never interrupts the stream). `0` or `off` disables the signal |
 | `GOGEN_STREAM_DRAIN_GRACE` | `5s` | How long to wait for the promised usage chunk (`stream_options.include_usage`) AFTER the round's finish_reason before treating the round as complete; an endpoint that finishes without usage and holds the connection open would otherwise park the turn until the read idle timeout. `0` or `off` waits for the read idle timeout |
+| `GOGEN_REASONING_ECHO` | `on` | Whether historical assistant reasoning is re-sent as `reasoning_content` on every request. `off` drops it: reasoning can be a third or more of a long session's payload and chat completions is stateless, so the whole of it is re-uploaded on every round — the bytes shrink and stay byte-stable (nothing is sent, so nothing shifts). The model then no longer sees its own earlier thinking, which is what several providers do by stripping replayed reasoning anyway |
+| `GOGEN_IMAGE_MAX_EDGE` | `1568` | Long-edge pixel budget for attached images (`read_image` and pasted screenshots). Anything larger is downscaled and re-encoded as JPEG at ingest, because every subsequent request re-uploads the image: a 3.5 MB screenshot is ~4.7 MB of base64 **per round**, while vision models resize to roughly this size internally and never see the extra pixels. PNG/JPEG only — WebP/BMP/GIF pass through untouched. `0` or `off` attaches images byte-for-byte |
 
 ### Example
 ```bash
@@ -722,14 +730,13 @@ The agent has access to the following tools:
 | `board` | Project kanban board (when `board: on`): list/show/add/update/claim/move/block/comment/done/remove (update edits title/description/priority/context; remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
 | `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the final report returns as the tool result. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
 | `subagent_fork` | Fork a child session seeded with a deep copy of this session's history and run one turn on it (web only, when `subagent: on`) |
-| `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth (web only, when `subagent: on`) |
-| `send_message` | Send a message to a running background subagent of this session (web only, when `subagent: on`) |
+| `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth, and each child's latest progress line (web only, when `subagent: on`) |
+| `send_message` | Send a message to a background subagent of this session — running, interrupted, or finished-but-retained — (web only, when `subagent: on`); the child's reply is injected into this session when the turn finishes |
 | `interrupt_agent` | Cancel a running background subagent's in-flight turn (web only, when `subagent: on`) |
-| `report` | Child-scoped: return a subagent's final report to its parent (web only, when `subagent: on`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |
 | `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |
-| `background_job` | Inspect or feed a background job (`execute_command background=true`): `action=status` (output tail), `action=cancel`, or `action=input` (write to the job's stdin) |
+| `background_job` | Manage a background job (`execute_command background=true`): `action=status` (output tail), `action=wait` (block until it exits; `timeout_ms` default 60s, max 10m — on timeout the job keeps running), `action=cancel`, `action=input` (write to the job's stdin), or `action=list` (every live job in this session) |
 
 Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>`. The system prompt carries the `Additional mcp_* tools may be available.` line only while such a registry is attached — with MCP off (the default) the session never advertises tools it does not have.
 

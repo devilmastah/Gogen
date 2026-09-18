@@ -21,15 +21,18 @@ const version = 1
 const legacyLabelMaxLen = 50
 
 type file struct {
-	Version       int       `json:"version"`
-	ID            string    `json:"id"`
-	Created       time.Time `json:"created"`
-	Updated       time.Time `json:"updated"`
-	WorkingDir    string    `json:"workingDir"`
-	Model         string    `json:"model"`
-	Mode          string    `json:"mode"`
-	ThinkingLevel string    `json:"thinkingLevel,omitempty"`
-	Label         string    `json:"label,omitempty"`
+	Version    int       `json:"version"`
+	ID         string    `json:"id"`
+	Created    time.Time `json:"created"`
+	Updated    time.Time `json:"updated"`
+	WorkingDir string    `json:"workingDir"`
+	Model      string    `json:"model"`
+	// ModelProvider is the provider profile owning Model ("" in legacy
+	// files; restored as the default profile's model).
+	ModelProvider string `json:"modelProvider,omitempty"`
+	Mode          string `json:"mode"`
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
+	Label         string `json:"label,omitempty"`
 	// LabelRenamed records that Label was set deliberately (RenameSession /
 	// session_rename tool) rather than derived from the first user message.
 	// The store must never regenerate a renamed label — not even one that

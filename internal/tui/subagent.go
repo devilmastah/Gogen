@@ -52,13 +52,7 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 		openaiProv := llm.NewOpenAIProviderWithProfiles(
 			llm.ProviderProfiles(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.OpenAIProviders),
 			cfg.OpenAIModel, parent.WorkingDir, nil)
-		// Share the parent's model→profile owner record: a child provider
-		// whose owning endpoint is down still routes inherited models to
-		// that endpoint instead of falling back to the default profile
-		// (the child's own catalog merge cannot map the model while the
-		// owner is unreachable).
 		if pp, ok := parent.Provider.(*llm.OpenAIProvider); ok {
-			openaiProv.SetOwnerRegistry(pp.OwnerRegistry())
 			// Share the parent's per-endpoint catalog cache too: a child
 			// must not re-download the catalog the parent already holds.
 			openaiProv.SetEndpointCatalog(pp.EndpointCatalog())
@@ -97,8 +91,10 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 	// the default the child is already seeded with). The explicit
 	// argument is a hard requirement and fails the spawn when
 	// unselectable; the other tiers fall back to the seeded default
-	// (fail open).
-	m, src := agent.ResolveSubagentModel(model, cfg.SubagentModel, parent.CurrentModel(), cfg.OpenAIModel)
+	// (fail open). The parent tier passes the qualified selector form
+	// ("profile/id" for a non-default owner) so the child selects the
+	// SAME (profile, ID) the parent runs on.
+	m, src := agent.ResolveSubagentModel(model, cfg.SubagentModel, parent.CurrentModelRef().String(), cfg.OpenAIModel)
 	if err := agent.ApplySubagentModel(ctx, child, m, src); err != nil {
 		return "", err
 	}

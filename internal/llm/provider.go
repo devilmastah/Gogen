@@ -160,6 +160,19 @@ type LLMProvider interface {
 	SetThinkingLevel(level string)
 }
 
+// ModelRefProvider is implemented by providers that route models by the
+// (provider profile, model ID) pair instead of the bare model ID alone
+// (OpenAIProvider: model IDs are not unique across registered providers).
+// It is optional: providers without it (test stubs) treat every model as
+// belonging to the default profile.
+type ModelRefProvider interface {
+	// SetModelRef selects the model AND its owning profile in one step.
+	SetModelRef(ref ModelRef) error
+	// CurrentModelRef returns the current model's routing key (owning
+	// profile + bare wire ID; zero ID = no model selected).
+	CurrentModelRef() ModelRef
+}
+
 // ReasoningEffortsProvider is implemented by providers that can report the
 // reasoning-effort values the current model accepts (from the models.dev
 // registry, or derived from a llama.cpp /props capability probe for unknown
@@ -167,19 +180,19 @@ type LLMProvider interface {
 // providers with no registry data) fall back to DefaultReasoningEfforts.
 type ReasoningEffortsProvider interface {
 	// ModelReasoningEfforts returns the effective reasoning-effort options for
-	// modelID: the models.dev accepted set when the model is known (empty for
+	// ref: the models.dev accepted set when the model is known (empty for
 	// toggle/budget-only models, meaning no effort control), else
 	// DefaultReasoningEfforts. Must never block on the network.
-	ModelReasoningEfforts(modelID string) []string
+	ModelReasoningEfforts(ref ModelRef) []string
 }
 
 // ModelDescriptionProvider is implemented by providers that can report the
 // models.dev description of a model. It is optional: providers without it
 // yield an empty description (no tooltip in the UI).
 type ModelDescriptionProvider interface {
-	// ModelDescription returns the models.dev description for modelID, or ""
+	// ModelDescription returns the models.dev description for ref, or ""
 	// when the model is unknown. Must never block on the network.
-	ModelDescription(modelID string) string
+	ModelDescription(ref ModelRef) string
 }
 
 // Message represents a chat message.

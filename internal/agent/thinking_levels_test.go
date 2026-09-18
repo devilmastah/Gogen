@@ -29,8 +29,8 @@ func (s *effortStub) ModelName() string { return s.model }
 
 func (s *effortStub) SetThinkingLevel(string) {}
 
-func (s *effortStub) ModelReasoningEfforts(modelID string) []string {
-	switch modelID {
+func (s *effortStub) ModelReasoningEfforts(ref llm.ModelRef) []string {
+	switch ref.ID {
 	case "glm-5.2":
 		return []string{"high", "max"}
 	case "glm-5":

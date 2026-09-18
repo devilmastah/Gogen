@@ -1133,7 +1133,13 @@ func (m *Model) loadSelectedModel(thinking agent.ThinkingLevel) (tea.Model, tea.
 	}
 	m.modal = ModalNone
 	a := m.agent
+	// Qualified selector for a non-default owner: the same model ID may be
+	// listed by several providers, and the row's group names the one the
+	// user picked (bare ids resolve to the first-listing profile).
 	id := mdl.ID
+	if prov := modelProviderName(mdl); prov != "default" {
+		id = prov + "/" + id
+	}
 	base := m.ctx
 	if base == nil {
 		base = context.Background()

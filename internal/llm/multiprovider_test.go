@@ -31,10 +31,10 @@ func catalogHandler(models ...string) *httptest.Server {
 }
 
 // TestListModelsAggregatesProfiles verifies the aggregated catalog: models
-// from every registered profile are merged into one list, each tagged with
-// its owning profile name, and a duplicate model ID resolves to the FIRST
-// profile (default wins — the model-picker grouping and the routing map
-// always agree).
+// from every registered profile are concatenated into one list, each tagged
+// with its owning profile name. A duplicate model ID appears once per
+// profile that lists it (providers are separate instances — the picker shows
+// each copy under its own group, and routing is per (profile, ID)).
 func TestListModelsAggregatesProfiles(t *testing.T) {
 	defSrv := catalogHandler("gpt-4o", "shared-model")
 	locSrv := catalogHandler("llama3.1", "shared-model")
@@ -50,21 +50,24 @@ func TestListModelsAggregatesProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	byID := make(map[string]ModelInfo, len(models))
+	if len(models) != 4 {
+		t.Fatalf("aggregated catalog has %d entries, want 4 (no cross-provider dedupe): %+v", len(models), models)
+	}
+	byRef := make(map[string]ModelInfo, len(models))
 	for _, m := range models {
-		byID[m.ID] = m
+		byRef[m.Provider+"/"+m.ID] = m
 	}
-	if len(byID) != 3 {
-		t.Fatalf("aggregated catalog has %d models, want 3 (dup deduped): %+v", len(byID), models)
+	if got := byRef["default/gpt-4o"].Provider; got != "default" {
+		t.Fatalf("gpt-4o provider = %q, want default", got)
 	}
-	if byID["gpt-4o"].Provider != "default" {
-		t.Fatalf("gpt-4o provider = %q, want default", byID["gpt-4o"].Provider)
+	if got := byRef["local-llama/llama3.1"].Provider; got != "local-llama" {
+		t.Fatalf("llama3.1 provider = %q, want local-llama", got)
 	}
-	if byID["llama3.1"].Provider != "local-llama" {
-		t.Fatalf("llama3.1 provider = %q, want local-llama", byID["llama3.1"].Provider)
+	if _, ok := byRef["default/shared-model"]; !ok {
+		t.Fatal("shared-model missing under the default profile")
 	}
-	if byID["shared-model"].Provider != "default" {
-		t.Fatalf("shared-model provider = %q, want default (first profile wins)", byID["shared-model"].Provider)
+	if _, ok := byRef["local-llama/shared-model"]; !ok {
+		t.Fatal("shared-model missing under the local-llama profile")
 	}
 }
 
@@ -148,12 +151,13 @@ func TestListModelsHangingProfileCostsOnlyItsOwnBudget(t *testing.T) {
 	}
 }
 
-// TestClientForModelRoutesToOwningProfile verifies per-model routing: after
-// the aggregated catalog fetch, each model's chat/stream requests go to its
-// OWN profile's endpoint (the backend knows the endpoint for every model in
-// the picker).
+// TestClientForModelRoutesToOwningProfile verifies per-model routing: a
+// model's chat/stream requests go to the endpoint of the profile the model
+// was picked under (the ModelRef routing key) — the same ID picked under a
+// different profile routes to THAT profile's endpoint, not the first
+// catalog that lists it.
 func TestClientForModelRoutesToOwningProfile(t *testing.T) {
-	defSrv := catalogHandler("gpt-4o")
+	defSrv := catalogHandler("gpt-4o", "llama3.1")
 	locSrv := catalogHandler("llama3.1")
 	t.Cleanup(defSrv.Close)
 	t.Cleanup(locSrv.Close)
@@ -175,18 +179,27 @@ func TestClientForModelRoutesToOwningProfile(t *testing.T) {
 	locStream := p.profiles[1].stream
 	p.modelsMu.RUnlock()
 
-	p.model = "gpt-4o"
-	if got := p.clientForModel(context.Background()); got != defStream {
-		t.Fatal("gpt-4o routed to the wrong endpoint (want default profile)")
+	// The same ID under two profiles: the routing key (profile + ID)
+	// decides, not the catalog listing.
+	if err := p.SetModelRef(ModelRef{Profile: "default", ID: "llama3.1"}); err != nil {
+		t.Fatal(err)
 	}
-	p.model = "llama3.1"
+	if got := p.clientForModel(context.Background()); got != defStream {
+		t.Fatal("llama3.1 picked under default routed to the wrong endpoint (want default profile)")
+	}
+	if err := p.SetModelRef(ModelRef{Profile: "local-llama", ID: "llama3.1"}); err != nil {
+		t.Fatal(err)
+	}
 	if got := p.clientForModel(context.Background()); got != locStream {
-		t.Fatal("llama3.1 routed to the wrong endpoint (want local-llama profile)")
+		t.Fatal("llama3.1 picked under local-llama routed to the wrong endpoint (want local-llama profile)")
 	}
-	// Unknown model falls back to the default profile's client.
-	p.model = "not-listed"
+	// Unknown model on the default profile falls back to the default
+	// profile's client.
+	if err := p.SetModelRef(ModelRef{Profile: "default", ID: "not-listed"}); err != nil {
+		t.Fatal(err)
+	}
 	if got := p.clientForModel(context.Background()); got != defStream {
-		t.Fatal("unknown model should fall back to the default client")
+		t.Fatal("unknown model on the default profile should fall back to the default client")
 	}
 }
 
@@ -279,7 +292,7 @@ func TestDefaultBaseURLTracksSetProfiles(t *testing.T) {
 	if got := p.propsBaseURLForCurrentModel(); got != newSrv.URL {
 		t.Fatalf("post-swap props base URL = %q, want %q", got, newSrv.URL)
 	}
-	if got := p.modelsDevURLsFor("gpt-4o"); len(got) == 0 || got[0] != newSrv.URL {
+	if got := p.modelsDevURLsFor(ModelRef{ID: "gpt-4o"}); len(got) == 0 || got[0] != newSrv.URL {
 		t.Fatalf("post-swap models.dev URLs = %v, want %q first", got, newSrv.URL)
 	}
 }
@@ -325,11 +338,11 @@ func TestModelsDevURLsForOwningProfile(t *testing.T) {
 	if _, err := p.ListModels(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.modelsDevURLsFor("llama3.1"); len(got) != 1 || got[0] != locSrv.URL+"/v1" {
+	if got := p.modelsDevURLsFor(ModelRef{ID: "llama3.1"}); len(got) != 1 || got[0] != locSrv.URL+"/v1" {
 		t.Fatalf("models.dev URLs for llama3.1 = %v, want [%s]", got, locSrv.URL+"/v1")
 	}
 	// Unknown model falls back to the default profile's URLs.
-	if got := p.modelsDevURLsFor("unknown"); len(got) != 1 || got[0] != defSrv.URL+"/v1" {
+	if got := p.modelsDevURLsFor(ModelRef{ID: "unknown"}); len(got) != 1 || got[0] != defSrv.URL+"/v1" {
 		t.Fatalf("models.dev URLs for unknown = %v, want [%s]", got, defSrv.URL+"/v1")
 	}
 }
@@ -451,7 +464,7 @@ func TestSetProfilesDropsOpenCodeRouting(t *testing.T) {
 	if p.hasOpenCodeProfile() {
 		t.Fatal("plain profiles must not report opencode after SetProfiles")
 	}
-	if got := p.inferOpenCodeEndpoint("gpt-4o"); got != nil {
+	if got := p.inferOpenCodeEndpoint(p.profiles[0], "gpt-4o"); got != nil {
 		t.Fatal("inferOpenCodeEndpoint must return nil once no opencode profile is registered")
 	}
 	// Reverse swap: SetProfiles to an OpenCode endpoint flips detection on.
@@ -524,7 +537,7 @@ func TestSetProfilesDiscardsInFlightFetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "new-model" {
+	if len(models) != 1 || models[0].model.ID != "new-model" {
 		t.Fatalf("models after SetProfiles = %+v, want [new-model]", models)
 	}
 }

@@ -20,9 +20,10 @@ import (
 // not of a session, so it belongs in one process-scoped cache.
 //
 // Sharing is safe because a catalog entry is pure endpoint data: the model
-// list and its raw JSON. Everything session-specific — which profile wins a
-// duplicate model ID, the model → client routing map, sticky ownership — is
-// still derived per provider from the shared list.
+// list and its raw JSON. Everything session-specific — the per-entry
+// profile tags, the model → client routing map (the OpenCode profiles'
+// zen/go twin routing) — is still derived per provider from the shared
+// lists.
 //
 // A nil *EndpointCatalog is not usable; providers built without one (tests,
 // direct construction) fetch directly, exactly as before.

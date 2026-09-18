@@ -115,7 +115,7 @@ func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.Ch
 // one has been probed, else DefaultReasoningEfforts. Never blocks — registry
 // lookups and the derived cache are in-memory map reads.
 func (p *OpenAIProvider) acceptedReasoningEfforts() []string {
-	return p.ModelReasoningEfforts(p.currentModel())
+	return p.ModelReasoningEfforts(p.CurrentModelRef())
 }
 
 // templateSupportsPreserveReasoning probes llama.cpp GET /props once per
@@ -198,11 +198,20 @@ func (p *OpenAIProvider) propsCapsCache() *PropsCapsCache {
 }
 
 // propsBaseURLForModel returns the base URL of the endpoint that serves
-// modelID: the model's owning profile when the catalog has been fetched, else
-// the default profile's base URL.
+// modelID: the model's owning profile when the catalog has been fetched (a
+// bare ID resolves to the first cached entry that lists it), else the
+// default profile's base URL.
 func (p *OpenAIProvider) propsBaseURLForModel(modelID string) string {
 	p.modelsMu.RLock()
-	info := p.modelProfile[modelID]
+	info := p.modelProfile[ModelRef{ID: modelID}]
+	if info.baseURL == "" {
+		for _, cm := range p.modelsCache {
+			if cm.model.ID == modelID {
+				info = p.modelProfile[ModelRef{Profile: cm.profile, ID: modelID}]
+				break
+			}
+		}
+	}
 	p.modelsMu.RUnlock()
 	if info.baseURL != "" {
 		return info.baseURL

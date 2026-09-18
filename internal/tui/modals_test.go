@@ -309,8 +309,8 @@ func (p *modelsTestProvider) ModelName() string { return p.current }
 
 func (p *modelsTestProvider) SetThinkingLevel(level string) {}
 
-func (p *modelsTestProvider) ModelReasoningEfforts(modelID string) []string {
-	if e, ok := p.efforts[modelID]; ok {
+func (p *modelsTestProvider) ModelReasoningEfforts(ref llm.ModelRef) []string {
+	if e, ok := p.efforts[ref.ID]; ok {
 		return e
 	}
 	return llm.DefaultReasoningEfforts

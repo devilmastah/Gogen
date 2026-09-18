@@ -8,9 +8,16 @@ import (
 
 // SessionSnapshot is persisted conversation state.
 type SessionSnapshot struct {
-	WorkingDir    string
-	Oneshot       bool
-	Model         string
+	WorkingDir string
+	Oneshot    bool
+	// Model is the bare model ID the endpoint expects on the wire.
+	Model string
+	// ModelProvider is the registered provider profile that owns Model
+	// ("" in legacy snapshots = the default profile). Restored together
+	// with Model as the routing key; an empty value restores the model
+	// under the default profile (legacy snapshots predate per-profile
+	// routing).
+	ModelProvider string
 	Mode          string
 	ThinkingLevel string // persisted thinking level; empty/absent means "off"
 	Label         string

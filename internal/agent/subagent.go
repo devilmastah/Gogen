@@ -181,8 +181,13 @@ type SubagentSpawner interface {
 // for background/continuable subagents (web host; the TUI stays foreground
 // in v1). When the installed spawner implements it, the subagent tool gains
 // run_in_background and the control tools (subagent_fork, list_agents,
-// send_message, interrupt_agent) are registered; report is additionally
-// child-scoped via the agent's report hook.
+// send_message, interrupt_agent) are registered.
+//
+// Return contract (one channel per run, as in the other harnesses): a
+// background child's outcome reaches the parent exactly once — the
+// completion notice delivered by the spawner, plus one captured reply per
+// send_message. Progress is pull-side via ListAgents; children never push
+// intermediate messages into the parent conversation.
 type ContinuableSubagentSpawner interface {
 	// SpawnBackground starts a nested session that keeps running after this
 	// call returns. The parent is notified (delivery service) when the
@@ -194,7 +199,7 @@ type ContinuableSubagentSpawner interface {
 	// prompt. Returns the fork's final output.
 	Fork(ctx context.Context, parent *Agent, job string, depth int) (string, error)
 	// ListAgents lists the caller's live children (id, label, status,
-	// depth) as a human-readable listing.
+	// depth, latest progress line) as a human-readable listing.
 	ListAgents(caller *Agent) (string, error)
 	// SendMessage delivers text to a live child of caller as a new user
 	// message; queued when the child is mid-turn.
@@ -245,22 +250,30 @@ func subagentForkToolDef() llm.Tool {
 	)
 }
 
-// listAgentsToolDef is the schema for the read-only live-child listing.
+// listAgentsToolDef is the schema for the read-only live-child listing. Each
+// child's latest progress line is included (bounded): this is the PULL side
+// of a background child's progress — reports are never pushed into the
+// parent's conversation as turns, so the model checks deliberately.
 func listAgentsToolDef() llm.Tool {
 	return toolDef("list_agents",
-		"List this session's child subagents: id, label, status (running/idle/finished), depth. "+
-			"Read-only. Use to resolve agent ids for send_message/interrupt_agent or check background "+
-			"status. Finished children remain listed briefly.",
+		"List this session's child subagents: id, label, status (running/idle/finished), depth, and each "+
+			"child's latest progress line. Read-only. Use to resolve agent ids for send_message/"+
+			"interrupt_agent, to check background status, or to see what a child is doing. Finished "+
+			"children remain listed briefly.",
 		toolSchema(map[string]any{}),
 	)
 }
 
-// sendMessageToolDef is the schema for steering a background subagent.
+// sendMessageToolDef is the schema for steering/resuming a background
+// subagent: the message is delivered as its next user turn (queued when it
+// is mid-turn) and the child's reply is injected into this session as one
+// message when that turn finishes — the single return channel per run.
 func sendMessageToolDef() llm.Tool {
 	return toolDef("send_message",
-		"Send a message to a running background subagent (agent_id); queued if it is mid-turn. "+
-			"Its reply is injected into this session when it finishes. Use to steer a background subagent: "+
-			"new instructions, changed requirements, or stop-and-report.",
+		"Send a message to a background subagent of this session (agent_id) — running, interrupted, or "+
+			"finished-but-retained; queued if it is mid-turn. Its reply is injected into this session "+
+			"when the turn finishes. Use to steer a background subagent, to ask a finished one a "+
+			"follow-up (resuming it), or to request a stop-and-report.",
 		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 			"message":  toolProp("string", "The message to deliver to the subagent"),
@@ -277,19 +290,6 @@ func interruptAgentToolDef() llm.Tool {
 		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 		}, "agent_id"),
-	)
-}
-
-// reportToolDef is the schema for the child-scoped progress report. It is
-// exposed ONLY to agents that are themselves live nested children with an
-// installed report hook.
-func reportToolDef() llm.Tool {
-	return toolDef("report",
-		"Send a progress update to the parent session (starts a turn there; queued if busy). Use to "+
-			"surface findings, hand back partial results, or ask the parent for input. Child-only.",
-		toolSchema(map[string]any{
-			"message": toolProp("string", "Progress update for the parent"),
-		}, "message"),
 	)
 }
 
@@ -397,20 +397,6 @@ func handleInterruptAgent(_ context.Context, a *Agent, args map[string]any) (str
 	return fmt.Sprintf("Interrupted subagent %s.", agentID), nil
 }
 
-// handleReport delivers a progress message from a child to its live parent.
-// Reachable only for nested children with an installed report hook (all
-// tool surfaces gate on that), so the hook nil-guard is the only check.
-func handleReport(_ context.Context, a *Agent, args map[string]any) (string, error) {
-	message, err := stringArg(args, "message")
-	if err != nil {
-		return "", err
-	}
-	if err := a.reportToParent(message); err != nil {
-		return "", err
-	}
-	return "Reported to the parent session.", nil
-}
-
 // SetSubagentSpawner installs the nested-session runner (nil detaches).
 // Called once at startup by the web server and TUI runner; the subagent tool
 // stays gated on SubagentsEnabled regardless.
@@ -444,9 +430,6 @@ func (a *Agent) SubagentDepth() int {
 // (empty clears the mark).
 func (a *Agent) SetParentID(parentID string) {
 	a.parentID.Store(parentID)
-	// ParentID gates the child-scoped report tool (llmTools), so a change
-	// invalidates the cached wire overhead.
-	a.noteToolsChanged()
 }
 
 // ParentID returns the parent session id for nested (subagent) sessions
@@ -484,39 +467,15 @@ func (a *Agent) SubagentOutcome() (string, string) {
 	return o.Status, o.Summary
 }
 
-// SetReportHook installs the child-scoped report hook (continuable
-// subagents only): delivering a progress message to the live parent
-// session. nil detaches (the report tool is then not registered).
-func (a *Agent) SetReportHook(h func(text string) error) {
-	a.reportHookMu.Lock()
-	a.reportHook = h
-	a.reportHookMu.Unlock()
-	a.noteToolsChanged()
-}
-
-// ReportHook returns the installed report hook (nil when this agent is not
-// a continuable child).
-func (a *Agent) ReportHook() func(text string) error {
-	a.reportHookMu.RLock()
-	defer a.reportHookMu.RUnlock()
-	return a.reportHook
-}
-
-// reportToParent delivers a progress message to the live parent session via
-// the installed hook.
-func (a *Agent) reportToParent(text string) error {
-	a.reportHookMu.RLock()
-	h := a.reportHook
-	a.reportHookMu.RUnlock()
-	if h == nil {
-		return fmt.Errorf("report is not available in this session")
-	}
-	return h(text)
-}
-
 // subagentWiring groups the nested-session (subagent) state: the installed
-// spawner, this agent's nesting depth and parent link, the persisted
-// subagent outcome, and the child-scoped report hook.
+// spawner, this agent's nesting depth and parent link, and the persisted
+// subagent outcome. A child has exactly ONE return channel per run — its
+// final message (the spawn tool result, or the completion notice delivered
+// by the host) plus, per send_message, the captured reply — mirroring the
+// one-channel model of the other harnesses (Claude Code's task
+// notification, OpenCode's task_result injection, Goose's task_results).
+// Children never push progress into the parent conversation as turns; the
+// parent PULLS progress (list_agents).
 type subagentWiring struct {
 	// spawnerMu guards spawner (the nested-session runner installed once at
 	// startup by the server/TUI). Reads happen per turn (llmTools,
@@ -537,11 +496,4 @@ type subagentWiring struct {
 	// true result after a reload/restart, when the subagent_started/
 	// finished events are not replayed.
 	subagentOutcome atomic.Value // *subagentOutcome
-
-	// reportHookMu guards reportHook: the web spawner installs it on
-	// continuable children so the child-scoped report tool can deliver a
-	// progress message into the live parent session. Nil for non-children
-	// and TUI children (the report tool is gated on it).
-	reportHookMu sync.RWMutex
-	reportHook   func(text string) error
 }

@@ -61,11 +61,25 @@ function appendModelGroupHeader(listEl, name) {
     listEl.appendChild(header);
 }
 
+// selectorFor returns the selection value for a catalog row: the bare
+// model id for the default profile, the qualified "provider/id" form for
+// non-default groups. Model ids are not unique across providers, so the
+// owning profile must travel with the selection (the server resolves the
+// qualified form against the catalog).
+function selectorFor(m) {
+    const provider = m.provider || 'default';
+    return (provider !== 'default') ? provider + '/' + m.id : m.id;
+}
+
 // buildModelRow renders one model row: description tooltip,
 // context-limit chip, and the current-model check. onSelect receives
-// (id, active, event); the caller decides what selecting means.
+// (selector, active, event); the caller decides what selecting means.
 function buildModelRow(m, current, onSelect) {
-    const active = m.id === current || m.current;
+    // The catalog's `current` flag is per (provider, id) — it marks only
+    // the copy the pane actually runs on. When the flag is absent (older
+    // payloads, the subagent picker strips it), compare the row's own
+    // selector against the passed current value.
+    const active = m.current === true || (m.current == null && selectorFor(m) === current);
     const row = document.createElement('button');
     row.className = 'tb-model-row' + (active ? ' active' : '');
     row.type = 'button';
@@ -88,7 +102,7 @@ function buildModelRow(m, current, onSelect) {
     }
     row.addEventListener('click', (e) => {
         e.stopPropagation();
-        onSelect(m.id, active, e);
+        onSelect(selectorFor(m), active, e);
     });
     return row;
 }

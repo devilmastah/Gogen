@@ -110,12 +110,6 @@ func (a *Agent) featureTools() []featureTool {
 				featureTool{Name: "send_message", Definition: sendMessageToolDef(), Handler: handleSendMessage},
 				featureTool{Name: "interrupt_agent", Definition: interruptAgentToolDef(), Handler: handleInterruptAgent},
 			)
-			// report is child-scoped: only nested agents with an installed
-			// report hook see it (a restored subagent session reopened by a
-			// user has ParentID but no hook, so it stays hidden).
-			if a.ParentID() != "" && a.ReportHook() != nil {
-				out = append(out, featureTool{Name: "report", Definition: reportToolDef(), Handler: handleReport})
-			}
 		}
 	}
 	if a.SkillsEnabled() && a.SkillsManager() != nil {

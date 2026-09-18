@@ -169,11 +169,12 @@ func (p *OpenAIProvider) ProbeReasoningEfforts(ctx context.Context, modelID stri
 	if strings.TrimSpace(baseURL) == "" {
 		return false, nil // official API: no llama.cpp capability discovery
 	}
+	ref := p.refForModelID(modelID).Normalized()
 	p.effortsMu.Lock()
 	if p.effortsDerived == nil {
-		p.effortsDerived = make(map[string]derivedEfforts)
+		p.effortsDerived = make(map[ModelRef]derivedEfforts)
 	}
-	prev, ok := p.effortsDerived[modelID]
+	prev, ok := p.effortsDerived[ref]
 	if ok && prev.probed && prev.baseURL == baseURL {
 		p.effortsMu.Unlock()
 		return false, nil // already derived for this endpoint
@@ -195,7 +196,7 @@ func (p *OpenAIProvider) ProbeReasoningEfforts(ctx context.Context, modelID stri
 		effective = prev.efforts
 	}
 	p.effortsMu.Lock()
-	p.effortsDerived[modelID] = derivedEfforts{probed: true, efforts: efforts, baseURL: baseURL}
+	p.effortsDerived[ref] = derivedEfforts{probed: true, efforts: efforts, baseURL: baseURL}
 	p.effortsMu.Unlock()
 	return !slices.Equal(effective, efforts), nil
 }
@@ -371,6 +372,6 @@ func llamaApplyTemplateURL(baseURL, modelID string) string {
 // may no longer describe the serving endpoint.
 func (p *OpenAIProvider) invalidateReasoningEfforts() {
 	p.effortsMu.Lock()
-	p.effortsDerived = make(map[string]derivedEfforts)
+	p.effortsDerived = make(map[ModelRef]derivedEfforts)
 	p.effortsMu.Unlock()
 }

@@ -64,7 +64,7 @@ func reasoningEffortsUnsupported(a *agent.Agent) bool {
 		return false
 	}
 	if p, ok := a.Provider.(*llm.OpenAIProvider); ok {
-		return p.ReasoningEffortUnsupported(a.CurrentModel())
+		return p.ReasoningEffortUnsupported(a.CurrentModelRef())
 	}
 	return false
 }
@@ -140,7 +140,7 @@ func echoConfigOffLoop(ws *wsConn, ctx context.Context, a *agent.Agent, cfg *WSM
 // registry cache (never blocks — pure map lookup).
 func fillModelPricing(a *agent.Agent, msg *WSMessage) {
 	if p, ok := a.Provider.(*llm.OpenAIProvider); ok && msg.Model != "" {
-		if in, out, cached, ok := p.ModelPricing(msg.Model); ok {
+		if in, out, cached, ok := p.ModelPricing(a.CurrentModelRef()); ok {
 			msg.InputPricePer1M = in
 			msg.OutputPricePer1M = out
 			msg.CachedPricePer1M = cached
@@ -160,7 +160,7 @@ func (s *Server) isValidThinkingLevel(a *agent.Agent, v string) bool {
 	}
 	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
 		// Membership check against the normalized value ("Max" → "max").
-		return slices.Contains(p.ModelReasoningEfforts(a.CurrentModel()), string(level))
+		return slices.Contains(p.ModelReasoningEfforts(a.CurrentModelRef()), string(level))
 	}
 	return true
 }

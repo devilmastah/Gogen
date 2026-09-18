@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -344,4 +345,55 @@ func TestDeliverToParentQueuesUntilRegistered(t *testing.T) {
 	if queued != 0 {
 		t.Fatalf("queued after flush = %d, want 0", queued)
 	}
+}
+
+// TestDeliverStartHookArmsOnlyChildMessages pins the delivery-source gate on
+// the per-runtime start hook (the continuable-subagent reply capture): a
+// plain system notice must NOT fire it, a send_message delivery
+// (deliverChildMessage) must fire it exactly once. Without the gate, a
+// child's reaction to any machine message (job notice, subagent report,
+// completion notice) is injected into its parent as an unsolicited reply.
+func TestDeliverStartHookArmsOnlyChildMessages(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	p := llmtest.NewMockProvider()
+	p.StreamResults = []*llm.StreamResult{{Content: "ack"}, {Content: "ack2"}}
+	a.Provider = p
+
+	// Keep a client attached so the delivered turns cannot orphan-evict the
+	// runtime between the two deliveries.
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	var fired atomic.Int32
+	rt.deliverStartHook = func() { fired.Add(1) }
+
+	// A plain system notice starts its turn without arming the capture (the
+	// hook fires BEFORE startTurn, so observing the delivered message proves
+	// the decision has been made).
+	if !rt.deliverToSession("plain notice") {
+		t.Fatal("system notice refused")
+	}
+	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "plain notice") })
+	if got := fired.Load(); got != 0 {
+		t.Fatalf("start hook fired %d times for a system notice, want 0", got)
+	}
+
+	// A send_message delivery arms it exactly once.
+	if !rt.deliverChildMessage("child message") {
+		t.Fatal("child message refused")
+	}
+	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "child message") })
+	if got := fired.Load(); got != 1 {
+		t.Fatalf("start hook fired %d times for a child message, want 1", got)
+	}
+	waitForParentDeliveriesSettled(t, s, a)
 }

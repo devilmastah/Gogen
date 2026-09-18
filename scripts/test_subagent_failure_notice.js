@@ -1,20 +1,23 @@
 'use strict';
-// Regression test for the live-only subagent failure notice: when a
-// background subagent FAILS, the parent's chat shows an ephemeral system
-// line with the failure reason (from the subagent_finished event's
-// subagentSummary). The line is NOT part of the transcript: it carries no
-// hist-idx, so history replay (reload / pane switch / turn convergence)
-// removes it. A successful finish appends nothing, and a failure whose
-// parent session has no open pane updates the sidebar only.
+// Regression test for the subagent failure notice: when a background
+// subagent FAILS, its failure reason (the subagent_finished event's
+// subagentSummary) is surfaced as a TOAST — never as a chat line. The
+// completion notice already reaches the parent MODEL as a persisted user
+// message (the delivery service) and the nested sidebar row shows the
+// failed state, so a rendered system bubble would duplicate the failure in
+// the transcript (and it was ephemeral anyway — any history rebuild removed
+// it). A successful finish toasts nothing, and a failure whose parent
+// session has no open pane still toasts (the event is sidebar-global)
+// while touching no transcript.
 //
 // Loads the real index.html + app.js into jsdom (imports stripped, editor/
 // marked/dompurify stubbed) with a controllable WebSocket stub, then:
 //   1. adopts a parent session A as the active pane
-//   2. subagent_finished (failed) for child C of A → system line with the
-//      label + reason, and NO data-hist-idx
-//   3. subagent_finished (success) for child S of A → no new system line
-//   4. subagent_finished (failed) for child X of parent B (no pane) → no
-//      new system line
+//   2. subagent_finished (failed) for child C of A → one error toast with
+//      the label + reason, and NO transcript line
+//   3. subagent_finished (success) for child S of A → no new toast
+//   4. subagent_finished (failed) for child X of parent B (no pane) → a
+//      toast, still no transcript line
 //
 // Run: node scripts/test_subagent_failure_notice.js
 // APPJS env var selects the app.js copy to test (defaults to the real one).
@@ -81,7 +84,8 @@ async function main() {
     console.log(`${ok ? 'PASS' : 'FAIL'}: ${desc}`);
     if (!ok) failures++;
   };
-  const systemLines = () => [...window.document.querySelectorAll('#messages .message.system')];
+  const toasts = () => [...window.document.querySelectorAll('#toast-host .toast')];
+  const chatMessages = () => [...window.document.querySelectorAll('#messages .message')];
 
   // 1. Connect and adopt the parent session A as the active pane.
   ws.readyState = FakeWS.OPEN;
@@ -94,8 +98,9 @@ async function main() {
   if (window.eval('activePane().id') !== 'A') throw new Error('parent pane A not adopted');
 
   // 2. A background child of A FAILS: the event carries the reason in
-  //    subagentSummary. The active parent pane must show an ephemeral
-  //    system line with the label and the reason.
+  //    subagentSummary. The failure must surface as an error toast with the
+  //    label and the reason — and append NOTHING to the transcript (the
+  //    delivered completion notice is the persisted copy).
   recv({
     type: 'subagent_started', subagentId: 'C', subagentParent: 'A',
     subagentLabel: 'subagent: fix parser', subagentJob: 'fix parser',
@@ -105,15 +110,14 @@ async function main() {
     subagentLabel: 'subagent: fix parser', subagentSuccess: false,
     subagentSummary: 'provider exploded',
   });
-  let lines = systemLines();
-  check('failed child appends a system line to the parent chat', lines.length === 1);
-  const text = lines[0] ? lines[0].textContent : '';
-  check('system line names the child and the failure reason',
+  let shown = toasts();
+  check('failed child shows one error toast', shown.length === 1 && shown[0].dataset.kind === 'error');
+  const text = shown[0] ? shown[0].textContent : '';
+  check('toast names the child and the failure reason',
     text.includes('subagent: fix parser') && text.includes('failed') && text.includes('provider exploded'));
-  check('system line is ephemeral (no data-hist-idx)',
-    !!lines[0] && lines[0].dataset.histIdx === undefined);
+  check('failure appends no chat line', chatMessages().length === 0);
 
-  // 3. A child of A that SUCCEEDS appends nothing to the chat.
+  // 3. A child of A that SUCCEEDS toasts nothing (and appends nothing).
   recv({
     type: 'subagent_started', subagentId: 'S', subagentParent: 'A',
     subagentLabel: 'subagent: good job', subagentJob: 'good job',
@@ -123,11 +127,11 @@ async function main() {
     subagentLabel: 'subagent: good job', subagentSuccess: true,
     subagentSummary: 'all done',
   });
-  lines = systemLines();
-  check('successful child appends no system line', lines.length === 1);
+  check('successful child shows no toast', toasts().length === 1);
+  check('successful child appends no chat line', chatMessages().length === 0);
 
-  // 4. A failure whose parent session has NO open pane updates the sidebar
-  //    only — no chat line (the event is sidebar-global).
+  // 4. A failure whose parent session has NO open pane still toasts (the
+  //    event is sidebar-global) and touches no transcript.
   recv({
     type: 'subagent_started', subagentId: 'X', subagentParent: 'B',
     subagentLabel: 'subagent: other parent', subagentJob: 'other job',
@@ -137,8 +141,10 @@ async function main() {
     subagentLabel: 'subagent: other parent', subagentSuccess: false,
     subagentSummary: 'boom',
   });
-  lines = systemLines();
-  check('failure of a pane-less parent appends no system line', lines.length === 1);
+  shown = toasts();
+  check('pane-less parent failure still toasts',
+    shown.length === 2 && (shown[1].dataset.message || '').includes('boom'));
+  check('pane-less parent failure appends no chat line', chatMessages().length === 0);
 
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

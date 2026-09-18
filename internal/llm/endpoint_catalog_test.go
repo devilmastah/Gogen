@@ -51,7 +51,7 @@ func providerFor(t *testing.T, srv *httptest.Server, apiKey string, cat *Endpoin
 	)
 	p := &OpenAIProvider{
 		profiles:    []*providerProfile{{name: "default", baseURL: srv.URL + "/", apiKey: apiKey, stream: &client}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 	p.SetEndpointCatalog(cat)
 	return p

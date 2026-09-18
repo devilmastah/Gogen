@@ -121,57 +121,45 @@ type modelProfileInfo struct {
 
 type OpenAIProvider struct {
 	model string
+	// currentModelProfile is the registered provider profile that owns the
+	// current model (the ModelRef routing key; "" = the default profile).
+	// Guarded by modelsMu exactly like model — the two change together
+	// (SetModelRef / SetModel) so the routing key and the wire ID can never
+	// drift apart. (Distinct from the modelProfile map, which records the
+	// owning profile of each CATALOG model.)
+	currentModelProfile string
 	// profiles is the registered endpoint set — the single source of truth
 	// for every client and endpoint. profiles[0] is the default profile
 	// (fallback client, default base URL, new-session model seed). Nil for
 	// direct-constructed providers (tests) that only exercise pure methods;
 	// the accessors below return zero values for that shape.
 	profiles []*providerProfile
-	// modelClient maps model ID → streaming client for routing.
-	modelClient map[string]*openai.Client
+	// modelClient maps the ModelRef routing key → streaming client for the
+	// OpenCode profiles' twin routing (which of the zen/go twins serves the
+	// model — Go takes precedence on overlap, see queryProfile).
+	// Non-OpenCode profiles need no entry: clientForModel uses their stream
+	// client directly. Guarded by modelsMu.
+	modelClient map[ModelRef]*openai.Client
 	// profilesGen is bumped by SetProfiles. A catalog fetch started before
 	// the swap records the generation it began with; if the generation
 	// changed when it completes, its results came from the OLD endpoint set
 	// and are discarded instead of polluting the cache/routing with stale
 	// models (the next fetch hits the new endpoints).
 	profilesGen int
-	// modelProfile records which profile serves each catalog model (model ID
-	// → profile name + base URL), populated by listModels alongside the
-	// model cache. Used for picker grouping, models.dev resolution, and the
-	// /props probe target.
-	modelProfile map[string]modelProfileInfo
-	// modelOwner records the OWNING profile of each model (model ID →
-	// profile name) under the sticky-ownership rule (see applyRouting): the
-	// earliest-listing profile, except a model the user runs on one endpoint
-	// is not re-homed while that endpoint serves it, and a downed owner is
-	// not displaced by a same-ID model on another endpoint. Unlike
-	// modelClient it is NOT wholesale cleared by SetProfiles — records for
-	// profiles that are still registered survive the swap, so a model keeps
-	// routing to its owner across a provider-settings save even while the
-	// owner's catalog is unreachable (clientForModel's owner fallback).
-	// Guarded by modelsMu.
-	modelOwner map[string]string
-	// modelCoListed records, per model, the profiles observed listing it in
-	// a round where its owner was up (model ID → profile names). When the
-	// owner later goes down, a surviving lister is a legitimate failover
-	// target only if it is in this set — a same-ID model on an endpoint
-	// that never co-listed is a collision, not ownership (see
-	// applyRouting). Guarded by modelsMu.
-	modelCoListed map[string]map[string]struct{}
-	// ownerRegistry is the process-shared model→profile record (see
-	// OwnerRegistry): sibling providers (other sessions, subagents) publish
-	// the owners they learn, and a provider whose own routing for a model is
-	// unknown consults it before falling back to the default profile. Nil
-	// for standalone providers. Set at construction time via
-	// SetOwnerRegistry, before the provider serves requests.
-	ownerRegistry *OwnerRegistry
+	// modelProfile records which profile serves each catalog model (the
+	// ModelRef routing key → profile name + base URL), populated by
+	// listModels alongside the model cache. Used for models.dev resolution
+	// and the /props probe target (the OWNING profile's base URL — a bare
+	// ID can no longer name it, since the same ID may sit under several
+	// providers). Guarded by modelsMu.
+	modelProfile map[ModelRef]modelProfileInfo
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
 	// modelInfo resolves context limits from models.dev (optional enrichment).
 	modelInfo *modelinfo.Resolver
 
 	modelsMu       sync.RWMutex
-	modelsCache    []openai.Model
+	modelsCache    []catalogModel
 	modelsCachedAt time.Time // zero means no successful cache entry
 	// modelsFetchFailedAt is set when a catalog fetch fails; clientForModel
 	// skips re-fetching until modelsFetchBackoff has elapsed.
@@ -197,12 +185,13 @@ type OpenAIProvider struct {
 
 	// effortsDerived caches per-model reasoning-effort options derived from
 	// llama.cpp /props (+ /apply-template) capability probes (see
-	// ProbeReasoningEfforts). Keyed by model ID; entries record the endpoint
-	// they were derived from. Cleared by SetProfiles (the endpoint set
-	// changed); NOT cleared by SetModel — each model is probed once and the
-	// result stays valid across switches back to it.
+	// ProbeReasoningEfforts). Keyed by the ModelRef routing key (the same
+	// ID under two providers may have different derived efforts); entries
+	// record the endpoint they were derived from. Cleared by SetProfiles
+	// (the endpoint set changed); NOT cleared by SetModel — each model is
+	// probed once and the result stays valid across switches back to it.
 	effortsMu      sync.Mutex
-	effortsDerived map[string]derivedEfforts
+	effortsDerived map[ModelRef]derivedEfforts
 
 	// preserveReasoningMode: auto (default, probe /props), on, off.
 	// Guarded by modelsMu.
@@ -259,7 +248,7 @@ func ProviderProfiles(openAIKey, openAIModel, openAIURL string, providers []conf
 
 type modelsFetch struct {
 	done   chan struct{}
-	models []openai.Model
+	models []catalogModel
 	err    error
 }
 
@@ -273,7 +262,7 @@ func (p *OpenAIProvider) currentModel() string {
 	return p.model
 }
 
-func (p *OpenAIProvider) cachedModelsLocked() ([]openai.Model, bool) {
+func (p *OpenAIProvider) cachedModelsLocked() ([]catalogModel, bool) {
 	if p.modelsCachedAt.IsZero() || time.Since(p.modelsCachedAt) >= modelsCacheTTL {
 		return nil, false
 	}
@@ -385,12 +374,10 @@ func buildProfileClients(prof providerProfile, st *sessionHeaderState) *provider
 func newOpenAIProvider(profiles []*providerProfile, model string, resolver *modelinfo.Resolver, st *sessionHeaderState) *OpenAIProvider {
 	p := &OpenAIProvider{
 		model:          model,
-		modelClient:    make(map[string]*openai.Client),
-		modelOwner:     make(map[string]string),
-		modelCoListed:  make(map[string]map[string]struct{}),
+		modelClient:    make(map[ModelRef]*openai.Client),
 		modelInfo:      resolver,
 		profiles:       profiles,
-		effortsDerived: make(map[string]derivedEfforts),
+		effortsDerived: make(map[ModelRef]derivedEfforts),
 		sessionHdr:     st,
 	}
 	p.modelInfo.Warm() // non-blocking; populate cache before first limit lookup
@@ -484,19 +471,6 @@ func (p *OpenAIProvider) PropsCapsCache() *PropsCapsCache {
 	return p.propsCaps
 }
 
-// SetOwnerRegistry installs the process-shared model→profile owner record
-// (see OwnerRegistry). Construction-time setter, like SetPromptCacheKey:
-// call it before the provider serves requests. A nil argument detaches the
-// provider from any shared record (standalone behavior).
-func (p *OpenAIProvider) SetOwnerRegistry(r *OwnerRegistry) {
-	if p == nil {
-		return
-	}
-	p.modelsMu.Lock()
-	p.ownerRegistry = r
-	p.modelsMu.Unlock()
-}
-
 // EndpointCatalog returns the shared catalog cache installed by
 // SetEndpointCatalog (nil for standalone providers). Hosts that build a
 // child provider themselves (the TUI subagent spawner) share the parent's
@@ -510,45 +484,52 @@ func (p *OpenAIProvider) EndpointCatalog() *EndpointCatalog {
 	return p.endpointCatalog
 }
 
-// OwnerRegistry returns the shared owner record installed by
-// SetOwnerRegistry (nil for standalone providers). The TUI subagent spawner
-// uses it to share the parent's record with the child provider, so a child
-// whose owning endpoint is down still routes inherited models there.
-func (p *OpenAIProvider) OwnerRegistry() *OwnerRegistry {
-	if p == nil {
-		return nil
-	}
-	p.modelsMu.RLock()
-	defer p.modelsMu.RUnlock()
-	return p.ownerRegistry
-}
-
 // SetModel updates the provider model ID and invalidates template capability
-// caches that may differ across models.
+// caches that may differ across models. The caller supplies only the bare
+// ID, so the owning profile resets to the default profile (the model routes
+// to the default endpoint — model IDs are not unique across providers, so a
+// bare ID cannot name a non-default owner). Callers that know the owner use
+// SetModelRef.
 func (p *OpenAIProvider) SetModel(id string) error {
 	p.modelsMu.Lock()
 	p.model = id
+	p.currentModelProfile = ""
 	p.modelsMu.Unlock()
 	// Template caps can change with the model on multi-model / router hosts.
 	p.invalidatePropsCaps()
 	return nil
 }
 
+// SetModelRef selects the model AND its owning profile in one step: the
+// routing key (model + modelProfile) and the wire ID are set together so
+// they can never drift apart. Like SetModel it invalidates the template
+// capability caches.
+func (p *OpenAIProvider) SetModelRef(ref ModelRef) error {
+	p.modelsMu.Lock()
+	p.model = ref.ID
+	p.currentModelProfile = ref.ProfileName()
+	p.modelsMu.Unlock()
+	p.invalidatePropsCaps()
+	return nil
+}
+
+// CurrentModelRef returns the current model's routing key: the owning
+// profile plus the bare wire ID (a zero ID is the "no model selected"
+// state). Thread-safe.
+func (p *OpenAIProvider) CurrentModelRef() ModelRef {
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	return ModelRef{Profile: p.currentModelProfile, ID: p.model}
+}
+
 // SetProfiles replaces the registered provider set at runtime (the web
 // settings modal's provider_save/provider_delete). The profile client sets
 // are rebuilt and the catalog/routing caches are invalidated so the next
 // ListModels re-fetches every endpoint. The current model is kept: it stays
-// routable when its profile is still registered, otherwise clientForModel
-// falls back to the default client and requireModelSelected re-validates it
-// on the next turn.
-//
-// The sticky-ownership records (modelOwner/modelCoListed) are pruned, not
-// cleared: records naming profiles that are still registered survive the
-// swap, so a model keeps routing to its owner across a settings save even
-// while the owner's catalog is unreachable (clientForModel's owner fallback
-// resolves the rebuilt client). Records for removed profiles are dropped —
-// their models fall through to the default fallback and re-validation
-// surfaces the gap.
+// routable when its profile is still registered, otherwise the model's
+// routing key resets to the default profile (the bare ID is kept),
+// clientForModel falls back to the default client, and requireModelSelected
+// re-validates it on the next turn.
 //
 // The swap replaces the whole endpoint set: every fallback (default base
 // URL, API key, stream client) resolves through the NEW profiles, so no
@@ -579,34 +560,18 @@ func (p *OpenAIProvider) SetProfiles(profiles []ProviderProfile) error {
 	p.modelsCache = nil
 	p.modelsCachedAt = time.Time{}
 	p.modelProfile = nil
-	p.modelClient = make(map[string]*openai.Client)
-	pruneOwnerRecords(p.modelOwner, p.modelCoListed, built)
+	p.modelClient = make(map[ModelRef]*openai.Client)
 	p.modelsFetchFailedAt = time.Time{}
+	// The current model's routing key must name a profile that still
+	// exists: a model whose provider was removed/renamed cannot keep
+	// routing to it. Reset to the default profile (bare ID kept) so
+	// re-validation surfaces the gap instead of silently re-homing the
+	// model to a different provider.
+	if p.model != "" && p.currentModelProfile != "" && !hasProfileName(built, p.currentModelProfile) {
+		p.currentModelProfile = ""
+	}
 	p.modelsMu.Unlock()
 	return nil
-}
-
-// pruneOwnerRecords drops sticky-ownership records that name profiles absent
-// from the rebuilt set (their models can no longer route there and fall
-// through to the default fallback); records for still-registered profiles
-// survive. Mutates the maps in place; caller holds modelsMu.
-func pruneOwnerRecords(owner map[string]string, coListed map[string]map[string]struct{}, built []*providerProfile) {
-	if len(owner) == 0 && len(coListed) == 0 {
-		return
-	}
-	for id, name := range owner {
-		if !hasProfileName(built, name) {
-			delete(owner, id)
-			delete(coListed, id)
-		}
-	}
-	for _, co := range coListed {
-		for name := range co {
-			if !hasProfileName(built, name) {
-				delete(co, name)
-			}
-		}
-	}
 }
 
 // hasProfileName reports whether the built profile set contains a profile
@@ -700,19 +665,6 @@ func (p *OpenAIProvider) hasOpenCodeProfile() bool {
 	return false
 }
 
-// profileFor returns the registered provider profile name that serves
-// modelID ("default" when the catalog has not been fetched or the model is
-// unknown). The web model picker groups models by this name.
-func (p *OpenAIProvider) profileFor(modelID string) string {
-	p.modelsMu.RLock()
-	info := p.modelProfile[modelID]
-	p.modelsMu.RUnlock()
-	if info.name != "" {
-		return info.name
-	}
-	return "default"
-}
-
 // SetThinkingLevel sets the reasoning_effort level. Empty string means omit
 // the parameter (the model will not use reasoning/thinking).
 func (p *OpenAIProvider) SetThinkingLevel(level string) {
@@ -722,9 +674,10 @@ func (p *OpenAIProvider) SetThinkingLevel(level string) {
 }
 
 // ModelPricing returns per-token pricing (USD per 1M tokens) for the given
-// model from the models.dev registry. Only cached map lookup — never blocks.
-func (p *OpenAIProvider) ModelPricing(modelID string) (input, output, cached float64, ok bool) {
-	_, cost, _, _ := p.lookupModelsDevInfo(modelID)
+// model from the models.dev registry, resolved against the model's OWNING
+// profile's registry entry. Only cached map lookup — never blocks.
+func (p *OpenAIProvider) ModelPricing(ref ModelRef) (input, output, cached float64, ok bool) {
+	_, cost, _, _ := p.lookupModelsDevInfo(ref)
 	if cost != nil {
 		return cost.Input, cost.Output, cost.CacheRead, true
 	}
@@ -739,8 +692,8 @@ func (p *OpenAIProvider) ModelPricing(modelID string) (input, output, cached flo
 // blocks — the models.dev registry and the derived cache are in-memory map
 // reads; the probe itself runs off the hot path via ProbeReasoningEfforts.
 // This is the same set applyThinkingLevel uses to gate the wire value.
-func (p *OpenAIProvider) ModelReasoningEfforts(modelID string) []string {
-	efforts, _ := p.reasoningEffortResolution(modelID)
+func (p *OpenAIProvider) ModelReasoningEfforts(ref ModelRef) []string {
+	efforts, _ := p.reasoningEffortResolution(ref)
 	return efforts
 }
 
@@ -750,8 +703,8 @@ func (p *OpenAIProvider) ModelReasoningEfforts(modelID string) []string {
 // support — with no source reporting support. Unknown or not-yet-probed
 // models are NOT unsupported (callers keep the DefaultReasoningEfforts
 // fallback). Never blocks. The client hides the thinking chips in this case.
-func (p *OpenAIProvider) ReasoningEffortUnsupported(modelID string) bool {
-	_, unsupported := p.reasoningEffortResolution(modelID)
+func (p *OpenAIProvider) ReasoningEffortUnsupported(ref ModelRef) bool {
+	_, unsupported := p.reasoningEffortResolution(ref)
 	return unsupported
 }
 
@@ -768,15 +721,22 @@ func (p *OpenAIProvider) ReasoningEffortUnsupported(modelID string) bool {
 //  4. DefaultReasoningEfforts otherwise (unknown / not yet probed).
 //
 // Never blocks: registry and derived-cache reads are in-memory map lookups.
-func (p *OpenAIProvider) reasoningEffortResolution(modelID string) (efforts []string, unsupported bool) {
-	if p == nil || modelID == "" {
+func (p *OpenAIProvider) reasoningEffortResolution(ref ModelRef) (efforts []string, unsupported bool) {
+	if p == nil || !ref.Valid() {
 		return DefaultReasoningEfforts, false
 	}
+	// A bare-ID ref (Profile "") must resolve to the same owner the probe
+	// cached under: ProbeReasoningEfforts keys effortsDerived by the
+	// catalog-resolved owner profile, so the lookup must resolve it too.
+	if ref.Profile == "" {
+		ref = p.refForModelID(ref.ID)
+	}
+	ref = ref.Normalized()
 	registryKnown := false
 	var registryEfforts []string
 	if p.modelInfo != nil {
-		for _, u := range p.modelsDevURLsFor(modelID) {
-			if _, _, efforts, _, err := p.modelInfo.Resolve(u, modelID); err == nil {
+		for _, u := range p.modelsDevURLsFor(ref) {
+			if _, _, efforts, _, err := p.modelInfo.Resolve(u, ref.ID); err == nil {
 				registryKnown = true
 				registryEfforts = efforts
 				break
@@ -787,7 +747,7 @@ func (p *OpenAIProvider) reasoningEffortResolution(modelID string) (efforts []st
 		return append([]string(nil), registryEfforts...), false
 	}
 	p.effortsMu.Lock()
-	d, ok := p.effortsDerived[modelID]
+	d, ok := p.effortsDerived[ref]
 	p.effortsMu.Unlock()
 	if ok && d.probed && len(d.efforts) > 0 {
 		return append([]string(nil), d.efforts...), false
@@ -798,14 +758,15 @@ func (p *OpenAIProvider) reasoningEffortResolution(modelID string) (efforts []st
 	return DefaultReasoningEfforts, false
 }
 
-// ModelDescription returns the models.dev description for the given model, or
-// "" when the model is unknown. Only cached map lookup — never blocks.
-func (p *OpenAIProvider) ModelDescription(modelID string) string {
-	if p == nil || p.modelInfo == nil || modelID == "" {
+// ModelDescription returns the models.dev description for the given model
+// (resolved against its owning profile's registry entry), or "" when the
+// model is unknown. Only cached map lookup — never blocks.
+func (p *OpenAIProvider) ModelDescription(ref ModelRef) string {
+	if p == nil || p.modelInfo == nil || !ref.Valid() {
 		return ""
 	}
-	for _, u := range p.modelsDevURLsFor(modelID) {
-		if _, _, _, desc, err := p.modelInfo.Resolve(u, modelID); err == nil {
+	for _, u := range p.modelsDevURLsFor(ref) {
+		if _, _, _, desc, err := p.modelInfo.Resolve(u, ref.ID); err == nil {
 			return desc
 		}
 	}

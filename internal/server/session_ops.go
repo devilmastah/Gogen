@@ -434,11 +434,12 @@ func (s *Server) sessionFork(ctx context.Context, ws *wsConn, pane **sessionRunt
 	// turnMu (write lock) — a turnMu.RLock here would self-deadlock, since
 	// sync.RWMutex is not reentrant.
 	mode, thinking := src.agent.ModeAndThinkingLevel()
-	model := src.agent.CurrentModel()
+	ref := src.agent.CurrentModelRef()
 	todos := src.agent.TodoManager.Snapshot()
 	snap := agent.SessionSnapshot{
 		WorkingDir:    s.ws.GetWorkingDir(),
-		Model:         model,
+		Model:         ref.WireID(),
+		ModelProvider: ref.ProfileName(),
 		Mode:          mode.String(),
 		ThinkingLevel: string(thinking),
 		Todos:         todos,

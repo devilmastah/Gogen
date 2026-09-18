@@ -128,7 +128,7 @@ type sessionRuntime struct {
 	// deliverMu guards pendingDeliver; deliverWorker gates the single
 	// queue worker; deliverNotify wakes it at turn end (see deliver.go).
 	// pendingDeliver is the per-session FIFO queue shared by system
-	// deliveries (job notices, subagent reports) and user steering
+	// deliveries (job notices, subagent completion notices) and user steering
 	// messages (typed while a turn runs) — one queue, one drain path;
 	// deliverItem.Kind scopes presentation and policy.
 	deliverMu      sync.Mutex
@@ -142,10 +142,13 @@ type sessionRuntime struct {
 	// never reassigned, so a plain field is race-free.
 	turnEndHook func()
 	// deliverStartHook is invoked by the delivery worker immediately before
-	// it starts a delivered turn (see deliver.go). The continuable-subagent
+	// it starts a delivered turn (see deliver.go) — for a send_message
+	// delivery ONLY (deliverFromChildMessage): the continuable-subagent
 	// registry uses it to arm reply capture exactly when a send_message
-	// delivery actually starts — not when it was queued. Set once at child
-	// creation; never reassigned.
+	// delivery actually starts, not when it was queued, and never for a
+	// plain machine notice (a child's reaction to a job notice or subagent
+	// report must not be injected into its parent as a reply). Set once at
+	// child creation; never reassigned.
 	deliverStartHook func()
 	// approverOverride replaces the default deleteApprover when non-nil
 	// (the subagent spawner installs the D6 forwarding approver; the board
@@ -692,8 +695,8 @@ type sessionRegistry struct {
 	evictHook func(sessionID string)
 
 	// parentDeliverMu guards parentDeliveries, the per-parent queue of
-	// system messages (background-subagent completion notices, reports,
-	// replies) for sessions whose runtime is not live. The spawner queues
+	// system messages (background-subagent completion notices and captured
+	// send_message replies) for sessions whose runtime is not live. The spawner queues
 	// when the parent is evicted or closed while its children keep
 	// running; register() flushes the queue into the fresh runtime when
 	// the session is next loaded — "deliver once it is live again"
@@ -827,8 +830,8 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 		r.fireEvictHook(victimIDs[i])
 	}
 	// A session re-registered after eviction/close may have queued
-	// deliveries (background-subagent completions/reports queued while its
-	// runtime was not live); flush them into the fresh runtime now that
+	// deliveries (background-subagent completions and replies queued while
+	// its runtime was not live); flush them into the fresh runtime now that
 	// the session is live again. Outside r.mu: deliverToSession can
 	// broadcast (bounded by the send-queue timeout).
 	r.flushParentDeliveries(id, rt)

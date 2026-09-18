@@ -29,15 +29,15 @@ func (s *wsEffortStub) ModelName() string { return s.model }
 
 func (s *wsEffortStub) SetThinkingLevel(string) {}
 
-func (s *wsEffortStub) ModelReasoningEfforts(modelID string) []string {
-	if modelID == "glm-5.2" {
+func (s *wsEffortStub) ModelReasoningEfforts(ref llm.ModelRef) []string {
+	if ref.ID == "glm-5.2" {
 		return []string{"high", "max"}
 	}
 	return llm.DefaultReasoningEfforts // unknown model
 }
 
-func (s *wsEffortStub) ModelDescription(modelID string) string {
-	if modelID == "glm-5.2" {
+func (s *wsEffortStub) ModelDescription(ref llm.ModelRef) string {
+	if ref.ID == "glm-5.2" {
 		return "Open flagship GLM for agentic engineering"
 	}
 	return "" // unknown model

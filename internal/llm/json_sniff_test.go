@@ -50,7 +50,7 @@ func TestListModelsToleratesNonJSONContentType(t *testing.T) {
 			if err != nil {
 				t.Fatalf("listModels: %v", err)
 			}
-			if len(models) != 1 || models[0].ID != "model-a" {
+			if len(models) != 1 || models[0].model.ID != "model-a" {
 				t.Fatalf("unexpected models: %+v", models)
 			}
 		})
@@ -90,7 +90,7 @@ func TestListModelsKeepsJSONContentTypeResponseWorking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listModels: %v", err)
 	}
-	if len(models) != 1 || models[0].ID != "model-a" {
+	if len(models) != 1 || models[0].model.ID != "model-a" {
 		t.Fatalf("unexpected models: %+v", models)
 	}
 }
@@ -125,7 +125,7 @@ func TestListModelsToleratesUnrequestedGzip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listModels: %v (Accept-Encoding sent: %q)", err, sawAcceptEncoding)
 	}
-	if len(models) != 1 || models[0].ID != "model-a" {
+	if len(models) != 1 || models[0].model.ID != "model-a" {
 		t.Fatalf("unexpected models: %+v", models)
 	}
 	if !strings.Contains(sawAcceptEncoding, "gzip") {
@@ -136,12 +136,12 @@ func TestListModelsToleratesUnrequestedGzip(t *testing.T) {
 // listModelsFromServer builds a provider the way production does (through
 // newClientPair, so the catalog client carries the real transport stack) and
 // lists its models.
-func listModelsFromServer(t *testing.T, baseURL string) ([]openai.Model, error) {
+func listModelsFromServer(t *testing.T, baseURL string) ([]catalogModel, error) {
 	t.Helper()
 	stream, catalog := newClientPair(baseURL+"/", "test", nil)
 	p := &OpenAIProvider{
 		profiles:    []*providerProfile{{name: "default", stream: stream, catalog: catalog}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 	return p.listModels(context.Background())
 }

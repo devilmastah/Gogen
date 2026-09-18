@@ -5618,21 +5618,19 @@
                     rec.success = !!data.subagentSuccess;
                     rec.summary = data.subagentSummary || '';
                 }
-                // Live-only failure display: the completion notice reaches the
-                // parent MODEL as a persisted user message (the delivery
-                // service), but the error itself is shown here as an
-                // ephemeral system line — no hist-idx, so it is not part of
-                // the transcript and any history replay (reload, pane
-                // switch, turn convergence) removes it. The event is
-                // sidebar-global, so render into the chat only when the
-                // parent session is the focused pane.
+                // Failure display: a transient toast, NEVER a chat line. The
+                // completion notice already reaches the parent as a
+                // persisted user message (the delivery service) and the
+                // nested sidebar row shows the failed state, so a rendered
+                // system bubble would duplicate the same failure in the
+                // transcript (and it was ephemeral anyway — any history
+                // rebuild removed it). The event is sidebar-global, so the
+                // toast is shown regardless of which pane is focused.
                 if (!data.subagentSuccess) {
-                    const parentPane = findPaneBySession(data.subagentParent);
-                    if (parentPane && parentPane.key === activePaneKey) {
-                        const label = (rec && rec.label) || data.subagentLabel || 'subagent';
-                        appendMessage('system',
-                            `\u26a0 subagent ${label} failed${data.subagentSummary ? ': ' + data.subagentSummary : ''}`);
-                    }
+                    const label = (rec && rec.label) || data.subagentLabel || 'subagent';
+                    showToast(
+                        `\u26a0 subagent ${label} failed${data.subagentSummary ? ': ' + data.subagentSummary : ''}`,
+                        'error');
                 }
             }
             renderSessionList(getLastSessions() || []);

@@ -70,7 +70,7 @@ func NormalizeThinkingLevel(s string) ThinkingLevel {
 // llm.DefaultReasoningEfforts. Never blocks.
 func (a *Agent) CurrentModelEfforts() []string {
 	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
-		return p.ModelReasoningEfforts(a.CurrentModel())
+		return p.ModelReasoningEfforts(a.CurrentModelRef())
 	}
 	return llm.DefaultReasoningEfforts
 }
@@ -80,7 +80,7 @@ func (a *Agent) CurrentModelEfforts() []string {
 // without registry data). Never blocks.
 func (a *Agent) CurrentModelDescription() string {
 	if p, ok := a.Provider.(llm.ModelDescriptionProvider); ok {
-		return p.ModelDescription(a.CurrentModel())
+		return p.ModelDescription(a.CurrentModelRef())
 	}
 	return ""
 }
@@ -92,7 +92,7 @@ func (a *Agent) CurrentModelDescription() string {
 func (a *Agent) ThinkingLevelsForModel(modelID string) []ThinkingLevel {
 	var efforts []string
 	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
-		efforts = p.ModelReasoningEfforts(modelID)
+		efforts = p.ModelReasoningEfforts(llm.ModelRef{ID: modelID})
 	} else {
 		efforts = llm.DefaultReasoningEfforts
 	}
@@ -122,7 +122,7 @@ func (a *Agent) IsThinkingLevelActive() bool {
 		return false
 	}
 	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
-		return slices.Contains(p.ModelReasoningEfforts(a.CurrentModel()), string(level))
+		return slices.Contains(p.ModelReasoningEfforts(a.CurrentModelRef()), string(level))
 	}
 	return true // provider without effort reporting: assume active
 }

@@ -95,8 +95,11 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	// the workspace default the child is already seeded with). The
 	// explicit argument is a hard requirement: an unselectable model
 	// fails the spawn. The other tiers fall back to the default rather
-	// than failing — it is already on the provider (fail open).
-	m, src := agent.ResolveSubagentModel(model, runtimeCfg.SubagentModel, parent.CurrentModel(), s.ws.DefaultModel())
+	// than failing — it is already on the provider (fail open). The
+	// parent tier passes the qualified selector form ("profile/id" for a
+	// non-default owner) so the child selects the SAME (profile, ID) the
+	// parent runs on, not a same-ID model on the default profile.
+	m, src := agent.ResolveSubagentModel(model, runtimeCfg.SubagentModel, parent.CurrentModelRef().String(), s.ws.DefaultModel())
 	if err := agent.ApplySubagentModel(ctx, child, m, src); err != nil {
 		return nil, "", "", err
 	}
@@ -128,18 +131,11 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	// runtimes are cap-exempt, so register never evicts.
 	s.registry.register(childID, childRt)
 
-	// The child-scoped report tool delivers progress messages into the live
-	// parent session via the delivery service (queued when the parent is
-	// busy). Installed on every child — foreground and background — so the
-	// tool is exposed for the child's whole lifetime (llmTools gates it on
-	// ParentID + hook).
-	child.SetReportHook(func(text string) error {
-		// Delivered immediately when the parent is live; queued for its
-		// next registration otherwise — a progress report must not be lost
-		// to a parent that merely went idle with no viewers.
-		s.registry.deliverToParent(parent.SessionID, fmt.Sprintf("[subagent %s] %s", label, text))
-		return nil
-	})
+	// Children never push progress into the parent conversation: their ONE
+	// return channel is the run's final message (the Spawn tool result for a
+	// foreground child, the completion notice for a background one) plus the
+	// captured reply per send_message. Progress is pull-side — the parent
+	// checks list_agents, the user watches the child pane.
 
 	return childRt, label, rawJob, nil
 }

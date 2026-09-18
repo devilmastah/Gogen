@@ -36,6 +36,48 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSaveLoadModelProviderRoundTrip pins the routing-key persistence: the
+// provider profile owning the model survives a Save/Load round trip, and a
+// legacy file without the field loads with an empty ModelProvider (the
+// default-profile migration marker).
+func TestSaveLoadModelProviderRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	snap := SessionSnapshot{
+		WorkingDir:    dir,
+		Model:         "deepseek-v4-flash",
+		ModelProvider: "deepseek",
+		Messages:      []llm.Message{{Role: "user", Content: "hello"}},
+	}
+	id := "model-provider-session"
+	if err := store.Save(id, snap); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadInWorkingDir(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Model != "deepseek-v4-flash" || loaded.ModelProvider != "deepseek" {
+		t.Fatalf("round trip: model=%q provider=%q, want deepseek-v4-flash/deepseek", loaded.Model, loaded.ModelProvider)
+	}
+
+	// Legacy file: no modelProvider field at all.
+	legacy := filepath.Join(dir, ".gogen", "sessions", "legacy.json")
+	if err := os.WriteFile(legacy, []byte(`{"version":1,"id":"legacy","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z","workingDir":"`+dir+`","model":"gpt-4o","mode":"act","messages":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyLoaded, err := store.LoadInWorkingDir(dir, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyLoaded.Model != "gpt-4o" {
+		t.Fatalf("legacy model=%q, want gpt-4o", legacyLoaded.Model)
+	}
+	if legacyLoaded.ModelProvider != "" {
+		t.Fatalf("legacy ModelProvider=%q, want empty (default-profile migration marker)", legacyLoaded.ModelProvider)
+	}
+}
+
 func TestLatestIDUsesUpdatedNotMtime(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStoreWithOptions(true, StoreOptions{})

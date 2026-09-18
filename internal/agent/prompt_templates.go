@@ -210,10 +210,16 @@ func ReviewPrompt(item *BoardItem, template string) string {
 }
 
 // DefaultSubagentPrompt is the built-in template wrapping subagent jobs.
-// Placeholder: {job}.
+// Placeholder: {job}. The wording makes the return contract explicit: the
+// child's final message is the ONE channel back to the parent (task result /
+// completion notice), and a question is asked by ending the turn with it —
+// the parent replies with send_message, which resumes the child.
 const DefaultSubagentPrompt = `You are a subagent working on a task delegated by the parent agent.
-Work independently and completely on the job below, then report back
-with a concise summary of what you did and the outcome.
+Work independently and completely on the job below, then finish your
+turn with a concise summary of what you did and the outcome — the
+parent receives that final message as the task result. If you need
+input from the parent, end your turn with your question; the parent
+can reply to continue this session.
 
 Job:
 {job}`

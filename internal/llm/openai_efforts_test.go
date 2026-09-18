@@ -10,8 +10,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"gogen/internal/modelinfo"
+
+	"github.com/openai/openai-go/v3"
 )
 
 // unslothQwen38Template is the effort-relevant core of the real Unsloth
@@ -186,7 +189,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 		if !changed {
 			t.Fatal("first probe: want changed=true (default → derived)")
 		}
-		if got := p.ModelReasoningEfforts("qwen3.8"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
 			t.Fatalf("ModelReasoningEfforts = %v, want [xhigh medium low]", got)
 		}
 		if applyHits.Load() != 0 {
@@ -226,7 +229,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 		if !changed {
 			t.Fatal("want changed=true")
 		}
-		if got := p.ModelReasoningEfforts("qwen3.8"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
 			t.Fatalf("ModelReasoningEfforts = %v, want [xhigh medium low]", got)
 		}
 		if applyHits.Load() != 1 {
@@ -245,7 +248,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
 			t.Fatal(err)
 		}
-		if got := p.ModelReasoningEfforts("qwen3.8"); !slices.Equal(got, DefaultReasoningEfforts) {
+		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); !slices.Equal(got, DefaultReasoningEfforts) {
 			t.Fatalf("ModelReasoningEfforts = %v, want default %v", got, DefaultReasoningEfforts)
 		}
 		if applyHits.Load() != 1 {
@@ -265,7 +268,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 		if !changed {
 			t.Fatal("want changed=true (default → no effort control)")
 		}
-		if got := p.ModelReasoningEfforts("qwen3.8"); len(got) != 0 {
+		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); len(got) != 0 {
 			t.Fatalf("ModelReasoningEfforts = %v, want empty (no effort control)", got)
 		}
 		if applyHits.Load() != 0 {
@@ -280,7 +283,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err == nil {
 			t.Fatal("want errEffortsUnavailable for a server without capability keys")
 		}
-		if got := p.ModelReasoningEfforts("qwen3.8"); !slices.Equal(got, DefaultReasoningEfforts) {
+		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); !slices.Equal(got, DefaultReasoningEfforts) {
 			t.Fatalf("ModelReasoningEfforts = %v, want default (nothing cached)", got)
 		}
 		// Not cached: a second probe must retry the endpoint.
@@ -393,13 +396,13 @@ func TestModelReasoningEffortsPrecedence(t *testing.T) {
 	if err := p.SetModel("other"); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.ModelReasoningEfforts("other"); !slices.Equal(got, DefaultReasoningEfforts) {
+	if got := p.ModelReasoningEfforts(ModelRef{ID: "other"}); !slices.Equal(got, DefaultReasoningEfforts) {
 		t.Fatalf("unprobed ModelReasoningEfforts = %v, want default", got)
 	}
 	if _, err := p.ProbeReasoningEfforts(context.Background(), "other"); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.ModelReasoningEfforts("other"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+	if got := p.ModelReasoningEfforts(ModelRef{ID: "other"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
 		t.Fatalf("probed ModelReasoningEfforts = %v, want [xhigh medium low]", got)
 	}
 
@@ -410,7 +413,7 @@ func TestModelReasoningEffortsPrecedence(t *testing.T) {
 	if _, err := p.ProbeReasoningEfforts(context.Background(), "glm-5.2"); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.ModelReasoningEfforts("glm-5.2"); !slices.Equal(got, []string{"high", "max"}) {
+	if got := p.ModelReasoningEfforts(ModelRef{ID: "glm-5.2"}); !slices.Equal(got, []string{"high", "max"}) {
 		t.Fatalf("known-model ModelReasoningEfforts = %v, want [high max] (registry wins)", got)
 	}
 }
@@ -427,22 +430,22 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 			profiles:  []*providerProfile{{name: "default", baseURL: "https://opencode.ai/zen/v1/"}},
 			modelInfo: resolver,
 		}
-		if !known.ReasoningEffortUnsupported("glm-5") {
+		if !known.ReasoningEffortUnsupported(ModelRef{ID: "glm-5"}) {
 			t.Fatal("toggle-only model: want unsupported=true (models.dev, no probe needed)")
 		}
-		if got := known.ModelReasoningEfforts("glm-5"); len(got) != 0 {
+		if got := known.ModelReasoningEfforts(ModelRef{ID: "glm-5"}); len(got) != 0 {
 			t.Fatalf("toggle-only ModelReasoningEfforts = %v, want empty", got)
 		}
-		if known.ReasoningEffortUnsupported("glm-5.2") {
+		if known.ReasoningEffortUnsupported(ModelRef{ID: "glm-5.2"}) {
 			t.Fatal("model with effort options: want unsupported=false")
 		}
-		if got := known.ModelReasoningEfforts("glm-5.2"); !slices.Equal(got, []string{"high", "max"}) {
+		if got := known.ModelReasoningEfforts(ModelRef{ID: "glm-5.2"}); !slices.Equal(got, []string{"high", "max"}) {
 			t.Fatalf("ModelReasoningEfforts = %v, want [high max]", got)
 		}
-		if known.ReasoningEffortUnsupported("unknown-model") {
+		if known.ReasoningEffortUnsupported(ModelRef{ID: "unknown-model"}) {
 			t.Fatal("unknown model: want unsupported=false (no positive evidence)")
 		}
-		if got := known.ModelReasoningEfforts("unknown-model"); !slices.Equal(got, DefaultReasoningEfforts) {
+		if got := known.ModelReasoningEfforts(ModelRef{ID: "unknown-model"}); !slices.Equal(got, DefaultReasoningEfforts) {
 			t.Fatalf("unknown ModelReasoningEfforts = %v, want default", got)
 		}
 	})
@@ -451,13 +454,13 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 		srv, _, _ := effortsPropsServer(t, `{% if enable_thinking %}x{% endif %}`,
 			map[string]bool{"supports_reasoning_effort": false}, nil)
 		p := NewOpenAIProviderWithResolver("key", "qwen3.8", srv.URL+"/v1", t.TempDir(), nil)
-		if p.ReasoningEffortUnsupported("qwen3.8") {
+		if p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
 			t.Fatal("unprobed: want unsupported=false")
 		}
 		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
 			t.Fatal(err)
 		}
-		if !p.ReasoningEffortUnsupported("qwen3.8") {
+		if !p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
 			t.Fatal("probed no-support: want unsupported=true")
 		}
 	})
@@ -469,7 +472,7 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
 			t.Fatal(err)
 		}
-		if p.ReasoningEffortUnsupported("qwen3.8") {
+		if p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
 			t.Fatal("probe supported: want unsupported=false")
 		}
 	})
@@ -482,16 +485,16 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 			map[string]bool{"supports_reasoning_effort": true}, nil)
 		resolver := effortRegistryAt(t, srv.URL+"/v1", map[string][]string{"qwen3.8": nil})
 		p := NewOpenAIProviderWithResolver("key", "qwen3.8", srv.URL+"/v1", t.TempDir(), resolver)
-		if !p.ReasoningEffortUnsupported("qwen3.8") {
+		if !p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
 			t.Fatal("pre-probe: registry toggle-only → unsupported=true")
 		}
 		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
 			t.Fatal(err)
 		}
-		if p.ReasoningEffortUnsupported("qwen3.8") {
+		if p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
 			t.Fatal("post-probe: runtime supports effort → unsupported=false")
 		}
-		if got := p.ModelReasoningEfforts("qwen3.8"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
 			t.Fatalf("ModelReasoningEfforts = %v, want [xhigh medium low]", got)
 		}
 	})
@@ -508,7 +511,7 @@ func TestReasoningEffortsInvalidatedOnSetProfiles(t *testing.T) {
 	if _, err := p.ProbeReasoningEfforts(context.Background(), "m"); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.ModelReasoningEfforts("m"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+	if got := p.ModelReasoningEfforts(ModelRef{ID: "m"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
 		t.Fatalf("ModelReasoningEfforts = %v, want [xhigh medium low]", got)
 	}
 
@@ -516,13 +519,13 @@ func TestReasoningEffortsInvalidatedOnSetProfiles(t *testing.T) {
 	if err := p.SetProfiles([]ProviderProfile{{Name: "default", BaseURL: srv.URL + "/v1", APIKey: "k"}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.ModelReasoningEfforts("m"); !slices.Equal(got, DefaultReasoningEfforts) {
+	if got := p.ModelReasoningEfforts(ModelRef{ID: "m"}); !slices.Equal(got, DefaultReasoningEfforts) {
 		t.Fatalf("post-SetProfiles ModelReasoningEfforts = %v, want default", got)
 	}
 	if _, err := p.ProbeReasoningEfforts(context.Background(), "m"); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.ModelReasoningEfforts("m"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+	if got := p.ModelReasoningEfforts(ModelRef{ID: "m"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
 		t.Fatalf("re-probed ModelReasoningEfforts = %v, want [xhigh medium low]", got)
 	}
 	if propsHits.Load() != 2 {
@@ -570,8 +573,10 @@ func TestPropsProbeUsesOwningProfileAPIKey(t *testing.T) {
 	// The catalog associates sec-model with the secondary profile; emulate
 	// the post-fetch routing state directly.
 	p.modelsMu.Lock()
-	p.modelProfile = map[string]modelProfileInfo{
-		"sec-model": {name: "secondary", baseURL: secSrv.URL + "/v1"},
+	p.modelsCache = []catalogModel{{model: openai.Model{ID: "sec-model"}, profile: "secondary"}}
+	p.modelsCachedAt = time.Now()
+	p.modelProfile = map[ModelRef]modelProfileInfo{
+		{Profile: "secondary", ID: "sec-model"}: {name: "secondary", baseURL: secSrv.URL + "/v1"},
 	}
 	p.modelsMu.Unlock()
 
@@ -582,7 +587,7 @@ func TestPropsProbeUsesOwningProfileAPIKey(t *testing.T) {
 	if !changed {
 		t.Fatal("want changed=true (default → derived)")
 	}
-	if got := p.ModelReasoningEfforts("sec-model"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+	if got := p.ModelReasoningEfforts(ModelRef{ID: "sec-model"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
 		t.Fatalf("ModelReasoningEfforts = %v, want [xhigh medium low]", got)
 	}
 	if secHits.Load() != 1 {

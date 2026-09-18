@@ -13,7 +13,17 @@ import (
 	"github.com/openai/openai-go/v3"
 )
 
-func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error) {
+// catalogModel is one catalog entry with its owning profile tag. The merged
+// list may contain the same model ID under different providers (providers
+// are separate instances — see fetchModelsWithProfiles), so the tag travels
+// with the entry: an ID-keyed map cannot express which provider's copy an
+// entry is.
+type catalogModel struct {
+	model   openai.Model
+	profile string
+}
+
+func (p *OpenAIProvider) listModels(ctx context.Context) ([]catalogModel, error) {
 	return p.listModelsInternal(ctx, true)
 }
 
@@ -25,7 +35,7 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 // clientForModel skip catalog discovery for modelsFetchBackoff and route
 // every model through the fallback/owner inference. Only full-budget catalog
 // fetches (ListModels, clientForModel's discovery) arm the backoff.
-func (p *OpenAIProvider) listModelsProbe(ctx context.Context) ([]openai.Model, error) {
+func (p *OpenAIProvider) listModelsProbe(ctx context.Context) ([]catalogModel, error) {
 	return p.listModelsInternal(ctx, false)
 }
 
@@ -34,13 +44,13 @@ func (p *OpenAIProvider) listModelsProbe(ctx context.Context) ([]openai.Model, e
 // arms the shared failure backoff (modelsFetchFailedAt): callers whose budget
 // is shorter than a full catalog fetch (the ModelContextLimit probe) pass
 // false so their brief timeout cannot degrade routing.
-func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool) ([]openai.Model, error) {
+func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool) ([]catalogModel, error) {
 	ctx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
 	defer cancel()
 
 	p.modelsMu.RLock()
 	if models, ok := p.cachedModelsLocked(); ok {
-		out := append([]openai.Model(nil), models...)
+		out := append([]catalogModel(nil), models...)
 		p.modelsMu.RUnlock()
 		return out, nil
 	}
@@ -52,7 +62,7 @@ func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool
 
 	p.modelsMu.Lock()
 	if models, ok := p.cachedModelsLocked(); ok {
-		out := append([]openai.Model(nil), models...)
+		out := append([]catalogModel(nil), models...)
 		p.modelsMu.Unlock()
 		return out, nil
 	}
@@ -65,7 +75,7 @@ func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool
 	gen := p.profilesGen
 	p.modelsMu.Unlock()
 
-	models, profileFor, perProfile, err := p.fetchModelsWithProfiles(ctx, armBackoff)
+	models, perProfile, err := p.fetchModelsWithProfiles(ctx, armBackoff)
 
 	p.modelsMu.Lock()
 	f.models, f.err = models, err
@@ -73,23 +83,23 @@ func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool
 		if p.profilesGen == gen {
 			p.modelsCache = models
 			p.modelsCachedAt = time.Now()
-			p.modelProfile = profileFor
-			// Merge, don't replace: clientForModel caches fallback entries for
-			// models absent from the catalog (unknown/custom models resolved
-			// via models.dev or the primary client). A wholesale replacement
-			// would drop those entries and force a fresh lookup + inference on
-			// every request after each catalog refresh. applyRouting keeps
-			// entries for models the round does not cover (they only point at
-			// the endpoint that used to serve it, so this is a minor risk).
-			p.applyRouting(perProfile, models, profileFor)
-			// Publish the effective owners to the shared record so sibling
-			// providers (fresh sessions, subagents) route a model to its owner
-			// even while the owner's catalog is unreachable.
-			if p.ownerRegistry != nil {
-				for id, owner := range p.modelOwner {
-					p.ownerRegistry.Record(id, owner)
-				}
+			// Rebuild the per-model profile record from the tagged entries:
+			// it serves the models.dev /props lookups that need the OWNING
+			// profile's base URL (a bare ID can no longer name it — the same
+			// ID may sit under several providers).
+			profileBaseURL := make(map[string]string, len(p.profiles))
+			for _, prof := range p.profiles {
+				profileBaseURL[prof.name] = prof.baseURL
 			}
+			p.modelProfile = make(map[ModelRef]modelProfileInfo, len(models))
+			for _, cm := range models {
+				p.modelProfile[ModelRef{Profile: cm.profile, ID: cm.model.ID}] = modelProfileInfo{name: cm.profile, baseURL: profileBaseURL[cm.profile]}
+			}
+			// applyRouting rebuilds the OpenCode twin routing (model → the
+			// zen/go client that serves it). Non-OpenCode profiles need no
+			// routing entry: clientForModel uses their stream client
+			// directly.
+			p.applyRouting(perProfile)
 		}
 		// Stale fetch (SetProfiles swapped the endpoint set while this
 		// catalog fetch was in flight): the result came from the OLD
@@ -109,7 +119,7 @@ func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool
 	if err != nil {
 		return nil, err
 	}
-	return append([]openai.Model(nil), models...), nil
+	return append([]catalogModel(nil), models...), nil
 }
 
 // fetchEndpointModels returns one endpoint's catalog, sharing the download with
@@ -137,7 +147,7 @@ func (p *OpenAIProvider) catalogFetchOnBackoff() bool {
 		time.Since(p.modelsFetchFailedAt) < modelsFetchBackoff
 }
 
-func waitModelsFetch(ctx context.Context, f *modelsFetch) ([]openai.Model, error) {
+func waitModelsFetch(ctx context.Context, f *modelsFetch) ([]catalogModel, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -145,16 +155,14 @@ func waitModelsFetch(ctx context.Context, f *modelsFetch) ([]openai.Model, error
 		if f.err != nil {
 			return nil, f.err
 		}
-		return append([]openai.Model(nil), f.models...), nil
+		return append([]catalogModel(nil), f.models...), nil
 	}
 }
 
 // profileFetchResult is one profile's catalog outcome for a fetch round:
 // its name, the model → stream-client routing it contributed (empty when
-// the query failed), and the query error. listModels applies the
-// sticky-ownership rule (applyRouting) over the per-profile results — the
-// merged winner alone cannot tell a downed owner's model from a same-ID
-// collision on a surviving endpoint.
+// the query failed), and the query error. applyRouting consumes the
+// per-profile results to rebuild the OpenCode twin routing.
 type profileFetchResult struct {
 	name    string
 	routing map[string]*openai.Client
@@ -164,15 +172,17 @@ type profileFetchResult struct {
 // fetchModelsWithProfiles loads the merged catalog from every registered
 // provider endpoint: each profile's catalog is queried in parallel (an
 // OpenCode profile queries its zen and go endpoints in parallel with
-// Go-over-Zen precedence, exactly like the single-endpoint shape), then the
-// per-profile lists are merged in PROFILE ORDER — the first profile wins on
-// duplicate model IDs (the default profile first), so what /models shows
-// agrees with the routing for models with no prior owner. The returned
-// profileFor map records each model's winning profile (name + base URL) for
-// picker grouping and per-endpoint models.dev / props resolution, and the
-// perProfile slice carries every profile's own outcome (including failures)
-// for the sticky-ownership merge.
-func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context, armBackoff bool) ([]openai.Model, map[string]modelProfileInfo, []profileFetchResult, error) {
+// Go-over-Zen precedence — the ONLY cross-endpoint merge, since the two
+// gateways are one logical provider), then the per-profile lists are
+// concatenated in PROFILE ORDER (the default profile first) with NO
+// cross-provider dedupe: providers are separate instances, so the same
+// model ID may appear once per provider that lists it, each entry tagged
+// with its owning profile. The picker shows every entry under its provider
+// group, and routing is per (profile, ID) — a model the user picks under
+// one provider never routes to another. The returned perProfile slice
+// carries every profile's own outcome (including failures) for the twin
+// routing rebuild (applyRouting).
+func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context, armBackoff bool) ([]catalogModel, []profileFetchResult, error) {
 	type result struct {
 		models  []openai.Model
 		routing map[string]*openai.Client
@@ -300,9 +310,7 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context, armBackoff
 	// when ALL profiles failed.
 	<-done
 
-	models := make([]openai.Model, 0)
-	profileFor := make(map[string]modelProfileInfo)
-	seen := make(map[string]struct{})
+	models := make([]catalogModel, 0)
 	var errs []error
 	perProfile := make([]profileFetchResult, 0, len(profiles))
 	for i, prof := range profiles {
@@ -312,19 +320,17 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context, armBackoff
 			errs = append(errs, res.err)
 			continue
 		}
-		// Add this profile's models in profile order: the FIRST profile to
-		// list a model ID wins the merged list (the default profile first).
+		// Concatenate in profile order (default first) with NO cross-provider
+		// dedupe: a model ID listed by several providers appears once per
+		// provider, tagged with its owner. (The OpenCode profile's own
+		// zen/go dedupe already happened in queryProfile — that twin is one
+		// logical provider.)
 		for _, m := range res.models {
-			if _, dup := seen[m.ID]; dup {
-				continue // earlier profile wins
-			}
-			seen[m.ID] = struct{}{}
-			models = append(models, m)
-			profileFor[m.ID] = modelProfileInfo{name: prof.name, baseURL: prof.baseURL}
+			models = append(models, catalogModel{model: m, profile: prof.name})
 		}
 	}
 	if len(models) == 0 && len(errs) > 0 {
-		return nil, nil, perProfile, errors.Join(errs...)
+		return nil, perProfile, errors.Join(errs...)
 	}
 	if len(errs) > 0 {
 		// Partial failure: serve the catalogs that succeeded and say which
@@ -333,99 +339,37 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context, armBackoff
 		log.Printf("model catalog: %d of %d provider(s) failed, serving %d models: %v",
 			len(errs), len(profiles), len(models), errors.Join(errs...))
 	}
-	return models, profileFor, perProfile, nil
+	return models, perProfile, nil
 }
 
-// applyRouting rebuilds the model → client routing from one fetch round's
-// per-profile results under the sticky-ownership rule:
-//
-//   - A model's owner is the earliest profile that lists it (profile-order
-//     precedence, as before) — UNLESS the model already has an owner that is
-//     up this round and still lists it: the owner stays. A model the user
-//     runs on one endpoint is not re-homed to an earlier-listing endpoint
-//     mid-session.
-//   - When the owner is down for the round, the model fails over to a
-//     surviving lister only if that lister was observed listing the model in
-//     a round where the owner was up (modelCoListed — a genuine co-listed
-//     endpoint). A same-ID model on an endpoint that never co-listed is a
-//     collision, not ownership: the downed owner is kept, and
-//     clientForModel's owner fallback resolves its client.
-//   - When the owner is up but no longer lists the model, the model moved:
-//     the earliest surviving lister takes over.
-//
-// Entries for models no surviving profile lists linger (as before): they
-// only point at the endpoint that used to serve them. Caller holds modelsMu
-// (the shared-registry publish happens in listModels, which may then take
-// the registry lock — see OwnerRegistry's lock-ordering note).
-func (p *OpenAIProvider) applyRouting(perProfile []profileFetchResult, models []openai.Model, profileFor map[string]modelProfileInfo) {
-	if p.modelClient == nil {
-		p.modelClient = make(map[string]*openai.Client)
-	}
-	if p.modelOwner == nil {
-		p.modelOwner = make(map[string]string)
-	}
-	if p.modelCoListed == nil {
-		p.modelCoListed = make(map[string]map[string]struct{})
-	}
+// applyRouting rebuilds the OpenCode twin routing from one fetch round's
+// per-profile results: for each OpenCode profile, every model its merged
+// zen/go catalog listed maps to the twin that serves it (queryProfile
+// already applied the Go-over-Zen precedence). Non-OpenCode profiles need
+// no entry — clientForModel uses their stream client directly. The map is
+// rebuilt from scratch each round: entries for models the round no longer
+// lists are stale, and the models.dev fallback (inferOpenCodeEndpoint)
+// covers the gap until the next fetch. Caller holds modelsMu (the
+// shared-registry publish happens in listModels, which may then take the
+// registry lock — see OwnerRegistry's lock-ordering note).
+func (p *OpenAIProvider) applyRouting(perProfile []profileFetchResult) {
+	p.modelClient = make(map[ModelRef]*openai.Client)
 	byName := make(map[string]*profileFetchResult, len(perProfile))
 	for i := range perProfile {
 		byName[perProfile[i].name] = &perProfile[i]
 	}
-	for _, m := range models {
-		id := m.ID
-		if id == "" {
-			continue
+	for _, prof := range p.profiles {
+		if prof.zenStream == nil || prof.goStream == nil {
+			continue // not an OpenCode profile: clientForModel routes directly
 		}
-		winner := profileFor[id].name
-		old, known := p.modelOwner[id]
-		owner := winner
-		if known && old != winner {
-			oldRes := byName[old]
-			switch {
-			case oldRes != nil && oldRes.err == nil:
-				if _, still := oldRes.routing[id]; still {
-					owner = old // sticky: the owner is up and still serves it
-				}
-				// else: the owner is up but no longer lists the model — it
-				// moved; the earliest surviving lister takes over.
-			case coListedKnown(p.modelCoListed[id], winner):
-				owner = winner // failover to a known co-listed endpoint
-			default:
-				owner = old // sticky: the owner is down, no co-list known
-			}
+		r := byName[prof.name]
+		if r == nil || r.err != nil {
+			continue // the profile's catalog is down this round
 		}
-		p.modelOwner[id] = owner
-		ownerRes := byName[owner]
-		if ownerRes == nil || ownerRes.err != nil {
-			// The owner is down for this round: keep any existing entry (it
-			// points at the owner's last client) and the last co-list
-			// observation.
-			continue
+		for id, c := range r.routing {
+			p.modelClient[ModelRef{Profile: prof.name, ID: id}] = c
 		}
-		if c, ok := ownerRes.routing[id]; ok {
-			p.modelClient[id] = c
-		}
-		// The owner is up: every up lister of this model is now a known
-		// co-list — a legitimate failover target if the owner later goes
-		// down.
-		co := make(map[string]struct{})
-		for i := range perProfile {
-			r := &perProfile[i]
-			if r.err != nil {
-				continue
-			}
-			if _, ok := r.routing[id]; ok {
-				co[r.name] = struct{}{}
-			}
-		}
-		p.modelCoListed[id] = co
 	}
-}
-
-// coListedKnown reports whether name is in the co-list set for a model.
-func coListedKnown(co map[string]struct{}, name string) bool {
-	_, ok := co[name]
-	return ok
 }
 
 // resolvedProfiles returns the registered endpoint set to query (nil for
@@ -450,7 +394,7 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 	p.modelsMu.RLock()
 	cached, cacheOK := p.cachedModelsLocked()
 	if cacheOK {
-		cached = append([]openai.Model(nil), cached...)
+		cached = append([]catalogModel(nil), cached...)
 	}
 	p.modelsMu.RUnlock()
 	if cacheOK {
@@ -460,8 +404,7 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 	}
 
 	// 2. models.dev registry: disk-cached, resolves instantly with no network.
-	modelName := p.currentModel()
-	if limit, _, _, _ := p.lookupModelsDevInfo(modelName); limit > 0 {
+	if limit, _, _, _ := p.lookupModelsDevInfo(p.CurrentModelRef()); limit > 0 {
 		return limit, nil
 	}
 
@@ -484,12 +427,16 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 // auto-select only applies to the single default endpoint: with additional
 // registered profiles the aggregate list is a merge of several catalogs and
 // "sole model" is not meaningful.
-func (p *OpenAIProvider) contextLimitFromModels(models []openai.Model) (int, bool) {
+func (p *OpenAIProvider) contextLimitFromModels(models []catalogModel) (int, bool) {
 	if len(models) == 1 && !p.hasMultipleProfiles() {
-		sole := models[0]
+		sole := models[0].model
 		p.modelsMu.Lock()
 		if sole.ID != "" {
 			p.model = sole.ID
+			// Sole-model auto-select only runs with the single default
+			// profile, so the owner is the default profile ("" — the
+			// routing key and the wire ID must change together).
+			p.currentModelProfile = ""
 		}
 		p.modelsMu.Unlock()
 		if limit := parseContextLimitFromJSON(sole.RawJSON()); limit > 0 {
@@ -497,11 +444,11 @@ func (p *OpenAIProvider) contextLimitFromModels(models []openai.Model) (int, boo
 		}
 	}
 	modelName := p.currentModel()
-	for _, model := range models {
-		if model.ID != modelName {
+	for _, cm := range models {
+		if cm.model.ID != modelName {
 			continue
 		}
-		if limit := parseContextLimitFromJSON(model.RawJSON()); limit > 0 {
+		if limit := parseContextLimitFromJSON(cm.model.RawJSON()); limit > 0 {
 			return limit, true
 		}
 	}
@@ -515,16 +462,18 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	}
 	out := make([]ModelInfo, 0, len(models))
 	current := p.currentModel()
-	for _, m := range models {
+	for _, cm := range models {
+		m := cm.model
 		if m.ID == "" {
 			continue
 		}
-		limit, cost, efforts, desc := p.resolveContextLimit(m.RawJSON(), m.ID)
+		ref := ModelRef{Profile: cm.profile, ID: m.ID}
+		limit, cost, efforts, desc := p.resolveContextLimit(m.RawJSON(), ref)
 		info := ModelInfo{
 			ID:               m.ID,
 			ContextLimit:     limit,
 			Current:          m.ID == current,
-			Provider:         p.profileFor(m.ID),
+			Provider:         ref.ProfileName(),
 			Description:      desc,
 			ReasoningEfforts: efforts,
 		}
@@ -538,13 +487,24 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// modelsDevURLsFor returns the models.dev base URLs to try for modelID: the
-// owning profile's URLs first (so a model listed on a second endpoint
-// resolves against its own registry entry), falling back to the default
-// profile's URLs when the catalog has not been fetched.
-func (p *OpenAIProvider) modelsDevURLsFor(modelID string) []string {
+// modelsDevURLsFor returns the models.dev base URLs to try for the model
+// reference: the owning profile's URLs (so a model listed on a second
+// endpoint resolves against its own registry entry). A ref with no profile
+// (bare-ID callers: pricing, context-limit lookups) resolves the owner from
+// the cached catalog when possible, falling back to the default profile's
+// URLs when the catalog has not been fetched.
+func (p *OpenAIProvider) modelsDevURLsFor(ref ModelRef) []string {
 	p.modelsMu.RLock()
-	info := p.modelProfile[modelID]
+	info := p.modelProfile[ref.Normalized()]
+	if info.baseURL == "" && ref.Profile == "" {
+		// Bare ID: find the cached catalog entry that owns it.
+		for _, cm := range p.modelsCache {
+			if cm.model.ID == ref.ID {
+				info = p.modelProfile[ModelRef{Profile: cm.profile, ID: ref.ID}]
+				break
+			}
+		}
+	}
 	p.modelsMu.RUnlock()
 	if info.baseURL != "" {
 		return modelsDevURLsForBaseURL(info.baseURL)
@@ -576,18 +536,34 @@ func modelsDevURLsForBaseURL(baseURL string) []string {
 	return urls
 }
 
+// refForModelID resolves the ModelRef routing key for a bare model ID: the
+// owning profile from the cached catalog when the ID is listed (the first
+// cached entry wins — profile order, the default profile first), else a
+// default-profile ref. Used by bare-ID callers (the /props effort probe)
+// that must key per-model caches by the owning profile, not the bare ID.
+func (p *OpenAIProvider) refForModelID(modelID string) ModelRef {
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	for _, cm := range p.modelsCache {
+		if cm.model.ID == modelID {
+			return ModelRef{Profile: cm.profile, ID: modelID}
+		}
+	}
+	return ModelRef{ID: modelID}
+}
+
 // lookupModelsDevInfo queries the models.dev registry by base URL + model ID
 // for context limit, pricing, accepted reasoning-effort values, and the model
 // description in a single pass. OpenCode dual endpoints are both tried so zen
 // and go models resolve. Only models.dev entries with a usable limit or cost
 // are returned; the loop keeps trying the remaining URLs otherwise, matching
 // the previous behavior.
-func (p *OpenAIProvider) lookupModelsDevInfo(modelID string) (int, *modelinfo.Cost, []string, string) {
-	if p == nil || p.modelInfo == nil || modelID == "" {
+func (p *OpenAIProvider) lookupModelsDevInfo(ref ModelRef) (int, *modelinfo.Cost, []string, string) {
+	if p == nil || p.modelInfo == nil || !ref.Valid() {
 		return 0, nil, nil, ""
 	}
-	for _, u := range p.modelsDevURLsFor(modelID) {
-		lim, cost, efforts, desc, err := p.modelInfo.Resolve(u, modelID)
+	for _, u := range p.modelsDevURLsFor(ref) {
+		lim, cost, efforts, desc, err := p.modelInfo.Resolve(u, ref.ID)
 		if err != nil {
 			continue
 		}
@@ -609,13 +585,13 @@ func (p *OpenAIProvider) lookupModelsDevInfo(modelID string) (int, *modelinfo.Co
 // reasoning-effort values, and the model description. Provider JSON is tried
 // first for the limit, but models.dev is always consulted for cost, efforts,
 // and description since provider JSON never includes them.
-func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) (int, *modelinfo.Cost, []string, string) {
+func (p *OpenAIProvider) resolveContextLimit(rawJSON string, ref ModelRef) (int, *modelinfo.Cost, []string, string) {
 	// Always look up models.dev for pricing/efforts/description (provider JSON
 	// never has them).
 	var cost *modelinfo.Cost
 	var efforts []string
 	var desc string
-	devLimit, devCost, devEfforts, devDesc := p.lookupModelsDevInfo(modelID)
+	devLimit, devCost, devEfforts, devDesc := p.lookupModelsDevInfo(ref)
 	if devCost != nil {
 		cost = devCost
 	}

@@ -63,10 +63,10 @@ func TestFetchModelsGoTakesPrecedenceOverZen(t *testing.T) {
 			zenStream: &zenClient,
 			goStream:  &goClient,
 		}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
-	models, _, perProfile, err := p.fetchModelsWithProfiles(context.Background(), true)
+	models, perProfile, err := p.fetchModelsWithProfiles(context.Background(), true)
 	if err != nil {
 		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestFetchModelsGoTakesPrecedenceOverZen(t *testing.T) {
 	}
 	counts := make(map[string]int, len(models))
 	for _, m := range models {
-		counts[m.ID]++
+		counts[m.model.ID]++
 	}
 	if counts["shared-model"] != 1 {
 		t.Fatalf("shared-model listed %d times, want 1 (Go precedence dedupes)", counts["shared-model"])
@@ -120,7 +120,7 @@ func TestClientForModelDiscoversViaCatalogLists(t *testing.T) {
 			goStream:   &goClient,
 			goCatalog:  &goClient,
 		}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
 	cases := []struct {
@@ -165,7 +165,7 @@ func TestClientForModelNonOpenCodeUsesPrimaryClient(t *testing.T) {
 	primary := newTestOpenAIClient(srv)
 	p := &OpenAIProvider{
 		profiles:    []*providerProfile{{name: "default", stream: &primary}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 		model:       "some-local-model",
 	}
 
@@ -239,7 +239,7 @@ func TestClientForModelFallbackUsesModelsDevGoFirst(t *testing.T) {
 			goStream:   &goClient,
 			goCatalog:  &goClient,
 		}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 		modelInfo:   modelinfo.NewResolver(cache),
 	}
 
@@ -288,7 +288,7 @@ func TestClientForModelBacksOffFailedCatalogFetch(t *testing.T) {
 			goStream:   &goClient,
 			goCatalog:  &goClient,
 		}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
 	// First call: both catalog endpoints 500 → one fetch attempt per endpoint.
@@ -334,7 +334,7 @@ func TestClientForModelCancelledContextReturnsFast(t *testing.T) {
 			goStream:   &goClient,
 			goCatalog:  &goClient,
 		}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 		model:       "some-model",
 	}
 
@@ -385,27 +385,29 @@ func TestFetchModelsOpenCodeKeepsSurvivingTwinWhenPeerHangs(t *testing.T) {
 			goStream:   &goClient,
 			goCatalog:  &goClient,
 		}},
-		modelClient: make(map[string]*openai.Client),
+		modelClient: make(map[ModelRef]*openai.Client),
 	}
 
 	start := time.Now()
-	models, _, _, err := p.fetchModelsWithProfiles(context.Background(), true)
+	models, _, err := p.fetchModelsWithProfiles(context.Background(), true)
 	if err != nil {
 		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 3*window {
 		t.Fatalf("fetch took %s; the hanging twin must be bounded by profileCatalogTimeout (%s), not the %s budget", elapsed, window, modelsCatalogTimeout)
 	}
-	if len(models) != 1 || models[0].ID != "zen-only" {
+	if len(models) != 1 || models[0].model.ID != "zen-only" {
 		t.Fatalf("models = %+v, want the surviving zen catalog", models)
 	}
 }
 
-// TestListModelsPreservesManualRoutingEntries verifies a successful catalog
-// refresh merges routing into modelClient instead of replacing it, so
-// fallback entries clientForModel cached for models absent from the catalog
-// (unknown/custom models) survive the refresh.
-func TestListModelsPreservesManualRoutingEntries(t *testing.T) {
+// TestListModelsRebuildsTwinRouting verifies a successful catalog refresh
+// rebuilds modelClient from the round's per-profile results: the OpenCode
+// profile's twin routing (Go over Zen on overlap) is keyed by the normalized
+// ModelRef, and entries from a previous round that the round no longer lists
+// are dropped (the models.dev inference covers such models until the next
+// fetch).
+func TestListModelsRebuildsTwinRouting(t *testing.T) {
 	zenSrv := httptest.NewServer(openCodeCatalogHandler([]string{"zen-model"}, nil))
 	defer zenSrv.Close()
 	goSrv := httptest.NewServer(openCodeCatalogHandler([]string{"go-model"}, nil))
@@ -421,7 +423,9 @@ func TestListModelsPreservesManualRoutingEntries(t *testing.T) {
 			goStream:   &goClient,
 			goCatalog:  &goClient,
 		}},
-		modelClient: map[string]*openai.Client{"custom-model": &goClient},
+		modelClient: map[ModelRef]*openai.Client{
+			{Profile: "default", ID: "stale-model"}: &goClient,
+		},
 	}
 
 	models, err := p.listModels(context.Background())
@@ -431,13 +435,13 @@ func TestListModelsPreservesManualRoutingEntries(t *testing.T) {
 	if len(models) != 2 {
 		t.Fatalf("listModels returned %d models, want 2", len(models))
 	}
-	if got := p.modelClient["custom-model"]; got != &goClient {
-		t.Fatalf("manual fallback entry for custom-model was wiped by the catalog refresh")
+	if _, stale := p.modelClient[ModelRef{Profile: "default", ID: "stale-model"}]; stale {
+		t.Fatal("entry for a model the round no longer lists must be dropped")
 	}
-	if got := p.modelClient["go-model"]; got != &goClient {
+	if got := p.modelClient[ModelRef{Profile: "default", ID: "go-model"}]; got != &goClient {
 		t.Fatalf("catalog model go-model not routed to the Go client")
 	}
-	if got := p.modelClient["zen-model"]; got != &zenClient {
+	if got := p.modelClient[ModelRef{Profile: "default", ID: "zen-model"}]; got != &zenClient {
 		t.Fatalf("catalog model zen-model not routed to the Zen client")
 	}
 	if !p.modelsFetchFailedAt.IsZero() {
