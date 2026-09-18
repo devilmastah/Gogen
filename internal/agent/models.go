@@ -25,15 +25,26 @@ func (a *Agent) setModelUnverified(v bool) {
 	a.statsMu.Unlock()
 }
 
-// AdoptModel switches the session's provider to model and marks it
-// unverified, mirroring the restore contract (RestoreSessionLocal): the
-// model came from outside this session's provider — e.g. the web /new
-// pane-model inheritance — so it must be confirmed to exist at the endpoint
-// before the first turn sends it. The async confirmation is the caller's
-// job (ValidateRestoredModel); requireModelSelected re-checks a
-// still-unverified model on the first turn as a safety net.
-func (a *Agent) AdoptModel(model string) {
-	_ = a.Provider.SetModel(model)
+// AdoptModelRef switches the session's provider to the model AND its owning
+// profile (the full routing key) and marks it unverified, mirroring the
+// restore contract (RestoreSessionLocal): the model came from outside this
+// session's provider — e.g. the web /new pane-model inheritance — so it
+// must be confirmed to exist at the owning endpoint before the first turn
+// sends it. The async confirmation is the caller's job
+// (ValidateRestoredModel); requireModelSelected re-checks a still-unverified
+// model on the first turn as a safety net.
+//
+// The routing key must travel as a ModelRef, never a bare ID: a bare ID
+// resets the owner to the default profile, silently re-homing a model the
+// source session runs on a different provider (model IDs are not unique
+// across providers — e.g. a model also listed on the OpenCode catalog
+// would route to the OpenCode endpoint instead of the owning one).
+func (a *Agent) AdoptModelRef(ref llm.ModelRef) {
+	if p, ok := a.Provider.(llm.ModelRefProvider); ok {
+		_ = p.SetModelRef(ref)
+	} else {
+		_ = a.Provider.SetModel(ref.WireID())
+	}
 	a.setModelUnverified(true)
 }
 

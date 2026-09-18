@@ -11,7 +11,12 @@ import (
 type MockProvider struct {
 	mu sync.Mutex
 
-	Model         string
+	Model string
+	// ModelProfile is the registered provider profile owning Model (the
+	// ModelRef routing key; "" = the default profile). SetModel resets it
+	// to "" exactly like the real provider (a bare ID cannot name a
+	// non-default owner); SetModelRef sets both together.
+	ModelProfile  string
 	ContextLimit  int
 	Models        []llm.ModelInfo
 	Responses     []llm.Response // consumed in order by GenerateResponse
@@ -154,7 +159,31 @@ func (m *MockProvider) SetModel(id string) error {
 		return m.SetModelErr
 	}
 	m.Model = id
+	// A bare ID cannot name a non-default owner: the routing key resets to
+	// the default profile (the real provider's contract).
+	m.ModelProfile = ""
 	return nil
+}
+
+// SetModelRef selects the model AND its owning profile in one step (the
+// ModelRefProvider capability).
+func (m *MockProvider) SetModelRef(ref llm.ModelRef) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.SetModelErr != nil {
+		return m.SetModelErr
+	}
+	m.Model = ref.ID
+	m.ModelProfile = ref.Profile
+	return nil
+}
+
+// CurrentModelRef returns the current model's routing key (the
+// ModelRefProvider capability).
+func (m *MockProvider) CurrentModelRef() llm.ModelRef {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return llm.ModelRef{Profile: m.ModelProfile, ID: m.Model}
 }
 
 func (m *MockProvider) ModelName() string {

@@ -156,6 +156,114 @@ func TestSessionNewInheritsPaneModel(t *testing.T) {
 	}
 }
 
+// TestSessionNewInheritsModelProfile pins the /new routing-key inheritance:
+// a new session created from a pane that runs a model under a NON-DEFAULT
+// provider profile must adopt the FULL routing key (profile + ID), not the
+// bare ID. A bare ID resets the owner to the default profile and silently
+// re-homes the model to a same-ID model on the default endpoint — the
+// "picked a model under provider X, but the new session still routes to
+// OpenCode" regression (deepseek-flash is listed on the OpenCode Go
+// catalog, so the bare-ID reset was invisible in the toolbar, which shows
+// only the model ID).
+func TestSessionNewInheritsModelProfile(t *testing.T) {
+	s, prov, created := newModelServer(t)
+	// Both the default session's provider and the per-session factory's
+	// catalog carry the collision shape: "shared-model" listed by BOTH the
+	// default profile and the "deepseek" profile, plus a deepseek-only
+	// model.
+	catalog := []llm.ModelInfo{
+		{ID: "shared-model", Provider: "default", ContextLimit: 128000, Current: true},
+		{ID: "shared-model", Provider: "deepseek", ContextLimit: 128000},
+		{ID: "local-only", Provider: "deepseek", ContextLimit: 128000},
+	}
+	prov.Models = catalog
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.Models = append([]llm.ModelInfo(nil), catalog...)
+		_ = p.SetModel(s.ws.DefaultModel())
+		*created = append(*created, p)
+		return p
+	}
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	sidA := cfg.SessionID
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.SessionID == sidA })
+
+	// The pane selects the DEEPSEEK copy of shared-model (qualified
+	// selector — the picker's form for non-default groups).
+	if err := conn.WriteJSON(WSMessage{Type: "set_model", Model: "deepseek/shared-model", SessionID: sidA}); err != nil {
+		t.Fatalf("send set_model: %v", err)
+	}
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.SessionID == sidA && m.Model == "shared-model" })
+	rtA, ok := s.registry.get(sidA)
+	if !ok {
+		t.Fatal("pane session not registered")
+	}
+	if got := rtA.agent.CurrentModelRef(); got != (llm.ModelRef{Profile: "deepseek", ID: "shared-model"}) {
+		t.Fatalf("setup: pane routing key = %+v, want deepseek/shared-model", got)
+	}
+
+	// /new from the deepseek-model pane: the new session must adopt the
+	// FULL routing key — same ID AND same owning profile.
+	if err := conn.WriteJSON(WSMessage{Type: "session_new"}); err != nil {
+		t.Fatalf("send session_new: %v", err)
+	}
+	// Collect the post-/new frame sequence until it holds response,
+	// clear_chat, history, and TWO configs for the new session (initial
+	// adopt-config + async validation push) — same collection contract as
+	// TestSessionNewInheritsPaneModel.
+	msgs := readMessagesUntil(t, conn, 15*time.Second, func(ms []WSMessage) bool {
+		hasResponse, hasClear, hasHistory := false, false, false
+		newConfigs := 0
+		for _, m := range ms {
+			switch m.Type {
+			case "response":
+				hasResponse = true
+			case "clear_chat":
+				hasClear = true
+			case "history":
+				hasHistory = true
+			case "config":
+				if m.SessionID != sidA && m.Model == "shared-model" {
+					newConfigs++
+				}
+			}
+		}
+		return hasResponse && hasClear && hasHistory && newConfigs >= 2
+	})
+	var sidB string
+	for _, m := range msgs {
+		if m.Type == "config" && m.SessionID != sidA && m.Model == "shared-model" {
+			sidB = m.SessionID
+			break
+		}
+	}
+	if sidB == "" {
+		t.Fatal("no config for the new session (model shared-model)")
+	}
+	rtB, ok := s.registry.get(sidB)
+	if !ok {
+		t.Fatal("new session not registered")
+	}
+	// THE assertion: the routing key keeps its owning profile. A bare-ID
+	// inheritance (the regression) would yield {default, shared-model} —
+	// the same model ID silently re-homed to the default (OpenCode)
+	// endpoint.
+	if got := rtB.agent.CurrentModelRef(); got != (llm.ModelRef{Profile: "deepseek", ID: "shared-model"}) {
+		t.Fatalf("new session routing key = %+v, want deepseek/shared-model (profile must survive /new)", got)
+	}
+	// The pane's own routing key is untouched by the /new.
+	if got := rtA.agent.CurrentModelRef(); got != (llm.ModelRef{Profile: "deepseek", ID: "shared-model"}) {
+		t.Fatalf("pane routing key after session_new = %+v, want deepseek/shared-model", got)
+	}
+}
+
 // TestSessionNewNoAdoptionWhenPaneMatchesDefault pins the no-adoption
 // guard: a /new from a pane that still runs the workspace default seeds the
 // fresh provider from that default (verified by construction) — no

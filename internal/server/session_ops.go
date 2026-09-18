@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
+	"gogen/internal/llm"
 	"gogen/internal/session"
 )
 
@@ -250,27 +251,31 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 	// model is per-session), so without inheritance every /new would stay
 	// locked on the first session's model. The TUI's /new inherits
 	// implicitly (one shared provider); the web /new must do it explicitly.
+	// The inheritance carries the FULL routing key (owning profile + ID),
+	// never the bare ID: a bare ID resets the owner to the default profile
+	// and silently re-homes a model the pane runs on a different provider
+	// (a same-ID model on the OpenCode catalog would steal it).
 	var inheritLevel agent.ThinkingLevel
-	var inheritModel string
+	var inheritRef llm.ModelRef
 	if old := *pane; old != nil && old.agent != nil {
 		// Locked read: another connection can set the pane's thinking level
 		// concurrently (wsHandleSetThinkingLevel under the session turnMu),
-		// and /new must not tear the plain field read. CurrentModel is
+		// and /new must not tear the plain field read. CurrentModelRef is
 		// provider-internal-locked.
 		_, inheritLevel = old.agent.ModeAndThinkingLevel()
-		inheritModel = old.agent.CurrentModel()
+		inheritRef = old.agent.CurrentModelRef()
 	}
 	a := s.ws.NewSessionAgent(nil, newID)
 	// Adopt the pane's model when it differs from the fresh provider's seed
-	// (the workspace default — verified by construction). An equal model
-	// needs no adoption and no validation; a different one is adopted
+	// (the workspace default — verified by construction). An equal routing
+	// key needs no adoption and no validation; a different one is adopted
 	// unverified and confirmed in the background below (same contract as
 	// resume/fork), so the first turn never sends a model that no longer
 	// exists at the endpoint. An empty pane model (e.g. cleared as stale by
 	// its own validation) falls back to the workspace-default seed.
-	modelInherited := inheritModel != "" && inheritModel != a.CurrentModel()
+	modelInherited := inheritRef.Valid() && inheritRef != a.CurrentModelRef()
 	if modelInherited {
-		a.AdoptModel(inheritModel)
+		a.AdoptModelRef(inheritRef)
 	}
 	if inheritLevel != "" {
 		// Seeds the fresh session's agent and provider (SetThinkingLevel
@@ -294,7 +299,7 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 		// provider's own catalog — or cleared and replaced by sole-model
 		// auto-select when it is gone — and the clients are corrected via
 		// OnModelChanged.
-		s.validateModelAsync(rt, inheritModel)
+		s.validateModelAsync(rt, inheritRef.WireID())
 	}
 	return rt
 }

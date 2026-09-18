@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/llm"
 	"gogen/internal/session"
 
 	"charm.land/bubbles/v2/key"
@@ -1204,23 +1205,27 @@ func (m *Model) openNewLiveSession(label string) tea.Cmd {
 	// so without this every spawned session would start on whatever model
 	// the workspace was built with instead of the one the user last picked.
 	// The typed /new inherits implicitly (it reuses the same provider); the
-	// spawned session must do it explicitly.
-	var inheritModel string
+	// spawned session must do it explicitly. The inheritance carries the
+	// FULL routing key (owning profile + ID), never the bare ID: a bare ID
+	// resets the owner to the default profile and silently re-homes a model
+	// the focused session runs on a different provider (a same-ID model on
+	// the OpenCode catalog would steal it).
+	var inheritRef llm.ModelRef
 	var inheritLevel agent.ThinkingLevel
 	if m.agent != nil {
-		inheritModel = m.agent.CurrentModel()
+		inheritRef = m.agent.CurrentModelRef()
 		_, inheritLevel = m.agent.ModeAndThinkingLevel()
 	}
 	a := m.workspace.NewSessionAgent(nil, session.NewID())
 	// Adopt only when it differs from the fresh provider's seed (the
-	// workspace default — verified by construction). An equal model needs no
-	// adoption; the shared-provider path (single-session test/embed hosts)
-	// has a.CurrentModel() == the focused model, so it is a no-op and the
-	// shared provider is never mutated. An adopted model is marked
+	// workspace default — verified by construction). An equal routing key
+	// needs no adoption; the shared-provider path (single-session test/embed
+	// hosts) has a.CurrentModelRef() == the focused ref, so it is a no-op
+	// and the shared provider is never mutated. An adopted model is marked
 	// unverified and re-checked against the provider on the first turn
 	// (requireModelSelected), the same safety net a restored model gets.
-	if inheritModel != "" && inheritModel != a.CurrentModel() {
-		a.AdoptModel(inheritModel)
+	if inheritRef.Valid() && inheritRef != a.CurrentModelRef() {
+		a.AdoptModelRef(inheritRef)
 	}
 	if inheritLevel != "" {
 		// Seeds the fresh session's agent + provider and persists the level
