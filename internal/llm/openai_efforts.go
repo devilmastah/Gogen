@@ -151,25 +151,38 @@ func literalsFromClause(clause string) []string {
 }
 
 // ProbeReasoningEfforts derives the accepted reasoning_effort values for
-// modelID from a llama.cpp capability probe (GET /props, plus a single
-// /apply-template sentinel render when the template declares no parseable
-// vocabulary) and caches the result per model. Returns whether the derived
-// set differs from the previously effective one — the caller uses that to
-// refresh UI state. Never called on the inference or turn-lock path; the
-// probe performs bounded network I/O (propsProbeTimeout per call).
+// the model reference from a llama.cpp capability probe (GET /props, plus a
+// single /apply-template sentinel render when the template declares no
+// parseable vocabulary) and caches the result per model. Returns whether
+// the derived set differs from the previously effective one — the caller
+// uses that to refresh UI state. Never called on the inference or
+// turn-lock path; the probe performs bounded network I/O (propsProbeTimeout
+// per call).
+//
+// The probe targets the REF's owning profile endpoint (the production
+// caller passes the session's CurrentModelRef): model IDs are not unique
+// across registered providers, so probing by bare ID would ask the default
+// endpoint about a model that another provider serves. A ref with no
+// profile (bare-ID callers) resolves to the first cached catalog entry that
+// lists the ID.
 //
 // Cache misses and failures are NOT cached: a later trigger retries. The
 // cache is cleared by SetProfiles (the endpoint set changed) and keyed per
 // model so switching back to a previously probed model is a no-op.
-func (p *OpenAIProvider) ProbeReasoningEfforts(ctx context.Context, modelID string) (bool, error) {
-	if p == nil || modelID == "" {
+func (p *OpenAIProvider) ProbeReasoningEfforts(ctx context.Context, ref ModelRef) (bool, error) {
+	if p == nil || ref.ID == "" {
 		return false, nil
 	}
-	baseURL := p.propsBaseURLForModel(modelID)
+	// A bare-ID ref resolves to the catalog owner so the probe keys the
+	// same entry the lookup (reasoningEffortResolution) resolves.
+	if ref.Profile == "" {
+		ref = p.refForModelID(ref.ID)
+	}
+	ref = ref.Normalized()
+	baseURL := p.propsBaseURLForRef(ref)
 	if strings.TrimSpace(baseURL) == "" {
 		return false, nil // official API: no llama.cpp capability discovery
 	}
-	ref := p.refForModelID(modelID).Normalized()
 	p.effortsMu.Lock()
 	if p.effortsDerived == nil {
 		p.effortsDerived = make(map[ModelRef]derivedEfforts)
@@ -181,14 +194,14 @@ func (p *OpenAIProvider) ProbeReasoningEfforts(ctx context.Context, modelID stri
 	}
 	p.effortsMu.Unlock()
 
-	efforts, err := p.probeEffortsOnce(ctx, baseURL, modelID)
+	efforts, err := p.probeEffortsOnce(ctx, baseURL, ref.ID)
 	if err != nil {
 		return false, err
 	}
 	// The model may have been switched while the probe was in flight; only
 	// cache when the probe still describes the requested model (router hosts
 	// can change the loaded template mid-probe).
-	if p.currentModel() != modelID {
+	if p.currentModel() != ref.ID {
 		return false, nil
 	}
 	effective := DefaultReasoningEfforts

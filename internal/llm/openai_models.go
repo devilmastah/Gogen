@@ -443,9 +443,15 @@ func (p *OpenAIProvider) contextLimitFromModels(models []catalogModel) (int, boo
 			return limit, true
 		}
 	}
-	modelName := p.currentModel()
+	// Match the CURRENT routing key (owning profile + ID), not the bare ID:
+	// model IDs are not unique across registered providers, and the first
+	// catalog entry with a matching ID may belong to a different endpoint
+	// (e.g. a model an OpenCode catalog also lists) whose JSON reports a
+	// different n_ctx — the wrong context window for this session.
+	ref := p.CurrentModelRef().Normalized()
 	for _, cm := range models {
-		if cm.model.ID != modelName {
+		entry := ModelRef{Profile: cm.profile, ID: cm.model.ID}
+		if entry.Normalized() != ref {
 			continue
 		}
 		if limit := parseContextLimitFromJSON(cm.model.RawJSON()); limit > 0 {

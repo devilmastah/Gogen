@@ -182,7 +182,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 			map[string]bool{"supports_reasoning_effort": true}, nil)
 		p := newProvider(t, srv, "qwen3.8")
 
-		changed, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8")
+		changed, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -196,7 +196,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 			t.Fatalf("apply-template hits = %d, want 0 (static parse suffices)", applyHits.Load())
 		}
 
-		changed, err = p.ProbeReasoningEfforts(context.Background(), "qwen3.8")
+		changed, err = p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,7 +222,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 			})
 		p := newProvider(t, srv, "qwen3.8")
 
-		changed, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8")
+		changed, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +245,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 			})
 		p := newProvider(t, srv, "qwen3.8")
 
-		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
+		if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"}); err != nil {
 			t.Fatal(err)
 		}
 		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); !slices.Equal(got, DefaultReasoningEfforts) {
@@ -261,7 +261,7 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 			map[string]bool{"supports_reasoning_effort": false}, nil)
 		p := newProvider(t, srv, "qwen3.8")
 
-		changed, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8")
+		changed, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -280,14 +280,14 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 		srv, propsHits, _ := effortsPropsServer(t, "", map[string]bool{}, nil)
 		p := newProvider(t, srv, "qwen3.8")
 
-		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err == nil {
+		if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"}); err == nil {
 			t.Fatal("want errEffortsUnavailable for a server without capability keys")
 		}
 		if got := p.ModelReasoningEfforts(ModelRef{ID: "qwen3.8"}); !slices.Equal(got, DefaultReasoningEfforts) {
 			t.Fatalf("ModelReasoningEfforts = %v, want default (nothing cached)", got)
 		}
 		// Not cached: a second probe must retry the endpoint.
-		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err == nil {
+		if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"}); err == nil {
 			t.Fatal("want errEffortsUnavailable on retry")
 		}
 		if propsHits.Load() != 2 {
@@ -324,7 +324,7 @@ func TestProbeEffortValuesViaApplyTemplateSendsModel(t *testing.T) {
 	p := NewOpenAIProviderWithProfiles(
 		[]ProviderProfile{{Name: "default", BaseURL: srv.URL + "/v1", APIKey: "k"}},
 		"qwen3.8", t.TempDir(), nil)
-	if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
+	if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -399,7 +399,7 @@ func TestModelReasoningEffortsPrecedence(t *testing.T) {
 	if got := p.ModelReasoningEfforts(ModelRef{ID: "other"}); !slices.Equal(got, DefaultReasoningEfforts) {
 		t.Fatalf("unprobed ModelReasoningEfforts = %v, want default", got)
 	}
-	if _, err := p.ProbeReasoningEfforts(context.Background(), "other"); err != nil {
+	if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "other"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := p.ModelReasoningEfforts(ModelRef{ID: "other"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
@@ -410,7 +410,7 @@ func TestModelReasoningEffortsPrecedence(t *testing.T) {
 	if err := p.SetModel("glm-5.2"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.ProbeReasoningEfforts(context.Background(), "glm-5.2"); err != nil {
+	if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "glm-5.2"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := p.ModelReasoningEfforts(ModelRef{ID: "glm-5.2"}); !slices.Equal(got, []string{"high", "max"}) {
@@ -457,7 +457,7 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 		if p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
 			t.Fatal("unprobed: want unsupported=false")
 		}
-		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
+		if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"}); err != nil {
 			t.Fatal(err)
 		}
 		if !p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
@@ -469,7 +469,7 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 		srv, _, _ := effortsPropsServer(t, unslothQwen38Template,
 			map[string]bool{"supports_reasoning_effort": true}, nil)
 		p := NewOpenAIProviderWithResolver("key", "qwen3.8", srv.URL+"/v1", t.TempDir(), nil)
-		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
+		if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"}); err != nil {
 			t.Fatal(err)
 		}
 		if p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
@@ -488,7 +488,7 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 		if !p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
 			t.Fatal("pre-probe: registry toggle-only → unsupported=true")
 		}
-		if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
+		if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "qwen3.8"}); err != nil {
 			t.Fatal(err)
 		}
 		if p.ReasoningEffortUnsupported(ModelRef{ID: "qwen3.8"}) {
@@ -508,7 +508,7 @@ func TestReasoningEffortsInvalidatedOnSetProfiles(t *testing.T) {
 		[]ProviderProfile{{Name: "default", BaseURL: srv.URL + "/v1", APIKey: "k"}},
 		"m", t.TempDir(), nil)
 
-	if _, err := p.ProbeReasoningEfforts(context.Background(), "m"); err != nil {
+	if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "m"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := p.ModelReasoningEfforts(ModelRef{ID: "m"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
@@ -522,7 +522,7 @@ func TestReasoningEffortsInvalidatedOnSetProfiles(t *testing.T) {
 	if got := p.ModelReasoningEfforts(ModelRef{ID: "m"}); !slices.Equal(got, DefaultReasoningEfforts) {
 		t.Fatalf("post-SetProfiles ModelReasoningEfforts = %v, want default", got)
 	}
-	if _, err := p.ProbeReasoningEfforts(context.Background(), "m"); err != nil {
+	if _, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "m"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := p.ModelReasoningEfforts(ModelRef{ID: "m"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
@@ -580,7 +580,7 @@ func TestPropsProbeUsesOwningProfileAPIKey(t *testing.T) {
 	}
 	p.modelsMu.Unlock()
 
-	changed, err := p.ProbeReasoningEfforts(context.Background(), "sec-model")
+	changed, err := p.ProbeReasoningEfforts(context.Background(), ModelRef{ID: "sec-model"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,5 +595,59 @@ func TestPropsProbeUsesOwningProfileAPIKey(t *testing.T) {
 	}
 	if defHits.Load() != 0 {
 		t.Fatalf("default /props hits = %d, want 0 (probe must target the owning profile)", defHits.Load())
+	}
+}
+
+// TestPropsProbeFollowsOwningProfileOnCollidingID pins the colliding-ID
+// case of the same rule: a model ID listed by BOTH the default and a
+// second profile must have its capability probe (/props) sent to the
+// profile the session runs on. The bare-ID first-match used to ask the
+// default endpoint about a model it does not serve — deriving another
+// endpoint's reasoning-effort vocabulary (or failing outright) for the
+// session.
+func TestPropsProbeFollowsOwningProfileOnCollidingID(t *testing.T) {
+	t.Parallel()
+
+	// The default endpoint lists the ID too, with a template that
+	// declares no effort vocabulary; the owning (local) endpoint's
+	// template declares the set.
+	defSrv, defHits, _ := effortsPropsServer(t, `{% if enable_thinking %}x{% endif %}`,
+		map[string]bool{"supports_reasoning_effort": true}, nil)
+	locSrv, locHits, _ := effortsPropsServer(t, unslothQwen38Template,
+		map[string]bool{"supports_reasoning_effort": true}, nil)
+
+	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
+		{Name: "default", BaseURL: defSrv.URL + "/v1", APIKey: "k1"},
+		{Name: "local", BaseURL: locSrv.URL + "/v1", APIKey: "k2"},
+	}, "shared-model", t.TempDir(), nil)
+	// Emulate the post-fetch routing state: both profiles list the ID.
+	p.modelsMu.Lock()
+	p.modelsCache = []catalogModel{
+		{model: openai.Model{ID: "shared-model"}, profile: "default"},
+		{model: openai.Model{ID: "shared-model"}, profile: "local"},
+	}
+	p.modelsCachedAt = time.Now()
+	p.modelProfile = map[ModelRef]modelProfileInfo{
+		{Profile: "default", ID: "shared-model"}: {name: "default", baseURL: defSrv.URL + "/v1"},
+		{Profile: "local", ID: "shared-model"}:   {name: "local", baseURL: locSrv.URL + "/v1"},
+	}
+	p.modelsMu.Unlock()
+
+	if err := p.SetModelRef(ModelRef{Profile: "local", ID: "shared-model"}); err != nil {
+		t.Fatal(err)
+	}
+	// Production shape: the probe receives the session's routing key.
+	if _, err := p.ProbeReasoningEfforts(context.Background(), p.CurrentModelRef()); err != nil {
+		t.Fatal(err)
+	}
+	if locHits.Load() != 1 {
+		t.Fatalf("owning-profile /props hits = %d, want 1", locHits.Load())
+	}
+	if defHits.Load() != 0 {
+		t.Fatalf("default /props hits = %d, want 0 (probe must target the owning profile, not the first-listing entry)", defHits.Load())
+	}
+	// The derived vocabulary is the LOCAL template's.
+	if got := p.ModelReasoningEfforts(ModelRef{Profile: "local", ID: "shared-model"}); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+		t.Fatalf("ModelReasoningEfforts = %v, want [xhigh medium low] (local template)", got)
 	}
 }

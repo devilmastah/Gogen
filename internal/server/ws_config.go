@@ -101,7 +101,10 @@ func (s *Server) maybeProbeReasoningEfforts(ctx context.Context, a *agent.Agent)
 		return
 	}
 	go func() {
-		changed, err := p.ProbeReasoningEfforts(ctx, a.CurrentModel())
+		// The session's routing key, not the bare ID: the probe must target
+		// the endpoint that actually serves the model (a model another
+		// provider also lists must not be probed on the default endpoint).
+		changed, err := p.ProbeReasoningEfforts(ctx, a.CurrentModelRef())
 		if err != nil {
 			return // keep the fallback set; a later trigger retries
 		}

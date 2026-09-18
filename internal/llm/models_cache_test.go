@@ -267,3 +267,57 @@ func TestModelContextLimitProbeDoesNotArmBackoff(t *testing.T) {
 		t.Fatal("ModelContextLimit's brief probe must not arm the shared catalog backoff")
 	}
 }
+
+// TestContextLimitFollowsOwningProfile pins the context-limit resolution
+// against the routing key: a model ID listed by BOTH the default and a
+// second profile must take its limit from the entry of the profile the
+// session actually runs on. The bare-ID first-match used to return the
+// first-listing (default) entry's n_ctx — a different endpoint's context
+// window, which mis-sizes compaction and the context bar for the session.
+func TestContextLimitFollowsOwningProfile(t *testing.T) {
+	newLimitServer := func(t *testing.T, nCtx int) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/models" && r.URL.Path != "/v1/models" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data": []map[string]any{
+					{"id": "shared-model", "object": "model", "n_ctx": nCtx},
+				},
+			})
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	defSrv := newLimitServer(t, 1000000)
+	locSrv := newLimitServer(t, 32000)
+
+	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
+		{Name: "default", BaseURL: defSrv.URL + "/v1", APIKey: "k1"},
+		{Name: "local", BaseURL: locSrv.URL + "/v1", APIKey: "k2"},
+	}, "shared-model", t.TempDir(), nil)
+	if _, err := p.ListModels(context.Background()); err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+
+	// The default copy resolves from the default profile's entry.
+	if err := p.SetModelRef(ModelRef{Profile: "default", ID: "shared-model"}); err != nil {
+		t.Fatal(err)
+	}
+	if limit, err := p.ModelContextLimit(context.Background()); err != nil || limit != 1000000 {
+		t.Fatalf("default context limit = %d, %v; want 1000000", limit, err)
+	}
+
+	// The LOCAL copy must resolve from the LOCAL entry (32k), not the
+	// first-listing default entry (1M).
+	if err := p.SetModelRef(ModelRef{Profile: "local", ID: "shared-model"}); err != nil {
+		t.Fatal(err)
+	}
+	if limit, err := p.ModelContextLimit(context.Background()); err != nil || limit != 32000 {
+		t.Fatalf("local context limit = %d, %v; want 32000 (owning profile's entry)", limit, err)
+	}
+}
