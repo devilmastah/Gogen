@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,6 +190,66 @@ func TestSendMessageReplyCapture(t *testing.T) {
 		return deliveredMessages(a, "reply to message")
 	})
 }
+
+// TestSendMessageFailedReplyNotifiesParent pins the failure half of the
+// one-channel-per-run contract: when the delivered reply turn produces no
+// assistant message (provider failure, or an interrupt before any completed
+// round), the parent must still receive a notice. The send_message tool
+// result already told the parent the message was delivered, so silence
+// would leave it waiting for a reply that never comes.
+func TestSendMessageFailedReplyNotifiesParent(t *testing.T) {
+	// Call 1 = the child's main job (report); call 2 = the send_message
+	// reply turn, which fails outright. The counter and OnStream keep the
+	// failure deterministic and race-free (a bare field write after the
+	// spawn races the turn's locked read).
+	var calls atomic.Int32
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.OnStream = func(_ context.Context, _ []llm.Message, h *llm.StreamHandlers) (*llm.StreamResult, error) {
+			if calls.Add(1) > 1 {
+				return nil, errFailedReply
+			}
+			if h.OnStart != nil {
+				h.OnStart()
+			}
+			if h.OnToken != nil {
+				h.OnToken("main job report")
+			}
+			return &llm.StreamResult{Content: "main job report"}, nil
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+
+	// The parent pane stays attached (a real user watching the parent), so
+	// the parent runtime is not orphan-evicted between the notice and the
+	// reply — an evicted parent would have the notice queued for a next
+	// registration that never comes (the TestSendMessageReplyCapture
+	// contract).
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	id, err := sp.SpawnBackground(context.Background(), a, "main job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
+
+	if err := sp.SendMessage(a, id, "please elaborate"); err != nil {
+		t.Fatal(err)
+	}
+	// The parent must learn the reply never came — silence would leave it
+	// waiting forever on the "reply is injected when the turn finishes"
+	// contract.
+	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "no reply") })
+}
+
+var errFailedReply = errors.New("provider exploded")
 
 // TestBackgroundChildBusy pins the release-safety predicate: a quiet child
 // is not busy; a send_message delivery queued for the delivery worker (not

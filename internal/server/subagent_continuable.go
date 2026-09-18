@@ -81,6 +81,12 @@ type backgroundChild struct {
 	released     bool
 	pendingReply bool // a send_message delivery is in flight; capture the next turn's reply
 	replyBase    int  // len(SnapshotMessages()) when the delivery turn started
+	// replyErr is the delivered reply turn's failure, captured by the turn
+	// error hook (armed with pendingReply): when the turn produces no
+	// assistant message, the parent's no-reply notice carries this instead
+	// of the generic text. Nil for a cancelled turn (the cancel path does
+	// not fire the error hook) and for a turn that simply produced nothing.
+	replyErr error
 	// turnStart is when the captured delivery turn started (set with
 	// pendingReply). The reply scan's index baseline (replyBase) stops
 	// bounding the turn when auto-compaction renumbers the history mid-turn;
@@ -315,6 +321,8 @@ func (c *backgroundChild) onTurnEnd() {
 	c.pendingReply = false
 	base := c.replyBase
 	turnStart := c.turnStart
+	replyErr := c.replyErr
+	c.replyErr = nil
 	c.mu.Unlock()
 
 	msgs := c.rt.agent.SnapshotMessages()
@@ -346,6 +354,22 @@ func (c *backgroundChild) onTurnEnd() {
 		}
 	}
 	if reply == "" {
+		// The delivered turn produced no assistant message (provider
+		// failure, or an interrupt before any completed round). The run's
+		// ONE return channel must still deliver something — the parent's
+		// send_message tool result already said the message was delivered,
+		// so silence would leave it waiting for a reply that never comes.
+		// The notice carries no transcript text, so the interrupted-turn
+		// rule (never re-deliver an older report) holds. A runtime being
+		// torn down (release/cancelAll) informs nobody: its parent is
+		// leaving with it.
+		if !c.rt.evicted.Load() {
+			msg := fmt.Sprintf("[subagent %s] no reply (the turn failed or was interrupted before producing one)", c.label)
+			if replyErr != nil {
+				msg = fmt.Sprintf("[subagent %s] no reply (the turn failed: %v)", c.label, replyErr)
+			}
+			c.sp.s.registry.deliverToParent(c.parentID, msg)
+		}
 		return
 	}
 	// Deliver to the live parent, or queue for its next registration when
@@ -438,9 +462,21 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 	// consumed by the turn-end hook, which injects the reply into the
 	// parent.
 	childRt.turnEndHook = child.onTurnEnd
+	// The delivered turn's failure (reportErr turns — delivery turns go
+	// through startTurn, whose error path fires this hook; the cancel path
+	// does not): recorded only while the reply capture is armed, so a
+	// child-pane turn's error can never masquerade as the reply's.
+	childRt.turnErrorHook = func(err error) {
+		child.mu.Lock()
+		if child.pendingReply {
+			child.replyErr = err
+		}
+		child.mu.Unlock()
+	}
 	childRt.deliverStartHook = func() {
 		child.mu.Lock()
 		child.pendingReply = true
+		child.replyErr = nil
 		// Baseline the child's history at delivery start so reply capture
 		// can only pick up messages the delivered turn actually produced —
 		// an interrupted turn (no completed round) must not re-deliver an
