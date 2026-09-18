@@ -213,6 +213,78 @@ func TestRequireModelSelectedSkipsRecheckWhenVerified(t *testing.T) {
 	}
 }
 
+// twoProfileAgent returns an agent over a real two-profile provider: the
+// default profile's endpoint lists defaultIDs, the "deepseek" profile's
+// lists extraIDs (the merged catalog is in profile order, default first).
+func twoProfileAgent(t *testing.T, defaultIDs, extraIDs []string) (*Agent, *llm.OpenAIProvider) {
+	t.Helper()
+	srvDefault := modelsServer(t, defaultIDs...)
+	srvExtra := modelsServer(t, extraIDs...)
+	p := llm.NewOpenAIProviderWithProfiles([]llm.ProviderProfile{
+		{Name: "default", BaseURL: srvDefault.URL + "/v1"},
+		{Name: "deepseek", BaseURL: srvExtra.URL + "/v1"},
+	}, "", t.TempDir(), nil)
+	ctxMgr := contextmgr.NewManager(p, contextmgr.Settings{})
+	return NewAgent(p, NewExecutor(t.TempDir()), ctxMgr), p
+}
+
+// TestLegacyRestoreResolvesModelOwner pins the legacy-snapshot owner
+// re-resolution: a snapshot saved before per-profile routing (no
+// ModelProvider field) restores as a default-profile model, and the first
+// catalog validation must re-home it with the pre-refactor ownership rule
+// (first profile in profile order that lists the model) — a model only one
+// non-default provider lists must route there, not to the default endpoint
+// (which would reject it as unknown).
+func TestLegacyRestoreResolvesModelOwner(t *testing.T) {
+	a, p := twoProfileAgent(t, []string{"shared-model"}, []string{"shared-model", "local-only"})
+
+	// Legacy shape: Model set, no ModelProvider (restoreWithModel's shape).
+	restoreWithModel(a, "local-only")
+	if got := p.CurrentModelRef(); got != (llm.ModelRef{Profile: "default", ID: "local-only"}) {
+		t.Fatalf("setup: restored ref = %+v, want default/local-only (legacy shape)", got)
+	}
+
+	a.ValidateRestoredModel(t.Context(), "local-only")
+	if got := p.CurrentModelRef(); got != (llm.ModelRef{Profile: "deepseek", ID: "local-only"}) {
+		t.Fatalf("ref after validation = %+v, want deepseek/local-only (legacy owner re-resolved)", got)
+	}
+}
+
+// TestLegacyRestoreCollisionKeepsDefaultProfile pins the collision case: a
+// legacy restore of a model listed by BOTH the default and a non-default
+// profile keeps the default profile — the pre-refactor rule (profile-order
+// precedence) routed it there too, so legacy sessions behave exactly as
+// before the refactor.
+func TestLegacyRestoreCollisionKeepsDefaultProfile(t *testing.T) {
+	a, p := twoProfileAgent(t, []string{"shared-model"}, []string{"shared-model", "local-only"})
+
+	restoreWithModel(a, "shared-model")
+	a.ValidateRestoredModel(t.Context(), "shared-model")
+	if got := p.CurrentModelRef(); got != (llm.ModelRef{Profile: "default", ID: "shared-model"}) {
+		t.Fatalf("ref after validation = %+v, want default/shared-model (first-listing profile, pre-refactor rule)", got)
+	}
+}
+
+// TestNonLegacyRestoreKeepsSavedProfile pins the guard: a snapshot WITH a
+// ModelProvider carries a deliberate owner and must never be re-homed by
+// validation — even when another profile lists the same ID first in
+// profile order.
+func TestNonLegacyRestoreKeepsSavedProfile(t *testing.T) {
+	a, p := twoProfileAgent(t, []string{"shared-model"}, []string{"shared-model", "local-only"})
+
+	a.RestoreSessionLocal(SessionSnapshot{
+		ContextLimit:  128000,
+		Model:         "shared-model",
+		ModelProvider: "deepseek",
+		Messages:      []llm.Message{{Role: "user", Content: "hi"}},
+	}, "sess-1")
+
+	a.ValidateRestoredModel(t.Context(), "shared-model")
+	if got := p.CurrentModelRef(); got != (llm.ModelRef{Profile: "deepseek", ID: "shared-model"}) {
+		t.Fatalf("ref after validation = %+v, want deepseek/shared-model (saved owner must survive validation)", got)
+	}
+}
+
 // TestRequireModelSelectedFailOpenOnCatalogError pins the fail-open path: a
 // restored model cannot be verified while the catalog is unreachable, so it
 // is kept (and the turn proceeds) instead of being cleared on a transient

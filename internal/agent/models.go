@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -23,6 +22,26 @@ func (a *Agent) setModelUnverified(v bool) {
 	a.statsMu.Lock()
 	a.modelUnverified = v
 	a.statsMu.Unlock()
+}
+
+// setModelOwnerLegacy marks (or clears) the pending legacy-owner
+// re-resolution on the current model (see modelOwnerLegacy). Guarded by
+// statsMu (leaf lock: short critical section, no I/O).
+func (a *Agent) setModelOwnerLegacy(v bool) {
+	a.statsMu.Lock()
+	a.modelOwnerLegacy = v
+	a.statsMu.Unlock()
+}
+
+// consumeModelOwnerLegacy reads and clears the legacy-owner marker in one
+// step: the re-resolution runs at most once, at the first validation that
+// can see the catalog.
+func (a *Agent) consumeModelOwnerLegacy() bool {
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	v := a.modelOwnerLegacy
+	a.modelOwnerLegacy = false
+	return v
 }
 
 // AdoptModelRef switches the session's provider to the model AND its owning
@@ -46,6 +65,31 @@ func (a *Agent) AdoptModelRef(ref llm.ModelRef) {
 		_ = a.Provider.SetModel(ref.WireID())
 	}
 	a.setModelUnverified(true)
+	// An explicit adoption is a deliberate choice: a late legacy-owner
+	// re-resolution must not re-home it.
+	a.setModelOwnerLegacy(false)
+}
+
+// adoptLegacyModelOwner re-homes a model restored from a legacy snapshot
+// (see modelOwnerLegacy) to the profile that owns it: owner is the first
+// profile in catalog (profile) order that lists the model — the
+// pre-refactor ownership rule — so a legacy session routes exactly as the
+// old code did (a model only one non-default provider lists goes there,
+// not to the default endpoint). No-op when the marker is not set (a
+// deliberate selection, including an explicit default-profile pick, is
+// never re-homed), when the model changed since the restore, or when the
+// owner is already the current profile.
+func (a *Agent) adoptLegacyModelOwner(model, owner string) {
+	if owner == "" || !a.consumeModelOwnerLegacy() {
+		return
+	}
+	ref := a.CurrentModelRef()
+	if ref.ID != model || owner == ref.ProfileName() {
+		return
+	}
+	if p, ok := a.Provider.(llm.ModelRefProvider); ok {
+		_ = p.SetModelRef(llm.ModelRef{Profile: owner, ID: model})
+	}
 }
 
 func (a *Agent) CurrentModel() string {
@@ -108,8 +152,18 @@ func (a *Agent) recheckRestoredModel(ctx context.Context) {
 	if err != nil {
 		return // keep the model, keep it unverified (fail-open)
 	}
-	if slices.ContainsFunc(models, func(m llm.ModelInfo) bool { return m.ID == model }) {
+	owner := ""
+	for _, m := range models {
+		if m.ID == model {
+			// First match in catalog order (= profile order): the
+			// pre-refactor owner, for the legacy-restore re-home.
+			owner = m.Provider
+			break
+		}
+	}
+	if owner != "" {
 		a.setModelUnverified(false)
+		a.adoptLegacyModelOwner(model, owner)
 		return
 	}
 	// Confirmed absent: clear the stale model — unless a concurrent
@@ -120,6 +174,7 @@ func (a *Agent) recheckRestoredModel(ctx context.Context) {
 		_ = a.Provider.SetModel("")
 	}
 	a.setModelUnverified(false)
+	a.setModelOwnerLegacy(false)
 	if a.Provider.ModelName() == "" {
 		_, _ = a.Provider.ModelContextLimit(ctx)
 	}
@@ -217,8 +272,10 @@ func (a *Agent) SelectModel(ctx context.Context, selector string) error {
 		return err
 	}
 	// A selection always comes from the provider's own model list, so it is
-	// verified by construction.
+	// verified by construction, and it is a deliberate choice: a late
+	// legacy-owner re-resolution must not re-home it.
 	a.setModelUnverified(false)
+	a.setModelOwnerLegacy(false)
 	if a.Context != nil {
 		a.Context.RefreshAfterModelChange(ctx)
 	}

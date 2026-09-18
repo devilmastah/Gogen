@@ -186,6 +186,11 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 		// the first turn's re-check) confirms it still exists at the
 		// provider; until then it must not be blindly sent to the endpoint.
 		a.setModelUnverified(true)
+		// A legacy snapshot (no ModelProvider) lost the owning profile in
+		// the migration: mark it so the first catalog validation
+		// re-resolves the owner (pre-refactor rule) instead of leaving the
+		// model on the default endpoint.
+		a.setModelOwnerLegacy(snap.ModelProvider == "")
 	}
 
 	// Pre-warm the context limit from the snapshot so the first ContextStats
@@ -228,15 +233,21 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 		return
 	}
 	found := false
+	owner := ""
 	for _, m := range models {
 		if m.ID == model {
 			found = true
+			// First match in catalog order (= profile order, default
+			// first): the pre-refactor owner, used to re-home a legacy
+			// restore (see adoptLegacyModelOwner).
+			owner = m.Provider
 			break
 		}
 	}
 	if found {
 		// The restored model is still served by this provider.
 		a.setModelUnverified(false)
+		a.adoptLegacyModelOwner(model, owner)
 	} else {
 		// The restored model no longer exists at the provider. Clear it —
 		// unless a concurrent /models selection replaced it in the
@@ -247,6 +258,7 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 			_ = a.Provider.SetModel("")
 		}
 		a.setModelUnverified(false)
+		a.setModelOwnerLegacy(false)
 		if a.Provider.ModelName() == "" {
 			_, _ = a.Provider.ModelContextLimit(ctx)
 		}
@@ -964,15 +976,27 @@ type sessionMeta struct {
 	// label from the conversation (see sessionLabel).
 	labelRenamed bool
 	// modelUnverified is true when the selected model came from a session
-	// restore or an external adoption (AdoptModel — the web /new pane-model
-	// inheritance) and has not yet been confirmed to exist at the provider.
-	// RestoreSessionLocal and AdoptModel set it; ValidateRestoredModel
-	// clears it once the model is resolved (present, absent, or
-	// auto-selected); SelectModel clears it (a selection comes from the
-	// provider's own list). requireModelSelected re-checks a
+	// restore or an external adoption (AdoptModelRef — the web /new
+	// pane-model inheritance) and has not yet been confirmed to exist at
+	// the provider. RestoreSessionLocal and AdoptModelRef set it;
+	// ValidateRestoredModel clears it once the model is resolved (present,
+	// absent, or auto-selected); SelectModel clears it (a selection comes
+	// from the provider's own list). requireModelSelected re-checks a
 	// still-unverified model on the first turn so a stale model from a
 	// previous provider is never sent to the endpoint. Guarded by statsMu.
 	modelUnverified bool
+	// modelOwnerLegacy is true when the selected model was restored from a
+	// LEGACY snapshot (saved before per-profile routing: no ModelProvider
+	// field). Its owning profile was lost in the migration and is
+	// re-resolved by the first catalog validation (ValidateRestoredModel /
+	// recheckRestoredModel) with the pre-refactor ownership rule — the
+	// first profile in profile order that lists the model — so a legacy
+	// session routes exactly as the old code did: a model only one
+	// non-default provider lists goes there, not to the default endpoint.
+	// RestoreSessionLocal sets it; SelectModel/AdoptModelRef clear it (a
+	// deliberate choice is never re-homed by a late validation); the
+	// validation consumes it (adoptLegacyModelOwner). Guarded by statsMu.
+	modelOwnerLegacy bool
 
 	// onModelChangedMu serializes install (ValidateRestoredModelAsync) and
 	// read (ValidateRestoredModel) of the exported OnModelChanged hook.
