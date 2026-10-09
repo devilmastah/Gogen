@@ -75,7 +75,7 @@ func (s *Server) handleWSWorkingDir(ws *wsConn, ctx context.Context, pane **sess
 		paneRT.notifyTurnReleased()
 		accum := a.SnapshotUsageAccum()
 		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
-		echo := WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode, GlobalMode: cfg.GlobalMode, Board: cfg.Board, Subagent: cfg.Subagent, SubagentMaxDepth: cfg.SubagentMaxDepth}
+		echo := WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ModelProvider: cfg.ModelProvider, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode, GlobalMode: cfg.GlobalMode, Board: cfg.Board, Subagent: cfg.Subagent, SubagentMaxDepth: cfg.SubagentMaxDepth}
 		s.decorateConfig(&echo)
 		_ = ws.writeJSON(echo)
 		if len(skipped) > 0 {

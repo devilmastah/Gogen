@@ -775,18 +775,27 @@ func (m *Model) modelsModalContent() ([]styleLine, map[int]int) {
 }
 
 // modelsModalThinkingLevelsFor returns the thinking levels the models
-// modal's chip row offers for modelID: "off" (omit) plus the model's
-// accepted reasoning-effort values. supported=false means the model has
+// modal's chip row offers for one catalog row: "off" (omit) plus the
+// model's accepted reasoning-effort values. The row's OWNING profile
+// travels with the lookup (ref), because model IDs are not unique across
+// providers: a bare-ID lookup would resolve the owner by first-listing and
+// offer another profile's effort set. supported=false means the model has
 // no reasoning-effort control (a known toggle-only entry, or a llama.cpp
 // /props probe reporting no support): the section is hidden, mirroring
 // the web's reasoningEffortsUnsupported handling.
-func (m *Model) modelsModalThinkingLevelsFor(modelID string) (levels []agent.ThinkingLevel, supported bool) {
+func (m *Model) modelsModalThinkingLevelsFor(ref llm.ModelRef) (levels []agent.ThinkingLevel, supported bool) {
 	if m.agent == nil {
 		// Literal-built models (tests): the default closed set.
 		return []agent.ThinkingLevel{agent.ThinkingOff, agent.ThinkingLow, agent.ThinkingMedium, agent.ThinkingHigh}, true
 	}
-	levels = m.agent.ThinkingLevelsForModel(modelID)
+	levels = m.agent.ThinkingLevelsForRef(ref)
 	return levels, len(levels) > 1
+}
+
+// modelsModalRowRef is the routing ref of one catalog row: the model ID plus
+// the profile its group names (see modelProviderName).
+func modelsModalRowRef(mdl llm.ModelInfo) llm.ModelRef {
+	return llm.ModelRef{Profile: modelProviderName(mdl), ID: mdl.ID}
 }
 
 // modelsModalThinkingLevels is the chip row's level set for the model
@@ -794,13 +803,13 @@ func (m *Model) modelsModalThinkingLevelsFor(modelID string) (levels []agent.Thi
 // model's levels (web parity: the toolbar chips are anchored to the
 // active model, not the catalog).
 func (m *Model) modelsModalThinkingLevels() ([]agent.ThinkingLevel, bool) {
-	id := ""
 	if m.modelCursor >= 0 && m.modelCursor < len(m.modelList) {
-		id = m.modelList[m.modelCursor].ID
-	} else if m.agent != nil {
-		id = m.agent.CurrentModel()
+		return m.modelsModalThinkingLevelsFor(modelsModalRowRef(m.modelList[m.modelCursor]))
 	}
-	return m.modelsModalThinkingLevelsFor(id)
+	if m.agent != nil {
+		return m.modelsModalThinkingLevelsFor(m.agent.CurrentModelRef())
+	}
+	return m.modelsModalThinkingLevelsFor(llm.ModelRef{})
 }
 
 // thinkingChipLabel is a chip's display text, following the web
@@ -1009,7 +1018,7 @@ func (m *Model) modelsModalInner() int {
 			inner = w
 		}
 		// Thinking chip row for this model's accepted efforts.
-		if levels, supported := m.modelsModalThinkingLevelsFor(mdl.ID); supported {
+		if levels, supported := m.modelsModalThinkingLevelsFor(modelsModalRowRef(mdl)); supported {
 			text, _ := buildThinkingChipRow(levels, -1)
 			if w := lipgloss.Width(text) + 4; w > inner {
 				inner = w
@@ -1180,11 +1189,12 @@ func (m *Model) renderHelpModal() string {
 			{"backspace", "Delete backward"},
 			{"tab", "Complete slash cmds"},
 		}},
-		{"Viewport (esc to focus)", [][]string{
-			{"↑ ↓ j k", "Scroll line"},
-			{"pgup / pgdn", "Scroll page"},
-			{"home / end", "Top / bottom"},
-			{"[ / ]", "Previous / next prompt"},
+		{"Scrolling", [][]string{
+			{"↑ ↓ j k", "Scroll line (esc to focus viewport)"},
+			{"pgup / pgdn", "Scroll page (input or viewport focus)"},
+			{"home / end", "Top / bottom (empty input or viewport focus)"},
+			{"click divider label", "Jump to latest / New messages"},
+			{"[ / ]", "Previous / next prompt (viewport focus)"},
 			{"mouse wheel", "Scroll viewport"},
 			{"mouse (right edge)", "Prompt rail: hover = preview, click = jump"},
 			{"i / enter", "Return to input"},
@@ -1348,6 +1358,13 @@ func (m *Model) deleteSelectedSession() (tea.Model, tea.Cmd) {
 	m.confirmRestore = ModalSessions
 	m.confirmAction = func() (tea.Model, tea.Cmd) {
 		cmd := m.deleteSavedRow(s.ID)
+		if cmd == nil {
+			// Refused (e.g. the session is still hosted live in a
+			// background slot): nothing was deleted, so keep the row and
+			// close the list so the refusal status line is visible.
+			m.modal = ModalNone
+			return m, nil
+		}
 		// Remove from the local list.
 		m.sessionList = append(m.sessionList[:m.sessionCursor], m.sessionList[m.sessionCursor+1:]...)
 		if m.sessionCursor >= len(m.sessionList) {

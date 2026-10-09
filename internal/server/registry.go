@@ -128,28 +128,25 @@ type sessionRuntime struct {
 	// deliverMu guards pendingDeliver; deliverWorker gates the single
 	// queue worker; deliverNotify wakes it at turn end (see deliver.go).
 	// pendingDeliver is the per-session FIFO queue shared by system
-	// deliveries (job notices, subagent completion notices) and user steering
-	// messages (typed while a turn runs) — one queue, one drain path;
-	// deliverItem.Kind scopes presentation and policy.
+	// deliveries (job notices, compact subagent terminal events, exact
+	// replies) and user steering messages (typed while a turn runs) — one
+	// queue, one drain path; deliverItem.Kind scopes presentation and policy.
 	deliverMu      sync.Mutex
 	pendingDeliver []deliverItem
 	deliverWorker  atomic.Bool
 	deliverNotify  chan struct{}
 
-	// turnEndHook is invoked after every turn ends (setTurnActive
-	// active→false, turnMu still held). The continuable-subagent registry
-	// uses it to capture a send_message reply. Set once at child creation;
-	// never reassigned, so a plain field is race-free.
-	turnEndHook func()
 	// deliverStartHook is invoked by the delivery worker immediately before
 	// it starts a delivered turn (see deliver.go) — for a send_message
-	// delivery ONLY (deliverFromChildMessage): the continuable-subagent
-	// registry uses it to arm reply capture exactly when a send_message
-	// delivery actually starts, not when it was queued, and never for a
-	// plain machine notice (a child's reaction to a job notice or subagent
-	// report must not be injected into its parent as a reply). Set once at
-	// child creation; never reassigned.
+	// delivery ONLY (deliverFromChildMessage). It arms the child's per-run
+	// reply capture exactly when that delivery starts, not when it was queued.
+	// Set once at child creation; never reassigned.
 	deliverStartHook func()
+	// deliverResultFunc receives the exact output/error from a delivered turn
+	// whose source armed deliverStartHook. It replaces transcript scanning:
+	// runTurnBody already knows which response belongs to this invocation.
+	// Set once at child creation; never reassigned.
+	deliverResultFunc func(string, error)
 	// approverOverride replaces the default deleteApprover when non-nil
 	// (the subagent spawner installs the D6 forwarding approver; the board
 	// start installs a deny-when-unattended approver).
@@ -173,7 +170,7 @@ type pendingApproval struct {
 // newSessionRuntime builds a runtime with the per-session turn machinery
 // initialized. The agent must be non-nil.
 func newSessionRuntime(a *agent.Agent) *sessionRuntime {
-	return &sessionRuntime{
+	rt := &sessionRuntime{
 		agent:         a,
 		stream:        &wsConnStream{},
 		approvals:     make(map[string]*pendingApproval),
@@ -182,6 +179,14 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 		deliverNotify: make(chan struct{}, 1),
 		turnRelease:   make(chan struct{}),
 	}
+	// When this session's background work drains, re-check whether it has
+	// become an evictable orphan. Both eviction paths refuse to evict a
+	// session that still owns background work (keepsBackgroundWork), so
+	// without this callback a session kept alive only by a long-running job
+	// would stay resident forever. A no-op until register sets rt.registry,
+	// and for nested/held runtimes, whose own guards apply.
+	a.SetBackgroundIdleHook(rt.evictOrphanedIfPossible)
+	return rt
 }
 
 // newSessionRuntimeWithHold builds a runtime whose pending delete approvals
@@ -548,15 +553,6 @@ func (rt *sessionRuntime) setTurnActive(active bool, startedAt time.Time, owner 
 	rt.stateMu.Unlock()
 	if !active {
 		rt.signalDeliveries()
-		rt.fireTurnEndHook()
-	}
-}
-
-// fireTurnEndHook invokes the runtime's turn-end hook, if any (called with
-// turnMu still held by the ending turn — the hook must not acquire it).
-func (rt *sessionRuntime) fireTurnEndHook() {
-	if rt.turnEndHook != nil {
-		rt.turnEndHook()
 	}
 }
 
@@ -703,6 +699,43 @@ type sessionRegistry struct {
 	// (deliverToParent).
 	parentDeliverMu  sync.Mutex
 	parentDeliveries map[string][]string
+
+	// bgWorkHook reports whether a session id still owns background work
+	// that evicting its runtime would destroy. Agent.HasBackgroundWork
+	// covers the shell jobs and terminals and is consulted directly; the web
+	// server wires this to the subagent spawner's live continuable children
+	// (the cap-eviction tail cancels those through evictHook). Set once at
+	// construction; nil when the host has no such work.
+	bgWorkHook func(sessionID string) bool
+}
+
+// keepsBackgroundWork reports whether evicting rt would destroy background
+// work the user started in that session: a running execute_command
+// background=true job, a persistent terminal, or a live background subagent
+// child. Such a session is NOT idle however few clients are attached to it:
+// the eviction tail (evictRuntime → Agent.Close) kills exactly this work,
+// while the session itself stays saved on disk — so a client that merely
+// stopped watching (a pane switch, a page refresh, registry-cap pressure)
+// must not destroy it. Only an explicit end-of-session (session_close,
+// delete, shutdown) does.
+//
+// Locking: the cap-eviction loop (register) calls this while holding r.mu;
+// the orphan-eviction path calls it without it. Both are safe because
+// everything consulted here is a LEAF lock — the agent's bgMu/termMu and the
+// child registry's mu — and every holder of childRegistry.mu releases it
+// before calling back into the registry, so no reverse edge to r.mu exists
+// (see register's LOCK ORDER note).
+func (r *sessionRegistry) keepsBackgroundWork(rt *sessionRuntime) bool {
+	if rt == nil || rt.agent == nil {
+		return false
+	}
+	if rt.agent.HasBackgroundWork() {
+		return true
+	}
+	if r.bgWorkHook == nil {
+		return false
+	}
+	return r.bgWorkHook(rt.agent.SessionID)
 }
 
 func newSessionRegistry(maxActive int) *sessionRegistry {
@@ -718,10 +751,11 @@ func newSessionRegistry(maxActive int) *sessionRegistry {
 
 // register adds a runtime under id and returns the ids of any sessions it
 // evicted to make room (empty when none). Registering an already-active id is
-// a no-op (dedupe, E9) returning nil. Evicted sessions were flushed and their
-// background jobs killed before eviction; their ids are returned so callers
-// that prune the store right after (session create/fork) can protect the
-// fresh files (E2/E11).
+// a no-op (dedupe, E9) returning nil. Evicted sessions were flushed before
+// eviction; their ids are returned so callers that prune the store right
+// after (session create/fork) can protect the fresh files (E2/E11). A
+// victim with live background work or an attached viewer is never chosen
+// (see keepsBackgroundWork) — the cap is exceeded rather than destroy it.
 func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 	var victims []*sessionRuntime
 	var victimIDs []string
@@ -742,16 +776,22 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 	// session (scan from the back of order) until the new registration
 	// fits. The default session (front of order) is never evicted —
 	// messages without a sessionId and new connections' initial pane
-	// depend on it. A session with a running (including headless) turn is
-	// never evicted: if every candidate is busy the cap is allowed to be
-	// exceeded rather than kill an in-flight turn. Victims are only
-	// COLLECTED under the lock (cheap bookkeeping); the flush + notify
-	// happen after the lock is released, because broadcast's enqueue can
-	// block up to 5s on a stuck socket and must not stall registry
-	// lookups. Evicted sessions are flushed (nothing in memory is lost —
-	// the client's pane re-attaches from the store, E11) and their
-	// attached sockets get session_detached so the client closes the pane
-	// instead of sending messages to a stale runtime.
+	// depend on it. "Idle" means more than "no turn running": a session
+	// with an attached VIEWER is never evicted (the client is looking at
+	// it — an eviction would send it session_detached and close the pane
+	// out from under the user), and neither is one that still owns
+	// background work (keepsBackgroundWork: a running
+	// execute_command background=true job, a persistent terminal, or a
+	// live background subagent child — the tail below kills all three).
+	// As with a running (including headless) turn, if every candidate is
+	// busy the cap is allowed to be exceeded rather than destroy live work.
+	// Victims are only COLLECTED under the lock (cheap bookkeeping); the
+	// flush + notify happen after the lock is released, because
+	// broadcast's enqueue can block up to 5s on a stuck socket and must
+	// not stall registry lookups. Evicted sessions are flushed (nothing in
+	// memory is lost — the client's pane re-attaches from the store, E11)
+	// and their attached sockets get session_detached so the client closes
+	// the pane instead of sending messages to a stale runtime.
 	//
 	// The turnState check races a turn that is ABOUT to start: a message
 	// handler may have resolved this runtime before the eviction and not
@@ -764,13 +804,16 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 	// runtime. TryLock never blocks: a busy (or starting) session is
 	// skipped, exceeding the cap rather than killing the turn.
 	//
-	// LOCK ORDER (documented invariant): this loop takes r.mu → turnMu, and
-	// sessionDelete takes turnMu → r.mu (registry.remove) — the reverse
-	// order. That is NOT a deadlock only because neither path ever blocks on
-	// the other's inner lock: the victim lock here is a non-blocking TryLock
-	// and sessionDelete's turnMu acquisition is also a TryLock. Do not
-	// convert either to a blocking Lock()/RLock() without reworking both
-	// paths.
+	// LOCK ORDER (documented invariant): this loop takes r.mu → turnMu,
+	// r.mu → clientsMu, r.mu → stateMu, r.mu → bgMu/termMu and r.mu →
+	// childRegistry.mu — all of them LEAF locks (every holder of
+	// childRegistry.mu releases it before calling into the registry, so no
+	// reverse edge exists) — while sessionDelete takes turnMu → r.mu
+	// (registry.remove), the reverse order. That is NOT a deadlock only
+	// because neither path ever blocks on the other's inner lock: the
+	// victim lock here is a non-blocking TryLock and sessionDelete's turnMu
+	// acquisition is also a TryLock. Do not convert either to a blocking
+	// Lock()/RLock() without reworking both paths.
 	for i := len(r.order) - 1; len(r.agents) >= r.maxActive && i > 0; i-- {
 		victimID := r.order[i]
 		victim := r.agents[victimID]
@@ -781,7 +824,23 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 		if victim.nested {
 			continue
 		}
+		// A session the user is looking at is not a memory-management
+		// candidate: evicting it would close the pane (session_detached)
+		// mid-read. Attach recency (setDefault) keeps the pane just opened
+		// at the front, but a pane opened earlier and still open must not
+		// become the LRU victim either.
+		if victim.viewerCount() > 0 {
+			continue
+		}
 		if active, _ := victim.turnState(); active {
+			continue
+		}
+		// Live background work outlives the runtime's memory: the tail
+		// below kills it (agent.Close) and cancels the session's background
+		// subagent children (fireEvictHook), so it must not pick this
+		// victim. The session stays saved and reopens against the same
+		// live runtime, work included.
+		if r.keepsBackgroundWork(victim) {
 			continue
 		}
 		if !victim.turnMu.TryLock() {
@@ -805,17 +864,17 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 		// saved-session list and distort the recency ordering that
 		// Store.List/LatestID/Prune rely on.
 		victim.agent.FlushPending()
-		// The runtime is leaving memory: its background jobs (execute_command
-		// background=true) have no owner left to poll them, so kill them
-		// rather than leak orphan processes — the documented evictRuntime
-		// contract every other eviction path goes through. Close is
-		// idempotent, non-blocking (context cancels + retention-timer stops
-		// under bgMu), and nils the job registry: a finishing job can
-		// neither rearm a reaper on the closing Agent nor fire a completion
-		// notice the registry-backed deliverer would silently drop (the
-		// victim is already unregistered here). Under turnMu, mirroring
-		// evictRuntime; the sticky evicted flag set above already blocks
-		// any new turn once the lock is released.
+		// The victim owns no live background work (the loop above skips
+		// those), so any job still registered here has FINISHED: Close
+		// clears the bookkeeping rather than leave a stray process — the
+		// documented evictRuntime contract every other eviction path goes
+		// through. Close is idempotent, non-blocking (context cancels +
+		// retention-timer stops under bgMu), and nils the job registry: a
+		// finishing job can neither rearm a reaper on the closing Agent nor
+		// fire a completion notice the registry-backed deliverer would
+		// silently drop (the victim is already unregistered here). Under
+		// turnMu, mirroring evictRuntime; the sticky evicted flag set above
+		// already blocks any new turn once the lock is released.
 		victim.agent.Close()
 		victim.releaseTurn()
 		victim.broadcast(WSMessage{Type: "session_detached", SessionID: victimIDs[i]})
@@ -940,6 +999,17 @@ func (r *sessionRegistry) closeRuntime(rt *sessionRuntime) {
 // (session_detached) and detach any client that raced in between — see
 // evictRuntime for the ordering rationale.
 //
+// Background work is the other half of "idle". A session that still owns a
+// running background job, a persistent terminal, or a live background
+// subagent child is NOT an orphan however many clients dropped: the eviction
+// tail (evictRuntime → Agent.Close) kills exactly that work, and the session
+// stays saved, so a client that merely stopped watching — a pane switch, a
+// page refresh, a closed tab — must not destroy it. Such a runtime keeps its
+// registry slot until the work drains; the agent's background-idle hook
+// (installed in newSessionRuntime) then re-runs this check and the normal
+// idle eviction proceeds. The memory a still-running job pins is the same
+// trade the running-turn exemption makes above.
+//
 // A turn can only run while holding turnMu (startTurn's caller acquires it),
 // so winning the TryLock proves the runtime is idle — and a concurrent
 // message handler that resolved this runtime before the eviction cannot
@@ -958,6 +1028,11 @@ func (r *sessionRegistry) evictOrphaned(rt *sessionRuntime) {
 		return
 	}
 	if active, _ := rt.turnState(); active {
+		return
+	}
+	// Idle, but still doing work: evicting now would kill it (see above).
+	// Same exemption shape as a running turn.
+	if r.keepsBackgroundWork(rt) {
 		return
 	}
 	// A runtime with queued system deliveries is not idle: evicting it now

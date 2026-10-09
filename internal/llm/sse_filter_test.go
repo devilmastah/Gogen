@@ -155,9 +155,11 @@ func TestFilterSSEEvents(t *testing.T) {
 	}
 }
 
-// TestSSEFilterTransportNonSSEPassthrough: non-event-stream bodies (the JSON
-// error payloads the SDK parses for apierror) must reach the SDK untouched,
-// even when they contain comment-looking or data-looking lines.
+// TestSSEFilterTransportNonSSEPassthrough: non-event-stream bodies — including
+// the JSON error payloads the SDK parses for apierror — must pass this filter
+// untouched, even when they contain comment-looking or data-looking lines.
+// (Error payloads are normalized, if needed, by the separate transport this
+// one is wrapped in; see api_error_body_test.go.)
 func TestSSEFilterTransportNonSSEPassthrough(t *testing.T) {
 	t.Parallel()
 	const body = ": looks like a comment\n and data: {not sse}"

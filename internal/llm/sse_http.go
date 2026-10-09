@@ -149,10 +149,13 @@ func newSSEHTTPClient() *http.Client {
 		return conn, nil
 	}
 	return &http.Client{
-		// sseFilterTransport drops the SSE keep-alive frames that
-		// openai-go's stream decoder cannot digest (unexpected end of
-		// JSON input — see sse_filter.go for the per-version gap analysis).
-		Transport: &sseFilterTransport{base: tr},
+		// sseFilterTransport drops the SSE keep-alive frames that openai-go's
+		// stream decoder cannot digest (unexpected end of JSON input — see
+		// sse_filter.go for the per-version gap analysis).
+		// apiErrorBodyTransport (outermost) normalizes the >=400 JSON error
+		// payloads the SDK's apierror parser chokes on or loses (see
+		// api_error_body.go).
+		Transport: &apiErrorBodyTransport{base: &sseFilterTransport{base: tr}},
 	}
 }
 
@@ -178,7 +181,10 @@ func newCatalogHTTPClient() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = dialer.DialContext
 	return &http.Client{
-		Timeout:   modelsCatalogTimeout,
-		Transport: &jsonSniffTransport{base: tr},
+		Timeout: modelsCatalogTimeout,
+		// jsonSniffTransport normalizes a JSON body served under the wrong
+		// media type; apiErrorBodyTransport (outermost) normalizes the
+		// non-standard error payloads on top of that (see api_error_body.go).
+		Transport: &apiErrorBodyTransport{base: &jsonSniffTransport{base: tr}},
 	}
 }

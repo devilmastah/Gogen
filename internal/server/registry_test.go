@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -354,28 +353,29 @@ func TestRegistryEvictRuntimeUnregistersBeforeNotify(t *testing.T) {
 	}
 }
 
-// TestRegistryCapEvictionDetachesClients pins fix A in the cap-eviction path:
-// a victim evicted by the registry cap may have attached clients (another tab
-// watching it), and those sockets must be detached after the session_detached
-// notification — pre-fix they lingered in the evicted runtime's clients set
-// until connection teardown, which can never reach an unregistered runtime.
-func TestRegistryCapEvictionDetachesClients(t *testing.T) {
+// TestEvictedRuntimeDetachesClients pins the sweep in the shared eviction
+// tail: a runtime that leaves the registry may still have attached clients
+// (a client that raced in after the eviction was decided, or a session
+// closed explicitly while another tab was watching), and those sockets must
+// be detached AFTER the session_detached notification — pre-fix they lingered
+// in the removed runtime's clients set until connection teardown, which can
+// never reach an unregistered runtime.
+//
+// The registry cap no longer picks a session that has an attached viewer
+// (TestCapEvictionSkipsViewedSession), so this drives the tail directly:
+// a client that attaches in the window between the eviction decision and
+// the sweep lands in exactly the state the sweep exists for.
+func TestEvictedRuntimeDetachesClients(t *testing.T) {
 	r := newSessionRegistry(2)
 	rtA := newTestRuntime(t)
-	rtB := newTestRuntime(t)
+	rtA.agent.SessionID = "a"
 	r.register("a", rtA)
-	r.register("b", rtB)
-	r.setDefault("b") // b is the default (front of order)
 
-	// rtA is watched by a client when the cap evicts it.
 	ws := newFakeWSConn()
 	rtA.attach(ws)
 
-	r.register("c", newTestRuntime(t))
+	r.evictRuntime(rtA)
 
-	if _, ok := r.get("a"); ok {
-		t.Fatal("idle session was not evicted")
-	}
 	select {
 	case m := <-ws.sendQ:
 		if m.Type != "session_detached" {
@@ -477,41 +477,88 @@ func TestFSMutatingToolsConsistency(t *testing.T) {
 	}
 }
 
-// TestCapEvictionKillsBackgroundJobs pins the background-job half of the
-// cap-eviction teardown contract. Every eviction path except register's cap
-// tail goes through evictRuntime, which kills the session's execute_command
-// background=true jobs ("kill them rather than leak orphan processes");
-// pre-fix the cap tail flushed and detached the victim but skipped
-// agent.Close, so the job's process kept running with no owner left to poll
-// it, and its eventual completion notice was silently dropped (the
-// registry-backed deliverer resolves the live runtime and finds none).
-func TestCapEvictionKillsBackgroundJobs(t *testing.T) {
+// TestCapEvictionSkipsSessionWithBackgroundWork pins the background-work
+// half of the cap-eviction contract: a session that still owns a RUNNING
+// execute_command background=true job is NOT a victim, however idle and
+// unviewed it is. The cap is exceeded rather than destroy work the user
+// started — the same trade the running-turn exemption makes. The job keeps
+// running against the same live runtime, which is what the user's session
+// reopens against (loadOrCreateRuntime returns the registered runtime).
+func TestCapEvictionSkipsSessionWithBackgroundWork(t *testing.T) {
 	dir := t.TempDir()
 	r := newSessionRegistry(2)
 	rtA := newSessionRuntime(agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(dir), nil))
+	rtA.agent.SessionID = "a"
 	rtB := newTestRuntime(t)
 	r.register("a", rtA)
 	r.register("b", rtB)
 	r.setDefault("b") // b is the default (front of order): a is the LRU victim
 
-	// A long-running background job on the soon-to-be-evicted session:
-	// sleep 30, then write the marker. If the eviction fails to kill the
-	// job, the process outlives the runtime and completes its work. (The
-	// BackgroundJob handle is agent-internal; the test observes the job
-	// through the exported status/hook API only.)
+	// A long-running background job on the would-be victim: sleep 30, then
+	// write the marker. If the eviction killed it, the marker would appear
+	// later; if it is left alone, the job must still be pollable as RUNNING.
 	marker := filepath.Join(dir, "marker")
 	id, err := rtA.agent.StartBackgroundCommand(context.Background(), "sleep 30; echo done > "+marker)
 	if err != nil {
 		t.Fatalf("start background job: %v", err)
 	}
-	if st, err := rtA.agent.BackgroundJobStatus(id); err != nil || !strings.Contains(st, "RUNNING") {
-		t.Fatalf("status before eviction: %q, %v; want RUNNING", st, err)
+	defer rtA.agent.Close()
+
+	// The third registration exceeds the cap → a would be evicted, except
+	// that it is still doing background work.
+	r.register("c", newTestRuntime(t))
+
+	if _, ok := r.get("a"); !ok {
+		t.Fatal("cap eviction unregistered a session with a running background job")
 	}
-	// Record any completion notice: after the fix the eviction CANCELS the
-	// job, so onJobFinished never fires the hook — and a notice from a
-	// legitimately finished job would be dropped anyway, because the
-	// deliverer resolves the runtime through the registry the victim just
-	// left.
+	if rtA.evicted.Load() {
+		t.Fatal("a session with a running background job was marked evicted")
+	}
+	if st, err := rtA.agent.BackgroundJobStatus(id); err != nil || !strings.Contains(st, "RUNNING") {
+		t.Fatalf("job status after the cap was exceeded: %q, %v; want RUNNING", st, err)
+	}
+	requireNever(t, 750*time.Millisecond, "background job was killed by cap eviction", func() bool {
+		_, err := rtA.agent.BackgroundJobStatus(id)
+		return err != nil
+	})
+}
+
+// TestCapEvictionClosesEvictedSession pins the other half: an evicted victim
+// — one with no live background work — still goes through agent.Close, so its
+// job bookkeeping is cleared and no process outlives the runtime. Pre-fix the
+// cap tail flushed and detached the victim but skipped agent.Close, so a
+// finished job stayed pollable forever and a live one kept running with no
+// owner left to poll it.
+func TestCapEvictionClosesEvictedSession(t *testing.T) {
+	dir := t.TempDir()
+	r := newSessionRegistry(2)
+	rtA := newSessionRuntime(agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(dir), nil))
+	rtA.agent.SessionID = "a"
+	rtB := newTestRuntime(t)
+	r.register("a", rtA)
+	r.register("b", rtB)
+	r.setDefault("b") // b is the default (front of order): a is the LRU victim
+
+	// A job that has already FINISHED: the session owns no live work, so it
+	// is evictable — but the eviction must still clear the job registry so a
+	// stale id cannot be polled against a session that left memory.
+	//
+	// The background-idle hook is detached first: with it installed, this
+	// clientless runtime evicts ITSELF the moment the job finishes (that
+	// drain retry is TestBackgroundWorkDrainedThenEvicted), which would
+	// hide the cap tail this test is about.
+	rtA.agent.SetBackgroundIdleHook(nil)
+	id, err := rtA.agent.StartBackgroundCommand(context.Background(), "echo done")
+	if err != nil {
+		t.Fatalf("start background job: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		st, err := rtA.agent.BackgroundJobStatus(id)
+		return err == nil && strings.Contains(st, "FINISHED")
+	})
+	// Record any completion notice: the eviction must not synthesize one
+	// (onJobFinished already fired for this job, and the deliverer would
+	// drop a notice for a session that left the registry anyway).
 	notices := make(chan string, 1)
 	rtA.agent.SetJobNoticeHook(func(summary string) { notices <- summary })
 
@@ -525,20 +572,15 @@ func TestCapEvictionKillsBackgroundJobs(t *testing.T) {
 		t.Fatal("evicted runtime not marked")
 	}
 	// The eviction tail must have run agent.Close: the job registry is
-	// cleared, so a later poll reports the job unknown. Pre-fix the job
-	// stayed registered — RUNNING, then FINISHED for the whole retention
-	// window, and never unknown.
+	// cleared, so a later poll reports the job unknown. Without the Close
+	// the job stayed registered — FINISHED for the whole retention window,
+	// and never unknown.
 	waitFor(t, 5*time.Second, func() bool {
 		_, err := rtA.agent.BackgroundJobStatus(id)
 		return err != nil && strings.Contains(err.Error(), "unknown background job")
 	})
-	// The kill must have cut the sleep short: the marker is never written.
-	requireNever(t, 750*time.Millisecond, "background job survived cap eviction and completed its work", func() bool {
-		_, err := os.Stat(marker)
-		return err == nil
-	})
-	// No completion notice fires for the cancelled job.
-	requireNever(t, 250*time.Millisecond, "completion notice fired for a cap-evicted session's killed job", func() bool {
+	// No completion notice fires from the teardown.
+	requireNever(t, 250*time.Millisecond, "completion notice fired for a cap-evicted session's job", func() bool {
 		select {
 		case <-notices:
 			return true
@@ -549,6 +591,33 @@ func TestCapEvictionKillsBackgroundJobs(t *testing.T) {
 	// No pollable residue: the evicted session's job registry is empty.
 	if _, err := rtA.agent.BackgroundJobStatus(id); err == nil || !strings.Contains(err.Error(), "unknown background job") {
 		t.Fatalf("status after cap eviction: %v, want unknown background job", err)
+	}
+}
+
+// TestCapEvictionSkipsViewedSession pins the other "not idle" rule: a
+// session with an attached viewer is never the LRU victim. Evicting it sends
+// session_detached, which closes the user's pane mid-read — a cap that has
+// run out of genuinely idle sessions must be exceeded instead.
+func TestCapEvictionSkipsViewedSession(t *testing.T) {
+	r := newSessionRegistry(2)
+	rtA := newTestRuntime(t)
+	rtA.agent.SessionID = "a"
+	rtB := newTestRuntime(t)
+	rtB.agent.SessionID = "b"
+	r.register("a", rtA)
+	r.register("b", rtB)
+	r.setDefault("b") // b is the default (front of order): a would be the victim
+
+	// A is idle but open in a tab.
+	rtA.attach(newFakeWSConn())
+
+	r.register("c", newTestRuntime(t))
+
+	if _, ok := r.get("a"); !ok {
+		t.Fatal("cap eviction unregistered a session with an attached viewer")
+	}
+	if rtA.evicted.Load() {
+		t.Fatal("a session with an attached viewer was marked evicted")
 	}
 }
 

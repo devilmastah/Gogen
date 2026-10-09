@@ -25,7 +25,7 @@ export function initToolResult(d) {
 const BIG_RESULT_CHARS = 32000;
 const BIG_RESULT_LINES = 400;
 const BIG_ARG_CHARS = 4000;
-// Shared with app.js's tool-args formatters (formatToolArgs /
+// Shared with app.js's tool-args formatters (formatArgsCompact /
 // formatToolArgsFragment) as a function — the web test harness evals each
 // module in its own scope, so only function declarations are visible
 // cross-module (the components/ sharing convention).

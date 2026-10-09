@@ -220,7 +220,7 @@ func TestSystemOverflowSparesUserItems(t *testing.T) {
 			t.Fatalf("user enqueue %d refused", i)
 		}
 	}
-	for i := 0; i < defaultDeliverQueueCap+2; i++ {
+	for i := 0; i < maxSystemDeliveryQueue+2; i++ {
 		rt.deliverToSession("sys-" + string(rune('a'+i)))
 	}
 	// Every user item survives the system burst.
@@ -236,8 +236,8 @@ func TestSystemOverflowSparesUserItems(t *testing.T) {
 		}
 	}
 	rt.deliverMu.Unlock()
-	if sys != defaultDeliverQueueCap {
-		t.Fatalf("queued system items = %d, want %d", sys, defaultDeliverQueueCap)
+	if sys != maxSystemDeliveryQueue {
+		t.Fatalf("queued system items = %d, want %d", sys, maxSystemDeliveryQueue)
 	}
 }
 

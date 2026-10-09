@@ -91,6 +91,8 @@ const COMPONENT_MODULES = [
   'internal/server/web/components/palette.js',
   'internal/server/web/components/terminal.js',
   'internal/server/web/components/sessions.js',
+  // Status-display relay (browser mode); no imports, so order is free.
+  'internal/server/web/components/status-display.js',
   // Declarative settings schema + renderer; settings.js imports both and
   // calls renderSettings() at eval time, so they must land first.
   'internal/server/web/components/settings-schema.js',

@@ -104,6 +104,30 @@ func TestTUISubagentModelCascade(t *testing.T) {
 	}
 }
 
+// TestTUISubagentReportBounded verifies the TUI shares the documented
+// subagent report cap, so an oversized foreground child cannot bypass it via
+// a host-specific spawner.
+func TestTUISubagentReportBounded(t *testing.T) {
+	cfg := &config.Config{OpenAIModel: "default-model"}
+	models := []llm.ModelInfo{{ID: "default-model", ContextLimit: 128000}}
+	parentProv := llmtest.NewMockProvider()
+	parent := agent.NewAgent(parentProv, agent.NewExecutor(t.TempDir()), contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000}))
+	sp := &tuiSubagentSpawner{cfg: cfg, providerFactory: func(*config.Config, *agent.Agent) llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.Model = "default-model"
+		p.Models = models
+		p.StreamResults = []*llm.StreamResult{{Content: strings.Repeat("x", agent.MaxSubagentReportBytes+1000)}}
+		return p
+	}}
+	report, err := sp.Spawn(t.Context(), parent, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(report, "… (truncated)") {
+		t.Fatalf("oversized TUI subagent report was not truncated")
+	}
+}
+
 // TestTUISubagentExplicitModelFailsSpawn pins the shared spawner's hard
 // requirement: an explicit model that is not in the child's catalog fails
 // the spawn — the TUI must not silently run an unrelated model.

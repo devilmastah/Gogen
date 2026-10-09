@@ -4,8 +4,13 @@
 // a running turn or its tokenization) — must NOT flip the active pane's id.
 // If it did, paneForMessage would drop the history/config/context that
 // follow for the pane's real session and the transcript would appear never
-// to load. Re-keying is only allowed when the pane has no id yet (startup) or
-// a session change is in flight (typed /new, /resume, /fork, resend).
+// to load. Re-keying from a config is only allowed at startup, when the pane
+// has no id yet: every session change re-keys earlier and more precisely (the
+// reply's `response` carries the sessionAction, resume's `session_state`
+// adopts the target), so a config-driven re-key of an identified pane could
+// only be stale or mis-timed — e.g. the outgoing session's lagging config
+// landing after a fork's early validation push would flip the pane BACK and
+// detach the fork, stranding the resent turn's broadcast frames.
 // Run: node scripts/test_config_rekey_gate.js
 'use strict';
 
@@ -48,7 +53,7 @@ function makeEnv() {
     const pane = activePane();
     const oldId = pane.id;
     if (data.sessionId && pane.id !== data.sessionId) {
-      if (pane.id === null || pendingSessionResponse) {
+      if (pane.id === null) {
         pane.id = data.sessionId;
         if (oldId) detaches.push(oldId);
       }
@@ -100,16 +105,20 @@ function assert(cond, msg) {
   assert(p.id === 'SESS-X', 'startup config adopts the id on a null-id pane (got ' + p.id + ')');
 }
 
-// 3. Legit re-key: typed /new with a session change in flight re-keys the
-//    pane and detaches the old session.
+// 3. An in-flight session change does NOT let the config re-key: the reply
+//    frames (response with sessionAction / session_state) own the re-key.
+//    A config that re-keyed mid-change could only be the OUTGOING session's
+//    lagging config (arriving after the fork's early validation push already
+//    adopted the new id) — flipping the pane back would detach the fork and
+//    strand the resent turn's broadcast frames.
 {
   const env = makeEnv();
-  const p = env.makePane('SESS-OLD');
+  const p = env.makePane('SESS-NEW'); // early validation push adopted the fork
   env.switchTo(p.key);
-  env.pending = true; // typed /new marks the change in flight
-  env.configHandler({ type: 'config', sessionId: 'SESS-NEW' });
-  assert(p.id === 'SESS-NEW', 'in-flight session change re-keys the pane (got ' + p.id + ')');
-  assert(env.detaches.includes('SESS-OLD'), 'old session detached after re-key');
+  env.pending = true; // typed /new|/fork still awaiting its response
+  env.configHandler({ type: 'config', sessionId: 'SESS-OLD' });
+  assert(p.id === 'SESS-NEW', 'config never re-keys an identified pane mid-change (got ' + p.id + ')');
+  assert(env.detaches.length === 0, 'the fork is not detached by a lagging old-session config');
 }
 
 // 4. response handler already re-keyed (normal path): the follow-up config

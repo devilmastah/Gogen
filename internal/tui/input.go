@@ -39,10 +39,41 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m2, cmd, ok := m.handleEscapeKey(msg); ok {
 		return m2, cmd
 	}
+	if m2, cmd, ok := m.handleInputScrollKey(msg); ok {
+		return m2, cmd
+	}
 	// Pass all other keys to textarea (it handles editing, word nav, kill, etc.)
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
 	return m, cmd
+}
+
+// handleInputScrollKey scrolls the transcript while the composer has focus,
+// so pgup/pgdn/home/end work without the esc-into-viewport dance. pgup/pgdn
+// page the transcript unconditionally — the textarea's own pgup/pgdn only
+// page the cursor around a ≤8-row composer, a far smaller win. home/end
+// jump to the transcript top/bottom only while the composer is EMPTY: with
+// a draft they keep their documented textarea meaning (line start/end).
+func (m *Model) handleInputScrollKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
+	switch msg.String() {
+	case "pgup":
+		m.viewport.PageUp()
+	case "pgdown":
+		m.viewport.PageDown()
+	case "home", "end":
+		if strings.TrimSpace(m.textarea.Value()) != "" {
+			return m, nil, false
+		}
+		if msg.String() == "home" {
+			m.viewport.GotoTop()
+		} else {
+			m.viewport.GotoBottom()
+		}
+	default:
+		return m, nil, false
+	}
+	m.viewportScrolledByUser()
+	return m, nil, true
 }
 
 // handleInputHelpKey opens the help modal on F1 in any mode (but NOT "?" — that
@@ -368,35 +399,46 @@ func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// below: j/k/g/G are printable ASCII, and the typing check would
 	// steal them (while it came first, the vi-scroll keys were dead code
 	// and the documented "j/k scroll" binding typed into the input).
+	// Each case records the follow state: scrolling up detaches from the
+	// live edge (streaming tokens stop re-pinning), returning to the
+	// bottom re-attaches.
 	switch msg.String() {
 	case "up", "k":
 		m.viewport.LineUp(1)
+		m.viewportScrolledByUser()
 		return m, nil
 	case "down", "j":
 		m.viewport.LineDown(1)
+		m.viewportScrolledByUser()
 		return m, nil
 	case "pgup":
 		m.viewport.PageUp()
+		m.viewportScrolledByUser()
 		return m, nil
 	case "pgdown", "ctrl+f":
 		m.viewport.PageDown()
+		m.viewportScrolledByUser()
 		return m, nil
 	case "home", "g":
 		m.viewport.GotoTop()
+		m.viewportScrolledByUser()
 		return m, nil
 	case "end", "G":
 		m.viewport.GotoBottom()
+		m.viewportScrolledByUser()
 		return m, nil
 	}
 
 	// Ctrl+U half page up (in viewport mode)
 	if key.Matches(msg, m.keys.ViewportHalfUp) {
 		m.viewport.HalfPageUp()
+		m.viewportScrolledByUser()
 		return m, nil
 	}
 	// Ctrl+D half page down (in viewport mode)
 	if key.Matches(msg, m.keys.ViewportHalfDown) {
 		m.viewport.HalfPageDown()
+		m.viewportScrolledByUser()
 		return m, nil
 	}
 

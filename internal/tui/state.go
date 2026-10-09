@@ -29,9 +29,11 @@ const (
 )
 
 // maxPendingDeliveries caps queued system deliveries (job notices,
-// subagent reports), mirroring the web delivery queue: overflow drops the
-// OLDEST delivery — a stale job notice is worse than none.
-const maxPendingDeliveries = 8
+// subagent reports), mirroring the web delivery queue (32): overflow drops
+// the OLDEST delivery — a stale job notice is worse than none — and the
+// queue drains as ONE batched turn, so the cap bounds the notice backstop
+// rather than the number of drained turns.
+const maxPendingDeliveries = 32
 
 // ModalKind identifies the active modal overlay.
 type ModalKind int
@@ -78,6 +80,22 @@ type Model struct {
 	// Components
 	viewport Viewport
 	textarea textarea.Model
+
+	// viewDetached suspends viewport auto-follow while the user reads
+	// history: manual scrolls away from the live edge set it, returning to
+	// the bottom (or an explicit pin: submit, session switch, rebuild)
+	// clears it. Content growth only re-pins while it is false — the TUI's
+	// stickToBottom (see follow.go).
+	viewDetached bool
+	// viewDetachLines is the viewport's total line count at the moment of
+	// detach (the web's contentHeightAtDetach): growth past it while
+	// detached means content landed below the fold, which latches
+	// viewNewContent and flips the jump button's label to "New messages".
+	viewDetachLines int
+	viewNewContent  bool
+	// viewJumpHover is true while the pointer is over the jump button (the
+	// divider label), for its hover highlight.
+	viewJumpHover bool
 
 	// State
 	focus     FocusTarget
@@ -410,7 +428,7 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 		// Build initial history
 		m.chatLines = renderMessages(a.Messages, a.WorkingDir, modelLine, a.Mode.String())
 		m.setViewportContent()
-		m.viewport.GotoBottom()
+		m.pinFollow()
 		if stats := a.ContextStats(context.Background()); stats.Snapshot.Limit > 0 || stats.Snapshot.Used > 0 {
 			m.contextStats = stats
 			m.contextLine = agent.FormatContextBrief(stats)
@@ -507,7 +525,16 @@ func (m *Model) SetSize(width, height int) {
 	m.textarea.SetHeight(textareaHeight)
 
 	m.setViewportContent()
-	m.viewport.GotoBottom()
+	if m.viewDetached {
+		// Re-wrapping redefines the "below the fold" baseline: without
+		// this, a width change alone would read as new messages.
+		m.viewDetachLines = m.viewport.TotalLines()
+	}
+	// A resize re-wraps the whole transcript; while following, re-anchor
+	// at the live edge. relayout() routes through here at every turn
+	// boundary too, so this must respect a detached reader (followBottom,
+	// not pinFollow) — otherwise every turn end would yank them down.
+	m.followBottom()
 }
 
 // busyStripRows reports how many rows the busy progress strip contributes

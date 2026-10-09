@@ -113,6 +113,18 @@ func (t *TUI) Run(ctx context.Context) {
 	m.ctx = ctx
 	m.workspace = t.workspace
 
+	// From here until p.Run returns, the inline renderer owns the terminal:
+	// divert every diagnostic write away from it (see divertTerminalWrites
+	// for the corruption this prevents and which call sites are affected).
+	// Installed before the program exists so setup-time logging is covered
+	// too. GOGEN_TUI_LOG diverts to a file instead of discarding.
+	restoreTerminalWrites := divertTerminalWrites()
+	defer func() {
+		// Idempotent; the explicit call below already restores so that
+		// teardown diagnostics reach the real stderr.
+		restoreTerminalWrites()
+	}()
+
 	// v2: mouse reporting is requested declaratively from View()
 	// (MouseModeCellMotion), not via a program option.
 	p := tea.NewProgram(
@@ -158,8 +170,13 @@ func (t *TUI) Run(ctx context.Context) {
 		p.Send(modelChangedMsg{})
 	}
 
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+	_, runErr := p.Run()
+	// The renderer has released the terminal, so restore the real stderr
+	// before anything else reports: a fatal TUI error and the teardown sweep
+	// below belong on the shell, not in the diversion sink.
+	restoreTerminalWrites()
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "TUI error: %v\n", runErr)
 	}
 	// The event loop has stopped: either an in-app quit (flushAndQuit already
 	// swept every session) or a context cancellation from SIGINT/SIGTERM/

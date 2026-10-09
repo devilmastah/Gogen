@@ -83,6 +83,10 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		Terminal:                  mergeString("GOGEN_TERMINAL", file.Terminal, def.Terminal),
 		JobNotices:                mergeString("GOGEN_JOB_NOTICES", file.JobNotices, def.JobNotices),
 		Automations:               mergeString("GOGEN_AUTOMATIONS", file.Automations, def.Automations),
+		StatusDisplay:             mergeString("GOGEN_STATUS_DISPLAY", file.StatusDisplay, def.StatusDisplay),
+		StatusDisplayHost:         mergeString("GOGEN_STATUS_DISPLAY_HOST", file.StatusDisplayHost, def.StatusDisplayHost),
+		StatusDisplayToken:        mergeString("GOGEN_STATUS_DISPLAY_TOKEN", file.StatusDisplayToken, def.StatusDisplayToken),
+		StatusDisplaySource:       mergeString("GOGEN_STATUS_DISPLAY_SOURCE", file.StatusDisplaySource, def.StatusDisplaySource),
 	}
 
 	if flags.WorkingDir != "" {

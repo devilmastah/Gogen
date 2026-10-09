@@ -322,6 +322,33 @@ func TestPropsBaseURLTracksCurrentModel(t *testing.T) {
 	}
 }
 
+// TestPropsBaseURLTracksCurrentModelBeforeCatalog pins the pre-catalog case
+// of the same rule: no catalog fetch has populated modelProfile (a fresh
+// per-session provider on restore), so the /props probe target must resolve
+// from the CURRENT ref's own registered profile. The default-profile
+// fallback used to probe the default endpoint about a model it does not
+// serve, deriving another provider's vocabulary (or failing outright).
+func TestPropsBaseURLTracksCurrentModelBeforeCatalog(t *testing.T) {
+	defSrv := catalogHandler("gpt-4o")
+	locSrv := catalogHandler("llama3.1")
+	t.Cleanup(defSrv.Close)
+	t.Cleanup(locSrv.Close)
+
+	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
+		{Name: "default", BaseURL: defSrv.URL + "/v1", APIKey: "k1"},
+		{Name: "local-llama", BaseURL: locSrv.URL + "/v1", APIKey: "k2"},
+	}, "", t.TempDir(), nil)
+	if err := p.SetModelRef(ModelRef{Profile: "local-llama", ID: "llama3.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.modelProfile) != 0 {
+		t.Fatalf("modelProfile has %d entries, want 0 (pre-catalog state)", len(p.modelProfile))
+	}
+	if got := p.propsBaseURLForCurrentModel(); got != locSrv.URL+"/v1" {
+		t.Fatalf("pre-catalog props base URL = %q, want %q (owning profile)", got, locSrv.URL+"/v1")
+	}
+}
+
 // TestModelsDevURLsForOwningProfile verifies models.dev resolution tries the
 // model's OWNING profile's base URL first, so a model listed on a second
 // endpoint resolves against its own registry entry.

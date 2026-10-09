@@ -34,12 +34,21 @@ update:
 	go get -u tool
 	go mod tidy
 
+# Test recipes run under a per-run scratch GOTMPDIR: the go command's build
+# work dirs and t.TempDir() (testing.go reads GOTMPDIR) both land in it, so a
+# killed or timed-out run leaves at most one /tmp/gogen-test-* dir instead of
+# hundreds of stray /tmp/Test* dirs. Removed on exit and on interrupt.
+GOTMPDIR_RUN = tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/gogen-test-XXXXXX") || exit 1; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM;
+
 test:
-	go test -race ./...
+	@$(GOTMPDIR_RUN) GOTMPDIR="$$tmp" go test -race ./...
 
 # Packages with //go:build debug code (view-drift, profiling, WS stall knobs).
 test-debug:
-	go test -race -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
+	@$(GOTMPDIR_RUN) GOTMPDIR="$$tmp" go test -race -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
 
 vet:
 	go vet ./...

@@ -239,15 +239,21 @@ func TestSubagentApprovalRoutesToReopenedParent(t *testing.T) {
 	})
 	stub.waitBlocked(1) // the child's turn is parked in the provider
 
-	// Orphan-evict the parent (no clients, idle): its background child
-	// deliberately keeps running.
+	// Evict the parent (no clients, idle) while its background child keeps
+	// running. NOTE: this uses the explicit eviction tail, NOT
+	// evictOrphaned: an unwatched parent that still owns a live background
+	// child is no longer an orphan (keepsBackgroundWork), which is the
+	// policy TestSwitchKeepsSessionWithBackgroundSubagent pins. The tail
+	// here is the one that fires on an end-of-session (close/delete/
+	// shutdown) and on cap eviction, and — like orphan eviction — it does
+	// NOT cancel children, so the child's approval keeps flowing.
 	parentRt, ok := s.registry.get(a.SessionID)
 	if !ok {
 		t.Fatal("parent runtime not registered")
 	}
-	s.registry.evictOrphaned(parentRt)
+	s.registry.evictRuntime(parentRt)
 	if _, ok := s.registry.get(a.SessionID); ok {
-		t.Fatal("parent must be unregistered after orphan eviction")
+		t.Fatal("parent must be unregistered after eviction")
 	}
 
 	// Reopen the parent (the sidebar attach path) and attach a client: the

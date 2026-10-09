@@ -425,7 +425,7 @@ func (m *Model) appendChatLine(line string) {
 		m.tocAppendAnchor(line) // prompt rail: the web's appendTocDot
 	}
 	m.buildFromPrefix()
-	m.viewport.GotoBottom()
+	m.followBottom()
 }
 
 // appendToLastLine appends text to the last line in the chat buffer.
@@ -438,7 +438,7 @@ func (m *Model) appendToLastLine(text string) {
 	m.chatLines[len(m.chatLines)-1] += text
 	m.tocRefreshLastPrompt()
 	m.buildFromPrefix()
-	m.viewport.GotoBottom()
+	m.followBottom()
 }
 
 // replaceLastLine replaces the last line in the chat buffer.
@@ -451,7 +451,7 @@ func (m *Model) replaceLastLine(text string) {
 	m.tocRefreshLastPrompt()
 	// Prefix is unchanged; only the last line may have been replaced.
 	m.buildFromPrefix()
-	m.viewport.GotoBottom()
+	m.followBottom()
 }
 
 func (m *Model) handleStreamToken(token string) {
@@ -642,7 +642,8 @@ func (m *Model) closeThinkingBlock() {
 // so only a write to the LAST chat line keeps it valid (cheap suffix
 // rebuild via buildFromPrefix); a write to any earlier line stales the
 // prefix and needs the full re-wrap (setViewportContent). The viewport is
-// always re-pinned to the bottom, matching streaming behavior.
+// re-pinned to the bottom only while following (followBottom): a reader
+// scrolled up keeps their position as tokens stream.
 func (m *Model) commitChatLineWrite(idx int, append bool, text string) {
 	if append {
 		m.chatLines[idx] += text
@@ -654,7 +655,7 @@ func (m *Model) commitChatLineWrite(idx int, append bool, text string) {
 	} else {
 		m.setViewportContent()
 	}
-	m.viewport.GotoBottom()
+	m.followBottom()
 }
 
 // appendToStreamLine appends text to a tracked streaming line (refresh rule
@@ -1027,7 +1028,7 @@ func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
 			// the full-rebuild path.
 			m.commitChatLineWrite(lineIdx, false, lineText)
 		} else {
-			m.viewport.GotoBottom()
+			m.followBottom()
 		}
 		return
 	}
@@ -1074,7 +1075,7 @@ func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
 	} else {
 		// argStr is cached, so the line is already final; just keep the
 		// viewport pinned like the unchanged-line branch above.
-		m.viewport.GotoBottom()
+		m.followBottom()
 	}
 }
 
@@ -1196,7 +1197,7 @@ func (m *Model) appendChatLines(lines []string) {
 		}
 	}
 	m.buildFromPrefix()
-	m.viewport.GotoBottom()
+	m.followBottom()
 }
 
 // resetStreamState clears all per-turn streaming buffers and indices. When
@@ -1276,7 +1277,7 @@ func (m *Model) handleStreamRoundEnd() {
 	// OnToolCall finals and patch diffs still resolve after OnStreamEnd.
 
 	m.setViewportContent()
-	m.viewport.GotoBottom()
+	m.followBottom()
 }
 
 func (m *Model) handleStreamEnd() {
@@ -1298,5 +1299,7 @@ func (m *Model) handleStreamEnd() {
 		}
 	}
 	m.setViewportContent()
-	m.viewport.GotoBottom()
+	// Turn end must not yank a reader who scrolled away mid-turn: the
+	// finished reply stays put until they return to the live edge.
+	m.followBottom()
 }

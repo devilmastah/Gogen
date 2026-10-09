@@ -85,14 +85,28 @@ func (a *Agent) CurrentModelDescription() string {
 	return ""
 }
 
-// ThinkingLevelsForModel returns the thinking levels selectable for
-// modelID: "off" (omit) plus the model's accepted reasoning-effort values
-// in the provider's order. Toggle-only models (no effort control) yield
-// just "off". Never blocks on the network.
+// ThinkingLevelsForModel returns the thinking levels selectable for the
+// bare model ID: "off" (omit) plus the model's accepted reasoning-effort
+// values in the provider's order. Toggle-only models (no effort control)
+// yield just "off". Never blocks on the network.
+//
+// The bare ID resolves its owner profile from the provider's catalog (first
+// listing wins); callers that already know the owning profile — the model
+// pickers, where the same ID may be listed by several profiles — must use
+// ThinkingLevelsForRef so the returned set is the one THAT profile accepts.
 func (a *Agent) ThinkingLevelsForModel(modelID string) []ThinkingLevel {
+	return a.ThinkingLevelsForRef(llm.ModelRef{ID: modelID})
+}
+
+// ThinkingLevelsForRef returns the thinking levels selectable for the model
+// identified by ref (owning profile + bare ID): "off" (omit) plus the
+// model's accepted reasoning-effort values in the provider's order.
+// Toggle-only models (no effort control) yield just "off". A ref whose
+// profile is empty falls back to bare-ID resolution. Never blocks.
+func (a *Agent) ThinkingLevelsForRef(ref llm.ModelRef) []ThinkingLevel {
 	var efforts []string
 	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
-		efforts = p.ModelReasoningEfforts(llm.ModelRef{ID: modelID})
+		efforts = p.ModelReasoningEfforts(ref)
 	} else {
 		efforts = llm.DefaultReasoningEfforts
 	}

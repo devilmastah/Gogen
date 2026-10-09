@@ -223,7 +223,7 @@ func cmdMode(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
 		m.chatLines = append(m.chatLines, SystemStyle.Render(out))
 		m.setViewportContent()
-		m.viewport.GotoBottom()
+		m.pinFollow() // the transcript was replaced wholesale
 	} else {
 		m.appendChatLine(SystemStyle.Render(out))
 	}
@@ -290,7 +290,7 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		if len(result.History) > 0 {
 			m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
 			m.setViewportContent()
-			m.viewport.GotoBottom()
+			m.pinFollow() // restored history starts at the live edge
 		}
 	}
 	// Session commands (new, resume, delete) persist.
@@ -318,7 +318,7 @@ func (m *Model) applySessionSwitch(result agent.SessionCommandResult) tea.Cmd {
 		m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
 	}
 	m.setViewportContent()
-	m.viewport.GotoBottom()
+	m.pinFollow() // fresh transcript (the focused session changed)
 	m.sessionID = m.agent.SessionID
 	// /new and /resume <id> rebind the focused agent: re-stamp the
 	// session's recency so the list does not reorder (see rebindActivity).
@@ -419,6 +419,10 @@ type deliveryRequestMsg struct {
 // wiring itself lives in startTurnOn (steering.go), which also serves
 // background sessions' queue drains.
 func (m *Model) startTurn(text, chatLine string) tea.Cmd {
+	// Submitting is an explicit jump to the live edge: the user's own line
+	// (and the streaming reply) must be visible even if they were reading
+	// history when they hit enter.
+	m.pinFollow()
 	m.appendChatLine(chatLine)
 	m.streaming = true
 	m.resetStreamState(false)

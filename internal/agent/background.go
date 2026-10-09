@@ -494,12 +494,23 @@ func (a *Agent) CancelBackgroundJob(jobID string) (string, error) {
 }
 
 // Close kills every background job of this session. Called when a session is
-// closed (web pane close / eviction / shutdown) and at process exit, so no
-// command is ever orphaned by a session that no longer exists. Idempotent.
+// closed (web pane close / session delete / shutdown) and at process exit, so
+// no command is ever orphaned by a session that no longer exists. Idempotent.
 // Retention timers are stopped so a reaped job cannot keep the (closing)
 // Agent alive; the wait goroutine of a cancelled job finds an empty registry
-// afterwards and does not arm a new timer.
+// afterwards and does not arm a new timer. It is a real end-of-session: an
+// eviction that only recycles a session's MEMORY (a web pane switch, a page
+// refresh, registry-cap pressure) must not call it — that is what
+// HasBackgroundWork is for.
 func (a *Agent) Close() {
+	// Latch closed BEFORE tearing anything down, so a job's or a terminal
+	// send's wait goroutine unwinding mid-teardown cannot fire the
+	// background-idle hook into a host that is already closing this session
+	// (it would re-run the host's teardown decision). The latch is only ever
+	// set, never cleared: Close is a one-way door for this Agent.
+	a.bgMu.Lock()
+	a.bgClosed = true
+	a.bgMu.Unlock()
 	// Close every owner-scoped persistent terminal and its background jobs
 	// alongside the shell jobs: a closed session must not orphan a PTY.
 	a.closeTerminals()
@@ -518,14 +529,82 @@ func (a *Agent) Close() {
 	a.bgMu.Unlock()
 }
 
+// HasBackgroundWork reports whether this session still owns background work
+// an eviction would destroy: a running shell job (execute_command
+// background=true), a running background terminal send, a live persistent
+// terminal (PTY), or the persistent shell behind bash_persistent.
+//
+// A session that owns background work is NOT idle, even with no client
+// attached: hosts use this to keep such a session resident instead of
+// treating "nobody is watching" as "safe to tear down", because
+// Agent.Close — the eviction tail — kills exactly this work. Leaf locks
+// only (bgMu, termMu); it never blocks, so it is safe on an eviction path.
+func (a *Agent) HasBackgroundWork() bool {
+	a.bgMu.Lock()
+	running := false
+	for _, job := range a.bgJobs {
+		select {
+		case <-job.done:
+			continue // finished: still pollable for the retention window, not work
+		default:
+			running = true
+		}
+	}
+	a.bgMu.Unlock()
+	return running || a.hasTerminalWork()
+}
+
+// SetBackgroundIdleHook installs a callback fired when this session's LAST
+// background work finishes (see HasBackgroundWork) and none has started
+// since. Hosts use it to re-run a decision they deferred while the work was
+// running — notably a web session runtime that refused to evict itself
+// because it still owned a job: this is what evicts it once the job drains,
+// so deferring the eviction cannot leak the runtime forever. nil detaches.
+// Never fires after Close.
+func (a *Agent) SetBackgroundIdleHook(h func()) {
+	a.bgIdleHookMu.Lock()
+	a.bgIdleHook = h
+	a.bgIdleHookMu.Unlock()
+}
+
+// maybeFireBackgroundIdle fires the background-idle hook when no background
+// work remains. Called from the wait goroutines that close a job's / a
+// terminal send's done channel and from the terminal close/reset paths, so
+// it must not block: the hook is invoked with no lock held.
+//
+// The drained check is inherently racy against a job starting concurrently
+// (the hook may fire just as new work appears); that is harmless — the
+// hook's own decision must tolerate it, exactly like the eviction TryLock
+// races it replaces. The next drain fires again.
+func (a *Agent) maybeFireBackgroundIdle() {
+	a.bgIdleHookMu.RLock()
+	h := a.bgIdleHook
+	a.bgIdleHookMu.RUnlock()
+	if h == nil {
+		return
+	}
+	a.bgMu.Lock()
+	closed := a.bgClosed
+	a.bgMu.Unlock()
+	if closed || a.HasBackgroundWork() {
+		return
+	}
+	h()
+}
+
 const defaultBackgroundOutputCap = 256 * 1024
 
 // defaultBackgroundJobRetain is how long a finished background job stays
 // registered after it exits, so background_job_status can still report its
-// exit code and output. After the window the reaper removes it, bounding
-// memory on long-lived sessions (each job keeps an outputBuffer tail). The
-// Agent.bgRetain field overrides it (0 = this default).
-const defaultBackgroundJobRetain = 5 * time.Minute
+// exit code and output. The window must comfortably outlive a compaction:
+// a job started before the middle of the history was summarized is still
+// addressable afterwards via background_job (action=list/status), so the
+// model can re-correlate it from the summary's executed-call roster. After
+// the window the reaper removes it, bounding memory on long-lived sessions
+// (each job keeps an outputBuffer tail); defaultMaxFinishedBackgroundJobs
+// remains the harder bound. The Agent.bgRetain field overrides it
+// (0 = this default).
+const defaultBackgroundJobRetain = 30 * time.Minute
 
 // defaultMaxFinishedBackgroundJobs caps how many finished jobs stay
 // registered at once: when a job finishes and the cap is exceeded, the
@@ -556,13 +635,16 @@ func jobExitSummary(job *BackgroundJob) string {
 // when the cap is exceeded), arms the retention timer that reaps THIS job
 // once its result has been pollable long enough, and — when the job finished
 // naturally (not cancelled) and a notice hook is installed — fires the
-// completion notice so the session is told without polling.
+// completion notice so the session is told without polling. Last, it lets the
+// host know the session may have drained its background work (a host that
+// kept this session resident because of THIS job can now retire it).
 func (a *Agent) onJobFinished(job *BackgroundJob) {
 	a.enforceFinishedJobCap(job)
 	a.armJobReaper(job)
 	if !job.cancelled.Load() {
 		a.fireJobNotice(jobExitSummary(job))
 	}
+	a.maybeFireBackgroundIdle()
 }
 
 // enforceFinishedJobCap reaps the oldest finished jobs when more than
@@ -714,4 +796,16 @@ type backgroundState struct {
 	// per-session cap (maxSessionImages) on image bytes — the most
 	// expensive content in context, resent on every API request.
 	sessionImages atomic.Int32
+
+	// bgClosed latches Close: once set, the background-idle hook never
+	// fires again. Guarded by bgMu, set-only — a closing Agent must not
+	// re-enter its host's teardown decision from a job's wait goroutine
+	// unwinding mid-Close.
+	bgClosed bool
+
+	// bgIdleHookMu guards bgIdleHook, fired when the session's last
+	// background work drains (maybeFireBackgroundIdle). Its own lock so the
+	// hook is invoked with none of this group's locks held.
+	bgIdleHookMu sync.RWMutex
+	bgIdleHook   func()
 }

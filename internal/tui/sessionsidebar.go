@@ -230,10 +230,13 @@ func (m *Model) buildSidebarRows() []sidebarRow {
 				r.label = l
 			}
 			// Message count: the live count is authoritative, but only
-			// safe to read when the session is not mid-turn (Messages is
-			// owned by the stream goroutine while streaming).
+			// read at a settled boundary (not mid-turn — the stream
+			// goroutine owns Messages while streaming, and a background
+			// /compact rewrites it off-thread even with streaming=false).
+			// MessageCount is the locked accessor: a raw len() here raced
+			// both writers and could print a torn count.
 			if !s.streaming {
-				r.msgCount = len(s.agent.Messages)
+				r.msgCount = s.agent.MessageCount()
 			}
 			r.lastActive = m.effectiveLastActive(s)
 			break
@@ -265,7 +268,8 @@ func (m *Model) buildSidebarRows() []sidebarRow {
 		if s.agent != nil {
 			r.label = s.agent.SessionLabelSnapshot()
 			if !s.streaming {
-				r.msgCount = len(s.agent.Messages)
+				// Locked accessor — see the overlay path above.
+				r.msgCount = s.agent.MessageCount()
 			}
 		}
 		if r.label == "" {
@@ -1115,7 +1119,9 @@ func (m *Model) spawnSavedSession(id string) tea.Cmd {
 }
 
 // deleteSavedRow deletes a saved session by id (the web's deleteSession).
-// Shared by the sidebar ✕/x action and the /resume sessions modal.
+// Shared by the sidebar ✕/x action and the /resume sessions modal. Refuses
+// (nil cmd, status message) when the id is still hosted in a background
+// live slot — see the guard below.
 func (m *Model) deleteSavedRow(id string) tea.Cmd {
 	// Deleting the CURRENT session rebinds the focused agent (a fresh
 	// session starts in its place) — the same mid-turn / mid-compaction
@@ -1129,6 +1135,18 @@ func (m *Model) deleteSavedRow(id string) tea.Cmd {
 			m.appendChatLine(ErrorStyle.Render(reason))
 			return nil
 		}
+	} else if m.lives != nil && m.lives.indexBySessionID(id) >= 0 {
+		// A session still hosted in a BACKGROUND live slot must be closed
+		// (x) before it can be deleted: deleting the file behind the live
+		// agent leaves the slot running, and the agent's next flush
+		// (turn end, close, quit sweep) re-creates the file — the deletion
+		// silently reverts. The sidebar's ✕/d path refuses these rows up
+		// front (sidebarDeleteRow); this guard covers the /resume modal,
+		// which lists saved-but-live sessions too. The focused session is
+		// exempt: it deletes through the agent, which rebinds to a fresh
+		// session in its place (the branch above).
+		m.statusMsg = "Delete: close the session first (x), then delete it"
+		return nil
 	}
 	result, _, err := m.agent.HandleSessionCommand(m.ctx, "resume del "+id, session.NewID())
 	if err != nil {
@@ -1141,7 +1159,7 @@ func (m *Model) deleteSavedRow(id string) tea.Cmd {
 		m.chatLines = nil
 		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
 		m.setViewportContent()
-		m.viewport.GotoBottom()
+		m.pinFollow() // fresh transcript (the deleted session was current)
 		m.sessionID = m.agent.SessionID
 		// The fresh session has no store entry yet: creation is its first
 		// recency event, so it starts at the top (web: makePane without

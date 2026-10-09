@@ -348,19 +348,22 @@ func TestDeleteParentUnregisteredEvictsChild(t *testing.T) {
 		t.Fatalf("child must be persisted before the delete: %v", err)
 	}
 
-	// Orphan-evict the parent (no attached clients, no running turn):
-	// children are deliberately NOT cancelled on orphan eviction, so the
-	// child stays registered and running.
+	// Evict the parent (no attached clients, idle) while its background child
+	// keeps running. This is the explicit eviction tail, NOT evictOrphaned:
+	// an unwatched parent that still owns a live background child is no
+	// longer evictable as an orphan (keepsBackgroundWork — see
+	// TestSwitchKeepsSessionWithBackgroundSubagent), and the tail here does
+	// not fire the eviction hook either, so the child stays registered.
 	parentRt, ok := s.registry.get(a.SessionID)
 	if !ok {
 		t.Fatal("parent runtime not registered")
 	}
-	s.registry.evictOrphaned(parentRt)
+	s.registry.evictRuntime(parentRt)
 	if _, ok := s.registry.get(a.SessionID); ok {
-		t.Fatal("parent must be unregistered after orphan eviction")
+		t.Fatal("parent must be unregistered after eviction")
 	}
 	if _, ok := s.registry.get(childID); !ok {
-		t.Fatal("child must stay registered while its parent is orphan-evicted")
+		t.Fatal("child must stay registered while its parent is evicted")
 	}
 
 	// Delete the parent by id (the sidebar ✕ on a session whose runtime is

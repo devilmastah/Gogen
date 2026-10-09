@@ -256,6 +256,12 @@ type WSMessage struct {
 	ResultTruncated bool           `json:"resultTruncated,omitempty"`
 	WorkingDir      string         `json:"workingDir,omitempty"`
 	Model           string         `json:"model,omitempty"`
+	// ModelProvider is the registered provider profile serving the current
+	// model ("default" for the legacy single endpoint). Model IDs are not
+	// unique across registered providers, so the client's current-model
+	// check must match (provider, id) — the bare Model alone would mark
+	// every catalog row that lists the same ID.
+	ModelProvider string `json:"modelProvider,omitempty"`
 	// TokensPerSec is the shared streamutil.SpeedMeter's smoothed token
 	// rate on stream_stats frames (content, thinking, and tool-args
 	// deltas alike).
@@ -436,10 +442,29 @@ type WSMessage struct {
 	WebFetchMode              string  `json:"webFetchMode,omitempty"`
 	TreeSitter                string  `json:"treesitter,omitempty"`
 	TreeSitterLangs           string  `json:"treesitterLangs,omitempty"`
-	PreserveReasoning         string  `json:"preserveReasoning,omitempty"`
-	SessionMaxCount           int     `json:"sessionMaxCount,omitempty"`
-	SessionMaxAgeDays         int     `json:"sessionMaxAgeDays,omitempty"`
-	WebApprovalHoldSecs       int     `json:"webApprovalHoldSecs,omitempty"`
+	StatusDisplay             string  `json:"statusDisplay,omitempty"` // off | auto (probe) | on | browser — LAN status-screen reporter
+	StatusDisplayHost         string  `json:"statusDisplayHost,omitempty"`
+	StatusDisplayToken        string  `json:"statusDisplayToken,omitempty"` // client→server only
+	StatusDisplayTokenSet     bool    `json:"statusDisplayTokenSet,omitempty"`
+	StatusDisplaySource       string  `json:"statusDisplaySource,omitempty"`
+	// StatusDisplayTokenValue is the display token pushed to web clients
+	// ONLY in browser mode (status_display: browser), where the browser —
+	// not the server — is the sender and therefore needs the value. Never
+	// pushed in the server-side modes (the settings modal shows the set flag
+	// instead). The chat socket is authenticated, and the settings UI
+	// already accepts the token, so this is not a new capability for a
+	// connected client.
+	StatusDisplayTokenValue string `json:"statusDisplayTokenValue,omitempty"`
+	// StatusDisplayRow / StatusDisplayClear / StatusDisplaySource relay one
+	// display operation to web clients in browser mode: the server builds
+	// the row (it owns the turn state) and the browser POSTs it, because the
+	// browser may be on the display's network when the server is not.
+	StatusDisplayRow    string `json:"statusDisplayRow,omitempty"`
+	StatusDisplayClear  bool   `json:"statusDisplayClear,omitempty"`
+	PreserveReasoning   string `json:"preserveReasoning,omitempty"`
+	SessionMaxCount     int    `json:"sessionMaxCount,omitempty"`
+	SessionMaxAgeDays   int    `json:"sessionMaxAgeDays,omitempty"`
+	WebApprovalHoldSecs int    `json:"webApprovalHoldSecs,omitempty"`
 	// Restart-staged options (A0b): persisted, applied on the next start.
 	WebBind              string `json:"webBind,omitempty"`
 	WebAllowedOrigins    string `json:"webAllowedOrigins,omitempty"`

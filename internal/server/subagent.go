@@ -131,11 +131,10 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	// runtimes are cap-exempt, so register never evicts.
 	s.registry.register(childID, childRt)
 
-	// Children never push progress into the parent conversation: their ONE
-	// return channel is the run's final message (the Spawn tool result for a
-	// foreground child, the completion notice for a background one) plus the
-	// captured reply per send_message. Progress is pull-side — the parent
-	// checks list_agents, the user watches the child pane.
+	// Children never push progress into the parent conversation. A run's
+	// result is the foreground Spawn tool result or a compact background
+	// terminal event plus get_agent_result; send_message adds one exact
+	// reply. Progress remains pull-side through list_agents and the child pane.
 
 	return childRt, label, rawJob, nil
 }
@@ -172,9 +171,13 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 	})
 
 	report, err := sp.runChildTurn(ctx, childRt, agent.FormatSubagentJob(rawJob))
+	// Every foreground return is bounded by the documented subagent-report
+	// cap. The generic tool-result cap may be lower, but must never be the
+	// only guard for a subagent report.
+	report = agent.TruncateSubagentReport(report)
 	sp.finalizeForegroundChild(childRt, parentRt, label, report, err)
 	if err != nil {
-		return "", fmt.Errorf("subagent %s: %w", childID, err)
+		return report, fmt.Errorf("subagent %s: %w", childID, err)
 	}
 	return report, nil
 }
@@ -255,18 +258,15 @@ func (sp *subagentSpawner) approvalHold() time.Duration {
 // error tail) is shared with startTurn via runTurnBody. The child's own
 // turnMu serializes against attach/approval handlers.
 func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRuntime, job string) (string, error) {
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	// Parent cancellation kills the child: the parent turn owns this tool
-	// call, so if it dies (user Cancel on the parent pane, shutdown) the
-	// child must unwind too.
-	go func() {
-		select {
-		case <-parentCtx.Done():
-			streamCancel()
-		case <-streamCtx.Done():
-		}
-	}()
-	errCh := rt.stream.begin(streamCancel)
+	// Derive the run directly from the supplied owner context. Foreground
+	// callers pass the parent tool context, so cancellation propagates without
+	// a relay goroutine; background callers pass their child-owned context,
+	// which intentionally survives the spawning tool call. Installed before
+	// stream registration, so an already-cancelled context is observed even
+	// if the provider has not started.
+	runCtx, runCancel := context.WithCancel(parentCtx)
+	defer runCancel()
+	errCh := rt.stream.begin(runCancel)
 
 	type turnResult struct {
 		out string
@@ -282,7 +282,7 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 		// frames, no error log/hook (the parent sees the error as the tool
 		// result), no persist warning/usage frame (the spawner flushes the
 		// outcome).
-		out, err := rt.runTurnBody(streamCtx, job, nil, turnOpts{})
+		out, err := rt.runTurnBody(runCtx, job, nil, turnOpts{})
 		if errors.Is(err, errTurnEvicted) {
 			// The runtime was released while we waited for the lock
 			// (close/delete/release evict without holding turnMu): nothing
@@ -298,12 +298,10 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 
 	select {
 	case res := <-resCh:
-		// The turn is over (natural completion or child error): cancel the
-		// stream context so the parent-cancel watcher goroutine above
-		// terminates. With a background child parentCtx is
-		// context.Background() and never fires, so without this the
-		// watcher leaks for every child that finishes naturally.
-		streamCancel()
+		// Cancel the child context so the watcher used by an earlier
+		// implementation (or a provider retaining the context) observes the
+		// terminal transition. Background ownership is supplied by runCtx.
+		runCancel()
 		// A cancelled parent turn surfaces as a child error; translate it
 		// so the parent agent sees a clear reason.
 		if parentCtx.Err() != nil && res.err == nil {
@@ -311,7 +309,7 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 		}
 		return res.out, res.err
 	case <-parentCtx.Done():
-		streamCancel()
+		runCancel()
 		<-resCh // let the child unwind (bounded by its own turn)
 		return "", parentCtx.Err()
 	}

@@ -17,12 +17,20 @@ var toolNameAliases = map[string]string{
 
 // argAliases maps a canonical tool name to misspelled parameter names that
 // models have actually emitted, each mapped to the canonical schema
-// property. The observed slip: the model mirrors the replace_in_file TOOL
-// name into the parameter name (38 occurrences in session history, all with
-// the replacement text under that key).
+// property. Observed slips:
+//
+//   - replace_in_file: the model mirrors the replace_in_file TOOL name into
+//     the parameter name (38 occurrences in session history, all with the
+//     replacement text under that key);
+//   - execute_command: the model uses the Unix shorthand "cmd" for the
+//     command string, which otherwise fails the dispatch with
+//     `missing required argument "command"`.
 var argAliases = map[string]map[string]string{
 	"replace_in_file": {
 		"replace_in_file": "replace",
+	},
+	"execute_command": {
+		"cmd": "command",
 	},
 }
 

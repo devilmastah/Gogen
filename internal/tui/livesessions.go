@@ -412,7 +412,7 @@ func (m *Model) switchToLive(i int) tea.Cmd {
 		m.clearProgress()
 	}
 	m.setViewportContent()
-	m.viewport.GotoBottom()
+	m.pinFollow() // fresh transcript (the focused session changed)
 	// The target's token-count cache may be cold (a large restored
 	// session): probe off the Update thread, like the resume path — a
 	// synchronous probe would tokenize the whole history on the render

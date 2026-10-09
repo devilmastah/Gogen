@@ -175,6 +175,9 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 		return llm.NewOpenAIProvider(op.APIKey, op.Model, op.BaseURL, workingDir), nil
 	}
 	s.mcpTestFn = mcp.TestServer
+	// Browser-mode status display: the web server (not main) owns the
+	// startup application, because only it can install the relay sink.
+	s.applyStatusDisplayStartup()
 	// Background model validation for a restored default session runs after
 	// the server starts; push the result to the session's clients so the
 	// toolbar does not keep showing a model that was cleared or replaced by
@@ -215,11 +218,22 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	a.SetSubagentSpawner(ws.SubagentSpawner)
 	// A session leaving the registry takes its continuable subagent
 	// children with it (cancel + release): a child whose parent is gone
-	// cannot deliver report/completion anyway.
+	// cannot deliver report/completion anyway. The EXPLICIT teardown paths
+	// (session_close, delete, shutdown) plus registry-cap eviction fire it.
 	s.registry.evictHook = func(id string) {
 		if sp, ok := ws.SubagentSpawner.(*subagentSpawner); ok {
 			sp.cancelAll(id)
 		}
+	}
+	// Background work pins its session: an eviction that only recycles
+	// memory (pane switch, page refresh, cap pressure) must not destroy a
+	// live background child. Agent.HasBackgroundWork covers shell jobs and
+	// terminals; this covers the children cancelAll would kill.
+	s.registry.bgWorkHook = func(id string) bool {
+		if sp, ok := ws.SubagentSpawner.(*subagentSpawner); ok {
+			return sp.children.hasLiveChildren(id)
+		}
+		return false
 	}
 	// Job-completion notices: the deliverer resolves a session id to its
 	// live runtime; NewSessionAgent installs per-agent hooks on top of it

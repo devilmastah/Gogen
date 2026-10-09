@@ -38,10 +38,10 @@ const toolCanceledMsg = "The operation was cancelled by the user."
 // identity (id/name), and collect images into sink. The sink is per-tool
 // so each call gets its own identity in the handler; read_image gets a
 // per-tool image sink the same way (the handler only collects the image
-// into the sink, and the synthetic user message is appended right after
-// the tool result, so the tool-call/result protocol is never violated).
-// Shared by the sequential and parallel execution paths so both stay in
-// sync.
+// into the sink; the synthetic user message is appended after every tool
+// message of the round — see appendRoundImages — so the tool-call/result
+// protocol is never violated). Shared by the sequential and parallel
+// execution paths so both stay in sync.
 func toolCallContext(ctx context.Context, h *llm.StreamHandlers, tc llm.ToolCall, sink *imageSink) context.Context {
 	if h.OnToolOutput != nil {
 		ctx = ContextWithToolOutput(ctx, func(command, chunk string) {
@@ -57,11 +57,14 @@ func toolCallContext(ctx context.Context, h *llm.StreamHandlers, tc llm.ToolCall
 }
 
 // deliverToolResult fires the OnToolResult callback and appends the tool
-// result (and any images collected into sink) to the transcript. res must
-// already be the final result string (callers wrap errors with
-// formatToolError first). Shared by the sequential and parallel execution
-// paths so both stay in sync.
-func (a *Agent) deliverToolResult(h *llm.StreamHandlers, tc llm.ToolCall, res string, success bool, sink *imageSink) {
+// result to the transcript. res must already be the final result string
+// (callers wrap errors with formatToolError first). Shared by the sequential
+// and parallel execution paths so both stay in sync. Images collected during
+// the call are NOT appended here: each path drains the round's sinks with
+// appendRoundImages only after every tool message of the round is on the
+// transcript (an image user message between two tool messages of one
+// assistant tool_calls batch breaks the strict pairing providers enforce).
+func (a *Agent) deliverToolResult(h *llm.StreamHandlers, tc llm.ToolCall, res string, success bool) {
 	if h.OnToolResult != nil {
 		h.OnToolResult(tc.ID, tc.Name, res, success)
 	}
@@ -72,7 +75,6 @@ func (a *Agent) deliverToolResult(h *llm.StreamHandlers, tc llm.ToolCall, res st
 	// index without them. A turn that ends on a tool message (stop/error)
 	// leaves the mark one behind — a conditional attach then falls back to
 	// the snapshot, which is correct, just not optimized.
-	a.appendImageMessages(sink)
 }
 
 // notifyMessageAppended tells the host the index of a message the turn just
@@ -123,6 +125,11 @@ func (a *Agent) runTurn(ctx context.Context, h *llm.StreamHandlers, first bool) 
 		a.FlushSession()
 		return nil, ctx.Err()
 	}
+	if !first {
+		// The model is about to be called again after a tool round: this
+		// is where a live "thinking…" state resumes after the tool names.
+		a.fireTurnEvent(a.newTurnEvent(TurnPhaseRoundStart))
+	}
 
 	a.Provider.SetThinkingLevel(string(a.ThinkingLevel))
 	result, err := a.Provider.GenerateResponseStream(ctx, view, a.AllowedToolNames(), a.llmTools(), h)
@@ -138,6 +145,9 @@ func (a *Agent) runTurn(ctx context.Context, h *llm.StreamHandlers, first bool) 
 	a.statsMu.Lock()
 	a.UsageAccum.Add(result.Usage)
 	a.statsMu.Unlock()
+	// The round completed: refresh any context-usage display (the observer
+	// samples ContextStats itself, off the turn's critical path).
+	a.fireTurnEvent(a.newTurnEvent(TurnPhaseProgress))
 
 	// Attribute the round to the provider-reported model BEFORE the
 	// round is finalized: OnStreamEnd (inside finishStreamUI below)
@@ -175,10 +185,19 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 		}
 		return toolRoundContinue, ""
 	}
+	// One image sink per call, drained only after the round's last tool
+	// message (appendRoundImages): an image user message between two tool
+	// messages of one assistant tool_calls batch breaks the strict pairing
+	// providers enforce. Sinks of calls that never ran stay empty.
+	sinks := make([]*imageSink, len(toolCalls))
+	for i := range sinks {
+		sinks[i] = &imageSink{}
+	}
 	for i, tc := range toolCalls {
 		if ctx.Err() != nil {
 			// Preserve a valid tool-call/result protocol for the next turn.
 			a.appendCanceledToolResults(toolCalls[i:])
+			a.appendRoundImages(sinks)
 			finishStreamUI(h)
 			a.FlushSession()
 			return toolRoundCancelled, ""
@@ -189,9 +208,11 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 		if h.OnToolExecute != nil {
 			h.OnToolExecute(tc.Name)
 		}
+		ev := a.newTurnEvent(TurnPhaseTool)
+		ev.Tool = tc.Name
+		a.fireTurnEvent(ev)
 
-		imgSink := &imageSink{}
-		toolCtx := toolCallContext(ctx, h, tc, imgSink)
+		toolCtx := toolCallContext(ctx, h, tc, sinks[i])
 		res, errTool := a.executeTool(toolCtx, tc)
 		if errors.Is(errTool, errPatchTurnStop) {
 			// The model is stuck in a patch retry loop: stop the turn. This
@@ -200,8 +221,9 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 			// protocol stays valid, and the caller returns stopMsg to the
 			// host instead of letting the model write another attempt.
 			res = formatToolError(res, errTool)
-			a.deliverToolResult(h, tc, res, false, imgSink)
+			a.deliverToolResult(h, tc, res, false)
 			a.appendCanceledToolResults(toolCalls[i+1:])
+			a.appendRoundImages(sinks)
 			finishStreamUI(h)
 			a.FlushSession()
 			return toolRoundStopped, res
@@ -215,8 +237,9 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 			} else {
 				res = toolCanceledMsg
 			}
-			a.deliverToolResult(h, tc, res, false, imgSink)
+			a.deliverToolResult(h, tc, res, false)
 			a.appendCanceledToolResults(toolCalls[i+1:])
+			a.appendRoundImages(sinks)
 			finishStreamUI(h)
 			a.FlushSession()
 			return toolRoundCancelled, ""
@@ -225,8 +248,9 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 		if errTool != nil {
 			res = formatToolError(res, errTool)
 		}
-		a.deliverToolResult(h, tc, res, success, imgSink)
+		a.deliverToolResult(h, tc, res, success)
 	}
+	a.appendRoundImages(sinks)
 	return toolRoundContinue, ""
 }
 
@@ -301,7 +325,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 
 // StreamProcessInputWithImages is StreamProcessInput with optional
 // user-attached images (vision input). images is nil for text-only prompts.
-func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, images []llm.ImageInput, h *llm.StreamHandlers) (string, error) {
+func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, images []llm.ImageInput, h *llm.StreamHandlers) (out string, err error) {
 	// Downscale user-attached images before they join the transcript: a
 	// pasted screenshot is re-uploaded on every subsequent request, so the
 	// attached size is paid once per round (see image_scale.go).
@@ -351,6 +375,20 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	if h == nil {
 		h = &llm.StreamHandlers{}
 	}
+	// Chain the turn-status observer (if one is installed) onto the
+	// context-maintenance / stream-hiccup callbacks, then bracket the whole
+	// turn with observer events: Started fires only once the turn is really
+	// running (the model check above passed), Ended on every exit from here
+	// on. The deferred event reads the named result so a failed turn reports
+	// its error.
+	h = a.observeStreamHandlers(h)
+	a.fireTurnEvent(a.newTurnEvent(TurnPhaseStarted))
+	defer func() {
+		ev := a.newTurnEvent(TurnPhaseEnded)
+		ev.Err = err
+		ev.Cancelled = err != nil && ctx.Err() != nil
+		a.fireTurnEvent(ev)
+	}()
 	// Per-turn patch retry budget: a model that fails patch_file three times
 	// in a row within this turn is looping; the turn is stopped instead of
 	// letting it retry indefinitely.
@@ -507,9 +545,10 @@ func (a *Agent) toolCallsParallelEligible(toolCalls []llm.ToolCall) bool {
 // executeToolCallsParallel runs every tool call concurrently, bounded by
 // maxParallelTools, then fires OnToolResult callbacks and appends results in
 // model order so the tool-call/result protocol stays valid (every tool_call
-// gets a matching tool result). It returns true when the turn was cancelled
-// during execution; in that case completed results are preserved and
-// interrupted calls read as cancelled.
+// gets a matching tool result). The round's images are appended only after
+// the last result (appendRoundImages). It returns true when the turn was
+// cancelled during execution; in that case completed results are preserved
+// and interrupted calls read as cancelled.
 func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandlers, toolCalls []llm.ToolCall) bool {
 	type execResult struct {
 		res  string
@@ -518,15 +557,20 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 	}
 	results := make([]execResult, len(toolCalls))
 	// Per-tool-call image sinks, mirroring the sequential path: read_image
-	// handlers collect images into their call's sink, and each sink is
-	// drained right after its tool result below, in model order, so the
-	// transcript reads tool(result) → user(image) for every call.
+	// handlers collect images into their call's sink, and the round's sinks
+	// are drained in model order after the LAST tool result below
+	// (appendRoundImages) — the transcript reads tool(result) × N →
+	// user(image) …, never an image between two tool messages.
 	sinks := make([]*imageSink, len(toolCalls))
 	for i := range sinks {
 		sinks[i] = &imageSink{}
 	}
 
 	if ctx.Err() != nil {
+		// The caller already appended the assistant tool_calls message, so
+		// the batch must still be closed before returning (mirrors the
+		// sequential loop-top cancel): one cancelled placeholder per call.
+		a.appendCanceledToolResults(toolCalls)
 		return true
 	}
 	for i := range toolCalls {
@@ -537,6 +581,9 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 		if h.OnToolExecute != nil {
 			h.OnToolExecute(tc.Name)
 		}
+		ev := a.newTurnEvent(TurnPhaseTool)
+		ev.Tool = tc.Name
+		a.fireTurnEvent(ev)
 	}
 
 	sem := make(chan struct{}, maxParallelTools)
@@ -575,15 +622,19 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 		// ran (still waiting to start when the batch finished) reads as
 		// cancelled.
 		if errors.Is(errTool, context.Canceled) || (cancelled && !results[i].done) {
-			a.deliverToolResult(h, tc, toolCanceledMsg, false, sinks[i])
+			a.deliverToolResult(h, tc, toolCanceledMsg, false)
 			continue
 		}
 		success := errTool == nil
 		if errTool != nil {
 			res = formatToolError(res, errTool)
 		}
-		a.deliverToolResult(h, tc, res, success, sinks[i])
+		a.deliverToolResult(h, tc, res, success)
 	}
+	// The batch is closed (every call has a result above); the images come
+	// last so no user message splits the tool messages of the assistant's
+	// tool_calls message.
+	a.appendRoundImages(sinks)
 	return cancelled
 }
 

@@ -114,8 +114,9 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 	// web spawner — FinishSubagentOutcome): the sidebar reads it from the
 	// sessions payload when the live subagent events are gone.
 	child.FinishSubagentOutcome(report, err)
+	report = agent.TruncateSubagentReport(report)
 	if sp.m != nil {
-		sp.m.recordSubagent(subagentRecord{label: label, report: agent.TruncateSubagentReport(report), err: err})
+		sp.m.recordSubagent(subagentRecord{label: label, report: report, err: err})
 	}
 	return report, err
 }

@@ -9,6 +9,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/onoff"
+	"gogen/internal/statusdisplay"
 	"gogen/internal/treesitter"
 )
 
@@ -438,6 +439,106 @@ func buildConfigFields() map[string]fieldSpec {
 		func(m *WSMessage, v string) { m.PreserveReasoning = v })
 	f.applyLive = func(s *Server, r *config.Config) { s.applyPreserveReasoningToAll(r.PreserveReasoning) }
 	f.sample = "on"
+	add(f)
+
+	// --- status display (LAN status screen) -------------------------------
+	// One row per top-level turn on a ttgo/status display: progress is the
+	// context-window usage, the state is running / done / error / idle, and
+	// the message names the current activity. Off by default; applied live
+	// like the other host integrations, and every sub-field's applyLive
+	// re-applies the whole tuple so a single changed field can never
+	// desync the others.
+	applyStatusDisplay := func(s *Server, r *config.Config) {
+		host, token := r.StatusDisplayHost, r.StatusDisplayToken
+		source, workdir := r.StatusDisplaySource, s.ws.GetWorkingDir()
+		switch r.StatusDisplayMode() {
+		case config.StatusDisplayBrowser:
+			// Server transport wins when the server can reach the display;
+			// the browser relay is the fallback for when it cannot.
+			statusdisplay.ProbeWithRelay(host, token, source, workdir, s.broadcastStatusDisplay)
+		case config.StatusDisplayOn:
+			statusdisplay.SetSink(nil)
+			statusdisplay.Configure(true, host, token, source, workdir)
+		case config.StatusDisplayOff:
+			statusdisplay.SetSink(nil)
+			statusdisplay.Configure(false, host, token, source, workdir)
+		default: // auto: probe for the screen, enable reporting when it answers
+			statusdisplay.SetSink(nil)
+			statusdisplay.Probe(host, token, source, workdir)
+		}
+	}
+
+	f = strSpec("statusDisplay",
+		func(r *config.Config) string { return r.StatusDisplay },
+		func(r *config.Config, v string) { r.StatusDisplay = v },
+		func(m *WSMessage) string { return m.StatusDisplay },
+		func(m *WSMessage, v string) { m.StatusDisplay = v })
+	// off / auto (probe at startup) / on / browser (the web UI sends).
+	f.normalize = func(v any) (any, string) {
+		raw := v.(string)
+		mode := strings.ToLower(strings.TrimSpace(raw))
+		switch mode {
+		case config.StatusDisplayOff, config.StatusDisplayAuto, config.StatusDisplayOn, config.StatusDisplayBrowser:
+			return mode, ""
+		}
+		return nil, fmt.Sprintf("Error: invalid statusDisplay %q (want off, auto, on, or browser)", raw)
+	}
+	f.applyLive = applyStatusDisplay
+	f.sample = "on"
+	add(f)
+
+	f = strSpec("statusDisplayHost",
+		func(r *config.Config) string { return r.StatusDisplayHost },
+		func(r *config.Config, v string) { r.StatusDisplayHost = v },
+		func(m *WSMessage) string { return m.StatusDisplayHost },
+		func(m *WSMessage, v string) { m.StatusDisplayHost = v })
+	// An empty host falls back to the firmware's mDNS default rather than
+	// disabling the row silently.
+	f.normalize = func(v any) (any, string) {
+		host := strings.TrimSpace(v.(string))
+		if host == "" {
+			host = config.DefaultStatusDisplayHost
+		}
+		return host, ""
+	}
+	f.applyLive = applyStatusDisplay
+	f.sample = "192.168.1.50"
+	add(f)
+
+	f = strSpec("statusDisplayToken",
+		func(r *config.Config) string { return r.StatusDisplayToken },
+		func(r *config.Config, v string) { r.StatusDisplayToken = v },
+		func(m *WSMessage) string { return m.StatusDisplayToken },
+		func(m *WSMessage, v string) { m.StatusDisplayToken = v })
+	// The token itself is pushed only in browser mode, where the client is
+	// the sender and therefore needs the value; the server-side modes see
+	// just the set flag.
+	f.project = func(r *config.Config, m *WSMessage) {
+		m.StatusDisplayTokenSet = r.StatusDisplayToken != ""
+		if r.StatusDisplayMode() == config.StatusDisplayBrowser {
+			m.StatusDisplayTokenValue = r.StatusDisplayToken
+		}
+	}
+	f.msgGet = func(m *WSMessage) any { return m.StatusDisplayTokenSet }
+	f.applyLive = applyStatusDisplay
+	// Like web_auth_token: user-entered, so the save forces the 0600
+	// secret write and it survives the restart it is staged for.
+	f.forceSecrets = true
+	f.sample = "token"
+	add(f)
+
+	f = strSpec("statusDisplaySource",
+		func(r *config.Config) string { return r.StatusDisplaySource },
+		func(r *config.Config, v string) { r.StatusDisplaySource = v },
+		func(m *WSMessage) string { return m.StatusDisplaySource },
+		func(m *WSMessage, v string) { m.StatusDisplaySource = v })
+	// Empty = AUTO ("gogen-<project dir>"); keep it empty so the reporter
+	// derives the name, and an explicit value always wins.
+	f.normalize = func(v any) (any, string) {
+		return strings.TrimSpace(v.(string)), ""
+	}
+	f.applyLive = applyStatusDisplay
+	f.sample = "gogen-alt"
 	add(f)
 
 	// --- sessions ---------------------------------------------------------

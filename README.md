@@ -177,6 +177,10 @@ review_agent_model: gpt-4o-mini  # default review model (empty = ticket override
 review_agent_thinking_level: high  # review agent reasoning effort (empty = inherit the workspace level)
 job_notices: off   # notify the session when a background command finishes
 automations: off   # file-based cron scheduler: fire saved prompts as headless runs on a schedule
+status_display: auto  # off | auto (probe for the screen at startup) | on
+status_display_host: statusscreen.local  # mDNS name, IP, or base URL of the display
+status_display_token: ""                 # only if the display has a shared secret set
+status_display_source: ""                # display row name; empty = auto (gogen-<project folder>)
 skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
 terminal: off      # persistent terminal tool (open/send/read/signal/list/close actions) + bash_persistent
 agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
@@ -378,6 +382,76 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_SKILLS` | off | Set to `on` to enable the skill tool (`skill` list/read over `.gogen/skills` + `~/.config/gogen/skills`) |
 | `GOGEN_TERMINAL` | off | Set to `on` to enable the persistent-terminal feature tools: `terminal` (actions `open`/`send`/`read`/`signal`/`list`/`close` over session-scoped PTY sessions) and `bash_persistent` (a per-session shell whose cwd/env persist across calls; it bypasses the fresh-process model of `execute_command`). The command guard applies to `bash_persistent`; the PTY `send` action writes raw stdin, so the guard does not apply to it |
 | `GOGEN_AGENT_INSTRUCTIONS` | off | Set to `on` to load `AGENTS.md` / `CLAUDE.md` workspace instruction files (below the project guidelines) |
+| `GOGEN_STATUS_DISPLAY` | `auto` | Status-screen gate: `off`, `auto` (probe for the screen at startup and enable reporting when it answers), `on` (report without probing), or `browser` (the web UI sends; web mode only) — see [Status display](#status-display-lan-status-screen); live-toggleable from the web settings modal |
+| `GOGEN_STATUS_DISPLAY_HOST` | `statusscreen.local` | Display host: mDNS name, IP, or base URL |
+| `GOGEN_STATUS_DISPLAY_TOKEN` | *(empty)* | Shared secret for the display's mutating endpoints (sent as `X-Status-Token`) |
+| `GOGEN_STATUS_DISPLAY_SOURCE` | *(auto)* | Display row (feed) name; empty derives `gogen-<project folder>` so instances in different projects get their own row |
+
+### Status display (LAN status screen)
+
+With `status_display: auto` (the default), GoGen probes for the display at
+startup — a background `GET /info` with a short timeout, so startup never
+waits on the network — and enables reporting when the ttgo/status firmware
+answers. An absent display costs nothing and stays silent; `on` reports
+without probing, `off` disables the feature entirely.
+
+Once active, GoGen pushes live turn status over plain HTTP — no extra
+dependency, and updates are best-effort: a slow or unreachable display never
+delays a turn, and losing an update costs nothing because every update is a
+full snapshot. One row per top-level turn (nested subagent turns are ignored):
+
+- **progress** — the current context-window usage, the same figure as the web
+  sidebar's context meter
+- **state** — `running` while a turn is in flight, `done` / `error` on the
+  outcome, `idle` when the turn was cancelled
+- **title** — `Gogen@<project>: <session label>`, drawn on the display's first
+  label line (the firmware's two-line mode) and trimmed to the bar width; the
+  project tag is how concurrent instances are told apart on the panel
+- **message** — the current activity (`thinking...`, the running tool's name,
+  `compacting...`, `waiting...`), the turn's elapsed time and the context
+  usage (`thinking... 1m42s 368k/1M`), on the second label line. While a turn
+  runs the row is refreshed every few seconds so the elapsed time visibly
+  ticks — a long model prefill shows a live screen instead of a frozen line;
+  a clean finish reads `done 3m12s 368k/1M`
+
+All text sent to the display is printable ASCII: the firmware's built-in
+fonts have no glyphs above `0x7E`, so non-ASCII characters (including the
+session label's) are replaced with `?` instead of drawing as junk glyphs.
+
+Reporter diagnostics (screen found at startup, send failures and recovery)
+are written to the **debug log** when one is configured (`debug_log` /
+`GOGEN_DEBUG_LOG`) and are silent otherwise — never to stderr, because a raw
+line while the TUI owns the terminal desyncs its inline renderer.
+
+**Browser mode** (`status_display: browser`, web mode only) makes the web UI
+a fallback sender for when the GoGen server cannot reach the display's network
+but your browser can. The server probes for the display first: when the server
+itself can reach it, the server sends directly — the reliable path, no browser
+tab needed and a single writer. Only when the server cannot does it build the
+rows and relay them over the chat socket, and the web UI performs the
+POST/DELETE itself. The display token is pushed to the web UI in this mode
+(the browser may be the sender) and travels as a `?token=` query parameter,
+because the firmware's CORS preflight only allows the `Content-Type` header.
+Every attached tab relays the rows (duplicates are harmless). In the TUI/CLI
+there is no browser to fall back to, so the gate probes server-side and
+reports directly when the display answers.
+
+With several sessions running at once (web panes / TUI sessions), they share
+the row — the most recent activity wins. Separate Gogen **instances** are kept
+apart automatically: an empty `status_display_source` derives the row name
+from the project folder (`gogen-<folder>`), so instances in different projects
+get their own row (the display shows up to 8 rows, 5 visible). Two instances
+sharing one project folder need an explicit `status_display_source` each
+(e.g. `gogen-tui` / `gogen-web`).
+
+The row clears when the feature is turned off or GoGen exits; otherwise it
+expires after its TTL (15 min while running, 5 min for an outcome). The
+default host is the firmware's mDNS name, `statusscreen.local`; set
+`status_display_host` to an IP when `.local` does not resolve on the machine
+running GoGen (for example a `CGO_ENABLED=0` build on a host without a system
+mDNS resolver). Set `status_display_token` when the display has a shared
+secret configured (`/token?set=…` on the device). In web mode all of these
+are live-editable in **Settings → Tools**.
 
 ### Session persistence
 
@@ -449,7 +523,9 @@ mode it is fixed to the project directory and the input is hidden.
   delivered as the next user turn when the in-flight one ends, on the session
   it was typed into. The queued bubble shows a **queued** chip whose ✕ removes
   that one item; the input bar counts them ("· N queued") and **Cancel**
-  clears the user's own queued items (machine notices keep draining). Command
+  clears the user's own queued items (machine notices keep draining — they
+  are one-way deliveries and a run of them drains as one batched turn, so a
+  burst of job/child completions costs one request). Command
   words (`/new`, `help`, `plan`, …) and image-only messages: commands keep
   taking the turn lock, images queue like chat. At most 20 user messages may
   wait per session — beyond that the send is refused with a visible error
@@ -531,12 +607,16 @@ mode it is fixed to the project directory and the input is hidden.
 - **TUI subagents are foreground-only in v1**: the TUI's `subagent` tool runs
   the child to completion inline and returns the final report, but
   `run_in_background` and the control tools (`subagent_fork`, `list_agents`,
-  `send_message`, `interrupt_agent`) are web-only — they depend on the web
-  server's session registry and delivery worker, which the TUI does not host.
-- **A child has one return channel** (web, like the other agent harnesses):
-  the run's final message — the `subagent` tool result for a foreground
-  child, or the completion notice for a background one — plus one captured
-  reply per `send_message`. Children never push interim messages into the
+  `get_agent_result`, `wait_agent`, `send_message`, `interrupt_agent`) are
+  web-only — they depend on the web server's session registry and delivery
+  worker.
+- **A child has one logical return path** (web, like the other agent
+  harnesses): the run's final message — the `subagent` tool result for a
+  foreground child, or a compact terminal event for a background one — plus
+  one exact reply per `send_message`. Background parents use `wait_agent` to
+  block for the main run and `get_agent_result` to pull its authoritative
+  bounded report; the report remains available from the persisted child after
+  the live retention window. Children never push interim progress into the
   parent conversation as turns; the parent checks `list_agents` (which lists
   each child's latest progress line) and the user watches the child pane.
 - **Max concurrent subagents** (`subagent_max_concurrent`, default `4`): caps
@@ -728,11 +808,13 @@ The agent has access to the following tools:
 | `call_graph` | Call relationships / impact analysis for a symbol (`direction=impact`) |
 | `todo` | Manage todo items: add/list/done/remove/clear |
 | `board` | Project kanban board (when `board: on`): list/show/add/update/claim/move/block/comment/done/remove (update edits title/description/priority/context; remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
-| `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the final report returns as the tool result. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
+| `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the bounded final report returns as the foreground tool result. Set `run_in_background=true` in web mode to return a child id and receive a compact terminal event. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
 | `subagent_fork` | Fork a child session seeded with a deep copy of this session's history and run one turn on it (web only, when `subagent: on`) |
 | `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth, and each child's latest progress line (web only, when `subagent: on`) |
-| `send_message` | Send a message to a background subagent of this session — running, interrupted, or finished-but-retained — (web only, when `subagent: on`); the child's reply is injected into this session when the turn finishes |
-| `interrupt_agent` | Cancel a running background subagent's in-flight turn (web only, when `subagent: on`) |
+| `get_agent_result` | Get a background subagent's current status or authoritative final result by id; the persisted result remains available after the live child is released (web only, when `subagent: on`) |
+| `wait_agent` | Wait up to `timeout_ms` (default 60000, max 600000) for a background subagent's main run to finish; timeout/cancellation leaves the child running (web only, when `subagent: on`) |
+| `send_message` | Queue a message for a background subagent of this session — running, interrupted, or finished-but-retained. It runs after any current child turn; its exact reply is injected into this session when that turn finishes (web only, when `subagent: on`) |
+| `interrupt_agent` | Cancel the current main or follow-up turn of a live background subagent; an interrupted main run remains continuable (web only, when `subagent: on`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |
 | `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |

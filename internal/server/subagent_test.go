@@ -25,9 +25,10 @@ func TestSubagentSpawnEndToEnd(t *testing.T) {
 	s, a, store := newContinuationServer(t, stub, dir)
 	// Children get their own provider via the workspace factory: serve a
 	// canned response.
+	bigReport := strings.Repeat("r", agent.MaxSubagentReportBytes+1000)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
 		p := llmtest.NewMockProvider()
-		p.StreamResults = []*llm.StreamResult{{Content: "subagent report here"}}
+		p.StreamResults = []*llm.StreamResult{{Content: bigReport}}
 		return p
 	}
 	// The server installed the spawner at construction; enable the feature
@@ -39,8 +40,11 @@ func TestSubagentSpawnEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(report, "subagent report here") {
+	if !strings.Contains(report, strings.Repeat("r", 32)) {
 		t.Fatalf("report = %q", report)
+	}
+	if !strings.HasSuffix(report, "… (truncated)") {
+		t.Fatalf("foreground report was not bounded: suffix missing in %q", report[len(report)-40:])
 	}
 
 	// The child persisted with ParentID and is excluded from the flat list.

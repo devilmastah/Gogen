@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"time"
 
 	"gogen/internal/onoff"
@@ -51,6 +52,22 @@ const (
 	// running subagents per parent session (web host). Spawning beyond it
 	// is refused; values <= 0 fall back to this default.
 	DefaultSubagentMaxConcurrent = 4
+	// DefaultStatusDisplayHost is the mDNS name the ttgo/status firmware
+	// advertises. DefaultStatusDisplaySource is empty = AUTO: the reporter
+	// derives "gogen-<project dir>" so several Gogen instances in different
+	// projects land on different display rows without configuration (see
+	// internal/statusdisplay.sourceForDir).
+	DefaultStatusDisplayHost   = "statusscreen.local"
+	DefaultStatusDisplaySource = ""
+	// The status-display gate values: off never reports; auto (the default)
+	// probes for the screen at startup and enables reporting when it
+	// answers; on reports without probing; browser builds the rows
+	// server-side but has the web UI POST them, for when the browser can
+	// reach the display and the server cannot (web mode only).
+	StatusDisplayOff     = "off"
+	StatusDisplayAuto    = "auto"
+	StatusDisplayOn      = "on"
+	StatusDisplayBrowser = "browser"
 )
 
 // Effective returns v when v > 0, else def. It is the single "0 = unset, use
@@ -275,6 +292,26 @@ type Config struct {
 	// `-p` runs (see internal/automation). The `gogen automation` CLI
 	// manages the records; the flag only gates firing.
 	Automations string
+
+	// StatusDisplay gates the LAN status-screen reporter: "off", "auto"
+	// (default: probe for the screen at startup, enable when it answers), or
+	// "on" (report without probing). When active, each top-level turn
+	// updates one display row over the firmware's HTTP API: progress is the
+	// context-window usage, the state is running / done / error / idle, and
+	// the message names the current activity. Updates are best-effort and
+	// never affect a turn.
+	StatusDisplay string
+	// StatusDisplayHost is the display's mDNS name, IP, or base URL
+	// (default statusscreen.local, the firmware's advertised name).
+	StatusDisplayHost string
+	// StatusDisplayToken is the optional shared secret the firmware
+	// requires on mutating endpoints (sent as the X-Status-Token header).
+	StatusDisplayToken string
+	// StatusDisplaySource names the display row (feed id) the session
+	// reports under. Empty (the default) derives "gogen-<project folder>"
+	// so instances in different projects get their own display row; set it
+	// explicitly when two instances share one project folder.
+	StatusDisplaySource string
 }
 
 // Defaults returns built-in default configuration values.
@@ -327,6 +364,9 @@ func Defaults() Config {
 		Terminal:                  "off",
 		JobNotices:                "off",
 		Automations:               "off",
+		StatusDisplay:             StatusDisplayAuto,
+		StatusDisplayHost:         DefaultStatusDisplayHost,
+		StatusDisplaySource:       DefaultStatusDisplaySource,
 	}
 }
 
@@ -411,6 +451,26 @@ func (c *Config) JobNoticesEnabled() bool {
 // enabled.
 func (c *Config) AutomationsEnabled() bool {
 	return c != nil && configOn(c.Automations)
+}
+
+// StatusDisplayMode returns the normalized status-display gate: "on",
+// "off", or "auto" (the default). Anything else — including an absent value
+// — resolves to "auto", so a typo degrades to discovery rather than
+// silently reporting to nowhere or staying off.
+func (c *Config) StatusDisplayMode() string {
+	if c == nil {
+		return StatusDisplayAuto
+	}
+	switch strings.ToLower(strings.TrimSpace(c.StatusDisplay)) {
+	case StatusDisplayOn:
+		return StatusDisplayOn
+	case StatusDisplayOff:
+		return StatusDisplayOff
+	case StatusDisplayBrowser:
+		return StatusDisplayBrowser
+	default:
+		return StatusDisplayAuto
+	}
 }
 
 // SubagentDepth returns the effective maximum subagent nesting depth

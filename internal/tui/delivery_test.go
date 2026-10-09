@@ -44,8 +44,9 @@ func keyPress(s string) tea.KeyPressMsg {
 }
 
 // TestDrainDeliveriesOnlyWhenIdle pins the TUI drain guard: the focused
-// session's queue is drained only when no turn is streaming, one item per
-// drain — the next waits for the just-started turn to end.
+// session's queue is drained only while no turn is streaming. A contiguous
+// run of system notices drains as ONE turn (one provider request), so both
+// items leave the queue together; the next drain waits for that turn to end.
 func TestDrainDeliveriesOnlyWhenIdle(t *testing.T) {
 	m := newQueueTestModel()
 	s := m.focusedSession()
@@ -66,22 +67,68 @@ func TestDrainDeliveriesOnlyWhenIdle(t *testing.T) {
 	if cmd := m.drainDeliveries(); cmd == nil {
 		t.Fatal("must drain when idle")
 	}
-	if len(s.steerQueue) != 1 || s.steerQueue[0].text != "notice-b" {
-		t.Fatalf("queue = %v, want [notice-b]", s.steerQueue)
+	if len(s.steerQueue) != 0 {
+		t.Fatalf("queue = %v, want empty (the system run drains as one turn)", s.steerQueue)
 	}
 	if !m.streaming {
 		t.Fatal("drain must mark the focused session as streaming")
 	}
 
-	// Still streaming (the just-started turn) → the second item waits.
+	// Still streaming (the just-started turn) → a further item waits.
 	if cmd := m.drainDeliveries(); cmd != nil {
-		t.Fatal("second item must wait for the first turn to end")
+		t.Fatal("further items must wait for the just-started turn to end")
 	}
 	// An empty queue yields no command even when idle.
 	m.streaming = false
 	s.steerQueue = nil
 	if cmd := m.drainDeliveries(); cmd != nil {
 		t.Fatal("empty queue must not drain")
+	}
+}
+
+// TestSystemDeliveriesBatchOneTurn pins the TUI batch boundaries: a
+// contiguous run of system notices drains as ONE turn, a USER steering item
+// keeps its own turn, and a system item behind the user item is not jumped
+// (FIFO across kinds).
+func TestSystemDeliveriesBatchOneTurn(t *testing.T) {
+	m := newQueueTestModel()
+	s := m.focusedSession()
+	s.steerQueue = []steerItem{
+		{id: "s1", text: "notice-1", system: true},
+		{id: "s2", text: "notice-2", system: true},
+		{id: "u1", text: "user-draft"},
+		{id: "s3", text: "notice-3", system: true},
+	}
+
+	// The two leading notices drain as one turn.
+	if cmd := m.drainSessionQueue(s); cmd == nil {
+		t.Fatal("batch drain must start a turn")
+	}
+	if len(s.steerQueue) != 2 || s.steerQueue[0].id != "u1" || s.steerQueue[1].id != "s3" {
+		t.Fatalf("after batch drain queue = %v, want [u1, s3]", s.steerQueue)
+	}
+
+	// Simulate the batched turn ending: drainSessionQueue only starts idle
+	// sessions, and the command is never executed in this test.
+	s.streaming = false
+	m.streaming = false
+
+	// The user item keeps its own turn...
+	if cmd := m.drainSessionQueue(s); cmd == nil {
+		t.Fatal("user drain must start a turn")
+	}
+	if len(s.steerQueue) != 1 || s.steerQueue[0].id != "s3" {
+		t.Fatalf("after user drain queue = %v, want [s3]", s.steerQueue)
+	}
+
+	s.streaming = false
+	m.streaming = false
+	// ...and the system item behind it drains alone.
+	if cmd := m.drainSessionQueue(s); cmd == nil {
+		t.Fatal("trailing system drain must start a turn")
+	}
+	if len(s.steerQueue) != 0 {
+		t.Fatalf("queue = %v, want empty", s.steerQueue)
 	}
 }
 
@@ -132,8 +179,9 @@ func TestDeliveryRequestMsgRoutesBySid(t *testing.T) {
 		t.Fatalf("notice landed on the focused session's queue: %v", q)
 	}
 
-	// 2. An IDLE background target drains its notice as its own turn
-	// immediately, leaving the focused session's queue alone.
+	// 2. An IDLE background target drains its queue as ONE batched turn
+	// immediately (the still-queued notice runs with the new one), leaving
+	// the focused session's queue alone.
 	bg.streaming = false
 	model, cmd = m2.handleMsg(deliveryRequestMsg{sid: bg.id, text: "idle notice"})
 	m3 := model.(*Model)
@@ -143,8 +191,8 @@ func TestDeliveryRequestMsgRoutesBySid(t *testing.T) {
 	if !bg.streaming {
 		t.Fatal("the drained turn must mark the background session as streaming")
 	}
-	if len(bg.steerQueue) != 1 {
-		t.Fatalf("background queue = %v, want the busy item still queued behind its turn", bg.steerQueue)
+	if len(bg.steerQueue) != 0 {
+		t.Fatalf("background queue = %v, want empty (the system run batches into one turn)", bg.steerQueue)
 	}
 	if q := m3.focusedSession().steerQueue; len(q) != 0 {
 		t.Fatalf("focused session queue = %v, want empty", q)

@@ -3205,6 +3205,16 @@
         }
         .file-link:hover { text-decoration: underline; }
 
+        /* ===== URL links (web_fetch / download_file tool cards) =====
+         * Real anchors opening in a new tab; the persistent underline
+         * marks them as links (file links stay hover-only). */
+        .url-link {
+            color: var(--accent);
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
+        .url-link:hover { opacity: 0.8; }
+
         /* ===== Message timestamps ===== */
         .message-time {
             display: block;

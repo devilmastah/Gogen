@@ -107,6 +107,8 @@ func (a *Agent) featureTools() []featureTool {
 			out = append(out,
 				featureTool{Name: "subagent_fork", Definition: subagentForkToolDef(), Handler: handleSubagentFork},
 				featureTool{Name: "list_agents", Definition: listAgentsToolDef(), Handler: handleListAgents},
+				featureTool{Name: "get_agent_result", Definition: getAgentResultToolDef(), Handler: handleGetAgentResult},
+				featureTool{Name: "wait_agent", Definition: waitAgentToolDef(), Handler: handleWaitAgent},
 				featureTool{Name: "send_message", Definition: sendMessageToolDef(), Handler: handleSendMessage},
 				featureTool{Name: "interrupt_agent", Definition: interruptAgentToolDef(), Handler: handleInterruptAgent},
 			)

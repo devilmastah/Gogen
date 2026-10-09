@@ -63,6 +63,9 @@ func ConfigFileHasSecrets(path string) bool {
 	if cfg.WebAuthToken != "" {
 		return true
 	}
+	if cfg.StatusDisplayToken != "" {
+		return true
+	}
 	for _, p := range cfg.OpenAIProviders {
 		if p.APIKey != "" {
 			return true

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,7 +28,7 @@ func newContinuableServer(t *testing.T, childProvider func() llm.LLMProvider) (*
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	// The parent's delivery turns (completion notices, replies) need a
+	// The parent's delivery turns (terminal events, replies) need a
 	// provider that answers.
 	p := llmtest.NewMockProvider()
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}, {Content: "ack2"}}
@@ -108,8 +109,8 @@ func waitForParentDeliveriesSettled(t *testing.T, s *Server, a *agent.Agent) {
 }
 
 // TestBackgroundSpawnCompletionNotice drives the full background path: the
-// child runs to completion, the parent receives the completion notice as a
-// user message, and the child stays registered (held) until release.
+// child runs to completion, the parent receives a compact terminal event, and
+// the child stays registered (held) until release.
 func TestBackgroundSpawnCompletionNotice(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
 		p := llmtest.NewMockProvider()
@@ -134,14 +135,19 @@ func TestBackgroundSpawnCompletionNotice(t *testing.T) {
 	if !child.rt.held.Load() {
 		t.Fatal("child must be held")
 	}
-	// The parent is notified when the child finishes.
+	// The parent receives a compact, correlated terminal event; the full
+	// report is pulled explicitly through get_agent_result.
 	waitFor(t, 5*time.Second, func() bool {
-		return deliveredMessages(a, "[subagent") && deliveredMessages(a, "background report")
+		return deliveredMessages(a, "[subagent") && deliveredMessages(a, "get_agent_result")
 	})
+	result, err := sp.GetAgentResult(a, id)
+	if err != nil || !strings.Contains(result, "background report") {
+		t.Fatalf("GetAgentResult = %q, %v", result, err)
+	}
 	if child.statusOf() != "finished" {
 		t.Fatalf("child status = %q, want finished", child.statusOf())
 	}
-	// The completion notice turn on the parent also completed.
+	// The terminal-event delivery turn on the parent also completed.
 	waitFor(t, 5*time.Second, func() bool {
 		for _, m := range a.SnapshotMessages() {
 			if m.Role == "assistant" && strings.Contains(m.Content, "ack") {
@@ -249,6 +255,43 @@ func TestSendMessageFailedReplyNotifiesParent(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "no reply") })
 }
 
+// TestSendMessageQueueFullRefuses pins the targeted refuse-at-submit policy:
+// when a busy child's system queue is full of targeted deliveries, a further
+// send_message fails with an actionable error instead of silently dropping
+// an older queued message whose reply the parent is waiting on.
+func TestSendMessageQueueFullRefuses(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		return &blockingProvider{} // the child's main job never finishes
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+
+	id, err := sp.SpawnBackground(context.Background(), a, "main job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	// Wait until the main job actually holds the turn lock, so the
+	// deliveries queue instead of draining between sends.
+	waitFor(t, 5*time.Second, func() bool {
+		active, _ := child.rt.turnState()
+		return active
+	})
+	for i := 0; i < maxSystemDeliveryQueue; i++ {
+		if err := sp.SendMessage(a, id, fmt.Sprintf("queued-%d", i)); err != nil {
+			t.Fatalf("send %d refused before the cap: %v", i, err)
+		}
+	}
+	err = sp.SendMessage(a, id, "one too many")
+	if err == nil || !strings.Contains(err.Error(), "delivery queue is full") {
+		t.Fatalf("send past a full targeted queue = %v, want a delivery-queue-full error", err)
+	}
+	// Tear the blocked child down: release evicts its runtime and drops the
+	// queued deliveries, so the spawn goroutine can exit (the provider
+	// unwinds on cancel) instead of leaking into the package teardown.
+	sp.releaseChild(child)
+}
+
 var errFailedReply = errors.New("provider exploded")
 
 // TestBackgroundChildBusy pins the release-safety predicate: a quiet child
@@ -302,15 +345,14 @@ func TestBackgroundChildBusy(t *testing.T) {
 		t.Fatal("a send_message delivery queued for the worker must read busy")
 	}
 
-	// Captured reply: the delivery turn acquired the lock and started
-	// (deliverStartHook armed pendingReply) but setTurnActive(true) has not
-	// run yet — the acquire→start handoff. Simulated by arming the flag
-	// directly.
+	// Captured result: the delivery turn acquired the lock and the exact
+	// callback is armed, but setTurnActive(true) has not run yet — the
+	// acquire→start handoff. Simulated by arming the flag directly.
 	child.mu.Lock()
 	child.pendingReply = true
 	child.mu.Unlock()
 	if !child.busy() {
-		t.Fatal("a captured reply not yet delivered to the parent must read busy")
+		t.Fatal("an armed exact-result callback must read busy")
 	}
 	child.mu.Lock()
 	child.pendingReply = false
@@ -402,8 +444,8 @@ func TestRetentionReleasesAfterQueuedDelivery(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id) == nil })
 }
 
-// TestInterruptAgent cancels the in-flight turn only: the child stays
-// registered and continuable, and no completion notice is delivered.
+// TestInterruptAgent cancels the current turn only: the child stays
+// registered and continuable, and no terminal event is delivered.
 func TestInterruptAgent(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
 		return &blockingProvider{} // blocks until cancelled
@@ -416,21 +458,33 @@ func TestInterruptAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "running" })
-	time.Sleep(100 * time.Millisecond) // let the turn enter the provider
-
+	// Deliberately interrupt immediately: runCancel is installed before the
+	// child is published, so cancellation must not depend on the provider
+	// having registered its stream handle yet.
 	if err := sp.InterruptAgent(a, id); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "idle" })
 	if deliveredMessages(a, "[subagent") {
-		t.Fatal("an interrupted child must not deliver a completion notice")
+		t.Fatal("an interrupted child must not deliver a terminal event")
+	}
+	waited, err := sp.WaitAgent(t.Context(), a, id, time.Second)
+	if err != nil || !strings.Contains(waited, "interrupted before completion") {
+		t.Fatalf("WaitAgent after immediate interrupt = %q, %v", waited, err)
+	}
+	result, err := sp.GetAgentResult(a, id)
+	if err != nil || !strings.Contains(result, "interrupted before completion") {
+		t.Fatalf("GetAgentResult after interrupt = %q, %v", result, err)
 	}
 	// Still live: messaging it works.
 	if err := sp.SendMessage(a, id, "wake up"); err != nil {
 		t.Fatalf("child should remain continuable after interrupt: %v", err)
 	}
-	// Authorization: a foreign caller cannot message/interrupt the child.
+	// Authorization: a foreign caller cannot retrieve/message/interrupt the
+	// child.
+	if _, err := sp.GetAgentResult(&agent.Agent{SessionID: "someone-else"}, id); err == nil {
+		t.Fatal("foreign caller must not retrieve the child")
+	}
 	if err := sp.SendMessage(&agent.Agent{SessionID: "someone-else"}, id, "hi"); err == nil {
 		t.Fatal("foreign caller must not message the child")
 	}
@@ -565,6 +619,15 @@ func TestChildRetentionRelease(t *testing.T) {
 		}
 		return !child.rt.held.Load()
 	})
+	// Retention removes only the live runtime/record. The persisted terminal
+	// result remains available to the original parent.
+	result, err := sp.GetAgentResult(a, id)
+	if err != nil || !strings.Contains(result, "done") {
+		t.Fatalf("GetAgentResult after retention = %q, %v", result, err)
+	}
+	if _, err := sp.GetAgentResult(&agent.Agent{SessionID: "someone-else"}, id); err == nil {
+		t.Fatal("a foreign parent must not retrieve a released child's result")
+	}
 }
 
 // TestParentEvictionCancelsChildren pins the parent-close policy: evicting
@@ -598,10 +661,10 @@ func TestParentEvictionCancelsChildren(t *testing.T) {
 	})
 }
 
-// TestChildProgressNeverPushesToParent pins the one-channel return contract:
-// a child cannot push interim messages into the parent conversation — the
-// parent gets exactly the completion notice (state + bounded outcome), and
-// progress is available via list_agents (pull). The child here ATTEMPTS a
+// TestChildProgressNeverPushesToParent pins the return contract: a child
+// cannot push interim messages into the parent conversation. The parent gets
+// one compact terminal event and pulls the bounded report through
+// get_agent_result; progress remains available via list_agents. The child here ATTEMPTS a
 // report tool call mid-turn: the tool no longer exists for children, so the
 // attempt is rejected as an unknown tool inside the child, and nothing
 // reaches the parent.
@@ -628,11 +691,11 @@ func TestChildProgressNeverPushesToParent(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
 	waitForParentDeliveriesSettled(t, s, a)
 	waitFor(t, 5*time.Second, func() bool {
-		return deliveredMessages(a, "finished: final outcome text")
+		return deliveredMessages(a, "get_agent_result")
 	})
 	// The report tool is gone for children: the attempt is an unknown tool
-	// (visible in the child's own transcript), and the parent receives
-	// exactly one message for the run — the completion notice.
+	// (visible in the child's own transcript), and the parent receives one
+	// compact terminal event for the run.
 	rejected := false
 	for _, m := range child.rt.agent.SnapshotMessages() {
 		if m.Role == "tool" && strings.Contains(m.Content, "unknown tool: report") {
@@ -646,7 +709,11 @@ func TestChildProgressNeverPushesToParent(t *testing.T) {
 		t.Fatal("a child must not be able to push interim messages into the parent conversation")
 	}
 	if n := deliveredCount(a, "[subagent"); n != 1 {
-		t.Fatalf("parent received %d child messages, want exactly 1 (the completion notice)", n)
+		t.Fatalf("parent received %d child terminal events, want exactly 1", n)
+	}
+	result, err := sp.GetAgentResult(a, id)
+	if err != nil || !strings.Contains(result, "final outcome text") {
+		t.Fatalf("get_agent_result = %q, %v", result, err)
 	}
 	out, err := sp.ListAgents(a)
 	if err != nil {
@@ -688,20 +755,25 @@ func TestChildCapReleasesOldest(t *testing.T) {
 			t.Fatalf("surviving child %s is not finished", c.id)
 		}
 	}
-	// Settle: each child's completion notice is enqueued/delivered only
-	// after its final flush lands, so waiting for all four notices
-	// (delivered into the parent transcript, or queued at the registry
-	// once the parent runtime was orphan-evicted) guarantees every child's
-	// session write has completed. The parent's own delivery-turn flush is
-	// covered by waitForParentDeliveriesSettled.
-	waitFor(t, 5*time.Second, func() bool {
-		delivered := deliveredCount(a, "finished: done")
-		s.registry.parentDeliverMu.Lock()
-		queued := len(s.registry.parentDeliveries[a.SessionID])
-		s.registry.parentDeliverMu.Unlock()
-		return delivered+queued == 4
-	})
+	// Settle: each child's compact terminal event is enqueued/delivered only
+	// after its final flush lands. Four completions may legitimately be
+	// coalesced into fewer parent delivery turns, so verify the durable child
+	// sessions/outcomes directly; the terminal-event text is asserted in the
+	// dedicated completion tests.
 	waitForParentDeliveriesSettled(t, s, a)
+	entries, err := s.ws.Store.List(s.ws.GetWorkingDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishedStored := 0
+	for _, entry := range entries {
+		if entry.ParentID == a.SessionID && entry.SubagentStatus == "success" {
+			finishedStored++
+		}
+	}
+	if finishedStored != 4 {
+		t.Fatalf("persisted successful children = %d, want 4", finishedStored)
+	}
 }
 
 // TestLiveChildCapRefuses pins the live-child bound: spawning beyond
@@ -1168,64 +1240,68 @@ func TestLiveGuardBoundsIdleChildren(t *testing.T) {
 	sp.cancelAll(a.SessionID)
 }
 
-// TestOnTurnEndReplyBaseline pins the reply-capture baseline: only
-// messages the delivered turn actually produced count as the reply — an
-// older assistant message (e.g. the main job report) must never be
-// re-delivered to the parent as the reply to an interrupted send_message.
-func TestOnTurnEndReplyBaseline(t *testing.T) {
+// TestOnTurnResultUsesExactOutput pins that reply delivery consumes the
+// current turn's returned output, never a transcript heuristic: an older
+// assistant message cannot be re-delivered after an interrupted turn.
+func TestOnTurnResultUsesExactOutput(t *testing.T) {
+	replyEvent := subagentEvent{
+		Kind:     subagentEventReply,
+		ChildID:  "child-1",
+		ParentID: "parent-1",
+		Label:    "subagent: test",
+		Text:     strings.Repeat("r", agent.MaxSubagentReportBytes+1000),
+	}
+	if got := replyEvent.parentMessage(); len(got) > agent.MaxSubagentReportBytes+len("… (truncated)")+len(replyEvent.Label)+32 {
+		t.Fatalf("typed reply event escaped the report cap: %d bytes", len(got))
+	}
+	if got := (subagentEvent{
+		Kind:     subagentEventReply,
+		ChildID:  "child-1",
+		ParentID: "parent-1",
+		Label:    "subagent: test",
+		Err:      context.Canceled,
+	}).parentMessage(); !strings.Contains(got, "context canceled") {
+		t.Fatalf("typed no-reply event = %q", got)
+	}
+
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
 		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
 		return p
 	})
 	sp := continuableSpawner(t, s)
-
-	newChild := func(msgs []llm.Message) *backgroundChild {
-		stub := newBlockingStub()
-		dir := t.TempDir()
-		childAgent := agent.NewAgent(stub, agent.NewExecutor(dir),
-			contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000}))
-		childAgent.Messages = msgs
-		return &backgroundChild{
-			id:       "child-1",
-			parentID: a.SessionID,
-			label:    "subagent: test",
-			depth:    1,
-			rt:       newSessionRuntime(childAgent),
-			sp:       sp,
-			status:   "idle",
-		}
+	// Keep the parent registered so the synthetic child's delivery can run.
+	if rt, ok := s.registry.get(a.SessionID); ok {
+		rt.held.Store(true)
 	}
-
-	// Completed reply turn: the new assistant message is delivered.
-	c := newChild([]llm.Message{
-		{Role: "user", Content: "job"},
-		{Role: "assistant", Content: "old report"},
+	t.Cleanup(func() {
+		if rt, ok := s.registry.get(a.SessionID); ok {
+			rt.held.Store(false)
+		}
 	})
+	id, err := sp.SpawnBackground(context.Background(), a, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return c.isFinished() })
+
+	c.mu.Lock()
 	c.pendingReply = true
-	c.replyBase = 2 // after "old report"
-	c.rt.agent.Messages = append(c.rt.agent.Messages,
-		llm.Message{Role: "user", Content: "steer"},
-		llm.Message{Role: "assistant", Content: "new reply"},
-	)
-	c.onTurnEnd()
+	c.mu.Unlock()
+	c.onTurnResult("new reply", nil)
 	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "new reply") })
+	waitForParentDeliveriesSettled(t, s, a)
 
-	// Interrupted reply turn (no completed round): the delivered user
-	// message is appended but no assistant message is — the older report
-	// must NOT be re-delivered as the reply.
-	c = newChild([]llm.Message{
-		{Role: "user", Content: "job"},
-		{Role: "assistant", Content: "old report"},
-	})
+	c.mu.Lock()
 	c.pendingReply = true
-	c.replyBase = 2
-	c.rt.agent.Messages = append(c.rt.agent.Messages, llm.Message{Role: "user", Content: "steer"})
-	c.onTurnEnd()
-	time.Sleep(200 * time.Millisecond)
-	if deliveredMessages(a, "old report") {
+	c.mu.Unlock()
+	c.onTurnResult("", context.Canceled)
+	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "no reply") })
+	if deliveredMessages(a, "ack") {
 		t.Fatal("an interrupted reply turn must not re-deliver an older assistant message")
 	}
+	waitForParentDeliveriesSettled(t, s, a)
 }
 
 // gateProvider streams one result only after release is closed, so a test
@@ -1264,9 +1340,9 @@ func (p *gateProvider) GenerateResponseStream(ctx context.Context, _ []llm.Messa
 func (p *gateProvider) ModelContextLimit(context.Context) (int, error) { return 1000, nil }
 
 // TestBackgroundSpawnCompletionQueuedUntilParentLive pins the deferred
-// completion delivery: a parent that is orphan-evicted (idle, no viewers)
-// while its background child runs receives the child's completion notice
-// when the session is next registered — the notice is queued, not dropped.
+// terminal-event delivery: a parent that is orphan-evicted (idle, no viewers)
+// while its background child runs receives the compact event when the session
+// is next registered; the event is queued, not dropped.
 func TestBackgroundSpawnCompletionQueuedUntilParentLive(t *testing.T) {
 	gate := make(chan struct{})
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
@@ -1293,8 +1369,8 @@ func TestBackgroundSpawnCompletionQueuedUntilParentLive(t *testing.T) {
 	s.registry.evictRuntime(parentRt)
 	close(gate) // let the child finish
 
-	// The child finishes; the parent is not live, so the completion notice
-	// is queued in the registry rather than delivered.
+	// The child finishes; the parent is not live, so the compact terminal
+	// event is queued in the registry rather than delivered.
 	waitFor(t, 5*time.Second, func() bool {
 		s.registry.parentDeliverMu.Lock()
 		defer s.registry.parentDeliverMu.Unlock()
@@ -1309,8 +1385,12 @@ func TestBackgroundSpawnCompletionQueuedUntilParentLive(t *testing.T) {
 	// the queued notice into it.
 	s.registry.register(a.SessionID, newSessionRuntime(a))
 	waitFor(t, 5*time.Second, func() bool {
-		return deliveredMessages(a, "[subagent") && deliveredMessages(a, "gated report")
+		return deliveredMessages(a, "[subagent") && deliveredMessages(a, "get_agent_result")
 	})
+	result, err := sp.GetAgentResult(a, id)
+	if err != nil || !strings.Contains(result, "gated report") {
+		t.Fatalf("GetAgentResult = %q, %v", result, err)
+	}
 }
 
 // --- subagent return-path fixes ---
@@ -1421,6 +1501,10 @@ func TestListAgentsProgressLineBounded(t *testing.T) {
 		t.Fatal("progress line must collapse to one line")
 	}
 
+	waited, err := sp.WaitAgent(t.Context(), a, id, time.Second)
+	if err != nil || !strings.Contains(waited, "second line") {
+		t.Fatalf("WaitAgent on finished child = %q, %v", waited, err)
+	}
 	// A second, running child is listed alongside (newest last).
 	blocking := make(chan struct{})
 	s.ws.ProviderFactory = func() llm.LLMProvider {
@@ -1456,9 +1540,8 @@ func TestListAgentsProgressLineBounded(t *testing.T) {
 }
 
 // TestEvictedChildWithArmedCaptureReleases pins the release predicate: an
-// evicted runtime is never "busy" — a capture armed by a delivery whose turn
-// never started (the evicted early return in runTurnBody skips the turn-end
-// hook that consumes pendingReply) must not pin the child record and re-arm
+// evicted runtime is never "busy" — an exact-result capture armed by a
+// delivery whose turn never started must not pin the child record and re-arm
 // its retention timer forever.
 func TestEvictedChildWithArmedCaptureReleases(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
@@ -1476,8 +1559,8 @@ func TestEvictedChildWithArmedCaptureReleases(t *testing.T) {
 	child := sp.children.get(id)
 	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
 
-	// Simulate the evicted early return: the start hook armed the capture
-	// but the turn never ran, so the turn-end hook never consumed it.
+	// Simulate the evicted early return: the start hook armed the exact
+	// callback but the turn never ran, so its callback never consumed it.
 	child.mu.Lock()
 	child.pendingReply = true
 	child.mu.Unlock()
@@ -1489,52 +1572,5 @@ func TestEvictedChildWithArmedCaptureReleases(t *testing.T) {
 	sp.maybeReleaseChild(child)
 	if sp.children.get(id) != nil {
 		t.Fatal("an evicted child must be released, not pinned by the armed capture")
-	}
-}
-
-// TestOnTurnEndCompactionFallback pins the timestamp fallback: when the
-// delivered turn's auto-compaction renumbered the history below the
-// replyBase baseline, the reply is still found via its CreatedAt — and a
-// pre-turn assistant message is never re-delivered as the reply.
-func TestOnTurnEndCompactionFallback(t *testing.T) {
-	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llmtest.NewMockProvider()
-		p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
-		return p
-	})
-	sp := continuableSpawner(t, s)
-
-	stub := newBlockingStub()
-	dir := t.TempDir()
-	childAgent := agent.NewAgent(stub, agent.NewExecutor(dir),
-		contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000}))
-	turnStart := time.Now().Truncate(time.Millisecond)
-	old := turnStart.Add(-time.Minute)
-	childAgent.Messages = []llm.Message{
-		{Role: "user", Content: "job", CreatedAt: old},
-		{Role: "assistant", Content: "old report", CreatedAt: old},
-		// The delivered turn's messages, renumbered below the baseline by
-		// the compaction the turn triggered.
-		{Role: "user", Content: "steer", CreatedAt: turnStart},
-		{Role: "assistant", Content: "new reply", CreatedAt: turnStart},
-	}
-	c := &backgroundChild{
-		id:       "child-1",
-		parentID: a.SessionID,
-		label:    "subagent: test",
-		depth:    1,
-		rt:       newSessionRuntime(childAgent),
-		sp:       sp,
-		status:   "idle",
-		// Stale baseline: len(msgs) < replyBase, so the index scan finds
-		// nothing and only the timestamp floor can locate the reply.
-		pendingReply: true,
-		replyBase:    4,
-		turnStart:    turnStart,
-	}
-	c.onTurnEnd()
-	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "new reply") })
-	if deliveredMessages(a, "old report") {
-		t.Fatal("a pre-turn assistant message must not be re-delivered")
 	}
 }

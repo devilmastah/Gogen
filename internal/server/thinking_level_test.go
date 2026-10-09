@@ -109,3 +109,48 @@ func TestAgentConfigMsgCarriesModelDescription(t *testing.T) {
 		t.Fatalf("reasoningEfforts = %v", msg.ReasoningEfforts)
 	}
 }
+
+// refEffortStub is a wsEffortStub that routes by (profile, ID), so the
+// config echo's ModelProvider is testable with a non-default owner.
+type refEffortStub struct {
+	*wsEffortStub
+	ref llm.ModelRef
+}
+
+func (s *refEffortStub) SetModelRef(ref llm.ModelRef) error {
+	s.ref = ref
+	return nil
+}
+
+func (s *refEffortStub) CurrentModelRef() llm.ModelRef { return s.ref }
+
+// TestAgentConfigMsgCarriesModelProvider pins the config echo's routing key:
+// ModelProvider names the profile serving the current model, so the client's
+// current-model check can match (provider, id). A bare Model alone would
+// mark every catalog row that lists the same ID (two providers listing
+// deepseek-flash would both light up in the picker).
+func TestAgentConfigMsgCarriesModelProvider(t *testing.T) {
+	p := &refEffortStub{
+		wsEffortStub: &wsEffortStub{model: "deepseek-flash"},
+		ref:          llm.ModelRef{Profile: "deepseek", ID: "deepseek-flash"},
+	}
+	a := &agent.Agent{
+		Provider: p,
+		Executor: &agent.Executor{WorkingDir: "."},
+	}
+	msg := agentConfigMsgBasic(a)
+	if msg.Model != "deepseek-flash" {
+		t.Fatalf("model = %q", msg.Model)
+	}
+	if msg.ModelProvider != "deepseek" {
+		t.Fatalf("modelProvider = %q, want deepseek", msg.ModelProvider)
+	}
+
+	// A default-profile model reports the default profile name (an empty
+	// ref profile normalizes to "default", as the client's fallback does).
+	p.ref = llm.ModelRef{Profile: "", ID: "gpt-4o"}
+	msg = agentConfigMsgBasic(a)
+	if msg.ModelProvider != "default" {
+		t.Fatalf("modelProvider = %q, want default", msg.ModelProvider)
+	}
+}

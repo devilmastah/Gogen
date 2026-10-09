@@ -22,9 +22,13 @@ import (
 func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	mode, thinking := a.ModeAndThinkingLevel()
 	msg := WSMessage{
-		Type:          "config",
-		WorkingDir:    a.Executor.GetWorkingDir(),
-		Model:         a.CurrentModel(),
+		Type:       "config",
+		WorkingDir: a.Executor.GetWorkingDir(),
+		Model:      a.CurrentModel(),
+		// The owning profile travels with the model: model IDs are not
+		// unique across registered providers, so the client's current-model
+		// check must match (provider, id), not the bare id.
+		ModelProvider: a.CurrentModelRef().ProfileName(),
 		Mode:          mode.String(),
 		ThinkingLevel: string(thinking),
 		GlobalMode:    a.GlobalMode,

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,13 +16,15 @@ import (
 	"gogen/internal/session"
 )
 
-// deliveredCount reports how many user messages in the agent's snapshot
-// contain needle.
+// deliveredCount reports how many times needle appears across the agent's
+// user messages. Occurrences, not messages: a batched system delivery joins
+// several notices into ONE message, so callers counting notices must count
+// occurrences.
 func deliveredCount(a *agent.Agent, needle string) int {
 	n := 0
 	for _, m := range a.SnapshotMessages() {
-		if m.Role == "user" && strings.Contains(m.Content, needle) {
-			n++
+		if m.Role == "user" {
+			n += strings.Count(m.Content, needle)
 		}
 	}
 	return n
@@ -140,8 +143,9 @@ func TestDeliverToSessionBusyQueuesUntilIdle(t *testing.T) {
 	})
 }
 
-// TestDeliverQueueOverflow pins the bounded queue: on overflow the OLDEST
-// delivery is dropped and the rest are delivered in order.
+// TestDeliverQueueOverflow pins the bounded notice queue and the batched
+// drain: on overflow the OLDEST notice is dropped, and the remaining run is
+// delivered as ONE joined turn.
 func TestDeliverQueueOverflow(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
@@ -150,7 +154,7 @@ func TestDeliverQueueOverflow(t *testing.T) {
 	// The FIRST stream call (the "block me" turn started below) blocks
 	// until cancelled, so the delivery worker's tryAcquireTurn fails while
 	// it runs and the burst below cannot be popped mid-append. Later calls
-	// (the delivered turns) answer immediately.
+	// (the delivered turn) answer immediately.
 	first := true
 	entered := make(chan struct{})
 	p.OnStream = func(ctx context.Context, _ []llm.Message, h *llm.StreamHandlers) (*llm.StreamResult, error) {
@@ -168,11 +172,10 @@ func TestDeliverQueueOverflow(t *testing.T) {
 	a.Provider = p
 
 	rt, _ := s.registry.get(a.SessionID)
-	// The six deliveries must land as one burst: the blocking turn holds
-	// turnMu, so the worker cannot pop the first notice mid-append (a
-	// worker that delivers notice-1 before the burst completes would leave
-	// no overflow to drop). The 6th append overflows the cap and drops the
-	// OLDEST (notice-1).
+	// The burst must land as one atomic append run: the blocking turn holds
+	// turnMu, so the worker cannot pop the head mid-append (a worker that
+	// delivers notice-1 before the burst completes would leave no overflow
+	// to drop). The (cap+1)-th append overflows and drops the OLDEST.
 	rt.turnMu.Lock()
 	rt.startTurn(nil, "block me", nil)
 	// Wait until the blocking turn is actually inside the provider (it
@@ -185,25 +188,33 @@ func TestDeliverQueueOverflow(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocking turn never entered the provider")
 	}
-	for i := 1; i <= 6; i++ {
-		rt.deliverToSession("notice-" + string(rune('0'+i)))
+	for i := 1; i <= maxSystemDeliveryQueue+1; i++ {
+		rt.deliverToSession(fmt.Sprintf("notice-%d", i))
 	}
 	// End the blocking turn: the worker wakes at turn end and drains the
-	// queue (2..6 — notice-1 was dropped by the overflow).
+	// surviving run (2..cap+1 — notice-1 was dropped by the overflow) as
+	// ONE joined turn.
 	rt.stream.cancelInFlight()
-	// The delivered turns complete quickly (mock provider); wait for the
-	// last one, then settle.
+	want := make([]string, 0, maxSystemDeliveryQueue)
+	for i := 2; i <= maxSystemDeliveryQueue+1; i++ {
+		want = append(want, fmt.Sprintf("notice-%d", i))
+	}
+	expected := strings.Join(want, "\n\n")
 	waitFor(t, 10*time.Second, func() bool {
-		return deliveredMessages(a, "notice-6")
+		return deliveredMessages(a, expected)
 	})
 	time.Sleep(200 * time.Millisecond)
-	if deliveredMessages(a, "notice-1") {
-		t.Fatal("oldest notice must be dropped on overflow")
-	}
-	for i := 2; i <= 6; i++ {
-		if !deliveredMessages(a, "notice-"+string(rune('0'+i))) {
-			t.Fatalf("notice-%d missing", i)
+	// Exactly one notice message must exist, and it is the joined run
+	// without notice-1: a per-notice delivery (or a surviving notice-1
+	// substring match) would break the equality.
+	var got []string
+	for _, m := range a.SnapshotMessages() {
+		if m.Role == "user" && strings.Contains(m.Content, "notice-") {
+			got = append(got, m.Content)
 		}
+	}
+	if len(got) != 1 || got[0] != expected {
+		t.Fatalf("notice deliveries = %d messages; want exactly the joined run (dropped oldest): got %#v", len(got), got)
 	}
 }
 
@@ -220,7 +231,7 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 		agent:         &agent.Agent{},
 		deliverNotify: make(chan struct{}, 1),
 	}
-	for i := 0; i < defaultDeliverQueueCap; i++ {
+	for i := 0; i < maxSystemDeliveryQueue; i++ {
 		rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: "stale", Kind: deliverSystem})
 	}
 	// No worker goroutine for this unit test: the queue stays at cap so the
@@ -249,8 +260,8 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 	n := len(rt.pendingDeliver)
 	last := rt.pendingDeliver[n-1]
 	rt.deliverMu.Unlock()
-	if n != defaultDeliverQueueCap || last.Text != "overflow notice" {
-		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last.Text, defaultDeliverQueueCap)
+	if n != maxSystemDeliveryQueue || last.Text != "overflow notice" {
+		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last.Text, maxSystemDeliveryQueue)
 	}
 }
 
@@ -347,13 +358,11 @@ func TestDeliverToParentQueuesUntilRegistered(t *testing.T) {
 	}
 }
 
-// TestDeliverStartHookArmsOnlyChildMessages pins the delivery-source gate on
-// the per-runtime start hook (the continuable-subagent reply capture): a
-// plain system notice must NOT fire it, a send_message delivery
-// (deliverChildMessage) must fire it exactly once. Without the gate, a
-// child's reaction to any machine message (job notice, subagent report,
-// completion notice) is injected into its parent as an unsolicited reply.
-func TestDeliverStartHookArmsOnlyChildMessages(t *testing.T) {
+// TestDeliverResultCallbackOnlyChildMessages pins the delivery-source gate on
+// the per-runtime exact-result callback (the continuable-subagent reply path):
+// a plain system notice must not arm it, while a send_message delivery must
+// receive that invocation's exact output.
+func TestDeliverResultCallbackOnlyChildMessages(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
 	s, a, _ := newContinuationServer(t, stub, dir)
@@ -375,6 +384,12 @@ func TestDeliverStartHookArmsOnlyChildMessages(t *testing.T) {
 	}
 	var fired atomic.Int32
 	rt.deliverStartHook = func() { fired.Add(1) }
+	var results atomic.Int32
+	rt.deliverResultFunc = func(reply string, err error) {
+		if reply == "ack2" && err == nil {
+			results.Add(1)
+		}
+	}
 
 	// A plain system notice starts its turn without arming the capture (the
 	// hook fires BEFORE startTurn, so observing the delivered message proves
@@ -383,17 +398,146 @@ func TestDeliverStartHookArmsOnlyChildMessages(t *testing.T) {
 		t.Fatal("system notice refused")
 	}
 	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "plain notice") })
+	waitForParentDeliveriesSettled(t, s, a)
 	if got := fired.Load(); got != 0 {
 		t.Fatalf("start hook fired %d times for a system notice, want 0", got)
 	}
 
 	// A send_message delivery arms it exactly once.
-	if !rt.deliverChildMessage("child message") {
-		t.Fatal("child message refused")
+	if ok, full := rt.deliverChildMessage("child message"); !ok || full {
+		t.Fatalf("child message refused (ok=%v full=%v)", ok, full)
 	}
 	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "child message") })
+	waitForParentDeliveriesSettled(t, s, a)
 	if got := fired.Load(); got != 1 {
 		t.Fatalf("start hook fired %d times for a child message, want 1", got)
 	}
-	waitForParentDeliveriesSettled(t, s, a)
+	if got := results.Load(); got != 1 {
+		t.Fatalf("exact result callback fired %d times with the expected output, want 1", got)
+	}
+}
+
+// TestDeliverNoticeBatchOneTurn pins the batched drain: a run of contiguous
+// system notices delivers as ONE joined user message (one provider call)
+// instead of one turn per notice, and a user steering item queued behind the
+// run keeps its own turn (FIFO across kinds).
+func TestDeliverNoticeBatchOneTurn(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	p := llmtest.NewMockProvider()
+	first := true
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	p.OnStream = func(ctx context.Context, _ []llm.Message, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+		if first {
+			first = false
+			close(entered)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		calls.Add(1)
+		return &llm.StreamResult{Content: "ack"}, nil
+	}
+	a.Provider = p
+
+	rt, _ := s.registry.get(a.SessionID)
+	rt.turnMu.Lock()
+	rt.startTurn(nil, "block me", nil)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking turn never entered the provider")
+	}
+	rt.deliverToSession("batch-a")
+	rt.deliverToSession("batch-b")
+	rt.deliverToSession("batch-c")
+	if !rt.enqueueUserTurn("", "user-steer", nil) {
+		t.Fatal("user enqueue refused")
+	}
+	rt.stream.cancelInFlight()
+
+	// The three notices land as ONE joined user message...
+	want := "batch-a\n\nbatch-b\n\nbatch-c"
+	waitFor(t, 10*time.Second, func() bool { return deliveredMessages(a, want) })
+	// ...and the user item behind them still drains as its own turn.
+	waitFor(t, 10*time.Second, func() bool { return deliveredMessages(a, "user-steer") })
+	time.Sleep(200 * time.Millisecond)
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("provider calls after the blocking turn = %d, want 2 (one batched notice turn + one user turn)", got)
+	}
+	if got := deliveredCount(a, "batch-a"); got != 1 {
+		t.Fatalf("batch-a delivered %d times, want 1 (the batch must be one message)", got)
+	}
+	for _, m := range a.SnapshotMessages() {
+		if m.Role == "user" && strings.Contains(m.Content, "batch-") && strings.Contains(m.Content, "user-steer") {
+			t.Fatal("a user steering item must not be joined into the notice batch")
+		}
+	}
+}
+
+// TestTargetedDeliveryOverflowPolicy pins the per-source overflow policy: a
+// targeted (send_message) delivery evicts the OLDEST NOTICE to make room;
+// when every slot holds a targeted delivery it is REFUSED with full=true
+// (never silently dropped); and a notice arriving at an all-targeted full
+// queue drops itself instead of evicting a pending reply.
+func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
+	rt := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
+	rt.deliverWorker.Store(true) // no worker goroutine: the queue stays put
+
+	// Notice slots full: a targeted delivery evicts the oldest notice.
+	for i := 0; i < maxSystemDeliveryQueue; i++ {
+		rt.deliverToSession(fmt.Sprintf("notice-%d", i))
+	}
+	if ok, full := rt.deliverChildMessage("targeted-1"); !ok || full {
+		t.Fatalf("targeted enqueue refused with notice slots free (ok=%v full=%v)", ok, full)
+	}
+	rt.deliverMu.Lock()
+	nSys, nNotice := 0, 0
+	for _, it := range rt.pendingDeliver {
+		if it.Kind != deliverSystem {
+			continue
+		}
+		nSys++
+		if it.Source == deliverFromSystem {
+			nNotice++
+		}
+	}
+	rt.deliverMu.Unlock()
+	if nSys != maxSystemDeliveryQueue || nNotice != maxSystemDeliveryQueue-1 {
+		t.Fatalf("after targeted enqueue: system=%d notices=%d, want %d/%d (oldest notice evicted)",
+			nSys, nNotice, maxSystemDeliveryQueue, maxSystemDeliveryQueue-1)
+	}
+
+	// All-targeted full: the next targeted delivery is REFUSED...
+	rt2 := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
+	rt2.deliverWorker.Store(true)
+	for i := 0; i < maxSystemDeliveryQueue; i++ {
+		if ok, full := rt2.deliverChildMessage(fmt.Sprintf("targeted-%d", i)); !ok || full {
+			t.Fatalf("targeted enqueue %d refused before the cap (ok=%v full=%v)", i, ok, full)
+		}
+	}
+	if ok, full := rt2.deliverChildMessage("one-too-many"); ok || !full {
+		t.Fatalf("targeted enqueue past a full targeted queue = ok=%v full=%v, want false/true", ok, full)
+	}
+	// ...while a notice is consumed-and-dropped, keeping the targeted items.
+	if !rt2.deliverToSession("notice-at-full") {
+		t.Fatal("a notice must be consumed (dropped) rather than refused")
+	}
+	rt2.deliverMu.Lock()
+	n, nTargeted := 0, 0
+	for _, it := range rt2.pendingDeliver {
+		if it.Kind != deliverSystem {
+			continue
+		}
+		n++
+		if it.Source == deliverFromChildMessage {
+			nTargeted++
+		}
+	}
+	rt2.deliverMu.Unlock()
+	if n != maxSystemDeliveryQueue || nTargeted != maxSystemDeliveryQueue {
+		t.Fatalf("queue = %d items (%d targeted), want all %d targeted preserved", n, nTargeted, maxSystemDeliveryQueue)
+	}
 }

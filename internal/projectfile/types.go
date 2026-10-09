@@ -88,6 +88,10 @@ type FileConfig struct {
 	Terminal                  string                `yaml:"terminal"`
 	JobNotices                string                `yaml:"job_notices"`
 	Automations               string                `yaml:"automations"`
+	StatusDisplay             string                `yaml:"status_display"`
+	StatusDisplayHost         string                `yaml:"status_display_host"`
+	StatusDisplayToken        string                `yaml:"status_display_token"`
+	StatusDisplaySource       string                `yaml:"status_display_source"`
 	// KeepRecentMessages is the pre-rename spelling of
 	// compact_keep_recent_messages, accepted for back-compat with a
 	// deprecation warning and cleared by parseYAMLFrontMatter after aliasing.

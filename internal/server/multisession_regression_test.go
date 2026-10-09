@@ -213,11 +213,11 @@ func TestConsecutiveTurnsSecondTurnCancellable(t *testing.T) {
 }
 
 // TestMessageToEvictedPaneDropped verifies the evicted-flag guard: a message
-// sent to a pane whose session was evicted by the registry cap is dropped
-// silently instead of starting a headless turn on an unregistered runtime
-// (invisible to cancel/prune/shutdown). The eviction happens between the
-// handler resolving the runtime and acquiring its turnMu — the window the
-// eviction TryLock + sticky flag close.
+// sent to a pane whose session left the registry is dropped silently instead
+// of starting a headless turn on an unregistered runtime (invisible to
+// cancel/prune/shutdown). The eviction happens between the handler resolving
+// the runtime and acquiring its turnMu — the window the eviction TryLock +
+// sticky flag close.
 func TestMessageToEvictedPaneDropped(t *testing.T) {
 	dir := t.TempDir()
 	prov := llmtest.NewMockProvider()
@@ -242,9 +242,10 @@ func TestMessageToEvictedPaneDropped(t *testing.T) {
 	defer conn2.Close()
 	readUntil(t, conn2, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
 
-	// conn2: /new → B (B becomes the server-global default), then /new → C,
-	// which evicts A — the oldest idle non-default session — while conn1's
-	// per-connection pane still points at A.
+	// conn2: /new → B (B becomes the server-global default), then /new → C.
+	// The cap now spares every session a client is watching (conn1 still
+	// shows A), so the eviction is driven explicitly — the guard under test
+	// is the sticky evicted flag, not which eviction path set it.
 	if err := conn2.WriteJSON(WSMessage{Type: "session_new"}); err != nil {
 		t.Fatalf("new 1: %v", err)
 	}
@@ -254,10 +255,7 @@ func TestMessageToEvictedPaneDropped(t *testing.T) {
 	}
 	_ = readUntil(t, conn2, 5*time.Second, func(m WSMessage) bool { return m.Type == "clear_chat" })
 
-	waitFor(t, 5*time.Second, func() bool {
-		_, ok := s.registry.get(sidA)
-		return !ok
-	})
+	s.registry.closeRuntime(rtA)
 	if !rtA.evicted.Load() {
 		t.Fatal("evicted runtime not marked")
 	}

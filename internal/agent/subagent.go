@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -181,26 +182,38 @@ type SubagentSpawner interface {
 // for background/continuable subagents (web host; the TUI stays foreground
 // in v1). When the installed spawner implements it, the subagent tool gains
 // run_in_background and the control tools (subagent_fork, list_agents,
-// send_message, interrupt_agent) are registered.
+// get_agent_result, wait_agent, send_message, interrupt_agent).
 //
-// Return contract (one channel per run, as in the other harnesses): a
-// background child's outcome reaches the parent exactly once — the
-// completion notice delivered by the spawner, plus one captured reply per
-// send_message. Progress is pull-side via ListAgents; children never push
-// intermediate messages into the parent conversation.
+// Return contract (one logical path per run, as in the other harnesses):
+// a background child's outcome reaches the parent through a compact terminal
+// event plus the authoritative GetAgentResult/WaitAgent result, and one exact
+// reply is delivered per send_message. Progress is pull-side via ListAgents;
+// children never push intermediate messages into the parent conversation.
 type ContinuableSubagentSpawner interface {
 	// SpawnBackground starts a nested session that keeps running after this
-	// call returns. The parent is notified (delivery service) when the
-	// child finishes; while it lives it can be messaged (SendMessage),
-	// interrupted (InterruptAgent), and listed (ListAgents).
+	// call returns. The parent receives a compact terminal event when the
+	// child finishes; while it lives it can be messaged, interrupted,
+	// listed, waited on, and queried for its authoritative result.
 	SpawnBackground(ctx context.Context, parent *Agent, job, model string, depth int) (id string, err error)
 	// Fork seeds a child with a deep copy of the parent's messages and runs
 	// one foreground turn. job may be empty for the default continuation
 	// prompt. Returns the fork's final output.
 	Fork(ctx context.Context, parent *Agent, job string, depth int) (string, error)
-	// ListAgents lists the caller's live children (id, label, status,
-	// depth, latest progress line) as a human-readable listing.
+	// ListAgents lists the caller's registered children (id, label, status,
+	// depth, latest progress line). Finished children remain available only for
+	// their retention window; GetAgentResult resolves older persisted results.
 	ListAgents(caller *Agent) (string, error)
+	// GetAgentResult returns the authoritative current/final result for one
+	// of the caller's background children. It remains readable after the
+	// in-memory child is released because the host resolves the persisted
+	// child outcome. Running children return their current status rather than
+	// an error, so callers can use WaitAgent when they need to block.
+	GetAgentResult(caller *Agent, agentID string) (string, error)
+	// WaitAgent blocks until the child reaches a terminal main-run state or
+	// the caller's context/timeout expires. A timeout is reported as current
+	// status, not an error; cancellation returns an error while the child
+	// keeps running unless the caller separately interrupts it.
+	WaitAgent(ctx context.Context, caller *Agent, agentID string, timeout time.Duration) (string, error)
 	// SendMessage delivers text to a live child of caller as a new user
 	// message; queued when the child is mid-turn.
 	SendMessage(caller *Agent, agentID, text string) error
@@ -227,9 +240,10 @@ func subagentToolDef(bg bool, maxConcurrent int) llm.Tool {
 		"model": toolProp("string", "Optional model override"),
 	}
 	if bg {
-		desc += " run_in_background=true returns the child id immediately; the parent is " +
-			"notified on completion. Steer with send_message, interrupt with " +
-			"interrupt_agent, check with list_agents."
+		desc += " run_in_background=true returns the child id immediately; a compact " +
+			"terminal event is queued for this parent. Use get_agent_result or wait_agent for the " +
+			"authoritative report, list_agents to check status/progress, send_message to queue a " +
+			"follow-up turn, and interrupt_agent to cancel the current turn."
 		props["run_in_background"] = toolProp("boolean", "Run in background; returns the child id immediately")
 	}
 	return toolDef("subagent", desc,
@@ -257,10 +271,36 @@ func subagentForkToolDef() llm.Tool {
 func listAgentsToolDef() llm.Tool {
 	return toolDef("list_agents",
 		"List this session's child subagents: id, label, status (running/idle/finished), depth, and each "+
-			"child's latest progress line. Read-only. Use to resolve agent ids for send_message/"+
-			"interrupt_agent, to check background status, or to see what a child is doing. Finished "+
-			"children remain listed briefly.",
+			"child's latest progress line. Read-only. Use to resolve agent ids for get_agent_result/"+
+			"wait_agent/send_message/interrupt_agent, to check background status, or to see what a child "+
+			"is doing. Finished children remain listed briefly.",
 		toolSchema(map[string]any{}),
+	)
+}
+
+// getAgentResultToolDef retrieves the authoritative current or persisted
+// outcome for one child. Keeping the potentially large report behind a pull
+// tool lets completion delivery stay compact and bounded.
+func getAgentResultToolDef() llm.Tool {
+	return toolDef("get_agent_result",
+		"Get a background subagent's current status or final result by agent_id. The result is "+
+			"authoritative and remains available after the child leaves the live list. Read-only.",
+		toolSchema(map[string]any{
+			"agent_id": toolProp("string", "Subagent id (from list_agents or subagent)"),
+		}, "agent_id"),
+	)
+}
+
+func waitAgentToolDef() llm.Tool {
+	return toolDef("wait_agent",
+		"Wait for a background subagent's main run to finish, up to timeout_ms (default 60000, "+
+			"maximum 600000). A timeout returns the current status without stopping the child; "+
+			"cancelling the parent turn also leaves the child running. Use get_agent_result after "+
+			"the wait when the authoritative result is needed.",
+		toolSchema(map[string]any{
+			"agent_id":   toolProp("string", "Subagent id (from list_agents or subagent)"),
+			"timeout_ms": toolProp("integer", "Maximum wait in milliseconds (default 60000, max 600000)"),
+		}, "agent_id"),
 	)
 }
 
@@ -272,8 +312,9 @@ func sendMessageToolDef() llm.Tool {
 	return toolDef("send_message",
 		"Send a message to a background subagent of this session (agent_id) — running, interrupted, or "+
 			"finished-but-retained; queued if it is mid-turn. Its reply is injected into this session "+
-			"when the turn finishes. Use to steer a background subagent, to ask a finished one a "+
-			"follow-up (resuming it), or to request a stop-and-report.",
+			"when the turn finishes. Use to queue a follow-up, ask a finished one for more detail, or "+
+			"request a stop-and-report. This does not alter the already-running LLM request; use "+
+			"interrupt_agent first when the current turn must be stopped immediately.",
 		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 			"message":  toolProp("string", "The message to deliver to the subagent"),
@@ -331,8 +372,9 @@ func handleSubagent(ctx context.Context, a *Agent, args map[string]any) (string,
 			return "", err
 		}
 		return fmt.Sprintf("Subagent %s started in background (label: %s). "+
-			"You will be notified when it finishes; use list_agents to check on it, send_message to steer it, "+
-			"and interrupt_agent to stop a turn.", id, SubagentLabel(job)), nil
+			"A compact terminal event will be queued for this parent. Use wait_agent to block for completion, "+
+			"get_agent_result for the authoritative report, list_agents for status/progress, send_message "+
+			"to queue a follow-up turn, and interrupt_agent to cancel the current turn.", id, SubagentLabel(job)), nil
 	}
 	return spawner.Spawn(ctx, a, job, model, a.SubagentDepth())
 }
@@ -359,6 +401,53 @@ func handleListAgents(_ context.Context, a *Agent, _ map[string]any) (string, er
 		return "", fmt.Errorf("list_agents is not supported in this mode")
 	}
 	return cs.ListAgents(a)
+}
+
+func handleGetAgentResult(_ context.Context, a *Agent, args map[string]any) (string, error) {
+	cs := a.continuableSpawner()
+	if cs == nil {
+		return "", fmt.Errorf("get_agent_result is not supported in this mode")
+	}
+	agentID, err := stringArg(args, "agent_id")
+	if err != nil {
+		return "", err
+	}
+	return cs.GetAgentResult(a, agentID)
+}
+
+const (
+	defaultWaitAgentTimeout = 60 * time.Second
+	maxWaitAgentTimeout     = 10 * time.Minute
+)
+
+func handleWaitAgent(ctx context.Context, a *Agent, args map[string]any) (string, error) {
+	cs := a.continuableSpawner()
+	if cs == nil {
+		return "", fmt.Errorf("wait_agent is not supported in this mode")
+	}
+	agentID, err := stringArg(args, "agent_id")
+	if err != nil {
+		return "", err
+	}
+	ms, err := intArgOptional(args, "timeout_ms")
+	if err != nil {
+		return "", err
+	}
+	if ms < 0 {
+		return "", fmt.Errorf("argument %q must be zero or a positive integer", "timeout_ms")
+	}
+	if ms > int(maxWaitAgentTimeout/time.Millisecond) {
+		return "", fmt.Errorf("argument %q exceeds the maximum of %d milliseconds", "timeout_ms", maxWaitAgentTimeout/time.Millisecond)
+	}
+	timeout := defaultWaitAgentTimeout
+	if ms > 0 {
+		if time.Duration(ms) > maxWaitAgentTimeout/time.Millisecond {
+			timeout = maxWaitAgentTimeout
+		} else {
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+	return cs.WaitAgent(ctx, a, agentID, timeout)
 }
 
 // handleSendMessage delivers a message to a live background subagent.
@@ -469,13 +558,11 @@ func (a *Agent) SubagentOutcome() (string, string) {
 
 // subagentWiring groups the nested-session (subagent) state: the installed
 // spawner, this agent's nesting depth and parent link, and the persisted
-// subagent outcome. A child has exactly ONE return channel per run — its
-// final message (the spawn tool result, or the completion notice delivered
-// by the host) plus, per send_message, the captured reply — mirroring the
-// one-channel model of the other harnesses (Claude Code's task
-// notification, OpenCode's task_result injection, Goose's task_results).
+// subagent outcome. A child has one logical return path per run — its final
+// message (the foreground spawn result or a compact background terminal event
+// plus the authoritative result pull) plus, per send_message, the exact reply.
 // Children never push progress into the parent conversation as turns; the
-// parent PULLS progress (list_agents).
+// parent PULLS progress with list_agents.
 type subagentWiring struct {
 	// spawnerMu guards spawner (the nested-session runner installed once at
 	// startup by the server/TUI). Reads happen per turn (llmTools,

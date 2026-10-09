@@ -334,6 +334,17 @@ export function applyRuntimeSettings(data) {
     if (searchKeyEl) searchKeyEl.placeholder = data.webSearchApiKeySet ? 'API key (blank keeps stored)' : 'API key';
     const authTokenEl = document.getElementById('web-auth-token-input');
     if (authTokenEl) authTokenEl.placeholder = data.webAuthTokenSet ? 'Token set (blank keeps stored)' : 'Auth token';
+    // Status display: the host/token/row controls are meaningless only when
+    // the reporter is explicitly off — 'auto' (the default) probes, so they
+    // must stay visible there too. The runtime channel has no generic row
+    // gating, so the gate follows the pushed value here.
+    const statusOn = data.statusDisplay !== 'off';
+    for (const id of ['status-display-host-row', 'status-display-token-row', 'status-display-source-row']) {
+        const row = document.getElementById(id);
+        if (row) row.hidden = !statusOn;
+    }
+    const statusTokenEl = document.getElementById('status-display-token-input');
+    if (statusTokenEl) statusTokenEl.placeholder = data.statusDisplayTokenSet ? 'Token set (blank keeps stored)' : 'Token';
     const banner = document.getElementById('restart-banner');
     if (banner) {
         if (Array.isArray(data.restartRequired) && data.restartRequired.length > 0) {

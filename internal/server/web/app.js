@@ -142,6 +142,15 @@
             showMCPTest,
             showProviderTest,
         } from '/components/settings.js';
+        // Status-display relay (components/status-display.js): in
+        // `status_display: browser` mode the server builds the rows and
+        // sends them over the chat socket; this browser POSTs them to the
+        // display, which may be reachable from the browser's network when
+        // the server's is not.
+        import {
+            applyStatusDisplayConfig,
+            handleStatusDisplayFrame,
+        } from '/components/status-display.js';
         // Command palette (components/palette.js): the Ctrl+K overlay,
         // fuzzy filtering and keyboard navigation. app.js keeps the
         // command catalog and the global shortcuts, and hands the
@@ -260,6 +269,11 @@
         const tbModeBtn = document.getElementById('tb-mode-btn');
         const tbContextBadge = document.getElementById('tb-context-badge');
         let messageRawStore = new WeakMap();
+        // User-attached images per user bubble, keyed like messageRawStore.
+        // dataset/rawContent only carries text — edit/resend must re-send
+        // the attachments too, and history replay repopulates this from the
+        // history entry's images so replayed bubbles stay resendable.
+        let messageImageStore = new WeakMap();
 
         // Bounded toast stack: a burst of events (copy feedback, connection
         // flips) must not pile an unbounded column over the composer. When
@@ -761,18 +775,22 @@
             }
         }
 
-        function updateModelSelect(models, current) {
+        function updateModelSelect(models, current, provider) {
             availableModels = Array.isArray(models) ? models : [];
             // The server's `current` is authoritative (empty after
             // validation cleared a stale restored model); do not fall back
             // to the last-known catalog entry.
             const modelId = current || '';
+            // (provider, id) is the routing key: the bare id is not unique
+            // across registered providers.
+            const owner = provider || 'default';
             const active = modelId
-                ? availableModels.find((m) => m.id === modelId)
+                ? availableModels.find((m) => m.id === modelId && (m.provider || 'default') === owner)
                 : availableModels.find((m) => m.current);
             updateModelInfo(modelId, active && active.description);
-            // Populate toolbar model list
-            renderToolbarModelList(availableModels, modelId);
+            // Populate toolbar model list (the qualified selector keeps the
+            // renderer's bare-flag fallback comparable for non-default rows).
+            renderToolbarModelList(availableModels, modelId ? (owner === 'default' ? modelId : owner + '/' + modelId) : '');
             // The board "Start agent" popover renders from the same
             // catalog — refresh it while open so a late list_models reply
             // is not stuck on "No models loaded" (same pattern as the
@@ -902,12 +920,26 @@
                 dirInput.value = data.workingDir;
                 if (workingDirPath) workingDirPath.textContent = data.workingDir;
             }
-            // Keep the popover model list in sync with the active model after a switch
+            // Keep the popover model list in sync with the active model after a switch.
+            // Match (provider, id), not the bare id: model IDs are not unique
+            // across registered providers, so a bare-id match would mark EVERY
+            // catalog row that lists the same id (the deepseek copy AND the
+            // opencode copy of deepseek-flash) as current — the server's
+            // modelProvider names the profile the pane actually runs on.
             if (data.model && availableModels.length > 0) {
+                const provider = data.modelProvider || 'default';
                 for (const m of availableModels) {
-                    m.current = (m.id === data.model);
+                    m.current = (m.id === data.model) && ((m.provider || 'default') === provider);
                 }
-                renderToolbarModelList(availableModels, data.model);
+                renderToolbarModelList(availableModels, provider === 'default' ? data.model : provider + '/' + data.model);
+            } else if (!data.model && availableModels.length > 0) {
+                // Model cleared (validation dropped a stale restored model):
+                // nothing is current — a leftover checkmark would keep
+                // pointing at a model the pane no longer runs.
+                for (const m of availableModels) {
+                    m.current = false;
+                }
+                renderToolbarModelList(availableModels, '');
             }
             // Remember the active model's accepted efforts + description so
             // pane switches and focus restores re-render the correct chips
@@ -933,8 +965,11 @@
             if (data.inputPricePer1M) {
                 currentModelPricing = modelPricing(data.inputPricePer1M, data.outputPricePer1M, data.cachedPricePer1M);
             } else if (data.model && availableModels.length > 0) {
-                // Fallback: look up from locally cached model list
-                const active = availableModels.find((m) => m.id === data.model);
+                // Fallback: look up from locally cached model list —
+                // (provider, id), since the bare id is not unique across
+                // registered providers.
+                const owner = data.modelProvider || 'default';
+                const active = availableModels.find((m) => m.id === data.model && (m.provider || 'default') === owner);
                 if (active && active.inputPricePer1M) {
                     currentModelPricing = modelPricing(active.inputPricePer1M, active.outputPricePer1M, active.cachedPricePer1M);
                 }
@@ -942,6 +977,7 @@
             updateContextInfo(data);
             applyFeatureSettings(data);
             applyRuntimeSettings(data);
+            applyStatusDisplayConfig(data);
             applyProviderSettings(data);
             applyMCPSettings(data);
 
@@ -1278,12 +1314,29 @@
         // After session_new / session_fork for edit-resend, send this as a
         // normal message once history has been replayed.
         let pendingResendContent = null;
+        // The images (data URLs) riding along with pendingResendContent —
+        // mirrored per pane exactly like the content it belongs to.
+        let pendingResendImages = null;
         // True only while a beginResend is waiting for its history snapshot.
         // Prevents unrelated history (reconnect/resume) from flushing a stale send.
         let resendAwaitingHistory = false;
+        // True from beginResend until the session change's rebuild has begun
+        // (its session_state, or the reply's history frame). The fork's
+        // background model validation pushes its own config BEFORE the reply
+        // (sessionFork → validateModelAsync → pushConfigForAgent wins the
+        // race on a warm catalog cache), and that config already carries the
+        // NEW session id: flushing from it would append the optimistic edited
+        // bubble only for the reply's clear_chat to wipe it — the rebuild
+        // then replays the truncated prefix without it, and flush already
+        // cleared needsFreshHistory, so no turn-end refetch ever restores it.
+        let resendRebuildPending = false;
         // Count of cancel→turn_end pairs to ignore so a cancelled turn's turn_end
         // cannot clobber an in-flight resend/send (pendingSessionResponse / turnActive).
         let suppressTurnEnds = 0;
+        // Watchdog for a resend waiting on its session-change reply (see
+        // armResendWatchdog): connection-scoped like the flags it clears.
+        const RESEND_FLUSH_TIMEOUT_MS = 15000;
+        let resendWatchdog = 0;
         // ── pending-ack tracking ─────────────────────────────────────────
         // user_acked carries only the server-side index, so the client
         // must remember WHICH bubble the ack belongs to. pendingAcks is a
@@ -1720,6 +1773,13 @@
                 // snapshot lacks the in-flight reply, so on turn_end we
                 // re-attach once to converge the transcript.
                 needsFreshHistory: false,
+                // The DOM's data-hist-idx stamps are stale for this pane
+                // (a compaction reshaped the server's indexes and no
+                // rebuild has landed since): edit/resend/fork are gated
+                // until the post-compact convergence attach re-stamps them.
+                // Cleared by the full history rebuild; a missed compacting
+                // frame self-heals on focus via the server's bumped epoch.
+                indexesDirty: false,
                 // historyEpoch of the last history payload applied to this
                 // pane's transcript (0 = the session was never reshaped;
                 // undefined = no payload applied yet). Compared against an
@@ -1757,6 +1817,7 @@
                 suppressTurnEnds: 0,
                 pendingSessionResponse: false,
                 pendingResendContent: null,
+                pendingResendImages: null,
                 resendAwaitingHistory: false,
                 compacting: false,
                 lastContextData: null,
@@ -1867,6 +1928,7 @@
             pane.suppressTurnEnds = suppressTurnEnds;
             pane.pendingSessionResponse = pendingSessionResponse;
             pane.pendingResendContent = pendingResendContent;
+            pane.pendingResendImages = pendingResendImages;
             pane.resendAwaitingHistory = resendAwaitingHistory;
             pane.compacting = compacting;
             pane.lastContextData = lastContextData;
@@ -1884,7 +1946,14 @@
             suppressTurnEnds = pane.suppressTurnEnds;
             pendingSessionResponse = pane.pendingSessionResponse;
             pendingResendContent = pane.pendingResendContent;
+            pendingResendImages = pane.pendingResendImages;
             resendAwaitingHistory = pane.resendAwaitingHistory;
+            // A restored still-pending resend needs its timeout back (the
+            // old one fired no-op'd while another pane was active, or was
+            // never armed for this pane); an idle restore drops any timer
+            // that could fire against this pane's state.
+            if (resendAwaitingHistory) armResendWatchdog();
+            else { clearTimeout(resendWatchdog); resendWatchdog = 0; }
             compacting = pane.compacting;
             lastContextData = pane.lastContextData;
             contextBaseUsed = pane.contextBaseUsed;
@@ -1957,6 +2026,7 @@
             pane.histEpoch = undefined;
             pane.renderedHistIdx = -1;
             pane.ignoreTurnEndsFor = null;
+            releaseStrandedSuppress(pane);
             if (pane === activePane() && sessionInfoDiv) sessionInfoDiv.textContent = id;
             sendSessionDetach(oldId);
             return true;
@@ -2073,10 +2143,14 @@
                     // background pane's transcript is rebuilt on focus.
                     if (pane.resendAwaitingHistory) {
                         const text = pane.pendingResendContent;
+                        const images = pane.pendingResendImages;
                         pane.resendAwaitingHistory = false;
                         pane.pendingResendContent = null;
+                        pane.pendingResendImages = null;
                         if (text && ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ type: 'message', content: text, sessionId: pane.id }));
+                            const bgPayload = { type: 'message', content: text, sessionId: pane.id };
+                            if (images && images.length > 0) bgPayload.images = images;
+                            ws.send(JSON.stringify(bgPayload));
                         }
                     }
                     break;
@@ -2102,6 +2176,7 @@
                     // message to the old session anyway.
                     if (String(data.content || '').startsWith('Error:')) {
                         pane.pendingResendContent = null;
+                        pane.pendingResendImages = null;
                         pane.resendAwaitingHistory = false;
                     }
                     // A session command's reply (typed /new, /resume, /fork)
@@ -2502,6 +2577,12 @@
                 showToast('Session change already in progress', 'info');
                 return;
             }
+            // Same stale-index gate as beginResend: a compaction reshaped
+            // the server's indexes since this DOM was stamped.
+            if (activePane() && activePane().indexesDirty) {
+                showToast('Transcript indexes are refreshing after compaction — try again in a moment', 'info');
+                return;
+            }
             const srcId = activePane().id;
             // Open a new pane; the source pane stays open in the background.
             const pane = makePane();
@@ -2536,23 +2617,91 @@
             updateTitle('idle');
         }
 
+        // A successful session re-key strands every suppressTurnEnds unit
+        // still held for the OLD session: paneForMessage drops the old
+        // turn's trailing cancelled/turn_end frames once no pane holds that
+        // id, so the units can never be consumed — the NEXT turn_end would
+        // be swallowed and turnActive would stick true (busy chrome, dead
+        // edit guard). Frames that arrived before the re-key already
+        // consumed their unit, so whatever is still held at re-key time is
+        // a leak by definition. Re-keys that KEEP the old session (the
+        // focus-pane / rekeySkipped paths) must not call this: their old
+        // session's frames still route here and still need their unit.
+        function releaseStrandedSuppress(pane) {
+            if (pane) pane.suppressTurnEnds = 0;
+            if (!pane || pane === activePane()) suppressTurnEnds = 0;
+        }
+
         function clearPendingResend() {
+            clearTimeout(resendWatchdog);
+            resendWatchdog = 0;
             pendingResendContent = null;
+            pendingResendImages = null;
             resendAwaitingHistory = false;
+            resendRebuildPending = false;
+        }
+
+        // A lost session-change reply (a write dropped while the socket
+        // somehow stays open) would leave resendAwaitingHistory latched
+        // forever — every later edit/resend then dead-ends on "Resend
+        // already in progress" until a reconnect. The reply normally lands
+        // in milliseconds; past the timeout it is treated as lost so the
+        // flags clear with an explicit error instead of poisoning the UI.
+        // Connection-scoped (reset alongside onclose's), not mirrored per
+        // pane; re-armed when a pane restore brings a still-pending resend
+        // back to the foreground.
+        function armResendWatchdog() {
+            clearTimeout(resendWatchdog);
+            resendWatchdog = setTimeout(() => {
+                // Flags already gone (a racing clear beat the timer): just
+                // drop the stale id.
+                if (!resendAwaitingHistory) { resendWatchdog = 0; return; }
+                // Clear through clearPendingResend WHILE the id still points
+                // at this timer (harmless in a browser — the timer has just
+                // fired — but it is what disarms an externally-fired copy).
+                clearPendingResend();
+                // The reply this resend was waiting on is the one that
+                // never came: leaving pendingSessionResponse set would trip
+                // the in-flight guard on every later session change (and a
+                // very late reply still re-keys on its sessionAction — it
+                // does not need this flag).
+                pendingSessionResponse = false;
+                showToast('Resend failed — no reply from the server', 'error');
+            }, RESEND_FLUSH_TIMEOUT_MS);
         }
 
         /** Fork/new to before a user message, then send content as a normal turn. */
-        function beginResend(histIdx, content) {
+        function beginResend(histIdx, content, images) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (histIdx === undefined || histIdx < 0 || !content) return;
             if (resendAwaitingHistory || pendingResendContent !== null) {
                 showToast('Resend already in progress', 'info');
                 return;
             }
+            // Same guard resumeSession/deleteSession/forkSession carry: a
+            // typed /new|/resume|/fork reply may already be in flight, and
+            // two interleaved session changes would flush the edited message
+            // into the WRONG session (the first reply's config passes the
+            // rebuild gate — its history preceded it).
+            if (pendingSessionResponse) {
+                showToast('Session change already in progress', 'info');
+                return;
+            }
+            // Compaction shifted the server's indexes since this DOM was
+            // stamped: forking at the cached index would truncate at the
+            // WRONG point (silently keeping the wrong prefix). The dirty
+            // flag clears when the post-compact rebuild replays.
+            if (activePane() && activePane().indexesDirty) {
+                showToast('Transcript indexes are refreshing after compaction — try again in a moment', 'info');
+                return;
+            }
             cancelActiveTurn();
             pendingResendContent = content;
+            pendingResendImages = (images && images.length > 0) ? images : null;
             resendAwaitingHistory = true;
+            resendRebuildPending = true;
             pendingSessionResponse = true;
+            armResendWatchdog();
             enableFollow();
             // D3: typed /new and the resend flow REPLACE the pane's session
             // (the config reply re-keys this pane to the new session id).
@@ -2567,18 +2716,30 @@
         function flushPendingResend() {
             if (!resendAwaitingHistory) return;
             const text = pendingResendContent;
+            const images = pendingResendImages;
             clearPendingResend();
             // The resent turn streams live in this pane — no convergence refetch needed.
             if (activePane()) activePane().needsFreshHistory = false;
+            // The fork re-keyed this pane, so the cancelled OLD turn's trailing
+            // cancelled/turn_end frames can no longer reach us (paneForMessage
+            // drops frames for a session no pane holds): a suppressTurnEnds
+            // unit still held for them would swallow the RESENT turn's
+            // turn_end and leave turnActive stuck true — which silently
+            // blocks the edit button's mid-turn guard. Units already consumed
+            // sit at 0, so this only clears leaked ones.
+            if (activePane()) activePane().suppressTurnEnds = 0;
+            suppressTurnEnds = 0;
             if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-            const el = appendMessage('user', text);
+            const el = appendMessage('user', text, undefined, undefined, images);
             markPendingAck(el);
             streamingToolCards = {};
             pendingToolCards = {};
             bgTermCards = {};
             toolsStartedThisTurn = false;
             contextEstAdded = 0;
-            ws.send(JSON.stringify({ type: 'message', content: text, sessionId: activePane().id }));
+            const payload = { type: 'message', content: text, sessionId: activePane().id };
+            if (images && images.length > 0) payload.images = images;
+            ws.send(JSON.stringify(payload));
             setTurnActive(true);
             enableFollow();
         }
@@ -2600,7 +2761,7 @@
                 const idx = parseInt(msgDiv.dataset.histIdx, 10);
                 const content = msgDiv.dataset.rawContent || '';
                 if (!content || Number.isNaN(idx) || idx < 0) return;
-                beginResend(idx, content);
+                beginResend(idx, content, messageImageStore.get(msgDiv));
             });
             msgDiv.appendChild(resendBtn);
 
@@ -2611,7 +2772,14 @@
             editBtn.title = 'Edit and resend';
             editBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                if (turnActive) return;
+                if (turnActive) {
+                    // Never fail silently: without feedback this guard reads
+                    // as "the edit button is broken" whenever the client
+                    // believes a turn is running (including the turn a prior
+                    // edit just started).
+                    showToast('The agent is busy — stop the turn to edit this message', 'info');
+                    return;
+                }
                 if (msgDiv.querySelector('.inline-edit-bar')) return;
                 const tw = msgDiv.querySelector('.msg-text');
                 if (!tw) return;
@@ -2690,7 +2858,7 @@
                 finishEdit(false);
                 const idx = parseInt(msgDiv.dataset.histIdx, 10);
                 if (Number.isNaN(idx) || idx < 0) return;
-                beginResend(idx, newContent);
+                beginResend(idx, newContent, messageImageStore.get(msgDiv));
             });
         }
 
@@ -2761,6 +2929,7 @@
             }
             if (role === 'user') {
                 msgDiv.dataset.rawContent = text;
+                if (images && images.length > 0) messageImageStore.set(msgDiv, images);
                 ensureUserResendActions(msgDiv);
             }
             appendTranscriptChild(msgDiv);
@@ -3175,8 +3344,7 @@
 
         // Render a single tool-arg value for a card header: strings are
         // quoted, long ones truncated to bigArgChars with an ellipsis,
-        // everything else String()-ed. Shared by formatToolArgs and
-        // formatToolArgsFragment so the two headers can't drift.
+        // everything else String()-ed.
         function formatToolArgValue(value) {
             if (typeof value === 'string' && value.length > bigArgChars()) {
                 return `"${value.substring(0, bigArgChars() - 3)}..."`;
@@ -3187,21 +3355,18 @@
             return String(value);
         }
 
-        function formatToolArgs(args) {
-            if (!args || typeof args !== 'object') return '';
-            const parts = [];
-            for (const [key, value] of Object.entries(args)) {
-                // Diffs are shown in Monaco; keep the header compact.
-                if (key === 'diff' && typeof value === 'string') {
-                    parts.push(`diff=<${value.length} chars>`);
-                    continue;
-                }
-                parts.push(`${key}=${formatToolArgValue(value)}`);
-            }
-            return parts.length > 0 ? `(${parts.join(', ')})` : '';
-        }
+        // http(s) URLs only: a model-supplied value must never become a
+        // javascript:/data: href (it would execute on click).
+        const URL_ARG_PATTERN = /^https?:\/\/\S+$/i;
 
-        /** Create a document fragment for tool args with clickable file paths. */
+        /**
+         * Create a document fragment for tool args with clickable file paths
+         * and URLs. The single header renderer for both card sources (the
+         * live finalize path and history replay), so the two can't drift.
+         * Diffs are shown in Monaco; the header keeps only a char-count
+         * stub. `url` args (web_fetch, download_file) become real anchors
+         * that open in a new tab.
+         */
         function formatToolArgsFragment(args) {
             if (!args || typeof args !== 'object') return document.createTextNode('');
             const frag = document.createDocumentFragment();
@@ -3211,12 +3376,26 @@
                 const [key, value] = entries[i];
                 if (i > 0) frag.appendChild(document.createTextNode(', '));
                 frag.appendChild(document.createTextNode(`${key}=`));
-                if (FILE_KEYS.includes(key) && typeof value === 'string' && value) {
+                if (key === 'diff' && typeof value === 'string') {
+                    frag.appendChild(document.createTextNode(`<${value.length} chars>`));
+                } else if (FILE_KEYS.includes(key) && typeof value === 'string' && value) {
                     const link = document.createElement('span');
                     link.className = 'file-link';
                     link.textContent = value;
                     link.title = 'Click to open in editor';
                     link.onclick = (e) => { e.stopPropagation(); openFileAtLine(value).catch(() => {}); };
+                    frag.appendChild(link);
+                } else if (key === 'url' && typeof value === 'string' && URL_ARG_PATTERN.test(value)) {
+                    const link = document.createElement('a');
+                    link.className = 'url-link';
+                    link.href = value;
+                    link.textContent = value;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.title = 'Open in a new tab';
+                    // The header click toggles the card; a link click must
+                    // not collapse/expand it.
+                    link.onclick = (e) => e.stopPropagation();
                     frag.appendChild(link);
                 } else {
                     frag.appendChild(document.createTextNode(formatToolArgValue(value)));
@@ -3612,7 +3791,9 @@
                     cardInfo.argsStream.remove();
                     cardInfo.argsStream = null;
                 }
-                cardInfo.toolArgs.textContent = formatToolArgs(args);
+                // Fragment (not textContent) so file paths and URLs render
+                // as clickable links, exactly like the replay path.
+                cardInfo.toolArgs.replaceChildren(formatToolArgsFragment(args));
                 cardInfo.args = args || {};
 
                 if (!cardInfo.waiting) {
@@ -4197,6 +4378,13 @@
                     handleDeleteApproval(data);
                     return;
                 }
+                // Display-relay frames are connection/process-global: every
+                // attached tab may relay them (the reporter is process-wide),
+                // so they are handled before pane routing.
+                if (data.type === 'status_display') {
+                    handleStatusDisplayFrame(data);
+                    return;
+                }
                 const msgPane = paneForMessage(data);
                 if (!msgPane) {
                     // The connect handshake attaches this connection to the
@@ -4261,6 +4449,7 @@
                     pane.suppressTurnEnds = 0;
                     pane.pendingSessionResponse = false;
                     pane.pendingResendContent = null;
+                    pane.pendingResendImages = null;
                     pane.resendAwaitingHistory = false;
                     pane.compacting = false;
                     pane._notifiedBusy = false;
@@ -4303,6 +4492,7 @@
             user_term_output: handleUserTermOutput,
             user_term_exit: handleUserTermExit,
             cancelled: handleCancelled,
+            cancel_ack: handleCancelAck,
             turn_end: handleTurnEnd,
             clear_chat: handleClearChat,
             user_acked: handleUserAcked,
@@ -4365,6 +4555,23 @@
             // response replaces it.
             setInputProgress('compacting', 'Compacting context\u2026');
 
+            // Compaction rewrites the middle of the message list — every
+            // index after the summary shifts, and NO history frame follows a
+            // compact to re-stamp the DOM (data-hist-idx feeds edit/resend/
+            // fork). Void the fingerprint claim so no attach can prove
+            // "already current" against the old epoch, and mark the indexes
+            // dirty: the next turn_end's convergence attach replays the
+            // compacted transcript with fresh stamps, and edit/resend/fork
+            // are gated (indexesDirty) until it lands. A background pane's
+            // compacting frame is dropped by its handler — its STALE epoch
+            // value then mismatches the server's on focus, which forces the
+            // same full snapshot. (Condensation — the `condensed` frame —
+            // rewrites content in place and shifts nothing: no invalidation.)
+            const cp = activePane();
+            if (cp && (!data.sessionId || cp.id === data.sessionId)) {
+                cp.histEpoch = undefined;
+                cp.indexesDirty = true;
+            }
         }
 
         function handleCondensed(data) {
@@ -4660,6 +4867,24 @@
 
         }
 
+        // The server's answer to a cancel that found nothing in flight
+        // (session gone, turn already ended, or another connection's cancel
+        // won the race): the cancelled/turn_end pair that would normally
+        // consume the unit held by cancelActiveTurn never comes. Consume
+        // exactly ONE unit — the net effect of that pair (pending-cancel
+        // record shifted + unit decremented + stale cancel target dropped)
+        // — and nothing else: no turnActive / pendingSessionResponse /
+        // notification side effects, so it is safe in every interleaving. A
+        // real pair that was already broadcast precedes this frame on the
+        // socket and drains the unit first, leaving this a no-op.
+        function handleCancelAck() {
+            if (suppressTurnEnds <= 0) return;
+            suppressTurnEnds--;
+            const rec = pendingCancels.shift();
+            if (rec && pendingAcks.includes(rec)) dropPendingAck(rec);
+            lastCancelTarget = null;
+        }
+
         function handleCancelled(data) {
 
             // A turn cancelled before the server emitted its user_acked
@@ -4728,7 +4953,7 @@
             // full history is available — re-attach once so the
             // transcript converges.
             const tp = pane;
-            if (tp && tp.needsFreshHistory) {
+            if (tp && (tp.needsFreshHistory || tp.indexesDirty)) {
                 tp.needsFreshHistory = false;
                 if (tp.id && ws && ws.readyState === WebSocket.OPEN) {
                     const attachMsg = { type: 'session_attach', sessionId: tp.id };
@@ -5020,6 +5245,11 @@
             // turn keeps the config echo — which normally adopts the
             // id — pending until the turn ends.
             const pane = activePane();
+            // session_state opens an attach rebuild (state → history →
+            // config). For a pending edit-resend this is the rebuild
+            // sequence reaching the client (e.g. a pane switched away and
+            // back mid-fork): the config that follows may flush.
+            resendRebuildPending = false;
             // A session change in flight (typed /resume or the palette's
             // "resume latest"): the resume reply IS the attach sequence, so
             // session_state is the re-key frame — adopt the target id here
@@ -5229,6 +5459,7 @@
                 if (!focusOpen && (rp.id === null || data.sessionAction) && (!other || other === rp)) {
                     const oldId = rp.id;
                     rp.id = data.sessionId;
+                    releaseStrandedSuppress(rp);
                     refreshSidebarSessions();
                     // Release the old session's attachment only when
                     // no other pane still has it open: detaching a
@@ -5341,7 +5572,7 @@
                 appendMessage('assistant', data.content);
             }
             if (data.models) {
-                updateModelSelect(data.models, data.model);
+                updateModelSelect(data.models, data.model, data.modelProvider);
                 // The settings modal's subagent picker renders from the
                 // same catalog — refresh it when the modal is open (the
                 // effort options come from the catalog's per-model
@@ -5358,7 +5589,10 @@
                     }
                 }
             } else if (data.model) {
-                updateModelInfo(data.model, availableModels.find((m) => m.id === data.model)?.description);
+                // (provider, id): the bare id is not unique across
+                // registered providers.
+                const owner = data.modelProvider || 'default';
+                updateModelInfo(data.model, availableModels.find((m) => m.id === data.model && (m.provider || 'default') === owner)?.description);
             }
             // list_models replies omit context stats — don't wipe the indicator
             if (data.contextLimit || data.usedTokens || data.usedSource) {
@@ -5430,6 +5664,12 @@
             if (histPane.needsFreshHistory && hasLiveInFlight() && !data.rewind) {
                 return;
             }
+            // The rebuild a pending edit-resend waited for has begun: the
+            // wipe + replay below replace the transcript the fork asked for,
+            // so its config may now flush the resent message. Configs that
+            // raced AHEAD of this frame (the fork's model-validation push)
+            // stayed gated by resendRebuildPending.
+            resendRebuildPending = false;
             // Capture the live stream state BEFORE clearing so the
             // rewind (the in-flight reply) can merge exactly with
             // whatever the client already rendered live — never
@@ -5451,6 +5691,9 @@
             // NUMBER so the stale-skip epoch comparison works for sessions
             // that were never compacted/rolled back either.
             histPane.histEpoch = data.historyEpoch || 0;
+            // A full rebuild re-stamps every index — compaction's stale
+            // indexes are resolved (see handleCompacting).
+            histPane.indexesDirty = false;
             // The rebuild replaces the whole transcript: the rendered-index
             // mark restarts empty and is re-advanced by the replay below (the
             // rewind-only and stale-skip paths return before this, keeping
@@ -5498,7 +5741,8 @@
                 flushReplayEventBuffer();
                 // NOTE: the resend message is flushed from the config
                 // handler, which adopts the new session id first (the
-                // server sends history before config).
+                // server sends history before config) — once this rebuild
+                // cleared resendRebuildPending.
             };
             if (data.history && data.history.length) {
                 replayHistory(data.history, scrollSettle).then(afterHistory).catch((err) => {
@@ -5542,16 +5786,24 @@
             const pane = activePane();
             const oldId = pane.id;
             if (data.sessionId && pane.id !== data.sessionId) {
-                // Re-key ONLY when the pane has no id yet (startup /
-                // fresh pane) or a session change is genuinely in
-                // flight (typed /new, /resume, /fork, resend). A
-                // stale full config from a pane we left/closed (its
-                // ContextStats tokenization lags a running turn) must
-                // not flip the active pane's id — paneForMessage
-                // would then drop every message for the session the
-                // user switched to ("can't switch to the responding
-                // session").
-                if (pane.id === null || pendingSessionResponse) {
+                // Re-key ONLY at startup, when the pane has no id yet. An
+                // identified pane must NOT adopt a session id from a config:
+                // every session change announces itself earlier and more
+                // precisely — the reply's `response` (typed /new|/fork,
+                // delete, edit-resend fork) or its `session_state` (resume,
+                // attach) re-keys the pane, and a config that re-keyed too
+                // could only be stale or mis-timed. In particular, an OLD
+                // session's lagging config (its ContextStats tokenization
+                // runs seconds behind) landing between the fork's early
+                // validation push and the fork's response would flip the
+                // pane BACK to the outgoing session and detach the fork —
+                // stranding the resent turn's broadcast frames and sticking
+                // turnActive forever. A stale full config from a pane we
+                // left/closed is dropped here for the same reason —
+                // paneForMessage would otherwise drop every message for the
+                // session the user switched to ("can't switch to the
+                // responding session").
+                if (pane.id === null) {
                     pane.id = data.sessionId;
                     pane.needsFreshHistory = false; // new session: no mid-turn gap from the old one
                     // The pane now shows a DIFFERENT session: any transcript
@@ -5574,9 +5826,15 @@
             applyPaneMeta(pane, data);
             applyServerConfig(data);
             // The resend message must carry the (possibly new) session
-            // id, which config just adopted — flushing from history
-            // would use the stale pre-fork id.
-            if (resendAwaitingHistory) flushPendingResend();
+            // id — by the time a config arrives, the reply's response /
+            // session_state has already adopted it (config never re-keys,
+            // see above). Gated on the rebuild having begun: a config that
+            // arrives BEFORE the reply's clear_chat/history (the fork's
+            // model-validation push races ahead of the reply) must not
+            // flush — the optimistic bubble it appends would be wiped by
+            // that clear_chat, and the replayed prefix does not contain
+            // the resent message.
+            if (resendAwaitingHistory && !resendRebuildPending) flushPendingResend();
 
         }
 

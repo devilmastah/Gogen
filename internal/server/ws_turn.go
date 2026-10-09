@@ -307,9 +307,18 @@ const errAgentBusy = "Error: agent is busy with another client"
 // turn (§4, third kill path). owner is the connection that started the turn
 // (the only one allowed to interrupt it via the cancel-then-lock path, E29).
 func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.ImageInput) {
+	rt.startTurnWithResult(owner, content, images, nil)
+}
+
+// startTurnWithResult is startTurn plus an optional exact per-invocation
+// result callback. The callback runs after runTurnBody returns and before the
+// turn lock is released. A non-nil callback is allowed only for a delivery
+// whose source armed it (currently send_message into a continuable child), so
+// its output/error cannot be confused with a user- or child-pane turn.
+func (rt *sessionRuntime) startTurnWithResult(owner *wsConn, content string, images []llm.ImageInput, onResult func(string, error)) {
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	errCh := rt.stream.begin(streamCancel)
-	go func(content string, images []llm.ImageInput, turnCtx context.Context, done chan error) {
+	go func(content string, images []llm.ImageInput, turnCtx context.Context, done chan error, onResult func(string, error)) {
 		// Defers run LIFO, so the cleanup executes in this order: turn_end
 		// broadcast → setTurnActive(false) (both inside runTurnBody, while
 		// the lock is still held) → done → stream.end() → turnMu.Unlock().
@@ -333,14 +342,25 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 		defer func() { done <- nil }()
 		// runTurnBody owns the evicted check (an evicted runtime is a clean
 		// no-op turn: the defers above still signal errCh, clear the stream
-		// handles, and release the lock) and the turn-active lifecycle.
-		rt.runTurnBody(turnCtx, content, images, turnOpts{
+		// handles, and release the lock) and the turn-active lifecycle. The
+		// no-op still ANSWERS its owner: without a reply the sender's
+		// optimistic bubble and pending-ack entry would strand (the stale
+		// entry would stamp the NEXT user_acked with the wrong history
+		// index), so an "Error:" response revokes both — same pattern as
+		// the busy rejection.
+		out, turnErr := rt.runTurnBody(turnCtx, content, images, turnOpts{
 			owner:        owner,
 			tagPositions: true,
 			reportErr:    true,
 			persist:      true,
 		})
-	}(content, images, streamCtx, errCh)
+		if onResult != nil {
+			onResult(out, turnErr)
+		}
+		if turnErr == errTurnEvicted && owner != nil {
+			_ = owner.writeJSON(WSMessage{Type: "response", Content: "Error: session was closed before the message ran — nothing was sent"})
+		}
+	}(content, images, streamCtx, errCh, onResult)
 }
 
 // steerableInput reports whether a message typed while a turn is running

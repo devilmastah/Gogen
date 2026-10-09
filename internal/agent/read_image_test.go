@@ -74,8 +74,10 @@ func TestReadImageAttachesImageAfterToolResult(t *testing.T) {
 
 // TestReadImageParallelAppendsImagesInModelOrder covers the parallel batch
 // path: two read_image calls in one round must yield
-// tool(tc1) → user(a.png) → tool(tc2) → user(b.png), with images paired to
-// their tool results in the model's call order.
+// tool(tc1) → tool(tc2) → user(a.png) → user(b.png) — the whole tool batch
+// closes before the images, because strict providers require the tool
+// messages answering one assistant tool_calls message to directly follow it
+// — with images paired to their tool results in the model's call order.
 func TestReadImageParallelAppendsImagesInModelOrder(t *testing.T) {
 	dir := t.TempDir()
 	exec := NewExecutor(dir)
@@ -95,19 +97,61 @@ func TestReadImageParallelAppendsImagesInModelOrder(t *testing.T) {
 
 	msgs := a.Messages
 	if len(msgs) != 5 {
-		t.Fatalf("messages = %d, want 5 (assistant, tool, user, tool, user): %+v", len(msgs), msgs)
+		t.Fatalf("messages = %d, want 5 (assistant, tool, tool, user, user): %+v", len(msgs), msgs)
 	}
-	wantRoles := []string{"tool", "user", "tool", "user"}
+	wantRoles := []string{"tool", "tool", "user", "user"}
 	for i, role := range wantRoles {
 		if msgs[i+1].Role != role {
 			t.Fatalf("message %d role = %q, want %q (order is protocol-sensitive)", i+1, msgs[i+1].Role, role)
 		}
 	}
-	if msgs[1].ToolCallID != "tc1" || msgs[3].ToolCallID != "tc2" {
-		t.Fatalf("tool results out of model order: %q, %q", msgs[1].ToolCallID, msgs[3].ToolCallID)
+	if msgs[1].ToolCallID != "tc1" || msgs[2].ToolCallID != "tc2" {
+		t.Fatalf("tool results out of model order: %q, %q", msgs[1].ToolCallID, msgs[2].ToolCallID)
 	}
-	if !strings.Contains(msgs[2].Content, "a.png") || !strings.Contains(msgs[4].Content, "b.png") {
-		t.Fatalf("image captions out of model order: %q, %q", msgs[2].Content, msgs[4].Content)
+	if !strings.Contains(msgs[3].Content, "a.png") || !strings.Contains(msgs[4].Content, "b.png") {
+		t.Fatalf("image captions out of model order: %q, %q", msgs[3].Content, msgs[4].Content)
+	}
+}
+
+// TestReadImageNotLastInSequentialBatchKeepsToolMessagesContiguous pins the
+// wire-order rule for the sequential path: a read_image call that is NOT the
+// last call of its batch must not push its image user message between two
+// tool messages. The transcript must read tool(tc1) → tool(tc2) →
+// user(image) — otherwise strict OpenAI-compatible providers reject the next
+// request with "insufficient tool messages following tool_calls message".
+func TestReadImageNotLastInSequentialBatchKeepsToolMessagesContiguous(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	a := NewAgent(nil, exec, nil)
+	writeTestImage(t, filepath.Join(dir, "a.png"), mustDecodePNG(t))
+
+	// execute_command is not read-only, so the batch cannot take the
+	// parallel path — this exercises runToolRound's sequential loop.
+	calls := []llm.ToolCall{
+		{ID: "tc1", Name: "read_image", Args: map[string]any{"path": "a.png"}},
+		{ID: "tc2", Name: "execute_command", Args: map[string]any{"command": "echo hi"}},
+	}
+	a.appendMessage(llm.Message{Role: "assistant", Content: "", ToolCalls: calls})
+
+	if outcome, _ := a.runToolRound(context.Background(), &llm.StreamHandlers{}, calls); outcome != toolRoundContinue {
+		t.Fatal("tool round did not continue")
+	}
+
+	msgs := a.Messages
+	if len(msgs) != 4 {
+		t.Fatalf("messages = %d, want 4 (assistant, tool, tool, user): %+v", len(msgs), msgs)
+	}
+	wantRoles := []string{"tool", "tool", "user"}
+	for i, role := range wantRoles {
+		if msgs[i+1].Role != role {
+			t.Fatalf("message %d role = %q, want %q (tool messages must stay contiguous)", i+1, msgs[i+1].Role, role)
+		}
+	}
+	if msgs[1].ToolCallID != "tc1" || msgs[2].ToolCallID != "tc2" {
+		t.Fatalf("tool results out of model order: %q, %q", msgs[1].ToolCallID, msgs[2].ToolCallID)
+	}
+	if len(msgs[3].Images) != 1 || !strings.Contains(msgs[3].Content, "a.png") {
+		t.Fatalf("message 3 = %+v, want the image user message after the batch", msgs[3])
 	}
 }
 

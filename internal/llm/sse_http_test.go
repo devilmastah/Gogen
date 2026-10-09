@@ -43,10 +43,15 @@ func TestCatalogHTTPClientInheritsDefaultTransport(t *testing.T) {
 	assertDefaultTransportInherited(t, tr)
 }
 
-// catalogBaseHTTPTransport unwraps the catalog client's content-type sniffer
-// to the concrete *http.Transport underneath.
+// catalogBaseHTTPTransport unwraps the catalog client's transport stack (the
+// API-error normalizer around the content-type sniffer) to the concrete
+// *http.Transport underneath.
 func catalogBaseHTTPTransport(c *http.Client) (*http.Transport, bool) {
-	st, ok := c.Transport.(*jsonSniffTransport)
+	eb, ok := c.Transport.(*apiErrorBodyTransport)
+	if !ok {
+		return nil, false
+	}
+	st, ok := eb.base.(*jsonSniffTransport)
 	if !ok {
 		return nil, false
 	}

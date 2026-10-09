@@ -309,7 +309,7 @@ func (m *Model) handleCompactResultMsg(msg compactResultMsg) (tea.Model, tea.Cmd
 	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
 	m.chatLines = append(m.chatLines, SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
 	m.setViewportContent()
-	m.viewport.GotoBottom()
+	m.pinFollow() // the transcript was replaced wholesale
 	m.refreshContextStats()
 	return m, m.drainDeliveries()
 }
@@ -374,7 +374,7 @@ func (m *Model) handleModelSwitchMsg(msg modelSwitchMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	m.setViewportContent()
-	m.viewport.GotoBottom()
+	m.pinFollow() // the transcript was replaced wholesale
 	return m, nil
 }
 
@@ -649,6 +649,7 @@ func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the modal closes.
 		if m.modal != ModalNone {
 			m.sidebarHovering = false
+			m.viewJumpHover = false // the button is not rendered under a modal
 			if ev.kind == mouseRelease {
 				m.handleMouseSelection(ev)
 			}
@@ -661,9 +662,16 @@ func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The panel consumed the event: the mouse is over the panel
 			// area, so its border renders highlighted.
 			m.sidebarHovering = true
+			m.viewJumpHover = false // the pointer left the chat column
 			return m, cmd
 		}
 		m.sidebarHovering = false
+		// Jump button (the divider label): hover highlight + click-to-jump.
+		// Handled before the selection handler so a press on the label
+		// never starts a text selection.
+		if m.handleJumpButtonMouse(ev) {
+			return m, nil
+		}
 		if m.handleTocMouse(ev) {
 			return m, nil
 		}
@@ -673,5 +681,10 @@ func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
+	// A wheel scroll is a manual scroll: record the follow state so a
+	// wheel-up detaches from the live edge (streaming stops re-pinning).
+	if _, isWheel := msg.(tea.MouseWheelMsg); isWheel {
+		m.viewportScrolledByUser()
+	}
 	return m, tea.Batch(cmd)
 }

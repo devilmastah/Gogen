@@ -226,6 +226,10 @@ func (m *Model) View() tea.View {
 	// frame; a no-op unless the pointer is in the rail's trigger strip.
 	main = m.applyTocOverlay(main)
 
+	// Jump-to-latest label while the reader is parked above the live edge
+	// (web parity: #scroll-bottom-btn); a no-op while following.
+	main = m.applyJumpButtonOverlay(main)
+
 	v := tea.NewView(main)
 	// Mouse reporting: cell motion covers wheel scrolls and drag-selection.
 	v.MouseMode = tea.MouseModeCellMotion
@@ -240,6 +244,11 @@ func (m *Model) View() tea.View {
 
 	return v
 }
+
+// viewportFocusIndicator is the divider hint painted while the viewport
+// has focus. It owns the divider's right end, which the jump button yields
+// to (jumpbutton.go).
+const viewportFocusIndicator = " [SCROLL] Press i or Esc to return to input "
 
 // renderMainColumn assembles the chat column (viewport, divider, input,
 // status bar) WITHOUT the sidebar. Kept separate so the sidebar can match
@@ -290,10 +299,9 @@ func (m *Model) renderMainColumn() string {
 		m.dividerCacheStream != m.streaming
 	if dividerDirty {
 		if m.focus == FocusViewport {
-			indicator := " [SCROLL] Press i or Esc to return to input "
 			line := strings.Repeat("─", main)
-			keep := max(0, main-len(indicator))
-			m.dividerCache = DividerStyle.Render(sliceByRuneCount(line, keep) + indicator)
+			keep := max(0, main-len(viewportFocusIndicator))
+			m.dividerCache = DividerStyle.Render(sliceByRuneCount(line, keep) + viewportFocusIndicator)
 		} else if m.streaming {
 			m.dividerCache = DimStyle.Render(strings.Repeat("─", main))
 		} else {

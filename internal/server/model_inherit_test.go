@@ -264,6 +264,66 @@ func TestSessionNewInheritsModelProfile(t *testing.T) {
 	}
 }
 
+// TestSetModelEchoAndListModelsCarryModelProvider pins the client-facing
+// routing key: after a qualified set_model, BOTH the config echo and the
+// list_models reply must carry the owning profile alongside the bare model.
+// The web picker derives its current-model check from these fields — with a
+// bare id alone it would mark EVERY catalog row that lists the same ID
+// (the deepseek copy AND the default copy of shared-model both checked in
+// the popover, the user-visible "same model selected from 2 providers").
+func TestSetModelEchoAndListModelsCarryModelProvider(t *testing.T) {
+	s, prov, _ := newModelServer(t)
+	// The collision shape: "shared-model" listed by BOTH the default
+	// profile and the "deepseek" profile.
+	catalog := []llm.ModelInfo{
+		{ID: "shared-model", Provider: "default", ContextLimit: 128000},
+		{ID: "shared-model", Provider: "deepseek", ContextLimit: 128000},
+	}
+	prov.Models = catalog
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	sidA := cfg.SessionID
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.SessionID == sidA })
+
+	// The pane selects the DEEPSEEK copy (qualified selector — the picker's
+	// form for non-default groups).
+	if err := conn.WriteJSON(WSMessage{Type: "set_model", Model: "deepseek/shared-model", SessionID: sidA}); err != nil {
+		t.Fatalf("send set_model: %v", err)
+	}
+	echo := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.SessionID == sidA && m.Model == "shared-model" })
+	if echo.ModelProvider != "deepseek" {
+		t.Fatalf("config echo ModelProvider = %q, want deepseek", echo.ModelProvider)
+	}
+
+	// The list_models reply carries the same routing key, and its per-
+	// (provider, id) current flag marks only the deepseek copy.
+	if err := conn.WriteJSON(WSMessage{Type: "list_models", SessionID: sidA}); err != nil {
+		t.Fatalf("send list_models: %v", err)
+	}
+	reply := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "models" })
+	if reply.Model != "shared-model" || reply.ModelProvider != "deepseek" {
+		t.Fatalf("models reply = %q/%q, want shared-model/deepseek", reply.Model, reply.ModelProvider)
+	}
+	currentByProvider := map[string]bool{}
+	for _, e := range reply.Models {
+		if e.ID == "shared-model" {
+			currentByProvider[e.Provider] = e.Current
+		}
+	}
+	if !currentByProvider["deepseek"] {
+		t.Fatal("the deepseek copy of shared-model must be marked current")
+	}
+	if currentByProvider["default"] {
+		t.Fatal("the default copy of shared-model must NOT be marked current")
+	}
+}
+
 // TestSessionNewNoAdoptionWhenPaneMatchesDefault pins the no-adoption
 // guard: a /new from a pane that still runs the workspace default seeds the
 // fresh provider from that default (verified by construction) — no

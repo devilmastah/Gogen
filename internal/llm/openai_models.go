@@ -497,11 +497,31 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 // reference: the owning profile's URLs (so a model listed on a second
 // endpoint resolves against its own registry entry). A ref with no profile
 // (bare-ID callers: pricing, context-limit lookups) resolves the owner from
-// the cached catalog when possible, falling back to the default profile's
-// URLs when the catalog has not been fetched.
+// the cached catalog when possible; a profile the catalog has not resolved
+// yet falls back to that profile's own base URL, then the default profile's.
 func (p *OpenAIProvider) modelsDevURLsFor(ref ModelRef) []string {
 	p.modelsMu.RLock()
-	info := p.modelProfile[ref.Normalized()]
+	baseURL := p.ownedBaseURLLocked(ref)
+	p.modelsMu.RUnlock()
+	if baseURL != "" {
+		return modelsDevURLsForBaseURL(baseURL)
+	}
+	return modelsDevURLsForBaseURL(p.defaultBaseURL())
+}
+
+// ownedBaseURLLocked resolves the base URL of the endpoint that serves ref:
+// the catalog record when a fetch has populated it (see modelProfile), else
+// the ref's OWN registered profile. A lookup that runs before the catalog
+// fetch — ModelContextLimit's models.dev step on a freshly restored session
+// — must still target the endpoint that owns the model: the default
+// profile is a DIFFERENT provider, and resolving against it answers from
+// the wrong registry entry (the OpenCode entry for a model the deepseek
+// profile serves). A bare-ID ref first resolves its owner from the cached
+// catalog (first listing wins). Returns "" when neither resolves; callers
+// then fall back to defaultBaseURL. Caller must hold modelsMu for reading.
+func (p *OpenAIProvider) ownedBaseURLLocked(ref ModelRef) string {
+	normalized := ref.Normalized()
+	info := p.modelProfile[normalized]
 	if info.baseURL == "" && ref.Profile == "" {
 		// Bare ID: find the cached catalog entry that owns it.
 		for _, cm := range p.modelsCache {
@@ -511,11 +531,15 @@ func (p *OpenAIProvider) modelsDevURLsFor(ref ModelRef) []string {
 			}
 		}
 	}
-	p.modelsMu.RUnlock()
-	if info.baseURL != "" {
-		return modelsDevURLsForBaseURL(info.baseURL)
+	if info.baseURL == "" && normalized.Profile != DefaultProfileName {
+		for _, prof := range p.profiles {
+			if prof.name == normalized.Profile {
+				info = modelProfileInfo{name: prof.name, baseURL: prof.baseURL}
+				break
+			}
+		}
 	}
-	return modelsDevURLsForBaseURL(p.defaultBaseURL())
+	return info.baseURL
 }
 
 // modelsDevURLsForBaseURL is the shared URL derivation for one endpoint: the

@@ -110,6 +110,31 @@ func (a *Agent) terminalJob(id string) *terminalJob {
 	return a.termJobs[id]
 }
 
+// hasTerminalWork is HasBackgroundWork's terminal half: a live persistent
+// terminal (PTY), a running background terminal send, or a live persistent
+// shell. An EXITED persistent shell is not work — its process is already
+// gone, so counting it would keep a host resident with nothing running.
+// Leaf lock (termMu), never blocks.
+func (a *Agent) hasTerminalWork() bool {
+	a.termMu.Lock()
+	defer a.termMu.Unlock()
+	if len(a.terms) > 0 {
+		return true
+	}
+	if a.pshell != nil && !a.pshell.Exited() {
+		return true
+	}
+	for _, job := range a.termJobs {
+		select {
+		case <-job.done:
+			continue // finished: still pollable for the retention window, not work
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // closeTerminals kills every terminal session and background job owned by this
 // session. Called from Agent.Close so no PTY is orphaned. Idempotent.
 func (a *Agent) closeTerminals() {
@@ -203,6 +228,7 @@ func (a *Agent) startTerminalSendBackground(ts *terminalSession, text string, su
 		// Keep the finished job pollable for the standard retention window,
 		// then drop it so a long session cannot accumulate stale sends.
 		time.AfterFunc(defaultBackgroundJobRetain, func() { a.removeTerminalJob(job.ID) })
+		a.maybeFireBackgroundIdle()
 	}()
 	return job.ID
 }
@@ -455,6 +481,9 @@ func handleTerminalClose(_ context.Context, a *Agent, args map[string]any) (stri
 	if err := ts.Session.Close(); err != nil {
 		return "", fmt.Errorf("closing terminal %s: %w", id, err)
 	}
+	// Closing the last PTY can drain the session's background work; let a
+	// host that kept the session resident for it re-check now.
+	a.maybeFireBackgroundIdle()
 	return fmt.Sprintf("Closed terminal %s.", id), nil
 }
 

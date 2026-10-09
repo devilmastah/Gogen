@@ -15,7 +15,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/gortexhq/tree-sitter-dockerfile v0.1.0
 	github.com/makiuchi-d/gozxing v0.1.1
-	github.com/openai/openai-go/v3 v3.59.0
+	github.com/openai/openai-go/v3 v3.64.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/tiktoken-go/tokenizer v0.8.1
 	github.com/tree-sitter-grammars/tree-sitter-hcl v1.2.0
@@ -60,6 +60,7 @@ require (
 	github.com/charmbracelet/x/windows v0.2.2 // indirect
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/dlclark/regexp2/v2 v2.8.0 // indirect
 	github.com/fzipp/gocyclo v0.6.0 // indirect
 	github.com/go-shiori/dom v0.0.0-20230515143342-73569d674e1c // indirect

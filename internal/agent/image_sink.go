@@ -21,10 +21,12 @@ type imageEntry struct {
 // a handler that appended a user message directly would place the image
 // between the assistant's tool_call and its tool result — a wire-protocol
 // violation. Instead the handler only collects the image into the sink, and
-// the tool-round coordinator appends the synthetic user message immediately
-// after the tool result, in both the sequential and the parallel paths.
-// Handlers run concurrently in parallel read-only batches, so every
-// mutation is mutex-guarded.
+// the tool-round coordinator appends the synthetic user message only after
+// EVERY tool message of the round is on the transcript (see
+// appendRoundImages): strict OpenAI-compatible providers require the tool
+// messages answering one assistant tool_calls message to directly follow it,
+// before any other role. Handlers run concurrently in parallel read-only
+// batches, so every mutation is mutex-guarded.
 type imageSink struct {
 	mu    sync.Mutex
 	items []imageEntry
@@ -68,15 +70,20 @@ func ImageSinkFromContext(ctx context.Context) *imageSink {
 }
 
 // appendImageMessages appends every image collected by one read_image tool
-// call as a synthetic user message, preserving collection order. Must be
-// called by the tool-round coordinator immediately after the matching tool
-// result is appended, so the transcript reads assistant(tool_call) → tool
-// (result) → user(image+caption) — the only wire-legal placement for image
-// content (the provider accepts image parts on user messages only). The
-// message append goes through appendMessage, so token-count caching and the
-// statsMu discipline apply exactly as they do for user input; the turn
-// loop's persistSession (and the cancel paths' FlushSession) then persist it
-// like any other message.
+// call as a synthetic user message, preserving collection order. Callers
+// must drain the round's sinks only after EVERY tool message of the round
+// (results and cancel placeholders) is on the transcript — see
+// appendRoundImages. The transcript then reads assistant(tool_call) →
+// tool(result) × N → user(image+caption) …, and the image never lands
+// between two tool messages: strict OpenAI-compatible providers require the
+// tool messages answering one assistant tool_calls message to directly
+// follow it and reject an interleaved message with "insufficient tool
+// messages following tool_calls message". Image parts are accepted on user
+// messages only, so a user message is the only carrier for the image. The
+// append goes through appendMessage, so token-count caching and the statsMu
+// discipline apply exactly as they do for user input; the turn loop's
+// persistSession (and the cancel paths' FlushSession) then persist it like
+// any other message.
 func (a *Agent) appendImageMessages(sink *imageSink) {
 	if sink == nil {
 		return
@@ -88,5 +95,20 @@ func (a *Agent) appendImageMessages(sink *imageSink) {
 			Images:    []llm.ImageInput{e.img},
 			CreatedAt: time.Now().Truncate(time.Millisecond),
 		})
+	}
+}
+
+// appendRoundImages drains every per-call image sink of one tool round, in
+// model order, after all of the round's tool messages were appended. This is
+// the only protocol-safe point for the synthetic user image messages: an
+// assistant message with tool_calls must be directly followed by one tool
+// message per tool_call_id before any other role, so an image inserted right
+// after its own tool result splits the batch and strict providers reject the
+// round's next request (or the next turn) with "insufficient tool messages
+// following tool_calls message". Empty sinks — calls that produced no image,
+// or never ran — are no-ops.
+func (a *Agent) appendRoundImages(sinks []*imageSink) {
+	for _, sink := range sinks {
+		a.appendImageMessages(sink)
 	}
 }

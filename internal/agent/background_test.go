@@ -51,7 +51,7 @@ func TestBackgroundCommandLifecycle(t *testing.T) {
 	if !strings.Contains(status, "hello-background") {
 		t.Fatalf("expected output in status, got: %s", status)
 	}
-	// The default retention window (5m) keeps the finished job registered,
+	// The default retention window (30m) keeps the finished job registered,
 	// so the status is FINISHED. A job whose window already elapsed (a very
 	// slow runner, or a test that shortened bgRetain) reports "unknown"
 	// instead — both are correct reaper outcomes.

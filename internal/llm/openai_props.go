@@ -199,25 +199,17 @@ func (p *OpenAIProvider) propsCapsCache() *PropsCapsCache {
 
 // propsBaseURLForRef returns the base URL of the endpoint that serves the
 // model reference: the model's owning profile when the catalog has been
-// fetched, else the default profile's base URL. A ref with no profile (a
-// bare-ID caller) resolves to the first cached entry that lists the ID —
-// model IDs are not unique across registered providers, so callers that
-// know the owner pass the full ref.
+// fetched, else the ref's own registered profile (see
+// ownedBaseURLLocked), then the default profile's base URL. A ref with no
+// profile (a bare-ID caller) resolves to the first cached entry that lists
+// the ID — model IDs are not unique across registered providers, so callers
+// that know the owner pass the full ref.
 func (p *OpenAIProvider) propsBaseURLForRef(ref ModelRef) string {
 	p.modelsMu.RLock()
-	info := p.modelProfile[ref.Normalized()]
-	if info.baseURL == "" && ref.Profile == "" {
-		// Bare ID: find the cached catalog entry that owns it.
-		for _, cm := range p.modelsCache {
-			if cm.model.ID == ref.ID {
-				info = p.modelProfile[ModelRef{Profile: cm.profile, ID: ref.ID}]
-				break
-			}
-		}
-	}
+	baseURL := p.ownedBaseURLLocked(ref)
 	p.modelsMu.RUnlock()
-	if info.baseURL != "" {
-		return info.baseURL
+	if baseURL != "" {
+		return baseURL
 	}
 	return p.defaultBaseURL()
 }

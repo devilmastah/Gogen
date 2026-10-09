@@ -160,29 +160,50 @@ func (m *Model) startTurnOn(sess *liveSession, text string) tea.Cmd {
 	}
 }
 
-// drainSessionQueue pops ONE queued item from s and starts its turn — the
-// queue is drained one item per turn at every terminal boundary
-// (handleTurnFinishedMsg, handleCompactResultMsg, drainDeliveries), so
-// multiple queued items drain in order across consecutive turns. Returns
-// nil when nothing can start (empty queue, busy session). FOCUSED items
-// render through startTurn (chat line + mirrors); BACKGROUND items run on
-// their session's agent without touching the focused transcript — their
-// events buffer in the session's replay queue and their terminal routes
-// back here through handleTurnFinishedMsg.
+// drainSessionQueue pops the queue head from s — or, when the head is a
+// system delivery, the contiguous run of system deliveries behind it — and
+// starts its turn. The queue drains at every terminal boundary
+// (handleTurnFinishedMsg, handleCompactResultMsg, drainDeliveries). System
+// notices are one-way injections, so a run of them shares ONE turn (one
+// provider request); USER items keep their own turn each, and a run stops
+// at the first user item so FIFO arrival order is preserved. Returns nil
+// when nothing can start (empty queue, busy session). FOCUSED items render
+// through startTurn (chat line + mirrors); BACKGROUND items run on their
+// session's agent without touching the focused transcript — their events
+// buffer in the session's replay queue and their terminal routes back here
+// through handleTurnFinishedMsg.
 func (m *Model) drainSessionQueue(s *liveSession) tea.Cmd {
 	if s == nil || s.streaming || s.compacting || len(s.steerQueue) == 0 {
 		return nil
 	}
-	item := s.steerQueue[0]
-	s.steerQueue = s.steerQueue[1:]
+	n := 1
+	if s.steerQueue[0].system {
+		for n < len(s.steerQueue) && s.steerQueue[n].system {
+			n++
+		}
+	}
+	batch := s.steerQueue[:n]
+	s.steerQueue = s.steerQueue[n:]
+	item := batch[0]
+	// text is the turn prompt (blank-line separated); display is the
+	// focused transcript's system line (one notice per visual line).
+	text, display := item.text, item.text
+	if n > 1 {
+		texts := make([]string, n)
+		for i, it := range batch {
+			texts[i] = it.text
+		}
+		text = strings.Join(texts, "\n\n")
+		display = strings.Join(texts, "\n")
+	}
 	focused := m.lives != nil && m.lives.Active() == s
 	if focused {
 		if item.system {
-			return m.startTurn(item.text, SystemStyle.Render(noticeLabel+" "+item.text))
+			return m.startTurn(text, SystemStyle.Render(noticeLabel+" "+display))
 		}
-		return m.startTurn(item.text, UserStyle.Render(userLabel)+" "+item.text)
+		return m.startTurn(text, UserStyle.Render(userLabel)+" "+text)
 	}
-	return m.startTurnOn(s, item.text)
+	return m.startTurnOn(s, text)
 }
 
 // noticeTarget resolves the session a system delivery was raised for: the

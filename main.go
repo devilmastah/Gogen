@@ -23,6 +23,7 @@ import (
 	"gogen/internal/projectfile"
 	"gogen/internal/session"
 	"gogen/internal/spill"
+	"gogen/internal/statusdisplay"
 	"gogen/internal/treesitter"
 )
 
@@ -223,6 +224,9 @@ func run() error {
 	// web default-session agents at process exit (web session agents are
 	// closed by ShutdownSessions). Idempotent.
 	defer a.Close()
+	// Clear the LAN status-screen row on exit (best effort, bounded) so it
+	// cannot linger for its TTL after Gogen is gone.
+	defer statusdisplay.Shutdown()
 
 	mcpH := startMCP(a, cfg)
 	defer closeMCP(mcpH)
@@ -337,6 +341,26 @@ func generateToken() (string, error) {
 }
 
 func applyRuntimeConfig(cfg *config.Config) {
+	// The status-screen reporter is a passive turn observer: install it
+	// unconditionally (the on/off gate lives in the reporter) so a runtime
+	// toggle in the web settings modal takes effect without re-wiring
+	// anything.
+	agent.ConfigureTurnObserver(statusdisplay.Notify)
+	switch cfg.StatusDisplayMode() {
+	case config.StatusDisplayOn:
+		statusdisplay.Configure(true, cfg.StatusDisplayHost, cfg.StatusDisplayToken, cfg.StatusDisplaySource, cfg.WorkingDir)
+	case config.StatusDisplayBrowser:
+		// Browser mode is a web-mode feature: there the server probes first
+		// and the web UI is the fallback sender. The TUI/CLI has no browser
+		// to fall back to, so it just probes and reports directly when the
+		// display answers (the web server's own startup re-applies the full
+		// browser-mode behavior when it runs).
+		statusdisplay.Probe(cfg.StatusDisplayHost, cfg.StatusDisplayToken, cfg.StatusDisplaySource, cfg.WorkingDir)
+	case config.StatusDisplayOff:
+		statusdisplay.Configure(false, cfg.StatusDisplayHost, cfg.StatusDisplayToken, cfg.StatusDisplaySource, cfg.WorkingDir)
+	default: // auto: probe for the screen, enable reporting when it answers
+		statusdisplay.Probe(cfg.StatusDisplayHost, cfg.StatusDisplayToken, cfg.StatusDisplaySource, cfg.WorkingDir)
+	}
 	treesitter.Configure(cfg.TreeSitterEnabled(), cfg.TreeSitterLangs)
 	agent.ConfigureWebFetch(cfg.WebFetchEnabled(), cfg.WebFetchMode, cfg.WebAllowedDomains)
 	agent.ConfigureWebSearchEnabled(cfg.WebSearchEnabled())

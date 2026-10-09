@@ -41,8 +41,9 @@ var imageExtMIMEs = map[string]string{
 // a synthetic user message. The handler itself never touches the transcript:
 // it validates, reads, and encodes the file, then records the image in the
 // context-scoped image sink; the tool-round coordinator appends the user
-// message after the tool result (see appendImageMessages). The returned
-// text is a short ack — the image itself travels in the user message.
+// message after ALL tool messages of the round (see appendRoundImages) —
+// never between them, which strict providers reject. The returned text is a
+// short ack — the image itself travels in the user message.
 func handleReadImage(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {

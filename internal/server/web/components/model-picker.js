@@ -248,7 +248,11 @@ export function createModelThinkingPicker(cfg) {
     // model choice (see the section comment above).
     const effortOptions = (s) => {
         if (s.model) {
-            const m = (cfg.getModels() || []).find((m) => m.id === s.model);
+            // The stored value is the row's selector: bare id for the
+            // default profile, qualified "provider/id" otherwise — match
+            // both forms (a bare-id-only match would never find a
+            // non-default provider's row).
+            const m = (cfg.getModels() || []).find((m) => m.id === s.model || selectorFor(m) === s.model);
             if (m && Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length > 0) {
                 return m.reasoningEfforts;
             }

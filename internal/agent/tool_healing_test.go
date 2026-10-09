@@ -57,6 +57,14 @@ func TestHealToolCall(t *testing.T) {
 			wantNote: true,
 		},
 		{
+			name:     "execute_command cmd param healed to command",
+			tool:     "execute_command",
+			args:     map[string]any{"cmd": "ls"},
+			wantTool: "execute_command",
+			wantArgs: map[string]any{"command": "ls"},
+			wantNote: true,
+		},
+		{
 			name:     "grep healed to search_code",
 			tool:     "grep",
 			args:     map[string]any{"pattern": "foo"},
@@ -205,5 +213,33 @@ func TestHealToolCallCombinedNameAndArgAliasDoesNotMutate(t *testing.T) {
 	}
 	if !maps.Equal(args, orig) {
 		t.Fatalf("input map was mutated: got %v, want %v", args, orig)
+	}
+}
+
+// TestExecuteToolHealsExecuteCommandCmdArg pins the end-to-end self-healing
+// for a model that names execute_command's command under "cmd" (the Unix
+// shorthand): the call is accepted instead of failing with `missing
+// required argument "command"`, runs, and reports the healing as a note on
+// the tool result.
+func TestExecuteToolHealsExecuteCommandCmdArg(t *testing.T) {
+	a := &Agent{Mode: ModeAct, Executor: &Executor{WorkingDir: t.TempDir()}}
+
+	args := map[string]any{"cmd": "echo healed-cmd-ok"}
+	out, err := a.executeTool(context.Background(), llmToolCall("execute_command", args))
+	if err != nil {
+		t.Fatalf("healed call failed: %v", err)
+	}
+	if !strings.Contains(out, "healed tool call") {
+		t.Errorf("result missing healing note: %q", out)
+	}
+	if !strings.Contains(out, "healed-cmd-ok") {
+		t.Errorf("healed command output missing: %q", out)
+	}
+	// The caller's args map must stay untouched (prompt-cache stability).
+	if _, ok := args["command"]; ok {
+		t.Error("original args map was mutated: gained canonical key")
+	}
+	if _, ok := args["cmd"]; !ok {
+		t.Error("original args map lost the alias key")
 	}
 }

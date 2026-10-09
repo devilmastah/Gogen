@@ -330,6 +330,65 @@ func TestMergeOutputSpillFlag(t *testing.T) {
 	}
 }
 
+// TestMergeStatusDisplay pins the status-display option merge: the gate
+// defaults to auto (probe at startup), the host defaults to the firmware's
+// mDNS name, the source defaults to auto (derived from the project folder),
+// file values apply, and the env overrides them. An unknown gate value
+// resolves to auto rather than erroring the whole config.
+func TestMergeStatusDisplay(t *testing.T) {
+	for _, env := range []string{"GOGEN_STATUS_DISPLAY", "GOGEN_STATUS_DISPLAY_HOST", "GOGEN_STATUS_DISPLAY_TOKEN", "GOGEN_STATUS_DISPLAY_SOURCE"} {
+		os.Unsetenv(env)
+	}
+	cfg := Merge(nil, FlagOverrides{})
+	if got := cfg.StatusDisplayMode(); got != config.StatusDisplayAuto {
+		t.Fatalf("status_display default = %q, want auto", got)
+	}
+	if cfg.StatusDisplayHost != config.DefaultStatusDisplayHost || cfg.StatusDisplaySource != config.DefaultStatusDisplaySource {
+		t.Fatalf("defaults = host %q source %q, want %q / %q",
+			cfg.StatusDisplayHost, cfg.StatusDisplaySource, config.DefaultStatusDisplayHost, config.DefaultStatusDisplaySource)
+	}
+
+	pf, err := ParseContent("GOGEN.md", "---\nstatus_display: on\nstatus_display_host: 10.0.0.5\nstatus_display_token: s3cret\nstatus_display_source: gogen-alt\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromFile := Merge(pf, FlagOverrides{})
+	if got := fromFile.StatusDisplayMode(); got != config.StatusDisplayOn {
+		t.Fatalf("file status_display = %q, want on", got)
+	}
+	if fromFile.StatusDisplayHost != "10.0.0.5" || fromFile.StatusDisplayToken != "s3cret" || fromFile.StatusDisplaySource != "gogen-alt" {
+		t.Fatalf("file values not honored: %+v", fromFile)
+	}
+
+	pfAuto, err := ParseContent("GOGEN.md", "---\nstatus_display: auto\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Merge(pfAuto, FlagOverrides{}).StatusDisplayMode(); got != config.StatusDisplayAuto {
+		t.Fatalf("file status_display = %q, want auto", got)
+	}
+
+	t.Setenv("GOGEN_STATUS_DISPLAY", "off")
+	t.Setenv("GOGEN_STATUS_DISPLAY_HOST", "statusscreen.local")
+	t.Setenv("GOGEN_STATUS_DISPLAY_SOURCE", "gogen")
+	fromEnv := Merge(pf, FlagOverrides{})
+	if got := fromEnv.StatusDisplayMode(); got != config.StatusDisplayOff {
+		t.Fatalf("env status_display = %q, want off (env over file on)", got)
+	}
+	if fromEnv.StatusDisplayHost != "statusscreen.local" || fromEnv.StatusDisplaySource != "gogen" {
+		t.Fatalf("env values should override file: host %q source %q", fromEnv.StatusDisplayHost, fromEnv.StatusDisplaySource)
+	}
+
+	// An unknown gate value degrades to auto (discovery), not to an error.
+	if got := (&config.Config{StatusDisplay: "sometimes"}).StatusDisplayMode(); got != config.StatusDisplayAuto {
+		t.Fatalf("unknown gate = %q, want auto", got)
+	}
+	// browser is a first-class gate (the web UI sends the updates).
+	if got := (&config.Config{StatusDisplay: "browser"}).StatusDisplayMode(); got != config.StatusDisplayBrowser {
+		t.Fatalf("browser gate = %q, want browser", got)
+	}
+}
+
 func TestMergeBoardSubagentFlags(t *testing.T) {
 	for _, env := range []string{"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH", "GOGEN_SUBAGENT_MAX_CONCURRENT"} {
 		os.Unsetenv(env)

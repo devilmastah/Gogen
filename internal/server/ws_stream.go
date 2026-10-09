@@ -36,8 +36,16 @@ type wsConnStream struct {
 // later cancel/message can keep waiting. Clearing it on timeout made the next
 // tryAcquireTurn fail with "agent is busy" while a stuck command still held
 // turnMu.
-func (s *wsConnStream) cancelInFlight() {
+//
+// The bool result reports whether a stream was actually in flight (a
+// registered cancel handle existed when called). The web cancel handler uses
+// it to decide whether the cancelled/turn_end pair will follow: when nothing
+// was in flight it answers its sender with cancel_ack instead, so the
+// sender's per-cancel bookkeeping can drain (statement callers ignore the
+// result; calling convention is unchanged for them).
+func (s *wsConnStream) cancelInFlight() bool {
 	s.mu.Lock()
+	wasInFlight := s.cancel != nil
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
@@ -45,7 +53,7 @@ func (s *wsConnStream) cancelInFlight() {
 	prevErr := s.errCh
 	s.mu.Unlock()
 	if prevErr == nil {
-		return
+		return wasInFlight
 	}
 	// Wait for cancel repair (appendCanceledToolResults + FlushSession).
 	if drainStreamErr(prevErr) {
@@ -55,6 +63,7 @@ func (s *wsConnStream) cancelInFlight() {
 		}
 		s.mu.Unlock()
 	}
+	return wasInFlight
 }
 
 // begin registers a cancel handle for a new stream. Caller must already have

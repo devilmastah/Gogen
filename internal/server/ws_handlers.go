@@ -81,8 +81,10 @@ func wsHandleQueueClear(req *wsRequest) {
 // wsHandleFork handles session_fork: the fork source is the pane named by
 // sessionId (edit-resend forks its own pane's session). Re-align the
 // connection's pane with the explicit id so a reconnect-stale pointer cannot
-// fork the wrong session, and drop the request when the source session is
-// gone entirely (never fork a different session).
+// fork the wrong session, and answer with an error when the source session
+// is gone entirely (never fork a different session — and never drop the
+// request silently: the client's in-flight session-change/resend bookkeeping
+// waits for this reply, and an Error response is what clears it).
 func wsHandleFork(req *wsRequest) {
 	s, ws, r, msg := req.server, req.conn, req.request, req.msg
 	pane := &req.pane
@@ -92,6 +94,8 @@ func wsHandleFork(req *wsRequest) {
 			if *pane != nil && (*pane).agent.SessionID == msg.SessionID {
 				t = *pane
 			} else {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf(
+					"Error: session %s is gone — fork not started", msg.SessionID)})
 				return
 			}
 		}
@@ -159,14 +163,23 @@ func wsHandleListSessions(req *wsRequest) {
 // edit-resend path scopes it with the acting pane's id (beginResend:
 // histIdx == 0 sends session_new with sessionId). Re-align the pane pointer
 // to that id (like session_fork does) so a reconnect-stale pointer can never
-// replace the WRONG pane's session. session_resume/session_delete are NOT
-// re-aligned: their sessionId names the TARGET session, not the acting pane.
+// replace the WRONG pane's session: when the id resolves to neither a
+// registered session nor this pane's own (possibly evicted) session, the
+// request is REJECTED with an error instead of falling through onto a
+// different pane's session — a pane that still holds the id may proceed
+// (replacing our own evicted session is exactly what was asked).
+// session_resume/session_delete are NOT re-aligned: their sessionId names
+// the TARGET session, not the acting pane.
 func wsHandleSessionAction(req *wsRequest) {
 	s, ws, r, msg := req.server, req.conn, req.request, req.msg
 	pane := &req.pane
 	if msg.Type == "session_new" && msg.SessionID != "" {
 		if t := s.resolveRuntime(msg.SessionID); t != nil {
 			*pane = t
+		} else if *pane == nil || (*pane).agent.SessionID != msg.SessionID {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf(
+				"Error: session %s is not this pane's session — new session not started", msg.SessionID)})
+			return
 		}
 	}
 	s.handleWSSessionAction(ws, r.Context(), pane, msg)
@@ -193,12 +206,16 @@ func wsHandleListModels(req *wsRequest) {
 		}
 		// CurrentModel reads under the provider's own modelsMu (the same
 		// contract agentConfigMsgBasic relies on), so no turnMu is needed —
-		// a running turn never delays the model catalog reply.
-		current := rt.agent.CurrentModel()
+		// a running turn never delays the model catalog reply. The owning
+		// profile travels with the bare ID: model IDs are not unique across
+		// registered providers, so the client's current-model check must
+		// match (provider, id).
+		currentRef := rt.agent.CurrentModelRef()
 		_ = ws.writeJSON(WSMessage{
-			Type:   "models",
-			Model:  current,
-			Models: s.modelEntries(models),
+			Type:          "models",
+			Model:         currentRef.WireID(),
+			ModelProvider: currentRef.ProfileName(),
+			Models:        s.modelEntries(models),
 		})
 	}()
 }
@@ -326,14 +343,38 @@ func wsHandleConfig(req *wsRequest) {
 // messages are cleared with the turn ("stop what you're doing") and the
 // cleared queue is broadcast; system deliveries are kept (machine
 // bookkeeping — job notices, subagent reports, reply capture).
+//
+// When NOTHING is cancelled — the session is gone, the turn already ended,
+// or another connection's cancel won the race — no cancelled/turn_end pair
+// will follow, so the sender is answered with a `cancel_ack` instead: the
+// web client holds a per-cancel bookkeeping unit (suppressTurnEnds) from
+// every cancel it sends, and without an answer that unit could never drain —
+// the next real turn_end would be swallowed and the client's busy state
+// would stick. cancel_ack consumes exactly one unit and has no other
+// effects; a real pair that was already broadcast precedes this frame on the
+// socket, so the pair drains the unit first and the ack arrives as a no-op.
+// Clients without a cancel_ack handler ignore the frame (unknown types fall
+// through both dispatcher switches).
 func wsHandleCancel(req *wsRequest) {
-	target := req.target
-	if target == nil {
-		return
+	target, ws := req.target, req.conn
+	wasInFlight := false
+	if target != nil {
+		wasInFlight = target.stream.cancelInFlight()
+		if !wasInFlight {
+			// Another connection's cancel may hold the handle already (just
+			// released, pair not yet broadcast): while the turn still reads
+			// active its cancelled/turn_end pair is coming — withhold the
+			// ack so the real pair does the draining.
+			if active, _ := target.turnState(); active {
+				wasInFlight = true
+			}
+		}
+		if n := target.clearUserQueue(); n > 0 {
+			target.broadcastQueueState()
+		}
 	}
-	target.stream.cancelInFlight()
-	if n := target.clearUserQueue(); n > 0 {
-		target.broadcastQueueState()
+	if !wasInFlight {
+		_ = ws.writeJSON(WSMessage{Type: "cancel_ack"})
 	}
 }
 
@@ -462,7 +503,12 @@ func wsHandleCompact(req *wsRequest) {
 // pane pointer remains the fallback for legacy empty ids). An id that no
 // longer resolves is either an in-flight eviction of THIS very session
 // (continue on the same runtime) or a stale pane — in the latter case drop
-// the message rather than deliver it to a different session.
+// the message rather than deliver it to a different session, and SAY SO:
+// the client has already rendered an optimistic bubble and armed its
+// pending-ack correlation, so a silent drop would strand both (the stale
+// entry would then stamp the NEXT ack with the wrong history index —
+// edit/resend/fork at a wrong point). An "Error:" response is what the
+// client's response handler needs to revoke the bubble and drop the entry.
 func wsHandleMessage(req *wsRequest) {
 	s, ws, r, msg, target := req.server, req.conn, req.request, req.msg, req.target
 	pane := &req.pane
@@ -471,6 +517,8 @@ func wsHandleMessage(req *wsRequest) {
 			if *pane != nil && (*pane).agent.SessionID == msg.SessionID {
 				target = *pane
 			} else {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf(
+					"Error: session %s is not available — message not sent", msg.SessionID)})
 				return
 			}
 		}

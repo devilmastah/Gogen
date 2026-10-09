@@ -44,8 +44,9 @@ const sseFilterMaxLine = bufio.MaxScanTokenSize << 9
 
 // sseFilterTransport wraps a RoundTripper and, for text/event-stream
 // responses only, interposes the empty-event filter between the body and the
-// SDK. Non-SSE bodies (the JSON error payloads the SDK parses for apierror)
-// pass through untouched.
+// SDK. Everything else — including the JSON error payloads the SDK parses for
+// apierror — passes through untouched; those are normalized, when needed, by
+// the apiErrorBodyTransport wrapped around this one (api_error_body.go).
 type sseFilterTransport struct {
 	base http.RoundTripper
 }
@@ -144,10 +145,15 @@ func filterSSEEvents(src io.Reader, dst io.Writer) error {
 	return scn.Err()
 }
 
-// baseHTTPTransport unwraps the dial-level *http.Transport underneath the
-// SSE client's filter wrapper (for tests and diagnostics).
+// baseHTTPTransport unwraps the SSE client's transport stack — the API-error
+// normalizer around the SSE filter around the dial-level *http.Transport (for
+// tests and diagnostics).
 func baseHTTPTransport(c *http.Client) (*http.Transport, bool) {
-	ft, ok := c.Transport.(*sseFilterTransport)
+	eb, ok := c.Transport.(*apiErrorBodyTransport)
+	if !ok {
+		return nil, false
+	}
+	ft, ok := eb.base.(*sseFilterTransport)
 	if !ok {
 		return nil, false
 	}

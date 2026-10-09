@@ -288,6 +288,39 @@ func TestToolCallsParallelCancelStillClosesEveryToolCall(t *testing.T) {
 	}
 }
 
+// TestExecuteToolCallsParallelEntryCancelClosesBatch pins the entry-cancel
+// contract: when the turn context is already cancelled before the batch
+// starts, every tool call still receives a placeholder result. The caller
+// already appended the assistant tool_calls message, so returning an open
+// batch would make the next request fail provider-side ("insufficient tool
+// messages following tool_calls message").
+func TestExecuteToolCallsParallelEntryCancelClosesBatch(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(llmtest.NewMockProvider(), exec, nil)
+	toolCalls := []llm.ToolCall{
+		{ID: "c1", Name: "read_file", Args: map[string]any{"path": "a.txt"}},
+		{ID: "c2", Name: "read_file", Args: map[string]any{"path": "a.txt"}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !a.executeToolCallsParallel(ctx, &llm.StreamHandlers{}, toolCalls) {
+		t.Fatal("expected the pre-cancelled batch to report cancellation")
+	}
+
+	found := map[string]bool{}
+	for _, m := range a.Messages {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			found[m.ToolCallID] = true
+		}
+	}
+	for _, id := range []string{"c1", "c2"} {
+		if !found[id] {
+			t.Fatalf("tool call %s missing a result after the entry cancel", id)
+		}
+	}
+}
+
 // TestExecuteToolCallsParallelCancelKeepsCompletedResults verifies that when
 // the turn context is cancelled right after a parallel tool has returned,
 // that tool's completed result is preserved (real output, success=true)

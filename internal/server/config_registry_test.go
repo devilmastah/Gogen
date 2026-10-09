@@ -99,6 +99,8 @@ func TestRuntimeConfigFieldErrors(t *testing.T) {
 			`Error: invalid webFetch "sometimes" (want on or off)`},
 		{"outputSpill", WSMessage{Type: "config", ConfigFields: []string{"outputSpill"}, OutputSpill: "sometimes"},
 			`Error: invalid outputSpill "sometimes" (want on or off)`},
+		{"statusDisplay", WSMessage{Type: "config", ConfigFields: []string{"statusDisplay"}, StatusDisplay: "sometimes"},
+			`Error: invalid statusDisplay "sometimes" (want off, auto, on, or browser)`},
 		{"webSearch", WSMessage{Type: "config", ConfigFields: []string{"webSearch"}, WebSearch: "sometimes"},
 			`Error: invalid webSearch "sometimes" (want on or off)`},
 		{"treesitter", WSMessage{Type: "config", ConfigFields: []string{"treesitter"}, TreeSitter: "sometimes"},

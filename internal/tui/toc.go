@@ -108,6 +108,7 @@ func (m *Model) tocJumpNext(next bool) bool {
 		for _, a := range m.tocAnchors {
 			if a.line > m.viewport.YOffset+1 {
 				m.viewport.SetYOffset(a.line)
+				m.viewportScrolledByUser()
 				return true
 			}
 		}
@@ -125,6 +126,7 @@ func (m *Model) tocJumpNext(next bool) bool {
 		return false
 	}
 	m.viewport.SetYOffset(target)
+	m.viewportScrolledByUser()
 	return true
 }
 
@@ -162,6 +164,7 @@ func (m *Model) handleTocMouse(ev mouseEvent) bool {
 		if i := m.tocAnchorAt(ev.y); i >= 0 {
 			// Web parity: the prompt jumps to the top of the viewport.
 			m.viewport.SetYOffset(m.tocAnchors[i].line)
+			m.viewportScrolledByUser()
 			m.tocPreview = -1
 		}
 		return true // presses in the strip never start a selection

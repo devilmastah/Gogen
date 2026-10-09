@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,10 +11,9 @@ import (
 
 // deliverKind distinguishes the two producers sharing one FIFO queue per
 // runtime: system-generated messages (job notices, scheduled reminders,
-// subagent completion notices, captured send_message replies — rendered as
-// notices) and user steering messages (typed
-// into a busy session — rendered as the user's own message). One queue, one
-// drain path; the kind only changes presentation and policy.
+// compact subagent terminal events, exact send_message replies) and user
+// steering messages (typed into a busy session — rendered as the user's own
+// message). One queue, one drain path; kind changes presentation and policy.
 type deliverKind int
 
 const (
@@ -38,9 +38,9 @@ const (
 	// registry's per-parent queue. Never arms the start hook. Zero value.
 	deliverFromSystem deliverSource = iota
 	// deliverFromChildMessage is a send_message delivery into a child's
-	// runtime: the delivered turn's final assistant message is the reply
-	// the parent asked for, so this source arms the start hook
-	// (backgroundChild.onTurnEnd captures the reply).
+	// runtime: the delivered turn's exact returned output is the reply
+	// the parent asked for, so this source arms the start hook and
+	// per-invocation result callback (backgroundChild.onTurnResult).
 	deliverFromChildMessage
 )
 
@@ -61,17 +61,29 @@ type deliverItem struct {
 	Images []llm.ImageInput
 }
 
-// defaultDeliverQueueCap bounds pending SYSTEM message deliveries per
-// runtime. Overflow drops the OLDEST system delivery (freshness wins — a
-// stale job notice is worse than none) and toasts the drop. User items are
-// never dropped by system overflow (the scan below drops the oldest
-// system-kind entry), and system enqueue is never blocked by a queue full
-// of user steering messages: the caps are per-kind.
-const defaultDeliverQueueCap = 5
+// maxSystemDeliveryQueue bounds pending SYSTEM message deliveries per
+// runtime. NOTICE-style deliveries (job notices and compact subagent
+// terminal events) may be dropped oldest-first, while exact targeted
+// send_message replies are never silently dropped. User items are a separate
+// kind and are never dropped by system overflow.
+//
+// Sized to hold one full cohort of finished children (the default cap is 32)
+// plus replies. Terminal events are compact and authoritative reports are
+// pulled separately, so this queue no longer carries a 64 KiB report per
+// completion.
+const maxSystemDeliveryQueue = 32
+
+// maxParentDeliveryQueue bounds the registry's offline-parent queue
+// (notices and replies for a session whose runtime is not live). Sized like
+// the per-runtime queue because a drop here is invisible — no client is
+// attached to toast it, and the parent may not be reopened for a long time.
+const maxParentDeliveryQueue = 32
 
 // maxUserQueueCap bounds USER steering messages per runtime. Unlike system
 // deliveries, user text is never silently dropped: overflow REJECTS the new
-// message at submit time with a visible error.
+// message at submit time with a visible error. Kept low deliberately: each
+// item may carry up to 4 images (5MB data URL cap each) and drains as its
+// own turn, so the count doubles as a memory/backlog bound.
 const maxUserQueueCap = 20
 
 var (
@@ -269,8 +281,15 @@ func (rt *sessionRuntime) clearUserQueue() int {
 // runtime was evicted between the caller's lookup and this call). Callers
 // that must not lose the message can fall back to deliverToParent, which
 // queues it for the session's next registration.
+//
+// true means the notice was CONSUMED, not necessarily queued: a notice
+// arriving at a queue whose every slot holds a targeted (send_message)
+// delivery is dropped and toasted instead of evicting a pending reply (see
+// enqueueSystem). Only false may be re-routed to deliverToParent; a true
+// result has already been resolved either way.
 func (rt *sessionRuntime) deliverToSession(text string) bool {
-	return rt.enqueueSystem(text, deliverFromSystem)
+	accepted, _ := rt.enqueueSystem(text, deliverFromSystem)
+	return accepted
 }
 
 // deliverChildMessage delivers a parent's send_message into a child's
@@ -279,34 +298,68 @@ func (rt *sessionRuntime) deliverToSession(text string) bool {
 // asked for, so starting it arms the child's delivery-start hook (the
 // reply capture). This is the ONLY producer allowed to arm that capture —
 // see deliverSource.
-func (rt *sessionRuntime) deliverChildMessage(text string) bool {
+//
+// ok=false means nothing was queued: full=true reports a queue holding only
+// targeted deliveries, so the caller can tell the model to wait and retry
+// instead of dropping a message whose reply is pending.
+func (rt *sessionRuntime) deliverChildMessage(text string) (ok, full bool) {
 	return rt.enqueueSystem(text, deliverFromChildMessage)
 }
 
 // enqueueSystem is the shared system-delivery enqueue used by
 // deliverToSession (source = deliverFromSystem) and deliverChildMessage
 // (source = deliverFromChildMessage).
-func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) bool {
+//
+// Per-source overflow policy (the per-kind caps never touch user items):
+//   - a NOTICE (deliverFromSystem) first evicts the OLDEST queued notice
+//     (freshness wins — a stale job notice is worse than none). If every
+//     slot holds a targeted delivery, the notice itself is dropped instead:
+//     a message whose reply the parent is waiting on must not be evicted by
+//     a notice.
+//   - a TARGETED delivery (deliverFromChildMessage) first evicts the oldest
+//     notice to make room; when every slot holds a targeted delivery the
+//     enqueue is REFUSED (ok=false, full=true) rather than silently
+//     discarding a message — the caller turns that into a visible tool
+//     error the model can retry.
+func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) (ok, full bool) {
 	if rt == nil || rt.evicted.Load() {
-		return false
+		return false, false
 	}
 	rt.deliverMu.Lock()
-	dropped := false
 	nSys := 0
 	for _, it := range rt.pendingDeliver {
 		if it.Kind == deliverSystem {
 			nSys++
 		}
 	}
-	if nSys >= defaultDeliverQueueCap {
-		// Per-kind cap: drop the OLDEST SYSTEM item. A queue holding user
-		// steering messages must not lose them to a system overflow.
+	dropped := false
+	if nSys >= maxSystemDeliveryQueue {
+		// Evict the OLDEST notice first: freshness wins for notices, and a
+		// targeted delivery is a message whose reply the parent waits for.
+		victim := -1
 		for i, it := range rt.pendingDeliver {
-			if it.Kind == deliverSystem {
-				rt.pendingDeliver = append(rt.pendingDeliver[:i], rt.pendingDeliver[i+1:]...)
-				dropped = true
+			if it.Kind == deliverSystem && it.Source == deliverFromSystem {
+				victim = i
 				break
 			}
+		}
+		switch {
+		case victim >= 0:
+			rt.pendingDeliver = append(rt.pendingDeliver[:victim], rt.pendingDeliver[victim+1:]...)
+			dropped = true
+		case src == deliverFromChildMessage:
+			// Every slot holds a targeted delivery: refuse the new one so
+			// the caller reports an actionable error instead of dropping a
+			// queued message whose reply is pending.
+			rt.deliverMu.Unlock()
+			return false, true
+		default:
+			// All targeted and this producer is a notice: drop the notice
+			// itself (a full targeted queue must not lose its replies).
+			rt.deliverMu.Unlock()
+			rt.broadcast(WSMessage{Type: "notice", Kind: "delivery", Success: false,
+				Content: "A background message was dropped (delivery queue full)."})
+			return true, false
 		}
 	}
 	rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: text, Kind: deliverSystem, Source: src})
@@ -326,7 +379,7 @@ func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) bool {
 	case rt.deliverNotify <- struct{}{}:
 	default:
 	}
-	return true
+	return true, false
 }
 
 // --- parent-scoped delivery (survives runtime eviction) ---
@@ -361,7 +414,7 @@ func (r *sessionRegistry) queueParentDelivery(parentID, text string) {
 	r.parentDeliverMu.Lock()
 	defer r.parentDeliverMu.Unlock()
 	q := r.parentDeliveries[parentID]
-	if len(q) >= defaultDeliverQueueCap {
+	if len(q) >= maxParentDeliveryQueue {
 		q = append([]string(nil), q[1:]...) // drop the oldest entry
 	}
 	r.parentDeliveries[parentID] = append(q, text)
@@ -395,11 +448,15 @@ func (r *sessionRegistry) clearParentDeliveries(id string) {
 }
 
 // deliverLoop is the per-runtime queue worker (at most one per runtime,
-// guarded by deliverWorker). It pops one queued item — a system delivery or
-// a user steering message, strict FIFO arrival order across both kinds —
-// waits for the session turn lock (the idle check), hands the lock to
-// startTurn (whose goroutine defers the unlock), and repeats until the
-// queue is empty.
+// guarded by deliverWorker). It pops the queue head — a user steering
+// message, a targeted send_message delivery, or a contiguous run of one-way
+// notices (strict FIFO arrival order across kinds: a batch stops at the
+// first user/targeted item) — waits for the session turn lock (the idle
+// check), hands the lock to startTurn (whose goroutine defers the unlock),
+// and repeats until the queue is empty. Notice runs share ONE turn so a
+// burst of completions costs one provider request instead of one per
+// notice; user and targeted items keep their own turns (each typed message
+// is its own turn, and the send_message reply capture is armed per turn).
 //
 // The worker wakes without polling when either a turn-lock holder releases
 // the lock (releaseTurn's broadcast — covering both a turn end and a brief
@@ -480,8 +537,28 @@ func (rt *sessionRuntime) deliverLoop() {
 			rt.releaseTurn()
 			continue
 		}
-		item = rt.pendingDeliver[0]
-		rt.pendingDeliver = rt.pendingDeliver[1:]
+		// Pop the head item; when it is a one-way NOTICE, also pop the
+		// contiguous run of notices behind it and deliver the run as ONE
+		// turn (one provider request) instead of one turn per notice. The
+		// run stops at a USER steering message (each typed message is its
+		// own turn) and at a TARGETED send_message delivery (its reply
+		// capture is armed per turn and must stay 1:1 with the tool call);
+		// strict FIFO across kinds is preserved because only a contiguous
+		// head run is taken.
+		batch := rt.pendingDeliver[:1]
+		if batch[0].Kind == deliverSystem && batch[0].Source == deliverFromSystem {
+			n := 1
+			for n < len(rt.pendingDeliver) {
+				it := rt.pendingDeliver[n]
+				if it.Kind != deliverSystem || it.Source != deliverFromSystem {
+					break
+				}
+				n++
+			}
+			batch = rt.pendingDeliver[:n]
+		}
+		rt.pendingDeliver = rt.pendingDeliver[len(batch):]
+		item = batch[0]
 		rt.deliverMu.Unlock()
 		// A USER item left the queue to run: every attached client must see
 		// the queue state converge (the sending tab's optimistic queued
@@ -498,17 +575,25 @@ func (rt *sessionRuntime) deliverLoop() {
 		}
 		// The delivery-start hook arms per-delivery state exactly when the
 		// delivered turn begins — and ONLY for a send_message delivery
-		// (deliverFromChildMessage): the hook arms the continuable-
-		// subagent reply capture, and a child's reaction to any other
-		// machine message (job notice, subagent completion notice) must
-		// never be injected into its parent as a reply.
-		if item.Kind == deliverSystem && item.Source == deliverFromChildMessage && rt.deliverStartHook != nil {
-			rt.deliverStartHook()
+		// (deliverFromChildMessage). The callback receives that exact turn's
+		// output/error, so a child's reaction to any other machine message
+		// can never be injected into its parent as a reply.
+		var onResult func(string, error)
+		if item.Kind == deliverSystem && item.Source == deliverFromChildMessage {
+			if rt.deliverStartHook != nil {
+				rt.deliverStartHook()
+			}
+			onResult = rt.deliverResultFunc
 		}
-		// The drain pops ONE item per turn: the turn-end signal wakes the
-		// worker for the next one, so multiple queued items drain in order
-		// across consecutive turns.
-		rt.startTurn(nil, item.Text, item.Images)
+		// The turn-end signal wakes the worker for the next pop, so queued
+		// items drain in FIFO order across consecutive turns. A batched
+		// notice run is ONE turn (one provider request); user and targeted
+		// items keep one turn each.
+		text := item.Text
+		if len(batch) > 1 {
+			text = joinDeliveryTexts(batch)
+		}
+		rt.startTurnWithResult(nil, text, item.Images, onResult)
 	}
 }
 
@@ -534,4 +619,19 @@ func (rt *sessionRuntime) hasPendingDeliveries() bool {
 	rt.deliverMu.Lock()
 	defer rt.deliverMu.Unlock()
 	return len(rt.pendingDeliver) > 0
+}
+
+// joinDeliveryTexts merges a batch of one-way system notices into a single
+// turn input: one block per notice, blank-line separated so the model reads
+// them as distinct deliveries (each already carries its own "[job …]" /
+// "[subagent …]" prefix).
+func joinDeliveryTexts(batch []deliverItem) string {
+	var b strings.Builder
+	for i, it := range batch {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(it.Text)
+	}
+	return b.String()
 }

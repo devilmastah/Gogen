@@ -17,22 +17,20 @@ import (
 
 // Continuable (background) subagents: children that keep running after the
 // parent's tool call returns, can be messaged (send_message), interrupted
-// (interrupt_agent), and listed (list_agents, including each child's latest
-// progress line — the pull path). Web host only in v1 (the TUI spawner
-// stays foreground-only, so
-// its agents never see the continuable tools or the run_in_background
-// parameter).
+// (interrupt_agent), listed (list_agents), waited on (wait_agent), and queried
+// for their authoritative result (get_agent_result). Web host only in v1
+// (the TUI spawner stays foreground-only, so its agents never see the
+// continuable tools or the run_in_background parameter).
 //
 // Lifecycle:
 //   - SpawnBackground creates and registers the child exactly like the
 //     foreground Spawn, then runs the turn in a goroutine instead of
 //     blocking. The runtime is marked held, so orphan eviction (no clients,
 //     no turn) never collects it mid-lifecycle.
-//   - On natural completion the final report is delivered to the parent
-//     conversation (delivery service; queued for the session's next
-//     registration when the parent runtime is not live — an
-//     orphan-evicted/closed parent must not lose the outcome) and a
-//     retention timer is armed.
+//   - On natural completion a compact terminal event is delivered to the
+//     parent conversation (queued for the session's next registration when
+//     the parent runtime is not live). The authoritative bounded report is
+//     pulled with get_agent_result and remains persisted after live release.
 //   - Finished children stay registered for a retention window (bounded
 //     memory), then are released: held cleared, runtime evicted (the saved
 //     session stays attachable via the sidebar).
@@ -40,8 +38,8 @@ import (
 //   - When the PARENT session is evicted (closed/cap/orphan), all of its
 //     children are cancelled and released (fail-safe: a child whose parent
 //     is gone cannot deliver anyway).
-//   - interrupt_agent cancels only the in-flight turn; the child stays
-//     alive and continuable (no completion notice for an interruption).
+//   - interrupt_agent cancels the current main or follow-up turn; the child
+//     stays alive and continuable (no terminal event for an interruption).
 
 const (
 	// defaultSubagentRetain is how long a finished continuable child stays
@@ -71,7 +69,17 @@ type backgroundChild struct {
 	// listing shows oldest first (newest last).
 	createdAt time.Time
 	rt        *sessionRuntime
-	sp        *subagentSpawner // owning spawner (for parent lookup in onTurnEnd)
+	sp        *subagentSpawner // owning spawner (for parent delivery)
+	// runCancel is installed before the child is published and remains valid
+	// for the main run's whole lifetime. InterruptAgent can therefore cancel
+	// a just-spawned child even before its turn goroutine registers a stream
+	// handle, closing the old registration race.
+	runCancel context.CancelFunc
+	// done is closed exactly once when the main run reaches a terminal or
+	// interrupted state. WaitAgent waits on this one-shot signal and reads the
+	// authoritative result from the fields above after it closes.
+	done     chan struct{}
+	doneOnce sync.Once
 
 	mu           sync.Mutex
 	status       string // "running" | "idle" | "finished"
@@ -79,23 +87,58 @@ type backgroundChild struct {
 	err          error  // final error (status finished)
 	finishedAt   time.Time
 	released     bool
-	pendingReply bool // a send_message delivery is in flight; capture the next turn's reply
-	replyBase    int  // len(SnapshotMessages()) when the delivery turn started
-	// replyErr is the delivered reply turn's failure, captured by the turn
-	// error hook (armed with pendingReply): when the turn produces no
-	// assistant message, the parent's no-reply notice carries this instead
-	// of the generic text. Nil for a cancelled turn (the cancel path does
-	// not fire the error hook) and for a turn that simply produced nothing.
-	replyErr error
-	// turnStart is when the captured delivery turn started (set with
-	// pendingReply). The reply scan's index baseline (replyBase) stops
-	// bounding the turn when auto-compaction renumbers the history mid-turn;
-	// the scan then falls back to the assistant messages appended at or
-	// after this timestamp.
-	turnStart time.Time
+	pendingReply bool // a send_message delivery is in flight; capture its exact result
 }
 
-// childRegistry owns the live continuable children of a server.
+type subagentEventKind uint8
+
+const (
+	subagentEventTerminal subagentEventKind = iota
+	subagentEventReply
+)
+
+// subagentEvent is the typed, host-mediated child-to-parent event. Text is
+// produced only at the delivery boundary; identity, kind, and result remain
+// structured for routing, tests, and future non-text consumers. A raw Go
+// channel is deliberately not exposed to the model/parent Agent: transcript
+// writes still belong to the serialized parent delivery worker.
+type subagentEvent struct {
+	Kind     subagentEventKind
+	ChildID  string
+	ParentID string
+	Label    string
+	Text     string
+	Err      error
+}
+
+func (e subagentEvent) parentMessage() string {
+	switch e.Kind {
+	case subagentEventTerminal:
+		return e.Text
+	case subagentEventReply:
+		if e.Text == "" {
+			msg := fmt.Sprintf("[subagent %s] no reply (the turn failed or was interrupted before producing one)", e.Label)
+			if e.Err != nil {
+				msg = fmt.Sprintf("[subagent %s] no reply (the turn failed: %v)", e.Label, e.Err)
+			}
+			return msg
+		}
+		return fmt.Sprintf("[subagent %s] %s", e.Label, agent.TruncateSubagentReport(e.Text))
+	default:
+		return e.Text
+	}
+}
+
+func (c *backgroundChild) deliverEvent(event subagentEvent) {
+	event.ChildID = c.id
+	event.ParentID = c.parentID
+	event.Label = c.label
+	c.sp.deliverEvent(event)
+}
+
+// childRegistry owns the live continuable children of a server. A nil
+// registry means the foreground-only test path; continuable methods report
+// unsupported rather than panicking.
 type childRegistry struct {
 	mu       sync.Mutex
 	children map[string]*backgroundChild
@@ -119,7 +162,35 @@ func (cr *childRegistry) register(c *backgroundChild) {
 	cr.children[c.id] = c
 }
 
+// hasLiveChildren reports whether parentID still has a continuable child
+// registered — i.e. background subagent work that a registry eviction would
+// destroy, because the eviction hook (cancelAll) cancels every live child of
+// an evicted parent. Wired into sessionRegistry.bgWorkHook so the eviction
+// paths treat such a parent as NOT idle (see keepsBackgroundWork), exactly
+// like a running shell job or terminal.
+//
+// A released child is already out of the map (releaseChild deletes under mu),
+// so only genuinely live work counts. Leaf lock (mu): every critical section
+// releases it before calling into the registry, so the registry's cap
+// eviction may consult this while holding its own lock.
+func (cr *childRegistry) hasLiveChildren(parentID string) bool {
+	if cr == nil {
+		return false
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	for _, c := range cr.children {
+		if c.parentID == parentID {
+			return true
+		}
+	}
+	return false
+}
+
 func (cr *childRegistry) get(id string) *backgroundChild {
+	if cr == nil {
+		return nil
+	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	return cr.children[id]
@@ -128,6 +199,9 @@ func (cr *childRegistry) get(id string) *backgroundChild {
 // childrenOf returns the live children of parentID (id → child), newest
 // last (registration order, by createdAt).
 func (cr *childRegistry) childrenOf(parentID string) []*backgroundChild {
+	if cr == nil {
+		return nil
+	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	var out []*backgroundChild
@@ -222,12 +296,6 @@ func (cr *childRegistry) spawnCapExceeded(parentID string, limit, guard int) (ac
 	return cr.activeCountLocked(parentID) > limit, cr.liveCountLocked(parentID) > guard
 }
 
-func (c *backgroundChild) setStatus(s string) {
-	c.mu.Lock()
-	c.status = s
-	c.mu.Unlock()
-}
-
 // finish records the main-job outcome and closes done.
 func (c *backgroundChild) finish(report string, err error) {
 	c.mu.Lock()
@@ -236,6 +304,19 @@ func (c *backgroundChild) finish(report string, err error) {
 	c.err = err
 	c.finishedAt = time.Now()
 	c.mu.Unlock()
+	c.doneOnce.Do(func() { close(c.done) })
+}
+
+// markInterrupted records the main run's intentional cancellation and wakes
+// waiters without manufacturing a terminal result. The child remains
+// continuable through send_message.
+func (c *backgroundChild) markInterrupted() {
+	c.mu.Lock()
+	if c.status == "running" {
+		c.status = "idle"
+	}
+	c.mu.Unlock()
+	c.doneOnce.Do(func() { close(c.done) })
 }
 
 func (c *backgroundChild) isFinished() bool {
@@ -256,21 +337,14 @@ func (c *backgroundChild) isRunning() bool {
 
 // busy reports whether the child has lifecycle work a release would cut
 // short: an active turn, a send_message delivery queued for the delivery
-// worker but not yet turned into one, or a captured reply not yet delivered
-// to the parent. The last two cover the delivery handoffs the turn state
-// alone reads as idle: the worker holds the queued item until it has
-// ACQUIRED the turn lock (deliverLoop's peek-not-pop contract), and
-// deliverStartHook arms pendingReply before startTurn sets the turn active
-// — with the mirror-image window at turn end, where setTurnActive(false)
-// runs before the turn-end hook consumes the reply. Takes no locks on
-// entry; c.mu, rt.stateMu and rt.deliverMu are leaf locks (the documented
-// children.mu → c.mu order, never the reverse).
+// worker but not yet turned into one, or an exact reply result armed but not
+// yet delivered to the parent. Takes no locks on entry; c.mu, rt.stateMu and
+// rt.deliverMu are leaf locks (the documented children.mu → c.mu order,
+// never the reverse).
 func (c *backgroundChild) busy() bool {
 	// An evicted runtime can no longer run the work the checks below
-	// protect. In particular, a capture armed by a delivery whose turn
-	// never started (the evicted early return in runTurnBody skips the
-	// turn-end hook that consumes pendingReply) would otherwise read busy
-	// forever and re-arm the retention timer — pinning a dead record.
+	// protect. An exact-result capture whose callback will never run must not
+	// pin the child record and re-arm its retention timer forever.
 	if c.rt.evicted.Load() {
 		return false
 	}
@@ -307,78 +381,34 @@ func (c *backgroundChild) latestProgress() string {
 // listing line, not content: the full transcript stays in the child's pane).
 const maxAgentProgressLine = 160
 
-// onTurnEnd is installed as the child runtime's turn-end hook: when a
-// send_message delivery's turn has ended, the child's last assistant reply
-// is injected into the parent conversation as ONE bounded message (delivery
-// service; dropped when the parent is gone) — the single return channel for
-// that run.
-func (c *backgroundChild) onTurnEnd() {
+// onTurnResult receives the exact output and error returned by one
+// send_message delivery turn. Using the turn's return value avoids inferring
+// a reply by scanning (and potentially misidentifying) transcript messages
+// after tool rounds or auto-compaction.
+func (c *backgroundChild) onTurnResult(reply string, replyErr error) {
 	c.mu.Lock()
 	if !c.pendingReply {
 		c.mu.Unlock()
 		return
 	}
 	c.pendingReply = false
-	base := c.replyBase
-	turnStart := c.turnStart
-	replyErr := c.replyErr
-	c.replyErr = nil
 	c.mu.Unlock()
 
-	msgs := c.rt.agent.SnapshotMessages()
-	var reply string
-	// Only messages the delivered turn actually produced count as the
-	// reply: an interrupted turn (no completed round) appends nothing, so
-	// the scan finds nothing and no stale assistant message is re-sent.
-	for i := len(msgs) - 1; i >= base; i-- {
-		if msgs[i].Role == "assistant" && msgs[i].Content != "" {
-			reply = msgs[i].Content
-			break
-		}
-	}
-	// The delivered turn may have auto-compacted the child's history,
-	// renumbering the messages so the index baseline no longer bounds the
-	// turn (the reply can sit BELOW base). Fall back to the timestamp
-	// floor: the delivered turn appends its assistant message at or after
-	// turnStart. Zero-timestamp fixtures (hand-built records in tests)
-	// skip the fallback, exactly like the pre-compaction code.
-	if reply == "" && !turnStart.IsZero() {
-		for i := len(msgs) - 1; i >= 0; i-- {
-			if msgs[i].Role != "assistant" || msgs[i].Content == "" || msgs[i].CreatedAt.IsZero() {
-				continue
-			}
-			if !msgs[i].CreatedAt.Before(turnStart) {
-				reply = msgs[i].Content
-				break
-			}
-		}
-	}
-	if reply == "" {
-		// The delivered turn produced no assistant message (provider
-		// failure, or an interrupt before any completed round). The run's
-		// ONE return channel must still deliver something — the parent's
-		// send_message tool result already said the message was delivered,
-		// so silence would leave it waiting for a reply that never comes.
-		// The notice carries no transcript text, so the interrupted-turn
-		// rule (never re-deliver an older report) holds. A runtime being
-		// torn down (release/cancelAll) informs nobody: its parent is
-		// leaving with it.
-		if !c.rt.evicted.Load() {
-			msg := fmt.Sprintf("[subagent %s] no reply (the turn failed or was interrupted before producing one)", c.label)
-			if replyErr != nil {
-				msg = fmt.Sprintf("[subagent %s] no reply (the turn failed: %v)", c.label, replyErr)
-			}
-			c.sp.s.registry.deliverToParent(c.parentID, msg)
-		}
+	if c.rt.evicted.Load() {
 		return
 	}
-	// Deliver to the live parent, or queue for its next registration when
-	// the parent runtime is not live (orphan-evicted/closed mid-reply).
-	// The reply is bounded like the completion notice: one message per run,
-	// never an unbounded transcript dump (OpenHands' context-flood issue;
-	// Anthropic's "pass lightweight references").
-	c.sp.s.registry.deliverToParent(c.parentID,
-		fmt.Sprintf("[subagent %s] %s", c.label, agent.TruncateSubagentReport(reply)))
+	c.deliverEvent(subagentEvent{Kind: subagentEventReply, Text: reply, Err: replyErr})
+}
+
+// deliverEvent routes one typed child event through the parent's serialized
+// delivery service. The method is currently a narrow seam around the existing
+// string delivery API; keeping identity/kind here prevents a future producer
+// from bypassing parent routing and gives tests a structured contract.
+func (sp *subagentSpawner) deliverEvent(event subagentEvent) {
+	if sp == nil || sp.s == nil || sp.s.registry == nil || event.ParentID == "" {
+		return
+	}
+	sp.s.registry.deliverToParent(event.ParentID, event.parentMessage())
 }
 
 // --- spawner implementation ---
@@ -443,6 +473,10 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 	if err != nil {
 		return "", err
 	}
+	// Own the main run from the moment the child record is created. A cancel
+	// requested before the goroutine gets scheduled is observed when the run
+	// begins, rather than being lost because no stream handle exists yet.
+	runCtx, runCancel := context.WithCancel(context.Background())
 	child := &backgroundChild{
 		id:        childRt.agent.SessionID,
 		parentID:  parent.SessionID,
@@ -451,41 +485,23 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 		createdAt: time.Now(),
 		rt:        childRt,
 		sp:        sp,
+		runCancel: runCancel,
+		done:      make(chan struct{}),
 		status:    "running",
 	}
 	sp.children.register(child)
 	// Held: orphan eviction must never collect a continuable child while
 	// it is alive or awaiting release.
 	childRt.held.Store(true)
-	// Reply capture: pendingReply is armed by the delivery-start hook (the
-	// send_message turn ACTUALLY starting — not when it was queued) and
-	// consumed by the turn-end hook, which injects the reply into the
-	// parent.
-	childRt.turnEndHook = child.onTurnEnd
-	// The delivered turn's failure (reportErr turns — delivery turns go
-	// through startTurn, whose error path fires this hook; the cancel path
-	// does not): recorded only while the reply capture is armed, so a
-	// child-pane turn's error can never masquerade as the reply's.
-	childRt.turnErrorHook = func(err error) {
-		child.mu.Lock()
-		if child.pendingReply {
-			child.replyErr = err
-		}
-		child.mu.Unlock()
-	}
+	// Reply capture is armed exactly when a send_message delivery starts,
+	// and completed with that invocation's exact output/error. No transcript
+	// scan or shared turn-end hook is involved.
 	childRt.deliverStartHook = func() {
 		child.mu.Lock()
 		child.pendingReply = true
-		child.replyErr = nil
-		// Baseline the child's history at delivery start so reply capture
-		// can only pick up messages the delivered turn actually produced —
-		// an interrupted turn (no completed round) must not re-deliver an
-		// older assistant message as the reply. turnStart is the same
-		// baseline as a timestamp, for the scan's compaction fallback.
-		child.replyBase = len(child.rt.agent.SnapshotMessages())
-		child.turnStart = time.Now().Truncate(time.Millisecond)
 		child.mu.Unlock()
 	}
+	childRt.deliverResultFunc = child.onTurnResult
 	sp.enforceChildCap(parent.SessionID)
 	// Spawn caps (checked after registration so concurrent spawns cannot
 	// slip past them): the just-registered child counts itself in both, so
@@ -528,7 +544,8 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 	sp.spawnWg.Add(1)
 	go func() {
 		defer sp.spawnWg.Done()
-		report, runErr := sp.runChildTurn(context.Background(), childRt, agent.FormatSubagentJob(rawJob))
+		defer runCancel()
+		report, runErr := sp.runChildTurn(runCtx, childRt, agent.FormatSubagentJob(rawJob))
 		// Sweep the orphan on EVERY exit path: a concurrent DELETE of the
 		// parent cascades the child's file away and a write that lands
 		// after that delete (the cancelled turn's final flush, or the
@@ -538,6 +555,7 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 		// covers the window before this check runs.)
 		sp.sweepOrphanedChild(childRt, parent.SessionID, child.id)
 		if childRt.evicted.Load() {
+			child.markInterrupted()
 			return // released while running (parent close / retention) — nothing to notify
 		}
 		if runErr != nil && errors.Is(runErr, context.Canceled) {
@@ -546,14 +564,14 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 			// retention timer so an idle interrupted child cannot linger in
 			// memory forever (the parent's lifetime no longer bounds it:
 			// orphan eviction does not cancel children).
-			child.setStatus("idle")
+			child.markInterrupted()
 			time.AfterFunc(sp.retainWindow(), func() { sp.maybeReleaseChild(child) })
 			return
 		}
 		child.finish(report, runErr)
 		// Persist the final outcome on the child's snapshot (the events
 		// are not replayed after a reload/restart, so the saved session is
-		// what the sidebar falls back to).
+		// what get_agent_result and the sidebar fall back to).
 		success := runErr == nil
 		childRt.agent.FinishSubagentOutcome(report, runErr)
 		// Enforce the per-parent finished cap NOW (spawn-time enforcement
@@ -576,18 +594,13 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 				SubagentSummary: summary,
 			})
 		}
-		// Deliver the completion notice — immediately when the parent is
-		// live, queued for its next registration otherwise (deliverToParent
-		// re-resolves the runtime, so this also covers the eviction race
-		// between the lookup above and the queue append). This is the
-		// child's ONE return channel for the run: state (finished/failed)
-		// plus the bounded outcome text. Nothing else pushes into the
-		// parent conversation, so there is nothing to dedup.
-		notice := fmt.Sprintf("[subagent %s] %s", label, verb)
-		if summary != "" {
-			notice += ": " + summary
-		}
-		s.registry.deliverToParent(parent.SessionID, notice)
+		// Queue a compact, correlated terminal event. The potentially large
+		// authoritative report is pulled with get_agent_result; keeping it out
+		// of the automatic parent turn prevents completion bursts from flooding
+		// the parent's context. The child id makes duplicate/truncated labels
+		// resolvable without guessing.
+		notice := fmt.Sprintf("[subagent %s] %s (%s). Use get_agent_result(agent_id=%q) for the full result.", child.id, label, verb, child.id)
+		child.deliverEvent(subagentEvent{Kind: subagentEventTerminal, Text: notice, Err: runErr})
 		// Retention: release the runtime after the window so finished
 		// children cannot accumulate in memory. The saved session stays
 		// attachable; release is idempotent (child.released).
@@ -610,9 +623,9 @@ func (sp *subagentSpawner) enforceChildCap(parentID string) {
 	overflow := len(finished) - sp.maxFinishedLimit()
 	var victims []*backgroundChild
 	if overflow > 0 {
-		// Oldest-first, but never a child whose reply work is still in
-		// flight (an active send_message turn, a delivery queued for the
-		// worker, or a captured reply): releaseChild would cancel the
+		// Oldest-first, but never a child whose exact-reply work is still
+		// in flight (an active send_message turn, a delivery queued for the
+		// worker, or an armed reply result): releaseChild would cancel the
 		// turn and drop the reply silently — the same trap the retention
 		// timer's busy check guards. A spared child is released by its own
 		// retention timer once it goes quiet (armed at finish), and the
@@ -643,8 +656,8 @@ func (sp *subagentSpawner) enforceChildCap(parentID string) {
 //     reads idle — checking only the turn state released the child here and
 //     silently dropped the queued message (the parent got no reply and no
 //     error);
-//   - a reply captured but not yet delivered to the parent (the delivery
-//     turn's acquire→start handoff and the end→hook window).
+//   - an exact reply result armed by a delivery but not yet delivered to
+//     the parent (the acquire→start handoff and the turn-result callback).
 //
 // Quiet children are released.
 func (sp *subagentSpawner) maybeReleaseChild(c *backgroundChild) {
@@ -678,6 +691,7 @@ func (sp *subagentSpawner) releaseChild(c *backgroundChild) {
 	// Finished children keep the outcome already written at completion;
 	// interrupted-idle children leave the status unset (still continuable).
 	if releasedMidRun {
+		c.markInterrupted()
 		c.rt.agent.SetSubagentOutcome("failed", "cancelled")
 		// Force the write: the cancelled turn's final flush may have
 		// already run (turn end racing the teardown), in which case the
@@ -686,12 +700,36 @@ func (sp *subagentSpawner) releaseChild(c *backgroundChild) {
 		// child as done instead of failed.
 		c.rt.agent.FlushSession()
 	}
-	c.rt.stream.cancelInFlight() // no-op when idle
+	if c.runCancel != nil {
+		c.runCancel()
+	}
+	c.rt.stream.cancelInFlight() // active delivery turns unwind; queued ones are discarded by eviction
 	c.rt.held.Store(false)
 	sp.s.registry.evictRuntime(c.rt)
 	// Releasing a child is an explicit teardown of its session: its own
 	// children (grandchildren) are cancelled and released in turn.
 	sp.s.registry.fireEvictHook(c.id)
+	sp.recheckParent(c.parentID)
+}
+
+// recheckParent re-runs the orphan check for a parent session that may have
+// been kept resident ONLY by the background work just released. The eviction
+// paths refuse to evict a session that still owns background work
+// (sessionRegistry.keepsBackgroundWork, which counts live background
+// children), so without this a parent whose last child just finished would
+// stay registered until the next unrelated detach — a residency leak
+// disguised as a deferred cleanup.
+//
+// Best-effort and re-entrant: it resolves the parent's live runtime, and
+// evictOrphanedIfPossible no-ops for an evicted, viewed, busy, or
+// still-working one.
+func (sp *subagentSpawner) recheckParent(parentID string) {
+	if parentID == "" {
+		return
+	}
+	if rt, ok := sp.s.registry.get(parentID); ok {
+		rt.evictOrphanedIfPossible()
+	}
 }
 
 // discardUnstartedChild tears down a child refused BEFORE its turn ever
@@ -717,12 +755,16 @@ func (sp *subagentSpawner) discardUnstartedChild(c *backgroundChild) {
 	c.released = true
 	delete(sp.children.children, c.id)
 	sp.children.mu.Unlock()
+	if c.runCancel != nil {
+		c.runCancel()
+	}
 	c.rt.held.Store(false)
 	sp.s.registry.evictRuntime(c.rt)
 	// Same teardown symmetry as releaseChild: the refused child cannot have
 	// children of its own, but the hook keeps the "every child teardown
 	// fires the evict hook" invariant future-proof.
 	sp.s.registry.fireEvictHook(c.id)
+	sp.recheckParent(c.parentID)
 }
 
 // cancelAll cancels and releases every live child of parentID. Wired to the
@@ -739,7 +781,10 @@ func (sp *subagentSpawner) cancelAll(parentID string) {
 	}
 	sp.children.mu.Unlock()
 	for _, c := range victims {
-		c.rt.stream.cancelInFlight() // stop an in-flight turn
+		if c.runCancel != nil {
+			c.runCancel()
+		}
+		c.rt.stream.cancelInFlight() // stop an active turn; release/eviction drops queued turns
 		sp.releaseChild(c)
 	}
 }
@@ -812,9 +857,10 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 	})
 
 	report, err := sp.runChildTurn(ctx, childRt, job)
+	report = agent.TruncateSubagentReport(report)
 	sp.finalizeForegroundChild(childRt, parentRt, label, report, err)
 	if err != nil {
-		return "", fmt.Errorf("subagent_fork %s: %w", newID, err)
+		return report, fmt.Errorf("subagent_fork %s: %w", newID, err)
 	}
 	return report, nil
 }
@@ -826,6 +872,9 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 func (sp *subagentSpawner) ListAgents(caller *agent.Agent) (string, error) {
 	if caller == nil {
 		return "", fmt.Errorf("list_agents: caller agent is nil")
+	}
+	if sp.children == nil {
+		return "", fmt.Errorf("list_agents: background subagents are not available in this mode")
 	}
 	children := sp.children.childrenOf(caller.SessionID)
 	if len(children) == 0 {
@@ -841,6 +890,114 @@ func (sp *subagentSpawner) ListAgents(caller *agent.Agent) (string, error) {
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
+// ownedBackgroundChild resolves a live child and enforces direct-parent
+// ownership. Every result/wait/control operation uses this same guard.
+func (sp *subagentSpawner) ownedBackgroundChild(caller *agent.Agent, agentID, operation string) (*backgroundChild, error) {
+	if caller == nil {
+		return nil, fmt.Errorf("%s: caller agent is nil", operation)
+	}
+	if sp.children == nil {
+		return nil, fmt.Errorf("%s: background subagents are not available in this mode", operation)
+	}
+	child := sp.children.get(agentID)
+	if child == nil {
+		return nil, fmt.Errorf("%s: subagent %s is not live (use get_agent_result for a released child's persisted result)", operation, agentID)
+	}
+	if child.parentID != caller.SessionID {
+		return nil, fmt.Errorf("%s: subagent %s is not a child of this session", operation, agentID)
+	}
+	return child, nil
+}
+
+// persistedAgentResult resolves a released child from the session store. The
+// ParentID check is the authorization boundary: a model must not retrieve a
+// nested session belonging to another parent.
+func (sp *subagentSpawner) persistedAgentResult(caller *agent.Agent, agentID string) (string, bool) {
+	if caller == nil || agentID == "" || sp.s == nil || sp.s.ws == nil || sp.s.ws.Store == nil {
+		return "", false
+	}
+	info := sp.s.ws.Store.Info(sp.s.ws.GetWorkingDir(), agentID)
+	if info == nil || info.ParentID != caller.SessionID {
+		return "", false
+	}
+	switch info.SubagentStatus {
+	case "success":
+		return fmt.Sprintf("Subagent %s finished.\n\n%s", agentID, info.SubagentSummary), true
+	case "failed":
+		return fmt.Sprintf("Subagent %s failed.\n\n%s", agentID, info.SubagentSummary), true
+	default:
+		return fmt.Sprintf("Subagent %s has no persisted terminal result yet; it may have been interrupted before completion.", agentID), true
+	}
+}
+
+// GetAgentResult implements agent.ContinuableSubagentSpawner. Live children
+// return their current status; terminal children return the in-memory result.
+// After retention release, the persisted child outcome remains authoritative.
+func (sp *subagentSpawner) GetAgentResult(caller *agent.Agent, agentID string) (string, error) {
+	child, err := sp.ownedBackgroundChild(caller, agentID, "get_agent_result")
+	if err != nil {
+		if persisted, ok := sp.persistedAgentResult(caller, agentID); ok {
+			return persisted, nil
+		}
+		return "", err
+	}
+	child.mu.Lock()
+	status, result, runErr := child.status, child.result, child.err
+	child.mu.Unlock()
+	if status == "running" {
+		line := child.latestProgress()
+		if line != "" {
+			return fmt.Sprintf("Subagent %s is still running. Latest progress: %s", agentID, line), nil
+		}
+		return fmt.Sprintf("Subagent %s is still running.", agentID), nil
+	}
+	if status == "idle" {
+		return fmt.Sprintf("Subagent %s was interrupted before completion and remains available for a follow-up message.", agentID), nil
+	}
+	if runErr != nil {
+		return fmt.Sprintf("Subagent %s failed: %v", agentID, runErr), nil
+	}
+	return fmt.Sprintf("Subagent %s finished.\n\n%s", agentID, agent.TruncateSubagentReport(result)), nil
+}
+
+// WaitAgent blocks on the child's main-run done channel, then delegates to
+// GetAgentResult. The channel is a one-shot internal signal, not a payload
+// transport: all authoritative data remains in the guarded child/store state.
+func (sp *subagentSpawner) WaitAgent(ctx context.Context, caller *agent.Agent, agentID string, timeout time.Duration) (string, error) {
+	child, err := sp.ownedBackgroundChild(caller, agentID, "wait_agent")
+	if err != nil {
+		if persisted, ok := sp.persistedAgentResult(caller, agentID); ok {
+			return persisted, nil
+		}
+		return "", err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var timer <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		timer = t.C
+	}
+	timedOut := false
+	select {
+	case <-child.done:
+	case <-timer:
+		timedOut = true
+	case <-ctx.Done():
+		return "", fmt.Errorf("waiting for subagent %s interrupted: %w (the child keeps running; wait again or interrupt it)", agentID, ctx.Err())
+	}
+	status, err := sp.GetAgentResult(caller, agentID)
+	if err != nil {
+		return "", err
+	}
+	if timedOut {
+		return status + fmt.Sprintf("\nWait timed out after %s; wait again or interrupt the child.", timeout), nil
+	}
+	return status, nil
+}
+
 func (c *backgroundChild) statusOf() string {
 	c.mu.Lock()
 	status := c.status
@@ -853,25 +1010,26 @@ func (c *backgroundChild) statusOf() string {
 
 // SendMessage implements agent.ContinuableSubagentSpawner: the message is
 // delivered through the child's own delivery service (queued when the child
-// is mid-turn); the child's reply is captured by the turn-end hook and
-// injected into the parent.
+// is mid-turn); the exact reply result is delivered to the parent.
 func (sp *subagentSpawner) SendMessage(caller *agent.Agent, agentID, text string) error {
-	if caller == nil {
-		return fmt.Errorf("send_message: caller agent is nil")
-	}
-	child := sp.children.get(agentID)
-	if child == nil {
-		return fmt.Errorf("send_message: subagent %s is not live (finished children are released after their retention window)", agentID)
-	}
-	if child.parentID != caller.SessionID {
-		return fmt.Errorf("send_message: subagent %s is not a child of this session", agentID)
+	child, err := sp.ownedBackgroundChild(caller, agentID, "send_message")
+	if err != nil {
+		return err
 	}
 	// The message itself is delivered through the child's delivery service
 	// (queued when the child is mid-turn); reply capture is armed by the
 	// delivery-start hook when the delivered turn actually begins.
 	// deliverChildMessage is the dedicated source: it is the only system
 	// delivery that arms the capture (deliverFromChildMessage).
-	if !child.rt.deliverChildMessage(text) {
+	ok, full := child.rt.deliverChildMessage(text)
+	if !ok {
+		if full {
+			// Every slot of the child's system queue holds a targeted
+			// delivery: refuse rather than silently dropping a message
+			// whose reply the parent is waiting on. The error is
+			// actionable — the model can retry after the child drains.
+			return fmt.Errorf("send_message: subagent %s is busy and its delivery queue is full (%d queued messages); wait for it to finish its current turn or reply, then retry", agentID, maxSystemDeliveryQueue)
+		}
 		// The child's runtime was evicted between the registry lookup and
 		// the queue append (e.g. the retention release racing this send):
 		// report the loss instead of dropping the message silently — the
@@ -882,17 +1040,16 @@ func (sp *subagentSpawner) SendMessage(caller *agent.Agent, agentID, text string
 }
 
 // InterruptAgent implements agent.ContinuableSubagentSpawner: cancels the
-// child's in-flight turn (no-op when idle); the child stays alive.
+// child's current main or follow-up turn (no-op when idle); the child stays
+// alive. runCancel closes the main run's pre-start registration window;
+// the stream handle covers a follow-up turn once it has started.
 func (sp *subagentSpawner) InterruptAgent(caller *agent.Agent, agentID string) error {
-	if caller == nil {
-		return fmt.Errorf("interrupt_agent: caller agent is nil")
+	child, err := sp.ownedBackgroundChild(caller, agentID, "interrupt_agent")
+	if err != nil {
+		return err
 	}
-	child := sp.children.get(agentID)
-	if child == nil {
-		return fmt.Errorf("interrupt_agent: subagent %s is not live", agentID)
-	}
-	if child.parentID != caller.SessionID {
-		return fmt.Errorf("interrupt_agent: subagent %s is not a child of this session", agentID)
+	if child.runCancel != nil {
+		child.runCancel()
 	}
 	child.rt.stream.cancelInFlight()
 	return nil

@@ -144,6 +144,10 @@ type configYAML struct {
 	Terminal                  string                        `yaml:"terminal,omitempty"`
 	JobNotices                string                        `yaml:"job_notices,omitempty"`
 	Automations               string                        `yaml:"automations,omitempty"`
+	StatusDisplay             string                        `yaml:"status_display,omitempty"`
+	StatusDisplayHost         string                        `yaml:"status_display_host,omitempty"`
+	StatusDisplayToken        string                        `yaml:"status_display_token,omitempty"`
+	StatusDisplaySource       string                        `yaml:"status_display_source,omitempty"`
 	OutputSpill               string                        `yaml:"output_spill,omitempty"`
 	SessionMaxCount           int                           `yaml:"session_max_count,omitempty"`
 	SessionMaxAgeDays         int                           `yaml:"session_max_age_days,omitempty"`
@@ -232,6 +236,9 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		Terminal:                  omitDefaultString(cfg.Terminal, def.Terminal),
 		JobNotices:                omitDefaultString(cfg.JobNotices, def.JobNotices),
 		Automations:               omitDefaultString(cfg.Automations, def.Automations),
+		StatusDisplay:             omitDefaultString(cfg.StatusDisplay, def.StatusDisplay),
+		StatusDisplayHost:         omitDefaultString(cfg.StatusDisplayHost, def.StatusDisplayHost),
+		StatusDisplaySource:       omitDefaultString(cfg.StatusDisplaySource, def.StatusDisplaySource),
 		OutputSpill:               omitDefaultString(cfg.OutputSpill, def.OutputSpill),
 		SessionMaxCount:           omitDefaultInt(cfg.SessionMaxCount, def.SessionMaxCount),
 		SessionMaxAgeDays:         omitDefaultInt(cfg.SessionMaxAgeDays, def.SessionMaxAgeDays),
@@ -251,6 +258,12 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		// The auth token is a secret (like openai_api_key): persisted only
 		// with --save-config-secrets / a forced provider save.
 		out.WebAuthToken = cfg.WebAuthToken
+	}
+	if opts.IncludeSecrets && cfg.StatusDisplayToken != "" {
+		// Same secret rule as web_auth_token: a display token entered in
+		// the settings modal survives a restart (the modal save forces the
+		// secret write), but it is never echoed by a plain save.
+		out.StatusDisplayToken = cfg.StatusDisplayToken
 	}
 	if !opts.IncludeSecrets && len(cfg.OpenAIProviders) > 0 {
 		// Copy without api_key so provider keys are never persisted without

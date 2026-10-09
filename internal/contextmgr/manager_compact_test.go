@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gogen/internal/llm"
 )
@@ -253,6 +254,96 @@ func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 	}
 	if out[3].Role != "tool" || out[3].ToolCallID != "c1" {
 		t.Fatalf("expected tool result preserved in tail, got %+v", out[3])
+	}
+}
+
+// TestCompactAppendsExecutedCallRoster pins the deterministic executed-call
+// index on compaction summaries: every tool call in the summarized middle is
+// listed by call id, tool name, and the first line of its result, so ids
+// returned by tools (background job ids above all) survive the model's recap.
+func TestCompactAppendsExecutedCallRoster(t *testing.T) {
+	provider := &stubProvider{summary: "recap"}
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 2})
+	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: strings.Repeat("middle filler ", 40)},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_bg", Name: "execute_command"}}},
+		{Role: "tool", ToolCallID: "call_bg", Content: "Started background job job-abc123.\nCommand: sleep 600"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_read", Name: "read_file"}}},
+		{Role: "tool", ToolCallID: "call_read", Content: "\n\npackage main"},
+		{Role: "assistant", Content: "done"},
+		{Role: "user", Content: "next"},
+	}
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := out[1].Content
+	if !strings.HasPrefix(summary, SummaryPrefix) {
+		t.Fatalf("expected the summary at index 1, got %q", summary)
+	}
+	for _, want := range []string{
+		executedCallRosterHeader + " — 2 executed",
+		"call_bg execute_command: Started background job job-abc123.",
+		"call_read read_file: package main",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary missing %q:\n%s", want, summary)
+		}
+	}
+}
+
+// TestBuildExecutedCallRoster pins the roster's deterministic shape: model
+// order, one line per call, first-line result heads, placeholders for
+// malformed calls, and the explicit omission marker when the byte budget is
+// exceeded.
+func TestBuildExecutedCallRoster(t *testing.T) {
+	middle := []llm.Message{
+		{Role: "user", Content: "not a call"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{
+			{ID: "call_1", Name: "execute_command"},
+			{ID: "call_2", Name: "background_job"},
+			{},
+		}},
+		{Role: "tool", ToolCallID: "call_1", Content: "Started background job job-abc.\nmore"},
+		{Role: "tool", ToolCallID: "call_2", Content: "Job job-abc FINISHED in 1s with exit code 0."},
+	}
+	want := executedCallRosterHeader + " — 3 executed\n" +
+		"- call_1 execute_command: Started background job job-abc.\n" +
+		"- call_2 background_job: Job job-abc FINISHED in 1s with exit code 0.\n" +
+		"- unknown-id unknown-tool\n"
+	if got := buildExecutedCallRoster(middle); got != want {
+		t.Fatalf("roster = %q, want %q", got, want)
+	}
+
+	// A tiny budget lists the first entry, then names the omission.
+	got := buildExecutedCallRosterBudget(middle, 1)
+	if !strings.Contains(got, "call_1 execute_command") ||
+		!strings.Contains(got, "2 more executed call(s) omitted") {
+		t.Fatalf("budgeted roster = %q", got)
+	}
+
+	// Call-free middles carry no roster.
+	if got := buildExecutedCallRoster([]llm.Message{{Role: "user", Content: "hi"}}); got != "" {
+		t.Fatalf("roster for a call-free middle = %q", got)
+	}
+}
+
+// TestFirstResultLine pins the head extraction: blank leading lines are
+// skipped, the cut is rune-safe, and a result shorter than the cap passes
+// through unchanged.
+func TestFirstResultLine(t *testing.T) {
+	if got := firstResultLine("\n\n  Started background job job-abc.  \nextra"); got != "Started background job job-abc." {
+		t.Fatalf("firstResultLine = %q", got)
+	}
+	if got := firstResultLine(""); got != "" {
+		t.Fatalf("empty result head = %q", got)
+	}
+	long := strings.Repeat("a", maxCallRosterHeadBytes-1) + "日本語"
+	got := firstResultLine(long)
+	if !utf8.ValidString(got) || !strings.Contains(got, "…") {
+		t.Fatalf("long head not rune-safe truncated: %q", got)
 	}
 }
 
