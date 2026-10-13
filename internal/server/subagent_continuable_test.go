@@ -84,11 +84,12 @@ func continuableSpawner(t *testing.T, s *Server) *subagentSpawner {
 }
 
 // waitForParentDeliveriesSettled waits until the parent session's delivery
-// machinery is quiescent: no turn running, nothing queued, and the delivery
-// worker idle. The delivery turn appends its message to the transcript
-// before its final flush completes, so observing the message is not enough —
-// the disk write must land before the test's TempDir is removed, or the
-// cleanup sporadically fails with "directory not empty".
+// machinery is quiescent (sessionRuntimeQuiescent): no turn running, nothing
+// queued, the delivery worker idle, and the turn lock free. The delivery turn
+// appends its message to the transcript before its final flush completes, so
+// observing the message is not enough — the disk write must land before the
+// test's TempDir is removed, or the cleanup sporadically fails with
+// "directory not empty".
 func waitForParentDeliveriesSettled(t *testing.T, s *Server, a *agent.Agent) {
 	t.Helper()
 	rt, ok := s.registry.get(a.SessionID)
@@ -97,15 +98,43 @@ func waitForParentDeliveriesSettled(t *testing.T, s *Server, a *agent.Agent) {
 		// (and flushed): nothing can be in flight.
 		return
 	}
-	waitFor(t, 5*time.Second, func() bool {
-		if active, _ := rt.turnState(); active {
-			return false
-		}
-		if rt.hasPendingDeliveries() {
-			return false
-		}
-		return !rt.deliverWorker.Load()
-	})
+	waitFor(t, 5*time.Second, func() bool { return sessionRuntimeQuiescent(rt) })
+}
+
+// sessionRuntimeQuiescent reports whether rt can no longer start work that
+// writes to disk: no turn running, no queued delivery, the delivery worker
+// idle — AND the turn lock free.
+//
+// The lock check is the handoff the other three signals miss. deliverLoop
+// pops an item while HOLDING turnMu and passes ownership to the turn
+// goroutine startTurnWithResult spawns, but it empties the queue and clears
+// deliverWorker BEFORE spawning it. A probe that stops at the first three
+// signals therefore reads the runtime as quiet during the pop→start window —
+// while the worker still owns the lock and the turn has not yet set
+// turnActive — and the test's TempDir removal then races the turn's own
+// flush, which recreates .gogen/sessions through the atomic writer's
+// MkdirAll ("TempDir RemoveAll cleanup: ... directory not empty"). This is
+// the same signal production asks for the same question: evictOrphaned
+// decides "this runtime is idle" with rt.turnMu.TryLock, which cannot win
+// during the handoff.
+func sessionRuntimeQuiescent(rt *sessionRuntime) bool {
+	if active, _ := rt.turnState(); active {
+		return false
+	}
+	if rt.hasPendingDeliveries() {
+		return false
+	}
+	if rt.deliverWorker.Load() {
+		return false
+	}
+	if !rt.turnMu.TryLock() {
+		return false // a turn holds the lock: it runs, or the delivery worker is mid-handoff
+	}
+	// Release through the production helper, not turnMu.Unlock: it also
+	// broadcasts the release, so a delivery worker parked on the release
+	// signal re-probes now instead of waiting for the next wake-up.
+	rt.releaseTurn()
+	return true
 }
 
 // TestBackgroundSpawnCompletionNotice drives the full background path: the
@@ -293,6 +322,63 @@ func TestSendMessageQueueFullRefuses(t *testing.T) {
 }
 
 var errFailedReply = errors.New("provider exploded")
+
+// TestSessionRuntimeQuiescentCoversDeliveryHandoff pins the quiescence
+// probe the TempDir cleanups rely on. Simulating the delivery worker's
+// pop→start handoff (item popped, queue empty, deliverWorker cleared, turn
+// goroutine not yet running — so turnActive is still false) the runtime must
+// NOT read quiescent: the worker still owns the turn lock and the turn's
+// flush is about to write. A probe that stopped at the queue/worker/turn
+// signals let that write race the test's TempDir removal.
+func TestSessionRuntimeQuiescentCoversDeliveryHandoff(t *testing.T) {
+	rt := &sessionRuntime{}
+
+	// Quiet runtime: nothing running, nothing queued, no worker.
+	if !sessionRuntimeQuiescent(rt) {
+		t.Fatal("an untouched runtime must read quiescent")
+	}
+
+	// A queued delivery alone is enough to hold the answer at "no".
+	rt.deliverMu.Lock()
+	rt.pendingDeliver = []deliverItem{{ID: newQueueItemID(), Text: "notice", Kind: deliverSystem, Source: deliverFromSystem}}
+	rt.deliverMu.Unlock()
+	if sessionRuntimeQuiescent(rt) {
+		t.Fatal("a runtime with a queued delivery must not read quiescent")
+	}
+
+	// The handoff window: the worker popped the item (queue empty) and
+	// cleared deliverWorker, but still holds turnMu while the turn
+	// goroutine it just spawned has not started yet.
+	rt.deliverMu.Lock()
+	rt.pendingDeliver = nil
+	rt.deliverMu.Unlock()
+	rt.deliverWorker.Store(true)
+	rt.turnMu.Lock()
+	rt.deliverWorker.Store(false)
+	if sessionRuntimeQuiescent(rt) {
+		rt.turnMu.Unlock()
+		t.Fatal("the delivery worker's pop→start handoff must not read quiescent")
+	}
+
+	// A running turn: turnActive with the lock free is still busy.
+	rt.turnMu.Unlock()
+	rt.setTurnActive(true, time.Now(), nil)
+	if sessionRuntimeQuiescent(rt) {
+		rt.setTurnActive(false, time.Time{}, nil)
+		t.Fatal("a runtime with a running turn must not read quiescent")
+	}
+	rt.setTurnActive(false, time.Time{}, nil)
+
+	// Lock handed back: quiescent again (and the probe's probe-and-release
+	// must not leave the lock held).
+	if !sessionRuntimeQuiescent(rt) {
+		t.Fatal("an idle runtime must read quiescent again once the handoff ends")
+	}
+	if !rt.turnMu.TryLock() {
+		t.Fatal("the quiescence probe left the turn lock held")
+	}
+	rt.releaseTurn()
+}
 
 // TestBackgroundChildBusy pins the release-safety predicate: a quiet child
 // is not busy; a send_message delivery queued for the delivery worker (not
