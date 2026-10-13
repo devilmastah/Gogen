@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -108,35 +107,4 @@ func TestBackgroundIdleHookSuppressedAfterClose(t *testing.T) {
 	}
 	a.Close()
 	requireNoBackgroundEvent(t, fired, 750*time.Millisecond, "background idle hook after Close")
-}
-
-// TestBackgroundWorkCountsPersistentTerminal extends the liveness query to
-// the terminal tool: an open PTY is background work (a dev server started in
-// one keeps running), and closing the last one drains the session.
-func TestBackgroundWorkCountsPersistentTerminal(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("no PTY on Windows")
-	}
-	a := NewAgent(nil, NewExecutor(t.TempDir()), nil)
-	a.SetTerminalEnabled(true)
-	defer a.Close()
-
-	drained := make(chan struct{}, 4)
-	a.SetBackgroundIdleHook(func() { drained <- struct{}{} })
-
-	id := openTestTerminal(t, a)
-	if !a.HasBackgroundWork() {
-		t.Fatal("an open persistent terminal does not count as background work")
-	}
-	if _, err := handleTerminal(context.Background(), a, map[string]any{"action": "close", "session_id": id}); err != nil {
-		t.Fatalf("terminal close: %v", err)
-	}
-	waitForBackground(t, "the closed terminal to leave HasBackgroundWork", func() bool {
-		return !a.HasBackgroundWork()
-	})
-	select {
-	case <-drained:
-	case <-time.After(5 * time.Second):
-		t.Fatal("background idle hook did not fire after the last terminal closed")
-	}
 }

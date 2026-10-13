@@ -61,9 +61,25 @@ func TestSaveLoadModelProviderRoundTrip(t *testing.T) {
 		t.Fatalf("round trip: model=%q provider=%q, want deepseek-v4-flash/deepseek", loaded.Model, loaded.ModelProvider)
 	}
 
-	// Legacy file: no modelProvider field at all.
+	// Legacy file: no modelProvider field at all. Marshalled (not string
+	// concatenated) so the workingDir — an absolute path, backslash-laden on
+	// Windows — is escaped: a raw `"C:\Users\..."` is not a valid JSON string,
+	// and json.Marshal is exactly what the production Save path uses.
+	legacyBody, err := json.Marshal(map[string]any{
+		"version":    1,
+		"id":         "legacy",
+		"created":    "2026-01-01T00:00:00Z",
+		"updated":    "2026-01-01T00:00:00Z",
+		"workingDir": dir,
+		"model":      "gpt-4o",
+		"mode":       "act",
+		"messages":   []any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	legacy := filepath.Join(dir, ".gogen", "sessions", "legacy.json")
-	if err := os.WriteFile(legacy, []byte(`{"version":1,"id":"legacy","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z","workingDir":"`+dir+`","model":"gpt-4o","mode":"act","messages":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(legacy, legacyBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	legacyLoaded, err := store.LoadInWorkingDir(dir, "legacy")
