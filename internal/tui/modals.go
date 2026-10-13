@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
@@ -541,7 +540,7 @@ type styleLine struct {
 // padding a styled string with it never applied and the columns it was
 // used on rendered ragged.
 func padVisible(s string, n int) string {
-	if w := lipgloss.Width(s); w < n {
+	if w := cellWidth(s); w < n {
 		return s + strings.Repeat(" ", n-w)
 	}
 	return s
@@ -584,7 +583,7 @@ func (m *Model) renderBorderedModalWidth(rows []styleLine, minInner int) string 
 	// Compute max visible width of plain text (strip ANSI for measurement).
 	maxW := 0
 	for _, r := range rows {
-		w := lipgloss.Width(r.text)
+		w := cellWidth(r.text)
 		if w > maxW {
 			maxW = w
 		}
@@ -617,8 +616,8 @@ func (m *Model) renderBorderedModalWidth(rows []styleLine, minInner int) string 
 		text := r.text
 		// Truncate ANSI-aware to the clamped content width before any
 		// styling or padding so every row fits the box budget.
-		if lipgloss.Width(text) > contentW {
-			text = ansi.Cut(text, 0, contentW)
+		if cellWidth(text) > contentW {
+			text = cutCells(text, 0, contentW)
 		}
 		b.WriteString("│  ")
 		if r.preStyled {
@@ -634,7 +633,7 @@ func (m *Model) renderBorderedModalWidth(rows []styleLine, minInner int) string 
 			b.WriteString(ansiReset)
 		}
 		// Fill remaining content width after text.
-		pad := contentW - lipgloss.Width(text)
+		pad := contentW - cellWidth(text)
 		if pad > 0 {
 			b.WriteString(strings.Repeat(" ", pad))
 		}
@@ -845,20 +844,20 @@ func buildThinkingChipRow(levels []agent.ThinkingLevel, cursor int) (string, []t
 	var b strings.Builder
 	var spans []thinkingChipSpan
 	b.WriteString(indent)
-	w := lipgloss.Width(indent)
+	w := cellWidth(indent)
 	for i, l := range levels {
 		if i > 0 {
 			b.WriteString("  ")
 			w += 2
 		}
 		label := "[" + thinkingChipLabel(l) + "]"
-		spans = append(spans, thinkingChipSpan{value: l, x0: w, x1: w + lipgloss.Width(label)})
+		spans = append(spans, thinkingChipSpan{value: l, x0: w, x1: w + cellWidth(label)})
 		if i == cursor {
 			b.WriteString(ansiHighlightOn + label + ansiReset)
 		} else {
 			b.WriteString(ansiDimOn + label + ansiReset)
 		}
-		w += lipgloss.Width(label)
+		w += cellWidth(label)
 	}
 	return b.String(), spans
 }
@@ -955,7 +954,7 @@ func (m *Model) handleModelsModalMouse(ev mouseEvent) bool {
 	// The overlay centers the box in the terminal (renderModalOverlay);
 	// measure the rendered box to recover its origin.
 	modal := m.renderModelsModal()
-	boxW := lipgloss.Width(modal)
+	boxW := blockWidth(modal)
 	boxH := lipgloss.Height(modal)
 	ox := (m.width - boxW) / 2
 	oy := (m.height - boxH) / 2
@@ -1009,18 +1008,18 @@ func (m *Model) modelsModalInner() int {
 	for i, mdl := range m.modelList {
 		// Provider header: two-space prefix (buildModelRows's "  "+name),
 		// plus the renderer's four content-padding cells.
-		if w := lipgloss.Width("  "+modelProviderName(mdl)) + 4; w > inner {
+		if w := cellWidth("  "+modelProviderName(mdl)) + 4; w > inner {
 			inner = w
 		}
 		// Entry row at its real index: the %2d numbering width depends on
 		// the position, so the probe must use it.
-		if w := lipgloss.Width(modelEntryText(i, mdl)) + 4; w > inner {
+		if w := cellWidth(modelEntryText(i, mdl)) + 4; w > inner {
 			inner = w
 		}
 		// Thinking chip row for this model's accepted efforts.
 		if levels, supported := m.modelsModalThinkingLevelsFor(modelsModalRowRef(mdl)); supported {
 			text, _ := buildThinkingChipRow(levels, -1)
-			if w := lipgloss.Width(text) + 4; w > inner {
+			if w := cellWidth(text) + 4; w > inner {
 				inner = w
 			}
 		}
@@ -1030,7 +1029,7 @@ func (m *Model) modelsModalInner() int {
 		// model's levels) — probe it too.
 		if levels, supported := m.modelsModalThinkingLevels(); supported {
 			text, _ := buildThinkingChipRow(levels, -1)
-			if w := lipgloss.Width(text) + 4; w > inner {
+			if w := cellWidth(text) + 4; w > inner {
 				inner = w
 			}
 		}

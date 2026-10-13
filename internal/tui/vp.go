@@ -6,7 +6,6 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 )
 
 // Viewport is a custom scrollable viewport that tracks the longest line width
@@ -192,7 +191,7 @@ func (v Viewport) visibleLines() []string {
 
 	cutLines := make([]string, len(lines))
 	for i := range lines {
-		cutLines[i] = ansi.Cut(lines[i], v.xOffset, v.xOffset+w)
+		cutLines[i] = cutCells(lines[i], v.xOffset, v.xOffset+w)
 	}
 	return cutLines
 }
@@ -258,7 +257,7 @@ func (v *Viewport) scrollRight(n int) {
 func findLongestLineWidth(lines []string) int {
 	w := 0
 	for _, l := range lines {
-		if ww := ansi.StringWidth(l); ww > w {
+		if ww := cellWidth(l); ww > w {
 			w = ww
 		}
 	}

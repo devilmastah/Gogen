@@ -223,7 +223,7 @@ func (m *Model) copySelection() (bool, tea.Cmd) {
 
 // runeWidth returns the terminal cell width of r (at least 1 for printable).
 func runeWidth(r rune) int {
-	w := ansi.StringWidth(string(r))
+	w := cellWidth(string(r))
 	if w < 1 {
 		return 1
 	}
@@ -314,7 +314,7 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 	}
 
 	line := m.wrappedLines[contentY]
-	if max := ansi.StringWidth(line); contentX > max {
+	if max := cellWidth(line); contentX > max {
 		contentX = max
 	}
 
@@ -345,7 +345,7 @@ func (m *Model) getSelectedText() string {
 		}
 		line := m.wrappedLines[y]
 		ls := 0
-		le := ansi.StringWidth(line)
+		le := cellWidth(line)
 		if y == startY {
 			ls = startX
 		}
@@ -423,7 +423,7 @@ func (m *Model) renderViewportWithSelection() string {
 		if ci < len(styledLines) && ci < len(m.wrappedLines) {
 			line := styledLines[ci]
 			if ci >= selSY && ci <= selEY {
-				lineWidth := ansi.StringWidth(m.wrappedLines[ci])
+				lineWidth := cellWidth(m.wrappedLines[ci])
 				hs := 0
 				he := lineWidth
 				if ci == selSY {
@@ -443,7 +443,7 @@ func (m *Model) renderViewportWithSelection() string {
 				}
 			}
 			if cutAll && contentWidth > 0 {
-				line = ansi.Cut(line, cutX, cutX+contentWidth)
+				line = cutCells(line, cutX, cutX+contentWidth)
 			}
 			lines = append(lines, line)
 		} else {

@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/x/ansi"
 )
 
 // Jump button — the TUI's port of the web's scroll-bottom button
@@ -49,7 +48,7 @@ func (m *Model) jumpButtonZone() (x0, x1 int, ok bool) {
 	}
 	chatW := m.mainWidth()
 	left := m.sidebarOffsetX()
-	w := ansi.StringWidth(m.jumpButtonText()) + 2 // one padding cell each side
+	w := cellWidth(m.jumpButtonText()) + 2 // one padding cell each side
 	if chatW < w+2 {
 		return 0, 0, false
 	}

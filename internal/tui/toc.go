@@ -258,7 +258,7 @@ func buildTocTooltipBox(text string, index, w int) []string {
 		// w-5 cells BEFORE appending, so the clamped row stays within the
 		// box (appending "…" to a full w-4 line rendered that row one cell
 		// wider than the border).
-		body[5] = ansi.Cut(body[5], 0, w-5) + "…"
+		body[5] = cutCells(body[5], 0, w-5) + "…"
 	}
 	box := make([]string, 0, len(body)+3)
 	// Every border glyph carries its own dim style: the box is pasted into
@@ -266,9 +266,9 @@ func buildTocTooltipBox(text string, index, w int) []string {
 	// border would inherit the transcript text's color at the paste point.
 	box = append(box, ansiDimOn+"╭"+strings.Repeat("─", w-2)+"╮"+ansiReset)
 	label := ansiHighlightOn + "Prompt " + strconv.Itoa(index+1) + ansiReset
-	box = append(box, ansiDimOn+"│"+ansiReset+"  "+label+strings.Repeat(" ", max(0, w-4-ansi.StringWidth(label)))+ansiDimOn+"│"+ansiReset)
+	box = append(box, ansiDimOn+"│"+ansiReset+"  "+label+strings.Repeat(" ", max(0, w-4-cellWidth(label)))+ansiDimOn+"│"+ansiReset)
 	for _, b := range body {
-		box = append(box, ansiDimOn+"│"+ansiReset+"  "+ansiDimOn+b+strings.Repeat(" ", max(0, w-4-ansi.StringWidth(b)))+"│"+ansiReset)
+		box = append(box, ansiDimOn+"│"+ansiReset+"  "+ansiDimOn+b+strings.Repeat(" ", max(0, w-4-cellWidth(b)))+"│"+ansiReset)
 	}
 	box = append(box, ansiDimOn+"╰"+strings.Repeat("─", w-2)+"╯"+ansiReset)
 	return box
@@ -288,17 +288,17 @@ func pasteCell(lines *[]string, y, x int, segment string) {
 		return
 	}
 	row := (*lines)[y]
-	w := ansi.StringWidth(row)
+	w := cellWidth(row)
 	if x >= w {
 		return
 	}
-	sw := ansi.StringWidth(segment)
+	sw := cellWidth(segment)
 	if x+sw > w {
-		segment = ansi.Cut(segment, 0, w-x)
-		sw = ansi.StringWidth(segment)
+		segment = cutCells(segment, 0, w-x)
+		sw = cellWidth(segment)
 	}
 	var b strings.Builder
-	b.WriteString(ansi.Cut(row, 0, x))
+	b.WriteString(cutCells(row, 0, x))
 	if openSGRAt(row, x) != "" {
 		b.WriteString(ansi.ResetStyle)
 	}
@@ -306,20 +306,22 @@ func pasteCell(lines *[]string, y, x int, segment string) {
 	if open := openSGRAt(row, x+sw); open != "" {
 		b.WriteString(open)
 	}
-	b.WriteString(ansi.Cut(row, x+sw, w))
+	b.WriteString(cutCells(row, x+sw, w))
 	(*lines)[y] = b.String()
 }
 
 // openSGRAt returns the SGR styling that is active at the given printable
 // cell offset within row: the SGR sequences applied since the last full
-// reset ("" when the style is default). The walk uses ansi.DecodeSequence,
-// so wide graphemes advance the cell counter by their real width.
+// reset ("" when the style is default). The walk uses the Wc-width decoder
+// so the cell counter agrees with cellWidth and cutCells — otherwise a wide
+// grapheme would advance this counter by a different amount than the cut that
+// asked for it, and the style would be isolated at the wrong cell.
 func openSGRAt(row string, cell int) string {
 	var open []string
 	var state byte
 	cells := 0
 	for i := 0; i < len(row); {
-		seq, width, n, newState := ansi.DecodeSequence(row[i:], state, nil)
+		seq, width, n, newState := ansi.DecodeSequenceWc(row[i:], state, nil)
 		if width > 0 && cells >= cell {
 			// The next cell belongs to the right side of the cut.
 			break

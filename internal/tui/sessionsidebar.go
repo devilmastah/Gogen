@@ -12,8 +12,6 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 )
 
 // Sidebar panel layout constants (row indices inside the panel):
@@ -465,8 +463,8 @@ func (m *Model) renderSidebar(mainLines int) string {
 	// Measurement is ANSI-aware so styled meta lines truncate and pad by
 	// their VISIBLE width (raw-rune counting would break on escape codes).
 	dim := func(s string) string {
-		return ansiDimOn + "│ " + ansi.Cut(s, 0, inner) +
-			strings.Repeat(" ", max(0, inner-ansi.StringWidth(s))) + ansiReset
+		return ansiDimOn + "│ " + cutCells(s, 0, inner) +
+			strings.Repeat(" ", max(0, inner-cellWidth(s))) + ansiReset
 	}
 	out := make([]string, 0, mainLines)
 	add := func(s string) {
@@ -569,7 +567,7 @@ func (m *Model) renderSidebarFooter(inner int) string {
 	// line carries ANSI codes — measure the VISIBLE width (sliceRuneLen
 	// counts the escape runes too, which collapsed the padding and left
 	// the right border off the panel edge on wide panels).
-	pad := inner - lipgloss.Width(line)
+	pad := inner - cellWidth(line)
 	if pad < 0 {
 		pad = 0
 	}
@@ -603,7 +601,7 @@ func (m *Model) sidebarFooterAt(x, y int) (button int, ok bool) {
 // action. The state dot lives on the meta line (web parity — see
 // sidebarMeta). The ✕ sits two cells inside the drag handle so click zones
 // never overlap (see sidebarRowAt). The label is truncated to the row's
-// visible-cell budget (ansi.Cut), so wide-rune labels cannot widen the
+// visible-cell budget (cutCells), so wide-rune labels cannot widen the
 // panel past its column budget.
 func (m *Model) renderSidebarTitle(r sidebarRow, cursor bool, inner int) string {
 	prefix := "  "
@@ -611,8 +609,8 @@ func (m *Model) renderSidebarTitle(r sidebarRow, cursor bool, inner int) string 
 		prefix = "▸ "
 	}
 	// Content cells: prefix(2) + label + pad + "✕ "(2). The label is
-	// truncated and the pad computed in VISIBLE cells (ansi.Cut /
-	// ansi.StringWidth), like the panel's other rows: rune counting
+	// truncated and the pad computed in VISIBLE cells (cutCells /
+	// cellWidth), like the panel's other rows: rune counting
 	// under-pads wide runes (CJK, emoji) by half their width, which pushed
 	// the ✕ — and the right border — past the panel edge and widened the
 	// whole joined frame past the terminal (the inline renderer would
@@ -621,8 +619,8 @@ func (m *Model) renderSidebarTitle(r sidebarRow, cursor bool, inner int) string 
 	if labelMax < 2 {
 		labelMax = 2
 	}
-	label := ansi.Cut(r.label, 0, labelMax)
-	pad := inner - 4 - ansi.StringWidth(label)
+	label := cutCells(r.label, 0, labelMax)
+	pad := inner - 4 - cellWidth(label)
 	if pad < 1 {
 		pad = 1
 	}

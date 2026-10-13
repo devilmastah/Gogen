@@ -11,7 +11,6 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 )
 
 // tabWidthCells mirrors the viewport render style's default TabWidth
@@ -32,6 +31,48 @@ func (m *Model) wrapWidth() int {
 	return w
 }
 
+// normalizeCR removes carriage returns from a chat line before it is
+// wrapped. A CR is the one raw control byte that survives the whole render
+// pipeline as a real cursor move: ultraviolet's printString handles exactly
+// three cursor-affecting inputs — "\n" (y++), "\r" (x = the FRAME's left
+// margin) and SGR — and drops every other escape. So a CR left in a chat
+// line makes the renderer send the pen back to column 0 of the frame and
+// repaint over whatever sits there, wiping the sidebar, the divider and the
+// left of the transcript row.
+//
+// Command output is the source: execute_command and bash_persistent return
+// child bytes verbatim, and handleStreamToolResult splits the result on "\n"
+// only, so every CRLF leaves a trailing CR and a progress bar
+// ("10%\r50%\rdone") leaves mid-line ones. That made the frame's painted
+// rows disagree with the model's cell model, which is what breaks the layout.
+//
+// CRLF collapses to LF (the newline it already is — SetContent/SetContentMax
+// have always done this); a bare CR is dropped, because in a static
+// transcript its only meaning ("overwrite this row") cannot be honoured and
+// keeping it is what corrupts the frame. The content of the row is
+// unchanged, so no output is lost. This runs on every wrap, so the
+// streaming and renderMessages history paths are both covered.
+func normalizeCR(line string) string {
+	if !strings.ContainsRune(line, '\r') {
+		return line
+	}
+	var b strings.Builder
+	b.Grow(len(line))
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if c != '\r' {
+			b.WriteByte(c)
+			continue
+		}
+		// CRLF: the CR is redundant, the following LF already breaks the
+		// line. A bare CR falls through and is dropped.
+		if i+1 < len(line) && line[i+1] == '\n' {
+			continue
+		}
+	}
+	return b.String()
+}
+
 // wrapLine wraps a single chat line ready for display. lipgloss.Wrap does
 // word-wrapping plus hard-wrapping of overlong tokens (URLs, paths, etc.) in
 // one pass, and re-applies any SGR style that is still open onto every
@@ -40,8 +81,12 @@ func (m *Model) wrapWidth() int {
 // replaced was the source of the v2 label-bleed bug fixed in a3b358b).
 func (m *Model) wrapLine(line string) []string {
 	w := m.wrapWidth()
-	// Expand tabs BEFORE wrapping. Widths disagree on a raw tab: lipgloss.Wrap
-	// (via ansi.Wrap) counts it as one cell, ansi.StringWidth as zero, and the
+	// Drop carriage returns BEFORE wrapping (see normalizeCR): a CR is the
+	// one byte that makes the renderer move the pen, and wrapping around it
+	// would spread the repaint over several rows.
+	line = normalizeCR(line)
+	// Expand tabs BEFORE wrapping. Widths disagree on a raw tab: the wrap
+	// pass counts it as one cell, cellWidth as zero, and the
 	// viewport's View render replaces it with tabWidthCells spaces before its
 	// own wrap pass. A tab near the wrap boundary therefore passed through
 	// here as a single ≤limit part and then re-wrapped inside View onto two
@@ -50,7 +95,7 @@ func (m *Model) wrapLine(line string) []string {
 	// tab-bearing lines were affected (diffs, tool output, pasted code).
 	// Pre-expanding makes the wrap pass see exactly what the render pass sees.
 	line = strings.ReplaceAll(line, "\t", strings.Repeat(" ", tabWidthCells))
-	wrapped := lipgloss.Wrap(line, w, "")
+	wrapped := wrapCells(line, w)
 	parts := strings.Split(wrapped, "\n")
 	// Strip trailing empty elements caused by a trailing newline.
 	// Without this, a trailing \n creates a blank visual line that
@@ -70,7 +115,7 @@ func (m *Model) wrapLine(line string) []string {
 // of re-splitting the entire wrapped content into lines on every flush — the
 // old SetContentMax path was O(conversation) per token batch. The max line
 // width is likewise maintained incrementally (only the new last line is
-// measured), skipping the O(N) ansi.StringWidth scan of the full conversation
+// measured), skipping the O(N) cellWidth scan of the full conversation
 // that the stock bubbles viewport performs. The full wrappedContent string is
 // materialized lazily via wrappedContentString() for consumers that need it
 // (selection rendering); streaming itself only needs the split lines.
@@ -96,7 +141,7 @@ func (m *Model) buildFromPrefix() {
 	m.wrappedLinesDirty = true
 	// Incremental max width: only scan the newly wrapped last line.
 	for _, p := range lastParts {
-		if w := ansi.StringWidth(p); w > m.maxWrappedWidth {
+		if w := cellWidth(p); w > m.maxWrappedWidth {
 			m.maxWrappedWidth = w
 		}
 	}
@@ -172,7 +217,7 @@ func (m *Model) setViewportContent() {
 	// that is not the last line here).
 	m.maxWrappedWidth = 0
 	for _, p := range wrappedParts {
-		if w := ansi.StringWidth(p); w > m.maxWrappedWidth {
+		if w := cellWidth(p); w > m.maxWrappedWidth {
 			m.maxWrappedWidth = w
 		}
 	}

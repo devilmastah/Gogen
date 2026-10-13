@@ -4,9 +4,6 @@ import (
 	"strings"
 
 	"gogen/internal/contextmgr"
-
-	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 )
 
 // The bar spans the MAIN COLUMN, not the terminal: with the sidebar
@@ -32,11 +29,11 @@ func (m *Model) renderStatusBar() string {
 		// terminal, and desync the inline renderer.
 		avail := max(0, w-2) // -2 for the bar's horizontal padding
 		msg := m.statusMsg
-		if lipgloss.Width(msg) > avail {
-			msg = ansi.Cut(msg, 0, avail)
+		if cellWidth(msg) > avail {
+			msg = cutCells(msg, 0, avail)
 		}
 		content := StatusBarDimStyle.Render(msg)
-		padLeft := max(0, (avail-lipgloss.Width(msg))/2)
+		padLeft := max(0, (avail-cellWidth(msg))/2)
 		result := strings.Repeat(" ", padLeft) + content
 		return StatusBarStyle.Width(w).Render(result)
 	}
@@ -98,21 +95,21 @@ func (m *Model) renderStatusBar() string {
 	// Layout: left and right with padding between. Prefer keeping the context
 	// indicator visible — truncate the left side first when the bar is tight.
 	availWidth := w - 2 // -2 for padding
-	leftWidth := lipgloss.Width(left)
-	rightWidth := lipgloss.Width(right)
+	leftWidth := cellWidth(left)
+	rightWidth := cellWidth(right)
 
 	middleWidth := availWidth - leftWidth - rightWidth
 	if middleWidth < 1 {
 		keepRight := rightWidth
 		if keepRight > availWidth-2 {
 			keepRight = max(0, availWidth-2)
-			right = ansi.Cut(right, 0, keepRight)
-			rightWidth = lipgloss.Width(right)
+			right = cutCells(right, 0, keepRight)
+			rightWidth = cellWidth(right)
 		}
 		maxLeft := max(0, availWidth-rightWidth-1)
 		if leftWidth > maxLeft {
-			left = ansi.Cut(left, 0, maxLeft)
-			leftWidth = lipgloss.Width(left)
+			left = cutCells(left, 0, maxLeft)
+			leftWidth = cellWidth(left)
 		}
 		middleWidth = max(1, availWidth-leftWidth-rightWidth)
 	}

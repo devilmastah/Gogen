@@ -105,10 +105,10 @@ func (m *Model) clearProgress() {
 // before SetSize) are left alone.
 func (m *Model) fitStripRow(line string) string {
 	w := m.mainWidth()
-	if w <= 0 || ansi.StringWidth(line) <= w {
+	if w <= 0 || cellWidth(line) <= w {
 		return line
 	}
-	line = ansi.Cut(line, 0, w)
+	line = cutCells(line, 0, w)
 	// Cut preserves escape sequences but drops the closer that sat past the
 	// cut point — and SGR carries across newlines, so an open tail would
 	// bleed the strip's style into the composer row below it.
