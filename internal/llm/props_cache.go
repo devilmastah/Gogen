@@ -21,6 +21,13 @@ import (
 type PropsCapsCache struct {
 	mu      sync.Mutex
 	entries map[string]propsCapsEntry
+	// nextSeq hands out a strictly increasing write-order stamp. Ordering the
+	// eviction by a counter rather than time.Now keeps "written longest ago"
+	// exact even when the wall clock is coarse (Windows resolves time.Now far
+	// more coarsely than Linux/macOS, so a tight burst of writes can share one
+	// timestamp and the eviction would then pick a victim at random) and even
+	// if the clock steps backwards. Guarded by mu.
+	nextSeq uint64
 }
 
 type propsCapsEntry struct {
@@ -33,9 +40,10 @@ type propsCapsEntry struct {
 	// "unsupported" for the endpoint's lifetime — but re-dialing within
 	// propsProbeRetryTTL is exactly what this memo prevents.
 	negativeAt time.Time
-	// at is when the entry was written; it exists to age entries out when the
-	// map reaches its cap (Lookup deliberately does not touch it).
-	at time.Time
+	// seq is the entry's write order (see PropsCapsCache.nextSeq); the smallest
+	// seq is evicted when the map reaches its cap. Lookup deliberately does not
+	// touch it.
+	seq uint64
 }
 
 // maxPropsCapsEntries bounds the shared capability map: one entry per
@@ -87,9 +95,9 @@ func (c *PropsCapsCache) RecordSuccess(key string, supported bool) {
 	if c == nil {
 		return
 	}
-	now := time.Now()
 	c.mu.Lock()
-	c.putLocked(key, propsCapsEntry{checked: true, supported: supported, at: now})
+	e := propsCapsEntry{checked: true, supported: supported, seq: c.takeSeqLocked()}
+	c.putLocked(key, e)
 	c.mu.Unlock()
 }
 
@@ -99,26 +107,31 @@ func (c *PropsCapsCache) RecordFailure(key string) {
 	if c == nil {
 		return
 	}
-	now := time.Now()
 	c.mu.Lock()
 	e := c.entries[key]
 	if !e.checked {
-		e.negativeAt = now
-		e.at = now
+		e.negativeAt = time.Now()
+		e.seq = c.takeSeqLocked()
 		c.putLocked(key, e)
 	}
 	c.mu.Unlock()
 }
 
-// putLocked stores e under key, evicting the entry written longest ago when
-// the map is at its cap. Caller holds c.mu.
+// takeSeqLocked returns the next write-order stamp. Caller holds c.mu.
+func (c *PropsCapsCache) takeSeqLocked() uint64 {
+	c.nextSeq++
+	return c.nextSeq
+}
+
+// putLocked stores e under key, evicting the entry written longest ago (the
+// smallest seq) when the map is at its cap. Caller holds c.mu.
 func (c *PropsCapsCache) putLocked(key string, e propsCapsEntry) {
 	if _, exists := c.entries[key]; !exists && len(c.entries) >= maxPropsCapsEntries {
 		oldestKey := ""
-		var oldest time.Time
+		var oldestSeq uint64
 		for k, cand := range c.entries {
-			if oldestKey == "" || cand.at.Before(oldest) {
-				oldestKey, oldest = k, cand.at
+			if oldestKey == "" || cand.seq < oldestSeq {
+				oldestKey, oldestSeq = k, cand.seq
 			}
 		}
 		if oldestKey != "" {
