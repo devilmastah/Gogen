@@ -19,8 +19,14 @@ import (
 )
 
 const (
-	openCodeZenBaseURL = "https://opencode.ai/zen/v1/"
-	openCodeGoBaseURL  = "https://opencode.ai/zen/go/v1/"
+	// The OpenCode endpoints. models.dev lists them under the /inference/
+	// path, which is the canonical spelling used for both the wire clients
+	// and the models.dev registry lookups. The /zen/ path is a live alias
+	// that older configs and docs still use; a profile configured with it
+	// resolves against the registry via its own base URL plus these
+	// canonical URLs (see modelsDevURLsForBaseURL).
+	openCodeZenBaseURL = "https://opencode.ai/inference/v1/"
+	openCodeGoBaseURL  = "https://opencode.ai/inference/go/v1/"
 	// modelsCacheTTL avoids repeated full catalog fetches during startup
 	// (ValidateRestoredModel → ListModels + ModelContextLimit) and /models flows.
 	modelsCacheTTL = 60 * time.Second
@@ -81,6 +87,17 @@ var propsHTTPClient = func() *http.Client {
 // should also expose the Go model family at openCodeGoBaseURL.
 func isOpencodeURL(baseURL string) bool {
 	return strings.Contains(baseURL, "opencode.ai")
+}
+
+// openCodeRegistryURLs returns the canonical models.dev base URLs for the
+// OpenCode endpoints (the /inference/ paths models.dev lists). The go
+// endpoint comes first, matching inferOpenCodeEndpoint's Go-over-zen
+// precedence.
+func openCodeRegistryURLs() []string {
+	return []string{
+		openCodeGoBaseURL,
+		openCodeZenBaseURL,
+	}
 }
 
 // ProviderProfile is one registered OpenAI-compatible API endpoint: a base

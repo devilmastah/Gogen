@@ -16,10 +16,14 @@ import (
 )
 
 func TestLookupModelsDevLimitFromDisk(t *testing.T) {
+	// The registry uses the LIVE models.dev spelling: the OpenCode endpoints
+	// are listed under /inference/ while the wire clients (and the profile
+	// baseURL below) use the /zen/ alias. A lookup that only tried the zen
+	// spelling found no provider and the session fell to the 128k default.
 	reg := map[string]any{
 		"opencode": map[string]any{
 			"id":  "opencode",
-			"api": "https://opencode.ai/zen/v1",
+			"api": "https://opencode.ai/inference/v1",
 			"models": map[string]any{
 				"claude-opus-4-8": map[string]any{
 					"id":          "claude-opus-4-8",
@@ -30,7 +34,7 @@ func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 		},
 		"opencode-go": map[string]any{
 			"id":  "opencode-go",
-			"api": "https://opencode.ai/zen/go/v1",
+			"api": "https://opencode.ai/inference/go/v1",
 			"models": map[string]any{
 				"mimo-v2.5-pro": map[string]any{
 					"id":    "mimo-v2.5-pro",
@@ -80,6 +84,61 @@ func TestLookupModelsDevInfoNilSafe(t *testing.T) {
 	p = &OpenAIProvider{}
 	if got, _, _, _ := p.lookupModelsDevInfo(ModelRef{ID: "x"}); got != 0 {
 		t.Fatalf("got %d", got)
+	}
+}
+
+// TestInferOpenCodeEndpointViaInferenceRegistry pins the live models.dev
+// spelling for the cold-catalog Go-over-Zen routing: the registry lists the
+// OpenCode endpoints under /inference/ while the wire twins use /zen/. A
+// zen-wire profile must still route go models to the go twin, zen models to
+// the zen twin, and a model in both catalogs to the go twin.
+func TestInferOpenCodeEndpointViaInferenceRegistry(t *testing.T) {
+	reg := map[string]any{
+		"opencode": map[string]any{
+			"id":  "opencode",
+			"api": "https://opencode.ai/inference/v1",
+			"models": map[string]any{
+				"zen-only-model": map[string]any{"id": "zen-only-model", "limit": map[string]int{"context": 1000000}},
+				"both-model":     map[string]any{"id": "both-model", "limit": map[string]int{"context": 1000000}},
+			},
+		},
+		"opencode-go": map[string]any{
+			"id":  "opencode-go",
+			"api": "https://opencode.ai/inference/go/v1",
+			"models": map[string]any{
+				"go-only-model": map[string]any{"id": "go-only-model", "limit": map[string]int{"context": 1048576}},
+				"both-model":    map[string]any{"id": "both-model", "limit": map[string]int{"context": 1048576}},
+			},
+		},
+	}
+	cache := filepath.Join(t.TempDir(), "models.json")
+	b, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	zen := openai.NewClient()
+	goClient := openai.NewClient()
+	prof := &providerProfile{
+		name:      "default",
+		baseURL:   "https://opencode.ai/zen/go/v1/",
+		zenStream: &zen,
+		goStream:  &goClient,
+	}
+	p := &OpenAIProvider{modelInfo: modelinfo.NewResolver(cache)}
+	if got := p.inferOpenCodeEndpoint(prof, "go-only-model"); got != &goClient {
+		t.Fatalf("go-only model: got %v, want go twin", got)
+	}
+	if got := p.inferOpenCodeEndpoint(prof, "zen-only-model"); got != &zen {
+		t.Fatalf("zen-only model: got %v, want zen twin", got)
+	}
+	if got := p.inferOpenCodeEndpoint(prof, "both-model"); got != &goClient {
+		t.Fatalf("model in both catalogs: got %v, want go twin (Go precedence)", got)
+	}
+	if got := p.inferOpenCodeEndpoint(prof, "unknown-model"); got != nil {
+		t.Fatalf("unknown model: got %v, want nil", got)
 	}
 }
 

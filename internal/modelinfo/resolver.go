@@ -85,7 +85,7 @@ func (m modelEntry) ReasoningEfforts() []string {
 type providerEntry struct {
 	ID     string                `json:"id"`
 	Name   string                `json:"name"`
-	API    string                `json:"api"` // base URL, e.g. "https://opencode.ai/zen/v1"
+	API    string                `json:"api"` // base URL, e.g. "https://opencode.ai/inference/v1"
 	NPM    string                `json:"npm"`
 	Models map[string]modelEntry `json:"models"`
 }

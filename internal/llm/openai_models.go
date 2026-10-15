@@ -543,8 +543,10 @@ func (p *OpenAIProvider) ownedBaseURLLocked(ref ModelRef) string {
 }
 
 // modelsDevURLsForBaseURL is the shared URL derivation for one endpoint: the
-// base URL itself, plus the OpenCode zen/go endpoints when it is an OpenCode
-// URL. Deduplicated.
+// base URL itself, plus the canonical OpenCode endpoints
+// (openCodeRegistryURLs) when it is an OpenCode URL — so a profile still
+// configured on the legacy /zen/ path resolves against the registry's
+// /inference/ entries. Deduplicated.
 func modelsDevURLsForBaseURL(baseURL string) []string {
 	urls := make([]string, 0, 3)
 	seen := make(map[string]struct{}, 3)
@@ -560,8 +562,9 @@ func modelsDevURLsForBaseURL(baseURL string) []string {
 	}
 	add(baseURL)
 	if isOpencodeURL(baseURL) {
-		add(openCodeZenBaseURL)
-		add(openCodeGoBaseURL)
+		for _, u := range openCodeRegistryURLs() {
+			add(u)
+		}
 	}
 	return urls
 }

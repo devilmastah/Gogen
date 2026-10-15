@@ -212,15 +212,17 @@ func TestClientForModelFallbackUsesModelsDevGoFirst(t *testing.T) {
 	cache := filepath.Join(dir, "models.json")
 	writeModelsDevRegistry(t, cache, map[string]any{
 		"opencode": map[string]any{
+			// The profile below has no baseURL, so the lookup resolves via
+			// the canonical /inference/ URLs (the live models.dev spelling).
 			"id":  "opencode",
-			"api": "https://opencode.ai/zen/v1",
+			"api": "https://opencode.ai/inference/v1",
 			"models": map[string]any{
 				"claude-opus-4-8": map[string]any{"id": "claude-opus-4-8"},
 			},
 		},
 		"opencode-go": map[string]any{
 			"id":  "opencode-go",
-			"api": "https://opencode.ai/zen/go/v1",
+			"api": "https://opencode.ai/inference/go/v1",
 			"models": map[string]any{
 				"mimo-v2.5-pro": map[string]any{"id": "mimo-v2.5-pro"},
 			},
