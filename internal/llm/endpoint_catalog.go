@@ -34,6 +34,13 @@ type EndpointCatalog struct {
 	// allowed. Mirrors the provider-level cache TTL so a session that
 	// refreshes does not force its siblings to re-download.
 	ttl time.Duration
+	// nextSeq hands out a strictly increasing settle-order stamp. Ordering the
+	// eviction by a counter rather than time.Now keeps "loaded longest ago"
+	// exact even when the wall clock is coarse (Windows resolves time.Now far
+	// more coarsely than Linux/macOS, so a tight burst of loads can share one
+	// timestamp and the eviction would then pick a victim at random) and even
+	// if the clock steps backwards. Guarded by mu.
+	nextSeq uint64
 }
 
 // endpointCatalogEntry is one endpoint's cached catalog plus the shared
@@ -46,6 +53,11 @@ type endpointCatalogEntry struct {
 	// one per session. A brief probe that fails does not arm it.
 	failedAt time.Time
 	err      error
+	// seq is the entry's settle order (see EndpointCatalog.nextSeq): the
+	// smallest seq is the one evicted at the cap. It is stamped at the same
+	// points as loadedAt/failedAt, so it tracks "loaded longest ago" without
+	// depending on clock resolution.
+	seq uint64
 	// inflight is non-nil while a fetch runs; concurrent callers (including
 	// callers from other providers) wait on it instead of starting their own.
 	inflight *endpointCatalogLoad
@@ -142,6 +154,7 @@ func (c *EndpointCatalog) Models(ctx context.Context, key string, armBackoff boo
 			e.loadedAt = time.Now()
 			e.failedAt = time.Time{}
 			e.err = nil
+			e.seq = c.takeSeqLocked()
 		case armBackoff:
 			// Remember the failure for the shared backoff window so a dead
 			// endpoint costs one attempt process-wide. The previous list is
@@ -154,6 +167,7 @@ func (c *EndpointCatalog) Models(ctx context.Context, key string, armBackoff boo
 			e.loadedAt = time.Time{}
 			e.failedAt = time.Now()
 			e.err = err
+			e.seq = c.takeSeqLocked()
 		}
 		c.mu.Unlock()
 		close(l.done)
@@ -176,22 +190,24 @@ func waitCatalogLoad(ctx context.Context, l *endpointCatalogLoad) ([]openai.Mode
 	}
 }
 
-// evictOldestLocked drops the entry loaded (or failed) longest ago, skipping
-// keepKey and any entry with a fetch in flight — its waiters hold the load,
-// and evicting it would strand them. Caller holds c.mu.
+// takeSeqLocked returns the next settle-order stamp. Caller holds c.mu.
+func (c *EndpointCatalog) takeSeqLocked() uint64 {
+	c.nextSeq++
+	return c.nextSeq
+}
+
+// evictOldestLocked drops the entry loaded (or failed) longest ago — the
+// smallest seq — skipping keepKey and any entry with a fetch in flight: its
+// waiters hold the load, and evicting it would strand them. Caller holds c.mu.
 func (c *EndpointCatalog) evictOldestLocked(keepKey string) {
 	oldestKey := ""
-	var oldest time.Time
+	var oldestSeq uint64
 	for k, cand := range c.entries {
 		if k == keepKey || cand.inflight != nil {
 			continue
 		}
-		at := cand.loadedAt
-		if cand.failedAt.After(at) {
-			at = cand.failedAt
-		}
-		if oldestKey == "" || at.Before(oldest) {
-			oldestKey, oldest = k, at
+		if oldestKey == "" || cand.seq < oldestSeq {
+			oldestKey, oldestSeq = k, cand.seq
 		}
 	}
 	if oldestKey != "" {

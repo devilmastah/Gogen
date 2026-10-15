@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -227,5 +228,49 @@ func TestEndpointCatalogEvictsOldestWhenFull(t *testing.T) {
 	}
 	if !keptLast {
 		t.Fatal("the newest entry must stay cached")
+	}
+}
+
+// TestEndpointCatalogEvictionIgnoresCoarseClock pins the root cause of the
+// Windows failure of the test above: Windows resolves time.Now far more
+// coarsely than Linux/macOS, so a tight burst of catalog loads can share one
+// loadedAt and a time-ordered eviction then drops a victim at random. The
+// eviction must follow LOAD ORDER, not the clock. Every loadedAt is forced
+// identical here (exactly what a coarse timer produces), so only a
+// sequence-ordered eviction reliably drops the entry that loaded first.
+func TestEndpointCatalogEvictionIgnoresCoarseClock(t *testing.T) {
+	cat := NewEndpointCatalog()
+	fetch := func(context.Context) ([]openai.Model, error) {
+		return []openai.Model{{ID: "model-a"}}, nil
+	}
+	for i := 0; i < maxEndpointCatalogEntries; i++ {
+		if _, err := cat.Models(context.Background(), fmt.Sprintf("key-%d", i), false, fetch); err != nil {
+			t.Fatalf("fetch %d: %v", i, err)
+		}
+	}
+	// Flatten the clock: a coarse timer would hand every load the same tick.
+	cat.mu.Lock()
+	for _, e := range cat.entries {
+		e.loadedAt = time.Time{}
+	}
+	cat.mu.Unlock()
+
+	// One more load trips the cap, so one entry is evicted.
+	if _, err := cat.Models(context.Background(), "key-new", false, fetch); err != nil {
+		t.Fatalf("over-cap fetch: %v", err)
+	}
+	cat.mu.Lock()
+	size := len(cat.entries)
+	_, keptFirst := cat.entries["key-0"]
+	_, keptNew := cat.entries["key-new"]
+	cat.mu.Unlock()
+	if size != maxEndpointCatalogEntries {
+		t.Fatalf("entries = %d, want %d", size, maxEndpointCatalogEntries)
+	}
+	if keptFirst {
+		t.Fatal("eviction followed the flattened clock; the first-loaded entry must be dropped")
+	}
+	if !keptNew {
+		t.Fatal("the entry being inserted must stay cached")
 	}
 }
