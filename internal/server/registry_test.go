@@ -36,7 +36,7 @@ func newTestRuntime(t *testing.T) *sessionRuntime {
 func newFakeWSConn() *wsConn {
 	return &wsConn{
 		conn:  &websocket.Conn{},
-		sendQ: make(chan WSMessage, 64),
+		sendQ: make(chan *WSMessage, 64),
 		quit:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}

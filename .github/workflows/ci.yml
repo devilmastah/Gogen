@@ -32,7 +32,14 @@ jobs:
         run: go mod tidy -diff
       - name: Test
         run: go test -race ./...
-      - name: Test debug tags
+      # Debug-tagged sources (view-drift, profiling, WS stall knobs) only
+      # compile under -tags debug, so this re-run is the sole CI signal that
+      # they still build and pass. Keep it Linux-only: the normal Test step
+      # already runs -race here, and the macOS/Windows jobs skip -race (see
+      # their Test step), so the agent/server/profiling suites would otherwise
+      # be compiled and run a third time for no extra coverage.
+      - name: Test debug tags (Linux only)
+        if: runner.os == 'Linux'
         run: go test -race -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
       - name: Vet
         run: go vet ./...
@@ -61,7 +68,11 @@ jobs:
       - name: Build darwin/arm64
         run: GOOS=darwin GOARCH=arm64 go build -o gogen-darwin-arm64 -ldflags="-s -w" .
       - name: Test
-        run: go test -race ./...
+        # The race detector adds ~2min here (almost all in internal/agent's
+        # tokenizer-heavy compaction tests) and buys little: the Linux job
+        # already runs the full -race suite. This job therefore runs the
+        # detector-free suite; Linux remains the single -race gate.
+        run: go test ./...
       - name: Vet
         run: go vet ./...
 
@@ -82,6 +93,9 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: "1"
-        run: go test -race ./...
+        # No -race here: the detector adds ~2min (almost all in
+        # internal/agent's tokenizer-heavy compaction tests) and the Linux job
+        # already runs the full -race suite, so this buys no extra coverage.
+        run: go test ./...
       - name: Vet
         run: go vet ./...

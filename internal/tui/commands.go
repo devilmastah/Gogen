@@ -224,6 +224,7 @@ func cmdMode(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		m.chatLines = append(m.chatLines, SystemStyle.Render(out))
 		m.setViewportContent()
 		m.pinFollow() // the transcript was replaced wholesale
+		m.markTranscriptRendered()
 	} else {
 		m.appendChatLine(SystemStyle.Render(out))
 	}
@@ -291,6 +292,7 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 			m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
 			m.setViewportContent()
 			m.pinFollow() // restored history starts at the live edge
+			m.markTranscriptRendered()
 		}
 	}
 	// Session commands (new, resume, delete) persist.
@@ -319,6 +321,7 @@ func (m *Model) applySessionSwitch(result agent.SessionCommandResult) tea.Cmd {
 	}
 	m.setViewportContent()
 	m.pinFollow() // fresh transcript (the focused session changed)
+	m.markTranscriptRendered()
 	m.sessionID = m.agent.SessionID
 	// /new and /resume <id> rebind the focused agent: re-stamp the
 	// session's recency so the list does not reorder (see rebindActivity).
@@ -460,10 +463,7 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	}
 
 	// Update history
-	if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != trimmed {
-		m.inputHistory = append(m.inputHistory, trimmed)
-	}
-	m.historyIdx = len(m.inputHistory)
+	m.appendInputHistory(trimmed)
 
 	// Show user message in chat and start the turn.
 	return m.startTurn(trimmed, UserStyle.Render(userLabel)+" "+trimmed)

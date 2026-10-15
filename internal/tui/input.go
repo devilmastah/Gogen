@@ -184,10 +184,7 @@ func (m *Model) handleSubmitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) 
 		if m.streaming || m.compacting {
 			trimmed := strings.TrimSpace(input)
 			// History bookkeeping: queued text is typed input.
-			if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != input {
-				m.inputHistory = append(m.inputHistory, input)
-			}
-			m.historyIdx = len(m.inputHistory)
+			m.appendInputHistory(input)
 
 			if trimmed == "queue" || trimmed == "/queue" {
 				m.queueCursor = 0
@@ -205,10 +202,7 @@ func (m *Model) handleSubmitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) 
 		}
 
 		// Add to history
-		if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != input {
-			m.inputHistory = append(m.inputHistory, input)
-		}
-		m.historyIdx = len(m.inputHistory)
+		m.appendInputHistory(input)
 
 		// Check if it's a command
 		if handled, quit, cmd := m.dispatchCommand(input); handled {
@@ -225,6 +219,26 @@ func (m *Model) handleSubmitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) 
 		return m, tea.Batch(cmd, m.textarea.Focus()), true
 	}
 	return m, nil, false
+}
+
+// maxInputHistory bounds the ↑/↓ prompt history. Entries are whole prompts
+// (which may be large pastes), so an unbounded slice would grow for the life
+// of the process on a long-lived session.
+const maxInputHistory = 500
+
+// appendInputHistory records one submitted prompt (or queued steering text)
+// in the ↑ history, skipping an immediate duplicate, and keeps the list
+// within maxInputHistory by dropping the oldest entries. historyIdx is reset
+// to the end so the next ↑ starts from the newest entry.
+func (m *Model) appendInputHistory(s string) {
+	if n := len(m.inputHistory); n == 0 || m.inputHistory[n-1] != s {
+		m.inputHistory = append(m.inputHistory, s)
+		if over := len(m.inputHistory) - maxInputHistory; over > 0 {
+			// In-place shift, oldest first (dst index is always below src).
+			m.inputHistory = append(m.inputHistory[:0], m.inputHistory[over:]...)
+		}
+	}
+	m.historyIdx = len(m.inputHistory)
 }
 
 func (m *Model) handleHistoryUpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {

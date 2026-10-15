@@ -224,6 +224,16 @@ type Model struct {
 	prefixLines         []string
 	lastWrapped         string
 	wrappedContentDirty bool
+	// historyEpoch is the agent conversation epoch (agent.HistoryEpoch) the
+	// current transcript was rendered from. The transcript is append-only
+	// between full rebuilds, so a wholesale history reshape — a mid-turn
+	// AUTO-compaction most notably — must be detected and the transcript
+	// re-rendered from Messages; otherwise chatLines (plus its wrapped and
+	// styled copies) keeps every line ever rendered for the life of the
+	// process even though the agent's own history stays compacted, which is
+	// unbounded growth over a long-lived session. See
+	// rebuildTranscriptIfReshaped.
+	historyEpoch uint64
 
 	// Streaming accumulation
 	streamAssistantBuf  strings.Builder
@@ -429,6 +439,7 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 		m.chatLines = renderMessages(a.Messages, a.WorkingDir, modelLine, a.Mode.String())
 		m.setViewportContent()
 		m.pinFollow()
+		m.markTranscriptRendered()
 		if stats := a.ContextStats(context.Background()); stats.Snapshot.Limit > 0 || stats.Snapshot.Used > 0 {
 			m.contextStats = stats
 			m.contextLine = agent.FormatContextBrief(stats)
@@ -444,11 +455,23 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 	return &m
 }
 
+// maxRecordedSubagents bounds the /subagents list. Each record keeps the
+// child's final report (up to agent.MaxSubagentReportBytes), so an unbounded
+// list would grow for the life of a long-lived TUI process; the newest
+// entries are the ones the modal is opened for. The web host applies the
+// equivalent cap per parent (defaultMaxFinishedSubagents).
+const maxRecordedSubagents = 32
+
 // recordSubagent appends a finished nested session to the /subagents list
-// (called from the spawner on the agent's turn goroutine).
+// (called from the spawner on the agent's turn goroutine). The list is
+// bounded (maxRecordedSubagents): the oldest records are dropped.
 func (m *Model) recordSubagent(r subagentRecord) {
 	m.subagentMu.Lock()
 	m.subagents = append(m.subagents, r)
+	if over := len(m.subagents) - maxRecordedSubagents; over > 0 {
+		// In-place shift, oldest first (dst index is always below src).
+		m.subagents = append(m.subagents[:0], m.subagents[over:]...)
+	}
 	m.subagentMu.Unlock()
 }
 

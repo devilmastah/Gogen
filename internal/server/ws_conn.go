@@ -16,7 +16,20 @@ type wsConn struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
 
-	sendQ chan WSMessage
+	// sendQ carries outbound frames to the writeLoop goroutine.
+	//
+	// It is a channel of POINTERS, not of values, and that is a memory
+	// decision: a buffered channel allocates its whole ring eagerly at make,
+	// and WSMessage is a large struct (~2.1 KB — it carries the model list,
+	// the session list, image attachments, the history rewind snapshot and
+	// the queue payloads). A value channel at wsSendQueueSize would therefore
+	// reserve ~8.3 MB of *empty* buffer per connection, allocated before a
+	// single frame is sent — by far the biggest thing a web server holds
+	// (two sockets per browser tab = ~17 MB, and the connection limiter
+	// allows 32). With pointers the same depth, FIFO order and backpressure
+	// semantics cost ~32 KB idle, and only frames actually queued hold
+	// memory.
+	sendQ chan *WSMessage
 	quit  chan struct{} // closed by closeSend to stop writers + writeLoop
 	done  chan struct{} // closed when writeLoop exits, so writeJSON fails fast
 	once  sync.Once
@@ -54,7 +67,7 @@ func newWSConn(conn *websocket.Conn) *wsConn {
 	}
 	w := &wsConn{
 		conn:  conn,
-		sendQ: make(chan WSMessage, qsize),
+		sendQ: make(chan *WSMessage, qsize),
 		quit:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
@@ -145,8 +158,13 @@ func (w *wsConn) enqueueJSON(v WSMessage) error {
 		return errWSClosed
 	default:
 	}
+	// One heap message per queued frame (see the sendQ comment): the queue
+	// holds pointers, so memory tracks the actual backlog instead of the
+	// queue's depth. The pointer is what the writeLoop marshals; the JSON on
+	// the wire is identical to the value-channel form.
+	msg := &v
 	select {
-	case w.sendQ <- v:
+	case w.sendQ <- msg:
 		return nil
 	case <-w.quit:
 		return errWSClosed
@@ -155,7 +173,7 @@ func (w *wsConn) enqueueJSON(v WSMessage) error {
 	default:
 		// Queue full: block briefly rather than stall the LLM stream reader forever.
 		select {
-		case w.sendQ <- v:
+		case w.sendQ <- msg:
 			return nil
 		case <-w.quit:
 			return errWSClosed

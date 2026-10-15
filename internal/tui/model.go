@@ -171,6 +171,62 @@ func (m *Model) wrappedContentString() string {
 	return m.wrappedContent
 }
 
+// markTranscriptRendered records the agent conversation epoch the transcript
+// was just rendered from, so the next reshape check
+// (rebuildTranscriptIfReshaped) does not rebuild the same state again.
+// Call it from every path that rebuilds the transcript from the FOCUSED
+// agent's own messages.
+func (m *Model) markTranscriptRendered() {
+	if m.agent == nil {
+		return
+	}
+	m.historyEpoch = m.agent.HistoryEpoch()
+}
+
+// rebuildTranscriptFrom re-renders the focused transcript from a's committed
+// messages (via a SnapshotMessages, so it is safe to call once the turn
+// goroutine has returned) and records the epoch it was built from. The
+// per-turn stream state is reset first: chatLines is replaced wholesale, so
+// any stream line index would point at the wrong line.
+func (m *Model) rebuildTranscriptFrom(a *agent.Agent) {
+	// The stream state is dropped unconditionally: chatLines is about to be
+	// replaced wholesale, so any live line index would point at the wrong
+	// line (nil agent leaves the empty transcript, same as the join path).
+	m.resetStreamState(false)
+	if a == nil {
+		return
+	}
+	m.chatLines = renderMessages(a.SnapshotMessages(), a.WorkingDir, a.CurrentModel(), a.Mode.String())
+	m.historyEpoch = a.HistoryEpoch()
+}
+
+// rebuildTranscriptIfReshaped rebuilds the transcript when the agent replaced
+// the conversation wholesale since it was last rendered (agent.HistoryEpoch
+// moved: a mid-turn auto-compaction, a restore, a fork, or a rollback).
+//
+// The transcript is otherwise append-only, so without this a long-lived
+// session keeps every line it has ever rendered — chatLines plus its wrapped
+// (prefixLines, wrappedContent) and styled (styledLines, wrappedLines) copies
+// and the prompt-rail anchors — even though the agent's own history is
+// compacted in place. That is unbounded memory growth proportional to total
+// tokens ever produced, not to the size of the current conversation.
+//
+// It must run at a turn boundary (the turn goroutine has returned); the
+// explicit /compact and session-switch paths already rebuild on their own and
+// mark the epoch. Returns true when it rebuilt.
+func (m *Model) rebuildTranscriptIfReshaped() bool {
+	if m.agent == nil || m.agent.HistoryEpoch() == m.historyEpoch {
+		return false
+	}
+	m.rebuildTranscriptFrom(m.agent)
+	m.setViewportContent()
+	// Not pinFollow: a compaction is not a user navigation event, so a
+	// reader who scrolled away keeps their place (turn-end parity, see
+	// handleStreamEnd).
+	m.followBottom()
+	return true
+}
+
 // setViewportContent performs a full re-wrap of all chatLines and rebuilds
 // the incremental prefix.  Use this after window‑resize, session restore,
 // mode changes, or other events that touch the whole buffer. It is not

@@ -310,6 +310,7 @@ func (m *Model) handleCompactResultMsg(msg compactResultMsg) (tea.Model, tea.Cmd
 	m.chatLines = append(m.chatLines, SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
 	m.setViewportContent()
 	m.pinFollow() // the transcript was replaced wholesale
+	m.markTranscriptRendered()
 	m.refreshContextStats()
 	return m, m.drainDeliveries()
 }
@@ -375,6 +376,7 @@ func (m *Model) handleModelSwitchMsg(msg modelSwitchMsg) (tea.Model, tea.Cmd) {
 	}
 	m.setViewportContent()
 	m.pinFollow() // the transcript was replaced wholesale
+	m.markTranscriptRendered()
 	return m, nil
 }
 

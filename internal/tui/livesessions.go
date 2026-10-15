@@ -365,13 +365,7 @@ func (m *Model) switchToLive(i int) tea.Cmd {
 		m.joinStreamingSession(target, pending)
 	} else {
 		// Rebuild transcript (mirrors cmdSession's clear-chat resume path).
-		m.chatLines = renderMessages(
-			target.agent.Messages,
-			target.agent.WorkingDir,
-			target.agent.CurrentModel(),
-			target.agent.Mode.String(),
-		)
-		m.resetStreamState(false)
+		m.rebuildTranscriptFrom(target.agent)
 		// The rebuild is authoritative: heal any stale latch left by an
 		// earlier mid-turn join whose turn ended while this session was in
 		// the background (the focused turn-end path never ran for it).
@@ -466,6 +460,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 		target.agent.CurrentModel(),
 		target.agent.Mode.String(),
 	)
+	m.markTranscriptRendered()
 	// Reset BEFORE the round render: renderRoundBuffer pre-seeds the
 	// stream state this wipes (buffers, line indices, tool-call maps).
 	m.resetStreamState(false)
@@ -990,7 +985,9 @@ func (m *Model) cancelCompactForQuit() {
 // (the same converge-on-switch contract as the web UI's mid-turn attach).
 func (m *Model) handleTurnFinishedMsg(sid string, seq uint64, err error) (tea.Model, tea.Cmd) {
 	if m.lives == nil {
-		// Degenerate single-session construction without a registry.
+		// Degenerate single-session construction without a registry. The
+		// reshape check still runs: the transcript is append-only either way.
+		m.rebuildTranscriptIfReshaped()
 		return m.finishFocusedTurn(err)
 	}
 	s := m.lives.ByID(sid)
@@ -1056,16 +1053,13 @@ func (m *Model) handleTurnFinishedMsg(sid string, seq uint64, err error) (tea.Mo
 		// The rebuilt transcript has no live assistant/thinking line: drop
 		// the join's stream indices so finishFocusedTurn's finalizers
 		// (handleStreamEnd's trailing trim) cannot touch a stale line.
-		m.resetStreamState(false)
-		if s.agent != nil {
-			m.chatLines = renderMessages(
-				s.agent.SnapshotMessages(),
-				s.agent.WorkingDir,
-				s.agent.CurrentModel(),
-				s.agent.Mode.String(),
-			)
-		}
+		m.rebuildTranscriptFrom(s.agent)
 	}
+	// A mid-turn auto-compaction (or any other wholesale history reshape)
+	// replaced Messages while the transcript kept its rendered lines: rebuild
+	// around the compacted history, or the append-only transcript (with its
+	// wrapped and styled copies) grows for the life of the process.
+	m.rebuildTranscriptIfReshaped()
 	finished, cmd := m.finishFocusedTurn(err)
 	return finished, tea.Batch(refresh, cmd)
 }
