@@ -19,14 +19,21 @@ import (
 )
 
 const (
-	// The OpenCode endpoints. models.dev lists them under the /inference/
-	// path, which is the canonical spelling used for both the wire clients
-	// and the models.dev registry lookups. The /zen/ path is a live alias
-	// that older configs and docs still use; a profile configured with it
-	// resolves against the registry via its own base URL plus these
-	// canonical URLs (see modelsDevURLsForBaseURL).
+	// The OpenCode wire endpoints. The /zen/ path is the spelling older
+	// configs and docs use; these /inference/ twins are the ones the clients
+	// are built with.
 	openCodeZenBaseURL = "https://opencode.ai/inference/v1/"
 	openCodeGoBaseURL  = "https://opencode.ai/inference/go/v1/"
+	// The OpenCode base URLs models.dev lists. The registry's "api" field is
+	// the OpenAI-compatible path (it carries an extra /openai segment the
+	// wire endpoints do not need), and it drifts: the registry has shipped
+	// /zen/v1, then /inference/v1, and now /inference/openai/v1. Registry
+	// lookups therefore try the CURRENT spelling first and fall back to the
+	// earlier ones (see openCodeGoRegistryURLs / openCodeZenRegistryURLs), so
+	// a spelling change on either side does not silently drop every OpenCode
+	// context limit, price and description back to the 128k default.
+	openCodeZenRegistryURL = "https://opencode.ai/inference/openai/v1/"
+	openCodeGoRegistryURL  = "https://opencode.ai/inference/go/openai/v1/"
 	// modelsCacheTTL avoids repeated full catalog fetches during startup
 	// (ValidateRestoredModel → ListModels + ModelContextLimit) and /models flows.
 	modelsCacheTTL = 60 * time.Second
@@ -89,15 +96,41 @@ func isOpencodeURL(baseURL string) bool {
 	return strings.Contains(baseURL, "opencode.ai")
 }
 
-// openCodeRegistryURLs returns the canonical models.dev base URLs for the
-// OpenCode endpoints (the /inference/ paths models.dev lists). The go
-// endpoint comes first, matching inferOpenCodeEndpoint's Go-over-zen
-// precedence.
-func openCodeRegistryURLs() []string {
+// openCodeGoRegistryURLs returns the base URLs to try when asking models.dev
+// for the Go endpoint's catalog: the registry's current spelling first, then
+// the older spellings a registry snapshot (or a stale disk cache) may still
+// carry — the pre-/openai/ inference path and the original /zen/ path.
+func openCodeGoRegistryURLs() []string {
 	return []string{
+		openCodeGoRegistryURL,
 		openCodeGoBaseURL,
-		openCodeZenBaseURL,
+		"https://opencode.ai/zen/go/v1/",
 	}
+}
+
+// openCodeZenRegistryURLs is the Zen counterpart of openCodeGoRegistryURLs.
+func openCodeZenRegistryURLs() []string {
+	return []string{
+		openCodeZenRegistryURL,
+		openCodeZenBaseURL,
+		"https://opencode.ai/zen/v1/",
+	}
+}
+
+// openCodeRegistryURLs returns every models.dev base URL for the OpenCode
+// endpoints, deduplicated: the Go endpoint first, matching
+// inferOpenCodeEndpoint's Go-over-zen precedence.
+func openCodeRegistryURLs() []string {
+	urls := make([]string, 0, 6)
+	seen := make(map[string]struct{}, 6)
+	for _, u := range append(openCodeGoRegistryURLs(), openCodeZenRegistryURLs()...) {
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		urls = append(urls, u)
+	}
+	return urls
 }
 
 // ProviderProfile is one registered OpenAI-compatible API endpoint: a base

@@ -101,6 +101,24 @@ func (c *PropsCapsCache) RecordSuccess(key string, supported bool) {
 	c.mu.Unlock()
 }
 
+// Known returns a COMPLETED capability answer for key — a probe that answered,
+// or an observed rejection of the parameter — skipping the transient
+// incomplete-probe marker Lookup also reports. Callers that treat "no" as
+// final (a forced mode that must not send a parameter again) use this;
+// callers deciding whether to dial use Lookup.
+func (c *PropsCapsCache) Known(key string) (supported, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.mu.Lock()
+	e, ok := c.entries[key]
+	c.mu.Unlock()
+	if !ok || !e.checked {
+		return false, false
+	}
+	return e.supported, true
+}
+
 // RecordFailure remembers an incomplete probe for propsProbeRetryTTL, so the
 // endpoint is dialed once per window process-wide instead of once per session.
 func (c *PropsCapsCache) RecordFailure(key string) {

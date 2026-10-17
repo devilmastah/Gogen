@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"slices"
@@ -27,6 +28,31 @@ func (p *OpenAIProvider) SetPreserveReasoningMode(mode string) {
 	p.modelsMu.Unlock()
 }
 
+// chatTemplateKwargsRejected reports whether err is an endpoint refusing the
+// optional chat_template_kwargs parameter: a 400/422 whose body names it.
+// Strict OpenAI-compatible gateways reject the WHOLE request for an
+// unrecognized field instead of ignoring it, which turns an optional
+// prompt-cache optimization into a hard failure of every round.
+func chatTemplateKwargsRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	var oerr *openai.Error
+	if !errors.As(err, &oerr) {
+		return false
+	}
+	if oerr.StatusCode != http.StatusBadRequest && oerr.StatusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	// Read the parsed payload, not err.Error(): the SDK's text dereferences
+	// Request/Response, which a wrapped error may not carry. The raw body is
+	// the provider's own words (the transient rewrite in api_error_body.go
+	// keeps them), and Param is set when the gateway attributes the failure to
+	// the field explicitly.
+	text := strings.ToLower(oerr.RawJSON() + "\n" + oerr.Message + "\n" + oerr.Param)
+	return strings.Contains(text, "chat_template_kwargs")
+}
+
 func normalizePreserveReasoningMode(mode string) string {
 	if on, ok := onoff.Parse(mode); ok {
 		if on {
@@ -38,33 +64,44 @@ func normalizePreserveReasoningMode(mode string) string {
 }
 
 // applyChatCompletionExtras sets llama.cpp-style kwargs that keep prompt-cache
-// prefixes stable across multi-turn agent loops.
+// prefixes stable across multi-turn agent loops. It reports whether the kwargs
+// were applied, so the caller can re-issue the turn without them when the
+// endpoint refuses the parameter.
 //
 //   - mode "off": never send
-//   - mode "on": send when a custom base URL is set (skip /props probe)
+//   - mode "on": send when a custom base URL is set (skip /props probe), unless
+//     the endpoint has already answered that it does not accept the parameter
 //   - mode "auto" (default): send only if GET /props reports
 //     chat_template_caps.supports_preserve_reasoning
 //
 // Empty base URL is the default OpenAI API and never gets kwargs.
-func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *openai.ChatCompletionNewParams) {
+func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *openai.ChatCompletionNewParams) (applied bool) {
 	if p == nil || params == nil {
-		return
+		return false
 	}
 	p.modelsMu.RLock()
 	mode := p.preserveReasoningMode
 	p.modelsMu.RUnlock()
 	switch normalizePreserveReasoningMode(mode) {
 	case "off":
-		return
+		return false
 	case "on":
 		// The live default endpoint (SetProfiles may have replaced it): the
 		// kwargs must reach the endpoint the request actually goes to.
 		if strings.TrimSpace(p.defaultBaseURL()) == "" {
-			return
+			return false
+		}
+		// A known "no" wins even over the forced mode: "on" is the user's
+		// statement about their own (self-hosted) server, not evidence about
+		// every registered endpoint. A strict hosted gateway rejects the WHOLE
+		// request for this unrecognized field, and rejectPreserveReasoning has
+		// already recorded that answer for this endpoint+model.
+		if supported, known := p.cachedPreserveReasoningSupport(); known && !supported {
+			return false
 		}
 	default: // auto
 		if !p.templateSupportsPreserveReasoning(ctx) {
-			return
+			return false
 		}
 	}
 	params.SetExtraFields(map[string]any{
@@ -72,6 +109,41 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 			"preserve_reasoning": true,
 		},
 	})
+	return true
+}
+
+// cachedPreserveReasoningSupport returns the already-known capability answer
+// for the current endpoint+model (a completed /props probe, or an observed
+// parameter rejection) and whether an answer is known. Never performs I/O: no
+// dial, no retry window, no network.
+func (p *OpenAIProvider) cachedPreserveReasoningSupport() (supported, known bool) {
+	baseURL := p.propsBaseURLForCurrentModel()
+	if v, ok := p.propsCapsCache().Known(propsCapsKey(baseURL, p.currentModel())); ok {
+		return v, true
+	}
+	p.propsMu.Lock()
+	defer p.propsMu.Unlock()
+	if p.propsChecked && p.propsBaseURL == baseURL {
+		return p.propsPreserveReasoning, true
+	}
+	return false, false
+}
+
+// rejectPreserveReasoning records that the current endpoint refused
+// chat_template_kwargs (see chatTemplateKwargsRejected). The refusal is a
+// COMPLETED capability answer — the endpoint told us the field is not part of
+// its API — so it is stored as a negative exactly like a /props probe result:
+// locally for this provider and in the process-shared cache, so sibling
+// sessions on the same endpoint stop sending the parameter too.
+func (p *OpenAIProvider) rejectPreserveReasoning() {
+	baseURL := p.propsBaseURLForCurrentModel()
+	model := p.currentModel()
+	p.propsMu.Lock()
+	p.propsChecked = true
+	p.propsBaseURL = baseURL
+	p.propsPreserveReasoning = false
+	p.propsMu.Unlock()
+	p.propsCapsCache().RecordSuccess(propsCapsKey(baseURL, model), false)
 }
 
 // DefaultReasoningEfforts is the reasoning_effort value set used when the

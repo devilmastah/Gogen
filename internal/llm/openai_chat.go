@@ -107,13 +107,25 @@ func (p *OpenAIProvider) inferOpenCodeEndpoint(prof *providerProfile, model stri
 	if p.modelInfo == nil || model == "" || prof == nil {
 		return nil
 	}
-	if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
+	if p.registryListsModel(openCodeGoRegistryURLs(), model) {
 		return prof.goStream
 	}
-	if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
+	if p.registryListsModel(openCodeZenRegistryURLs(), model) {
 		return prof.zenStream
 	}
 	return nil
+}
+
+// registryListsModel reports whether any of urls resolves model in the
+// models.dev registry. The plural URL list covers the registry's spelling
+// drift for one endpoint (see openCodeGoRegistryURLs).
+func (p *OpenAIProvider) registryListsModel(urls []string, model string) bool {
+	for _, u := range urls {
+		if _, _, _, _, err := p.modelInfo.Resolve(u, model); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolUnionParam {
@@ -320,6 +332,10 @@ type roundRequest struct {
 	// StreamOptions: the converted messages, the tool definitions, the model,
 	// the prompt cache key, and the extras/thinking-level fields.
 	base openai.ChatCompletionNewParams
+	// extras records whether the llama.cpp-style chat_template_kwargs went
+	// into base: only a round that actually carried them can be re-issued
+	// without them (see chatTemplateKwargsRejected).
+	extras bool
 
 	// The two variants are memoized: the "stream" flag is added by the SDK
 	// (NewStreaming sets it on the serialized body), so the cached streaming
@@ -354,9 +370,9 @@ func (p *OpenAIProvider) newRoundRequest(ctx context.Context, messages []Message
 	if p.promptCacheKey.Valid() {
 		params.PromptCacheKey = p.promptCacheKey
 	}
-	p.applyChatCompletionExtras(ctx, &params)
+	extras := p.applyChatCompletionExtras(ctx, &params)
 	p.applyThinkingLevel(ctx, &params)
-	req := &roundRequest{client: p.clientForModel(ctx), base: params}
+	req := &roundRequest{client: p.clientForModel(ctx), base: params, extras: extras}
 	// Wire-byte accounting is diagnostic only: measured once per round, and
 	// only when someone is actually reading the debug log.
 	if debuglog.Enabled() {
@@ -419,6 +435,19 @@ func newChatRequest(body []byte, model string) (openai.ChatCompletionNewParams, 
 }
 
 func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {
+	req := p.newRoundRequest(ctx, messages, allowedTools, tools)
+	resp, err := p.nonStreamingTurn(ctx, req)
+	if err == nil || !req.extras || !chatTemplateKwargsRejected(err) {
+		return resp, err
+	}
+	// The endpoint refuses the optional chat_template_kwargs: record the
+	// refusal as its capability answer and re-issue the identical turn
+	// without the extras (see chatTemplateKwargsRejected).
+	debuglog.Write("llm/stream_recovery", "endpoint rejected chat_template_kwargs; retrying without extras", "", map[string]any{
+		"streamError": clipErrForLog(err),
+		"variant":     "non-stream",
+	})
+	p.rejectPreserveReasoning()
 	return p.nonStreamingTurn(ctx, p.newRoundRequest(ctx, messages, allowedTools, tools))
 }
 
@@ -546,6 +575,22 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	req := p.newRoundRequest(ctx, messages, allowedTools, tools)
 
 	at := p.streamChatAttempt(ctx, req, h)
+	if at.err != nil && req.extras && !at.acc.renderedOutput() && chatTemplateKwargsRejected(at.err) {
+		// The endpoint refuses the optional chat_template_kwargs (a strict
+		// gateway fails the whole request for the unrecognized field). Only
+		// an attempt that rendered NOTHING can be re-issued: a partial
+		// generation must not be restarted into the same bubble. The refusal
+		// is recorded as the endpoint's capability answer, so the rebuilt
+		// round (and every later round, in this session and its siblings)
+		// omits the parameter.
+		debuglog.Write("llm/stream_recovery", "endpoint rejected chat_template_kwargs; retrying without extras", "", map[string]any{
+			"streamError": clipErrForLog(at.err),
+			"variant":     "stream",
+		})
+		p.rejectPreserveReasoning()
+		req = p.newRoundRequest(ctx, messages, allowedTools, tools)
+		at = p.streamChatAttempt(ctx, req, h)
+	}
 	if at.err == nil {
 		return at.result, nil
 	}

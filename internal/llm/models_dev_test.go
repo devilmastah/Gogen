@@ -17,13 +17,15 @@ import (
 
 func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 	// The registry uses the LIVE models.dev spelling: the OpenCode endpoints
-	// are listed under /inference/ while the wire clients (and the profile
-	// baseURL below) use the /zen/ alias. A lookup that only tried the zen
-	// spelling found no provider and the session fell to the 128k default.
+	// are listed under /inference/openai/v1 (the OpenAI-compatible path) while
+	// the wire clients (and the profile baseURL below) use the /zen/ alias.
+	// models.dev has shipped three spellings over time (/zen/v1,
+	// /inference/v1, /inference/openai/v1); a lookup that only tried one of
+	// them found no provider and the session fell to the 128k default.
 	reg := map[string]any{
 		"opencode": map[string]any{
 			"id":  "opencode",
-			"api": "https://opencode.ai/inference/v1",
+			"api": "https://opencode.ai/inference/openai/v1",
 			"models": map[string]any{
 				"claude-opus-4-8": map[string]any{
 					"id":          "claude-opus-4-8",
@@ -34,7 +36,7 @@ func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 		},
 		"opencode-go": map[string]any{
 			"id":  "opencode-go",
-			"api": "https://opencode.ai/inference/go/v1",
+			"api": "https://opencode.ai/inference/go/openai/v1",
 			"models": map[string]any{
 				"mimo-v2.5-pro": map[string]any{
 					"id":    "mimo-v2.5-pro",
@@ -76,6 +78,73 @@ func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 	}
 }
 
+// TestLookupModelsDevLegacyOpenCodeSpellings pins the registry spelling
+// fallback: models.dev has listed the OpenCode endpoints under /zen/v1, then
+// /inference/v1, then /inference/openai/v1, and a stale disk cache (or a
+// registry rollback) still carries one of the older forms. The lookup must
+// resolve regardless of which generation of the spelling it finds, otherwise
+// every OpenCode context limit silently drops to the 128k default.
+func TestLookupModelsDevLegacyOpenCodeSpellings(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		zen   string
+		goURL string
+	}{
+		{name: "current", zen: "https://opencode.ai/inference/openai/v1", goURL: "https://opencode.ai/inference/go/openai/v1"},
+		{name: "inference", zen: "https://opencode.ai/inference/v1", goURL: "https://opencode.ai/inference/go/v1"},
+		{name: "zen", zen: "https://opencode.ai/zen/v1", goURL: "https://opencode.ai/zen/go/v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := map[string]any{
+				"opencode": map[string]any{
+					"id":  "opencode",
+					"api": tc.zen,
+					"models": map[string]any{
+						"zen-model": map[string]any{"id": "zen-model", "limit": map[string]int{"context": 1000000}},
+					},
+				},
+				"opencode-go": map[string]any{
+					"id":  "opencode-go",
+					"api": tc.goURL,
+					"models": map[string]any{
+						"go-model": map[string]any{"id": "go-model", "limit": map[string]int{"context": 1048576}},
+					},
+				},
+			}
+			cache := filepath.Join(t.TempDir(), "models.json")
+			b, err := json.Marshal(reg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(cache, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			p := &OpenAIProvider{
+				profiles:  []*providerProfile{{name: "default", baseURL: "https://opencode.ai/zen/go/v1"}},
+				modelInfo: modelinfo.NewResolver(cache),
+			}
+			if got, _, _, _ := p.lookupModelsDevInfo(ModelRef{ID: "zen-model"}); got != 1000000 {
+				t.Fatalf("zen model: got %d, want 1000000", got)
+			}
+			if got, _, _, _ := p.lookupModelsDevInfo(ModelRef{ID: "go-model"}); got != 1048576 {
+				t.Fatalf("go model: got %d, want 1048576", got)
+			}
+			// Registry-only inference (cold catalog) uses the same spellings.
+			prof := &providerProfile{name: "default", baseURL: "https://opencode.ai/zen/go/v1"}
+			zen := openai.NewClient()
+			goClient := openai.NewClient()
+			prof.zenStream, prof.goStream = &zen, &goClient
+			p.profiles = []*providerProfile{prof}
+			if got := p.inferOpenCodeEndpoint(prof, "go-model"); got != &goClient {
+				t.Fatalf("go-model inference: got %v, want go twin", got)
+			}
+			if got := p.inferOpenCodeEndpoint(prof, "zen-model"); got != &zen {
+				t.Fatalf("zen-model inference: got %v, want zen twin", got)
+			}
+		})
+	}
+}
+
 func TestLookupModelsDevInfoNilSafe(t *testing.T) {
 	var p *OpenAIProvider
 	if got, _, _, _ := p.lookupModelsDevInfo(ModelRef{ID: "x"}); got != 0 {
@@ -87,16 +156,16 @@ func TestLookupModelsDevInfoNilSafe(t *testing.T) {
 	}
 }
 
-// TestInferOpenCodeEndpointViaInferenceRegistry pins the live models.dev
-// spelling for the cold-catalog Go-over-Zen routing: the registry lists the
-// OpenCode endpoints under /inference/ while the wire twins use /zen/. A
-// zen-wire profile must still route go models to the go twin, zen models to
+// TestInferOpenCodeEndpointViaInferenceRegistry pins the models.dev spelling
+// for the cold-catalog Go-over-Zen routing: the registry lists the OpenCode
+// endpoints under /inference/openai/v1 while the wire twins use /inference/.
+// A zen-wire profile must still route go models to the go twin, zen models to
 // the zen twin, and a model in both catalogs to the go twin.
 func TestInferOpenCodeEndpointViaInferenceRegistry(t *testing.T) {
 	reg := map[string]any{
 		"opencode": map[string]any{
 			"id":  "opencode",
-			"api": "https://opencode.ai/inference/v1",
+			"api": "https://opencode.ai/inference/openai/v1",
 			"models": map[string]any{
 				"zen-only-model": map[string]any{"id": "zen-only-model", "limit": map[string]int{"context": 1000000}},
 				"both-model":     map[string]any{"id": "both-model", "limit": map[string]int{"context": 1000000}},
@@ -104,7 +173,7 @@ func TestInferOpenCodeEndpointViaInferenceRegistry(t *testing.T) {
 		},
 		"opencode-go": map[string]any{
 			"id":  "opencode-go",
-			"api": "https://opencode.ai/inference/go/v1",
+			"api": "https://opencode.ai/inference/go/openai/v1",
 			"models": map[string]any{
 				"go-only-model": map[string]any{"id": "go-only-model", "limit": map[string]int{"context": 1048576}},
 				"both-model":    map[string]any{"id": "both-model", "limit": map[string]int{"context": 1048576}},
