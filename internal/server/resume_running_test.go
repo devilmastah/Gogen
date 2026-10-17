@@ -280,6 +280,16 @@ func TestResumeHistoryPrecedesClientReactions(t *testing.T) {
 	if m.Type != "history" {
 		t.Fatalf("first transcript/sidebar frame = %q, want the resume history (the transcript swap must not wait behind sidebar traffic)", m.Type)
 	}
+
+	// The detach handler runs after the resume in the connection's read loop,
+	// i.e. possibly still in flight when the test body returns: its orphan
+	// eviction flushes the left-behind session into the store. Wait for that
+	// eviction to complete (it removes the runtime as its last step), so the
+	// write cannot race the caller's t.TempDir() removal.
+	waitFor(t, 5*time.Second, func() bool {
+		_, stillLive := s.registry.get(a.SessionID)
+		return !stillLive
+	})
 }
 
 // TestResumeReplyIsAttachSequence pins the wire-shape unification: a

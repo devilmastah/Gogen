@@ -25,6 +25,23 @@ func newLifecycleServer(t *testing.T) (*Server, *agent.Agent, *session.Store) {
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
+	// Quiesce async writers BEFORE the caller's t.TempDir() removal (cleanups
+	// run LIFO, so this later-registered cleanup runs after the test's own and
+	// before RemoveAll). A WS read-loop goroutine can outlive the test body —
+	// session_detach's orphan eviction flushes and rewrites the store, a resume
+	// restores (and flushes) the session it swapped in — and that write lands
+	// in .gogen/sessions while the temp dir is being deleted: "TempDir
+	// RemoveAll cleanup: ... directory not empty" (the same flake class the
+	// continuation/continuable helpers fix for their own tests).
+	t.Cleanup(func() {
+		s.stopAutomations()
+		s.ShutdownSessions()
+		for _, id := range s.registry.activeIDs() {
+			if rt, ok := s.registry.get(id); ok {
+				s.registry.evictRuntime(rt)
+			}
+		}
+	})
 	return s, a, store
 }
 
