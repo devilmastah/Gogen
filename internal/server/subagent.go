@@ -190,6 +190,9 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 // effort — the delete/eviction paths' own sweeps cover the window before
 // this check runs.
 func (sp *subagentSpawner) sweepOrphanedChild(rt *sessionRuntime, parentID, childID string) {
+	if sp.s.ws.Store == nil {
+		return // no persistence: no file to resurrect
+	}
 	if rt.evicted.Load() && sp.s.ws.Store.Info(sp.s.ws.GetWorkingDir(), parentID) == nil {
 		_ = sp.s.ws.Store.Delete(sp.s.ws.GetWorkingDir(), childID)
 	}

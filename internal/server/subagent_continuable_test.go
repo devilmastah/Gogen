@@ -36,6 +36,22 @@ func newContinuableServer(t *testing.T, childProvider func() llm.LLMProvider) (*
 	s := NewServer(a, &config.Config{})
 	s.ws.ProviderFactory = childProvider
 	a.SetSubagentsEnabled(true)
+	// Final quiesce before the caller's t.TempDir() removal. Registered
+	// BEFORE the settle cleanups below, so LIFO order runs it AFTER them and
+	// last before TempDir: whatever a settle could not observe (an evicted
+	// runtime's still-unwinding turn, an automation sweep) is cancelled,
+	// flushed and evicted here, synchronously, inside the cleanup. Same
+	// pattern (and same flake class: "TempDir RemoveAll cleanup: directory
+	// not empty") as newContinuationServer.
+	t.Cleanup(func() {
+		s.stopAutomations()
+		s.ShutdownSessions()
+		for _, id := range s.registry.activeIDs() {
+			if rt, ok := s.registry.get(id); ok {
+				s.registry.evictRuntime(rt)
+			}
+		}
+	})
 	// A delivered message is appended to the parent transcript BEFORE the
 	// delivery turn's final FlushSession lands (the write that persists
 	// the reply). Tests return as soon as they observe the message, so

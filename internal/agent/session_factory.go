@@ -1,11 +1,33 @@
 package agent
 
 import (
+	"reflect"
+
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 	"gogen/internal/skills"
 )
+
+// persistentStore normalizes a typed-nil SessionPersister to a real nil.
+//
+// A nil concrete pointer stored in the interface (the web workspace passes its
+// *session.Store field, which is nil on hosts built around an agent without
+// persistence) is NOT == nil, so every persistence guard would let it through
+// and (*session.Store).Save would dereference its nil receiver — the panic the
+// web bootstrap path hit when it created a session agent for a store-less
+// workspace (session_factory's thinking-level seed flushes immediately).
+// SessionAgentOptions.Store's "nil disables persistence" contract has to hold
+// for that shape too.
+func persistentStore(p SessionPersister) SessionPersister {
+	if p == nil {
+		return nil
+	}
+	if v := reflect.ValueOf(p); v.Kind() == reflect.Ptr && v.IsNil() {
+		return nil
+	}
+	return p
+}
 
 // SessionAgentOptions carries the shared per-session agent wiring used by
 // NewSessionAgent. Both the web server (Workspace.NewSessionAgent) and the
@@ -107,7 +129,7 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	a.TodoManager = NewTodoManager(opts.WorkingDir)
 	a.PinManager = NewPinManager()
 	a.DebugCompareMessages = opts.DebugCompareMessages
-	a.SessionStore = opts.Store
+	a.SessionStore = persistentStore(opts.Store)
 	a.SetSessionID(id)
 	a.SetMCPRegistry(opts.MCPRegistry)
 	if opts.ToolHandlers != nil {

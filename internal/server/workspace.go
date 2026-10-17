@@ -509,7 +509,6 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	opts := agent.SessionAgentOptions{
 		Provider:             ws.ProviderFactory(),
 		Executor:             ws.Exec,
-		Store:                ws.Store,
 		Config:               &runtimeCfg,
 		GlobalMode:           ws.GlobalMode,
 		ProjectFilePath:      ws.ProjectFilePath,
@@ -527,6 +526,14 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		InstructionsEnabled:  runtimeCfg.AgentInstructionsEnabled(),
 		SubagentSpawner:      ws.SubagentSpawner,
 		TerminalEnabled:      ws.terminalEnabled,
+	}
+	if ws.Store != nil {
+		// Assigned conditionally on purpose: ws.Store is a concrete
+		// *session.Store, and a nil one stored in the SessionPersister
+		// interface is NOT nil — it would slip past every persistence guard
+		// and dereference a nil receiver on the session's first flush (the
+		// bootstrap path from a host built without a store).
+		opts.Store = ws.Store
 	}
 	a := agent.NewSessionAgent(opts, snap, id)
 	a.SetOnBoardChanged(ws.BoardChangedHook)
