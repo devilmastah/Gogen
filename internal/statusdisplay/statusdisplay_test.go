@@ -429,6 +429,49 @@ func TestSinkRelaysRowsAndClears(t *testing.T) {
 	}
 }
 
+// TestProcessKeepsTheQueueTimeTransport pins the transport contract that made
+// TestSinkRelaysRowsAndClears flaky: an operation carries the relay that was
+// installed when it was QUEUED, so a sink installed afterwards (a test's fresh
+// sink, or ProbeWithRelay upgrading the browser relay to the server transport)
+// only ever receives operations queued for it. Replaying a queued clear through
+// the new sink handed one test the previous test's clear ("first relay =
+// {clear:true source:gogen-Gogen}").
+func TestProcessKeepsTheQueueTimeTransport(t *testing.T) {
+	resetForTest(t)
+	srv, rmu, reqs := newRecordingServer(t)
+
+	var smu sync.Mutex
+	var sinkCalls []relayed
+	SetSink(func(row []byte, clear bool, source string) {
+		smu.Lock()
+		sinkCalls = append(sinkCalls, relayed{row: string(row), clear: clear, source: source})
+		smu.Unlock()
+	})
+	t.Cleanup(func() { SetSink(nil) })
+
+	// An op queued while the HTTP transport was active (relay nil).
+	process(op{clear: true, cfg: Config{Enabled: true, Host: srv.URL, Source: "stale-row"}})
+
+	waitForReqs(t, rmu, reqs, 1)
+	rmu.Lock()
+	var deletes int
+	for _, r := range *reqs {
+		if r.method == http.MethodDelete {
+			deletes++
+		}
+	}
+	rmu.Unlock()
+	if deletes != 1 {
+		t.Fatalf("display DELETEs = %d, want 1 (the clear must go over HTTP, its queue-time transport)", deletes)
+	}
+	smu.Lock()
+	n := len(sinkCalls)
+	smu.Unlock()
+	if n != 0 {
+		t.Fatalf("the newly installed sink received %d call(s) from an op queued before it: %+v", n, sinkCalls)
+	}
+}
+
 // waitForRelayed waits until n sink calls were recorded.
 func waitForRelayed(t *testing.T, mu *sync.Mutex, got *[]relayed, n int) []relayed {
 	t.Helper()

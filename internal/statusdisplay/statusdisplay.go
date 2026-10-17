@@ -100,6 +100,14 @@ type op struct {
 	clear bool
 	cfg   Config
 	ev    agent.TurnEvent
+	// relay is the transport in effect when the op was QUEUED (the sink, or
+	// nil for the HTTP client). The worker delivers the op through it rather
+	// than through whatever sink happens to be installed when the op is
+	// dequeued: the sink can change while work is pending (ProbeWithRelay
+	// upgrades the browser relay to the server transport on a successful
+	// probe), and replaying an op through a transport it was not queued for
+	// hands a stale clear or row to a recipient that never asked for it.
+	relay func(row []byte, clear bool, source string)
 }
 
 var (
@@ -214,7 +222,7 @@ func Configure(enabled bool, host, token, source, workdir string) {
 	}
 	queuedClear := false
 	if prev.Enabled && prev.Host != "" && (!next.Enabled || prev.Host != next.Host || prev.Source != next.Source) {
-		pending = op{clear: true, cfg: prev}
+		pending = op{clear: true, cfg: prev, relay: sink}
 		dirty = true
 		queuedClear = true
 		startWorkerLocked()
@@ -350,7 +358,7 @@ func Notify(ev agent.TurnEvent) {
 		mu.Unlock()
 		return
 	}
-	pending = op{cfg: c, ev: ev}
+	pending = op{cfg: c, ev: ev, relay: sink}
 	dirty = true
 	switch ev.Phase {
 	case agent.TurnPhaseStarted:
@@ -429,7 +437,7 @@ func ticker() {
 			mu.Unlock()
 			continue
 		}
-		pending = op{cfg: cfg, ev: lastSet}
+		pending = op{cfg: cfg, ev: lastSet, relay: sink}
 		dirty = true
 		mu.Unlock()
 		signal()
@@ -466,12 +474,12 @@ func worker() {
 }
 
 // process sends one operation, deduping identical rows and logging only
-// failure/recovery transitions. With a sink installed the row is handed to
-// the relay instead of the HTTP client (browser mode).
+// failure/recovery transitions. When the op was queued for a relay (browser
+// mode) the row is handed to that relay instead of the HTTP client; the relay
+// travels WITH the op, so a sink swapped while work was pending cannot receive
+// an op it was not installed for (see op.relay).
 func process(p op) {
-	mu.Lock()
-	relay := sink
-	mu.Unlock()
+	relay := p.relay
 	if p.clear {
 		if relay != nil {
 			relay(nil, true, p.cfg.Source)
