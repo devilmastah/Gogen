@@ -70,6 +70,119 @@ func cutCells(s string, left, right int) string {
 	return ansi.Cut(s, left, right)
 }
 
+// truncateCells cuts s to at most width cells, measured the way the renderer
+// measures (cellWidth), keeping escape sequences intact and closing any SGR
+// that is still open at the cut so the row's style cannot bleed past it.
+//
+// ansi.Truncate/CutWc cannot do this job: their early return compares the
+// GRAPHEME width (ansi.StringWidth) whatever method was asked for, so a row
+// that is 2 cells by grapheme and 8 by wcwidth never takes the truncating
+// path at all — exactly the case that needs cutting.
+func truncateCells(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if cellWidth(s) <= width {
+		return s
+	}
+	var b strings.Builder
+	var state byte
+	cells := 0
+	cut := false
+	styleOpen := false
+	for i := 0; i < len(s); {
+		seq, w, n, newState := ansi.DecodeSequenceWc(s[i:], state, nil)
+		if w > 0 && cells+w > width {
+			cut = true
+			break
+		}
+		if w == 0 {
+			if params, ok := sgrSequenceParams(seq); ok {
+				styleOpen = params != "" && params != "0"
+			}
+		}
+		b.WriteString(seq)
+		cells += w
+		state = newState
+		if n <= 0 {
+			break // defensive: DecodeSequence always consumes ≥ 1 byte
+		}
+		i += n
+	}
+	if cut && styleOpen {
+		// The cut landed inside an SGR run; close it so the truncation cannot
+		// tint the padding that follows (or the next frame row).
+		b.WriteString(ansi.ResetStyle)
+	}
+	return b.String()
+}
+
+// padCells returns s padded with spaces to exactly width cells (measured the
+// renderer's way) and truncated when it would overflow. It is the row-filling
+// primitive the viewport and status bar use instead of lipgloss's Width, whose
+// padding measures by GRAPHEME width and therefore over-fills any row holding
+// a multi-codepoint cluster — pushing the row past the frame edge, where the
+// terminal soft-wraps it and desyncs the inline renderer.
+func padCells(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	s = truncateCells(s, width)
+	if w := cellWidth(s); w < width {
+		return s + strings.Repeat(" ", width-w)
+	}
+	return s
+}
+
+// joinVerticalCells stacks blocks and fills every row to exactly width cells.
+//
+// It replaces lipgloss.JoinVertical(lipgloss.Left, …), which aligns each row to
+// the block's widest line measured by GRAPHEME width: a row holding a
+// multi-codepoint cluster (a ZWJ emoji is 2 cells by grapheme and 8 by
+// wcwidth) measures narrower than it paints, so the join pads it to the block
+// width and pushes it past the frame edge. The terminal then soft-wraps that
+// row and every row below shifts — the inline renderer's cell diff desyncs
+// from the screen.
+func joinVerticalCells(width int, blocks ...string) string {
+	var rows []string
+	for _, b := range blocks {
+		rows = append(rows, strings.Split(b, "\n")...)
+	}
+	for i, r := range rows {
+		rows[i] = padCells(r, width)
+	}
+	return strings.Join(rows, "\n")
+}
+
+// joinHorizontalCells places left beside right (top-aligned), padding every
+// row of each side to its own column width in the renderer's measure and the
+// block with fewer rows with blank rows. It replaces lipgloss.JoinHorizontal
+// for the sidebar, for the same grapheme-vs-wcwidth reason as
+// joinVerticalCells: a session label holding a ZWJ cluster makes the panel row
+// measure narrower than it paints, and lipgloss's padding then widens the
+// joined frame past the terminal.
+func joinHorizontalCells(left string, leftWidth int, right string, rightWidth int) string {
+	leftRows := strings.Split(left, "\n")
+	rightRows := strings.Split(right, "\n")
+	rows := max(len(leftRows), len(rightRows))
+	out := make([]string, rows)
+	for i := range out {
+		var l, r string
+		if i < len(leftRows) {
+			l = padCells(leftRows[i], leftWidth)
+		} else {
+			l = padCells("", leftWidth)
+		}
+		if i < len(rightRows) {
+			r = padCells(rightRows[i], rightWidth)
+		} else {
+			r = padCells("", rightWidth)
+		}
+		out[i] = l + r
+	}
+	return strings.Join(out, "\n")
+}
+
 // wrapCells is lipgloss.Wrap measured the way the renderer measures, for the
 // same reason as cellWidth. It mirrors lipgloss.Wrap exactly — ansi.Wrap to
 // break the line, then a WrapWriter pass to re-open any SGR style that is

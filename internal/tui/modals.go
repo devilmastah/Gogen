@@ -615,9 +615,14 @@ func (m *Model) renderBorderedModalWidth(rows []styleLine, minInner int) string 
 	for _, r := range rows {
 		text := r.text
 		// Truncate ANSI-aware to the clamped content width before any
-		// styling or padding so every row fits the box budget.
+		// styling or padding so every row fits the box budget. truncateCells
+		// (wcwidth), not cutCells: a row holding a multi-codepoint cluster can
+		// be WIDER than the budget after a grapheme-measured cut, and the
+		// negative padding that follows then leaves the box row over-wide —
+		// the terminal soft-wraps it and the frame desyncs (a session label
+		// with a ZWJ emoji did exactly that).
 		if cellWidth(text) > contentW {
-			text = cutCells(text, 0, contentW)
+			text = truncateCells(text, contentW)
 		}
 		b.WriteString("│  ")
 		if r.preStyled {

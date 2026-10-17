@@ -57,7 +57,10 @@ func (m *Model) jumpButtonZone() (x0, x1 int, ok bool) {
 	// the dash fill).
 	x0 = left + (chatW-w)/2
 	if m.focus == FocusViewport {
-		hintStart := left + max(0, chatW-len(viewportFocusIndicator))
+		// The hint that is actually painted (dividerHint fits it to the
+		// column), not the full one: a narrower column shows the short form,
+		// and the button must yield to that.
+		hintStart := left + max(0, chatW-cellWidth(dividerHint(chatW)))
 		if x0+w > hintStart {
 			x0 = hintStart - w
 		}

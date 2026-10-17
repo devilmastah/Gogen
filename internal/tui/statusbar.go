@@ -6,6 +6,27 @@ import (
 	"gogen/internal/contextmgr"
 )
 
+// renderBar renders the bar's inner content (already measured to w-2 cells)
+// and returns exactly w cells.
+//
+// It deliberately does not use StatusBarStyle.Width(w): lipgloss pads to the
+// width by GRAPHEME measure, so content holding a multi-codepoint cluster (a
+// ZWJ emoji in the model name or working directory is 2 cells by grapheme and
+// 8 by wcwidth) is padded as if it were narrower than it paints and the bar
+// comes out wider than the terminal — the bottom row of the frame soft-wraps
+// and the inline renderer's cell diff desyncs from the screen. Padding the
+// content in the renderer's measure (padCells) and letting the style add only
+// its one-cell padding on each side keeps the row exact.
+func renderBar(w int, content string) string {
+	if w <= 0 {
+		return ""
+	}
+	if w > 2 {
+		content = padCells(content, w-2)
+	}
+	return StatusBarStyle.UnsetWidth().Render(content)
+}
+
 // The bar spans the MAIN COLUMN, not the terminal: with the sidebar
 // visible the column is narrower, and an over-wide bar would grow the
 // combined frame past the terminal width.
@@ -15,7 +36,7 @@ func (m *Model) renderStatusBar() string {
 		return ""
 	}
 	if m.agent == nil {
-		return StatusBarStyle.Width(w).Render("")
+		return renderBar(w, "")
 	}
 
 	var leftParts []string
@@ -30,12 +51,12 @@ func (m *Model) renderStatusBar() string {
 		avail := max(0, w-2) // -2 for the bar's horizontal padding
 		msg := m.statusMsg
 		if cellWidth(msg) > avail {
-			msg = cutCells(msg, 0, avail)
+			msg = truncateCells(msg, avail)
 		}
 		content := StatusBarDimStyle.Render(msg)
 		padLeft := max(0, (avail-cellWidth(msg))/2)
 		result := strings.Repeat(" ", padLeft) + content
-		return StatusBarStyle.Width(w).Render(result)
+		return renderBar(w, result)
 	}
 
 	// Mode
@@ -116,5 +137,5 @@ func (m *Model) renderStatusBar() string {
 
 	content := left + strings.Repeat(" ", middleWidth) + right
 
-	return StatusBarStyle.Width(w).Render(content)
+	return renderBar(w, content)
 }

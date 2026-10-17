@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -251,7 +250,10 @@ func (m *Model) pasteTocTooltip(lines []string, railCol, dotY int) {
 // width; every row is exactly w cells wide. Extracted from pasteTocTooltip
 // so the geometry is unit-testable.
 func buildTocTooltipBox(text string, index, w int) []string {
-	body := strings.Split(lipgloss.Wrap(text, w-4, " "), "\n")
+	// wrapCells, not lipgloss.Wrap: a prompt holding a ZWJ/skin-tone cluster
+	// would wrap late by the grapheme-vs-wcwidth difference and the box row
+	// would come out wider than its border (see cellWidth).
+	body := strings.Split(wrapCells(text, w-4), "\n")
 	if len(body) > 6 {
 		body = body[:6]
 		// The ellipsis must fit the row's padding budget: cut the line to

@@ -179,31 +179,48 @@ func TestJumpButtonHover(t *testing.T) {
 }
 
 // In viewport focus the divider's right end carries the " [SCROLL] …"
-// hint: the button yields to it (skipped when the column cannot fit
-// both), so the hint is never covered or truncated.
+// hint, and the button yields to it (skipped when the column cannot fit
+// both). The hint is fitted to the column: the full sentence when it fits, a
+// shorter form on a narrow column, and never a row wider than the column — an
+// over-wide divider row used to push the whole frame past the terminal, which
+// soft-wraps it and desyncs the inline renderer.
 func TestJumpButtonAvoidsFocusHint(t *testing.T) {
 	m := detachedJumpModel(t, 40)
 	m.focus = FocusViewport
-	hint := strings.TrimSpace(viewportFocusIndicator)
+	full := strings.TrimSpace(viewportFocusIndicator)
+	fullSeen := 0
 	visible := 0
 
 	for w := 60; w <= 160; w += 10 {
 		m.SetSize(w, 30)
 		rows := strings.Split(stripANSI(m.View().Content), "\n")
 		divider := rows[m.viewport.Height]
+		if got := cellWidth(divider); got > m.width {
+			t.Fatalf("width %d: frame row is %d cells, want <= %d: %q", w, got, m.width, divider)
+		}
+		if hint := dividerHint(m.mainWidth()); !strings.Contains(divider, strings.TrimSpace(hint)) {
+			t.Fatalf("width %d: painted divider lacks the fitted hint %q: %q", w, hint, divider)
+		}
 		if _, _, ok := m.jumpButtonZone(); ok {
 			visible++
 			if !strings.Contains(divider, jumpButtonJumpLabel) {
 				t.Fatalf("width %d: zone reported but label not painted: %q", w, divider)
 			}
 		}
-		if !strings.Contains(divider, hint) {
-			t.Fatalf("width %d: the focus hint is covered or truncated: %q", w, divider)
+		if !strings.Contains(divider, "[SCROLL]") {
+			t.Fatalf("width %d: the focus hint is missing: %q", w, divider)
+		}
+		if strings.Contains(divider, full) {
+			fullSeen++
 		}
 	}
 	// The button must be reachable while the hint is up (wide terminals),
-	// not silently suppressed everywhere.
+	// not silently suppressed everywhere…
 	if visible == 0 {
 		t.Fatal("button never rendered next to the focus hint")
+	}
+	// …and a wide-enough column must still show the whole sentence.
+	if fullSeen == 0 {
+		t.Fatal("the full focus hint was never rendered")
 	}
 }

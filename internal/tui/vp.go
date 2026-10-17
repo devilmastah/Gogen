@@ -197,6 +197,17 @@ func (v Viewport) visibleLines() []string {
 }
 
 // View renders the viewport into a string suitable for display.
+//
+// The rows are fitted by hand (padCells/truncateCells) instead of through
+// lipgloss's Width/MaxWidth: lipgloss pads and measures by GRAPHEME width,
+// while the renderer paints with wcwidth. On a row holding a multi-codepoint
+// cluster the two disagree — a ZWJ family emoji is 2 cells by grapheme and 8
+// by wcwidth, a skin-tone modifier 2 vs 4 — so lipgloss under-counts the row
+// and pads it wider than the frame. The terminal then soft-wraps that one row,
+// every row below it shifts down, and the inline renderer's cell diff desyncs
+// from the screen (ghost rows, stuck columns) until something forces a full
+// repaint — which is why a resize appears to "fix" it. Padding in the
+// renderer's own measure makes every row exactly contentWidth cells.
 func (v Viewport) View() string {
 	w, h := v.Width, v.Height
 	if sw := v.Style.GetWidth(); sw != 0 {
@@ -205,17 +216,43 @@ func (v Viewport) View() string {
 	if sh := v.Style.GetHeight(); sh != 0 {
 		h = min(h, sh)
 	}
+	padLeft := v.Style.GetPaddingLeft()
+	padRight := v.Style.GetPaddingRight()
 	contentWidth := w - v.Style.GetHorizontalFrameSize()
 	contentHeight := h - v.Style.GetVerticalFrameSize()
-	contents := lipgloss.NewStyle().
-		Width(contentWidth).
-		Height(contentHeight).
-		MaxHeight(contentHeight).
-		MaxWidth(contentWidth).
-		Render(strings.Join(v.visibleLines(), "\n"))
-	return v.Style.
+	// The horizontal padding is added here rather than by lipgloss: its
+	// padding aligns every line to the block's GRAPHEME width, which re-widens
+	// exactly the rows fitRows just fitted to the renderer's wcwidth measure.
+	body := v.Style.
 		UnsetWidth().UnsetHeight().
-		Render(contents)
+		UnsetPaddingLeft().UnsetPaddingRight().
+		Render(fitRows(v.visibleLines(), contentWidth, contentHeight))
+	if padLeft == 0 && padRight == 0 {
+		return body
+	}
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		lines[i] = strings.Repeat(" ", padLeft) + line + strings.Repeat(" ", padRight)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// fitRows renders exactly height rows of exactly width cells each, in the
+// renderer's (wcwidth) measure. Blank rows fill the tail so the viewport always
+// occupies its budgeted band; see View for why the padding is done here.
+func fitRows(lines []string, width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	rows := make([]string, height)
+	for i := range rows {
+		if i < len(lines) {
+			rows[i] = padCells(lines[i], width)
+			continue
+		}
+		rows[i] = padCells("", width)
+	}
+	return strings.Join(rows, "\n")
 }
 
 // Update handles tea.Msg for mouse wheel scrolling.

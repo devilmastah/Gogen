@@ -10,7 +10,6 @@ import (
 	"gogen/internal/session"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 )
 
 // tabWidthCells mirrors the viewport render style's default TabWidth
@@ -318,9 +317,13 @@ func (m *Model) View() tea.View {
 
 	// Sidebar panel (live sessions) — only when visible AND the main
 	// column keeps its minimum width (mainWidth auto-hides otherwise).
-	if m.sidebarOffsetX() > 0 {
+	if off := m.sidebarOffsetX(); off > 0 {
 		mainLines := strings.Count(main, "\n") + 1
-		main = lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(mainLines), main)
+		// joinHorizontalCells, not lipgloss.JoinHorizontal: the latter pads by
+		// GRAPHEME width, so a sidebar row holding a ZWJ label (or any
+		// multi-codepoint cluster) is padded wider than it paints and the
+		// joined frame overflows the terminal (see joinHorizontalCells).
+		main = joinHorizontalCells(m.renderSidebar(mainLines), off, main, m.mainWidth())
 	}
 
 	// Prompt rail (web TOC parity): dots + hover preview pasted into the
@@ -346,10 +349,30 @@ func (m *Model) View() tea.View {
 	return v
 }
 
-// viewportFocusIndicator is the divider hint painted while the viewport
+// viewportFocusIndicator is the full divider hint painted while the viewport
 // has focus. It owns the divider's right end, which the jump button yields
 // to (jumpbutton.go).
 const viewportFocusIndicator = " [SCROLL] Press i or Esc to return to input "
+
+// viewportFocusIndicatorShort and viewportFocusIndicatorTag are the fallbacks
+// for a narrow chat column (the sidebar takes half of it): the hint is fitted
+// to the divider instead of running past the column edge, which would push the
+// whole frame wider than the terminal.
+var (
+	viewportFocusIndicatorShort = " [SCROLL] Esc to return to input "
+	viewportFocusIndicatorTag   = " [SCROLL] "
+)
+
+// dividerHint returns the longest viewport-focus hint that fits in width
+// cells, truncating the tag only when even that does not fit.
+func dividerHint(width int) string {
+	for _, hint := range []string{viewportFocusIndicator, viewportFocusIndicatorShort, viewportFocusIndicatorTag} {
+		if cellWidth(hint) <= width {
+			return hint
+		}
+	}
+	return truncateCells(viewportFocusIndicatorTag, width)
+}
 
 // renderMainColumn assembles the chat column (viewport, divider, input,
 // status bar) WITHOUT the sidebar. Kept separate so the sidebar can match
@@ -400,9 +423,14 @@ func (m *Model) renderMainColumn() string {
 		m.dividerCacheStream != m.streaming
 	if dividerDirty {
 		if m.focus == FocusViewport {
-			line := strings.Repeat("─", main)
-			keep := max(0, main-len(viewportFocusIndicator))
-			m.dividerCache = DividerStyle.Render(sliceByRuneCount(line, keep) + viewportFocusIndicator)
+			// The hint is fitted to the column FIRST: appending the full
+			// indicator and truncating afterwards used to leave the divider
+			// wider than the column (the frame then overflowed the terminal
+			// and the inline renderer desynced), and a mid-word cut reads as
+			// broken. dividerHint picks the longest hint that fits.
+			hint := dividerHint(main)
+			line := strings.Repeat("─", max(0, main-cellWidth(hint)))
+			m.dividerCache = DividerStyle.Render(line + hint)
 		} else if m.streaming {
 			m.dividerCache = DimStyle.Render(strings.Repeat("─", main))
 		} else {
@@ -414,14 +442,18 @@ func (m *Model) renderMainColumn() string {
 	}
 	divider := m.dividerCache
 
-	// Assemble
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
+	// Assemble. joinVerticalCells (not lipgloss.JoinVertical) fills every row
+	// to the column width in the renderer's measure: lipgloss aligns by
+	// GRAPHEME width, which re-widens any row holding a multi-codepoint
+	// cluster and pushes the frame past the terminal (see
+	// joinVerticalCells).
+	sections := []string{
 		vpView,
 		divider,
 		inputArea,
 		m.renderStatusBar(),
-	)
+	}
+	return joinVerticalCells(main, sections...)
 }
 
 // refreshSavedSessions synchronously snapshots the persisted-session
@@ -495,13 +527,50 @@ func (m *Model) requestContextStats() tea.Cmd {
 }
 
 // renderModalOverlay covers the main view with an opaque background block
-// and centers the modal on top of it. lipgloss.Place is a noöp when the
-// modal exceeds the terminal in either dimension, matching the old manual
-// clamping; ModalOverlayBackground paints every cell, padding included.
+// and centers the modal on top of it, returning exactly width×height cells.
+//
+// The centering is computed here, in the renderer's (wcwidth) measure, rather
+// than by lipgloss.Place: Place sizes the block by GRAPHEME width, so a modal
+// row holding a multi-codepoint cluster (a session label with a ZWJ emoji is
+// 2 cells by grapheme and 8 by wcwidth) measures narrower than it paints and
+// Place pads it out past the terminal edge — one soft-wrapped row, and the
+// inline renderer's frame desyncs. Rows are also truncated to the terminal so
+// an oversized modal can never overflow it (lipgloss.Place leaves oversized
+// content untouched).
 func renderModalOverlay(modal string, width, height int) string {
-	return ModalOverlayBackground.Render(
-		lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, modal),
-	)
+	if width <= 0 || height <= 0 {
+		return ModalOverlayBackground.Render(modal)
+	}
+	lines := strings.Split(modal, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	boxW := blockWidth(modal)
+	if boxW > width {
+		boxW = width
+	}
+	padLeft := max(0, (width-boxW)/2)
+	top := max(0, (height-len(lines))/2)
+	blank := strings.Repeat(" ", width)
+	rows := make([]string, height)
+	for i := range rows {
+		rows[i] = blank
+	}
+	for i, line := range lines {
+		row := i + top
+		if row >= height {
+			break
+		}
+		line = truncateCells(line, width-padLeft)
+		rows[row] = strings.Repeat(" ", padLeft) + line +
+			strings.Repeat(" ", max(0, width-padLeft-cellWidth(line)))
+	}
+	// Background per row: applying the style to the whole block would re-pad
+	// its lines to the block's grapheme width (see joinVerticalCells).
+	for i, r := range rows {
+		rows[i] = ModalOverlayBackground.Render(r)
+	}
+	return strings.Join(rows, "\n")
 }
 
 // refocusInput restarts the textarea cursor blink after streaming (blink ticks
