@@ -321,3 +321,41 @@ func TestContextLimitFollowsOwningProfile(t *testing.T) {
 		t.Fatalf("local context limit = %d, %v; want 32000 (owning profile's entry)", limit, err)
 	}
 }
+
+// TestModelContextLimitUnknownReturnsZero pins the "unknown" contract: a
+// model the provider JSON does not size (no n_ctx), that models.dev does not
+// know, must report 0 — not the 128k display fallback. Reporting the
+// fallback as a resolved window made a session claim 128k while /models
+// resolved the real per-model size. 0 lets the context manager keep the
+// limit unresolved (and retry once the registry warms) so wire consumers
+// fall back to the model list's per-model limit.
+func TestModelContextLimitUnknownReturnsZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"object":"list","data":[{"id":"unknown-model","object":"model","owned_by":"test"}]}`))
+	}))
+	defer srv.Close()
+
+	client := openai.NewClient(
+		option.WithBaseURL(srv.URL+"/"),
+		option.WithAPIKey("test"),
+		option.WithHTTPClient(srv.Client()),
+	)
+	p := &OpenAIProvider{
+		profiles:    []*providerProfile{{name: "default", stream: &client}},
+		modelClient: make(map[ModelRef]*openai.Client),
+		model:       "unknown-model",
+	}
+
+	limit, err := p.ModelContextLimit(context.Background())
+	if err != nil {
+		t.Fatalf("ModelContextLimit: %v", err)
+	}
+	if limit != 0 {
+		t.Fatalf("ModelContextLimit = %d, want 0 (unknown window)", limit)
+	}
+}

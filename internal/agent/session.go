@@ -211,57 +211,61 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 	ctx, cancel := context.WithTimeout(ctx, validateModelTimeout)
 	defer cancel()
 
-	// Context limit first: ModelContextLimit tries /v1/models briefly (local
-	// n_ctx), then models.dev — without stacking a full catalog wait + Get.
-	// Also refresh when no model is selected yet: the probe performs
-	// sole-model auto-select, which must not be skipped just because the
-	// context limit is already resolved (e.g. pre-warmed from a session
-	// snapshot) — otherwise a single-model provider never gets its model
-	// chosen and the session stays stuck on "no model selected".
-	if a.Context != nil && (a.ContextLimit() <= 0 || a.Provider.ModelName() == "") {
+	// Validate the restored model FIRST: it may no longer exist, in which
+	// case it is cleared and the provider's sole model may be auto-selected
+	// in its place. The context-limit refresh below must resolve for that
+	// effective model, not the stale one.
+	if model != "" {
+		models, err := a.Provider.ListModels(ctx)
+		if err != nil {
+			// Cannot verify the restored model right now (endpoint down,
+			// timeout). Fail open — keep the model — but leave it marked
+			// unverified so requireModelSelected re-checks on the first
+			// turn instead of sending a possibly-stale model to the
+			// endpoint.
+			models = nil
+		} else {
+			found := false
+			owner := ""
+			for _, m := range models {
+				if m.ID == model {
+					found = true
+					// First match in catalog order (= profile order,
+					// default first): the pre-refactor owner, used to
+					// re-home a legacy restore (see
+					// adoptLegacyModelOwner).
+					owner = m.Provider
+					break
+				}
+			}
+			if found {
+				// The restored model is still served by this provider.
+				a.setModelUnverified(false)
+				a.adoptLegacyModelOwner(model, owner)
+			} else {
+				// The restored model no longer exists at the provider.
+				// Clear it — unless a concurrent /models selection
+				// replaced it in the meantime.
+				if a.Provider.ModelName() == model {
+					_ = a.Provider.SetModel("")
+				}
+				a.setModelUnverified(false)
+				a.setModelOwnerLegacy(false)
+			}
+		}
+	}
+
+	// Refresh the context limit UNCONDITIONALLY — never trust the snapshot's
+	// pre-warmed value (RestoreSessionLocal) just because it is positive: it
+	// was resolved by an earlier run/build, possibly to the 128k display
+	// fallback (a cold models.dev registry, the pre-fix OpenCode URL
+	// spelling, an endpoint that was down at save time). A positive value
+	// used to short-circuit this refresh for the life of the restored
+	// session, which kept the context bar at the fallback while /models
+	// already resolved the real window. The probe also performs sole-model
+	// auto-select, so a single-model provider still gets its model chosen.
+	if a.Context != nil {
 		a.Context.RefreshAfterModelChange(ctx)
-	}
-	if model == "" {
-		return
-	}
-	models, err := a.Provider.ListModels(ctx)
-	if err != nil {
-		// Cannot verify the restored model right now (endpoint down,
-		// timeout). Fail open — keep the model — but leave it marked
-		// unverified so requireModelSelected re-checks on the first turn
-		// instead of sending a possibly-stale model to the endpoint.
-		return
-	}
-	found := false
-	owner := ""
-	for _, m := range models {
-		if m.ID == model {
-			found = true
-			// First match in catalog order (= profile order, default
-			// first): the pre-refactor owner, used to re-home a legacy
-			// restore (see adoptLegacyModelOwner).
-			owner = m.Provider
-			break
-		}
-	}
-	if found {
-		// The restored model is still served by this provider.
-		a.setModelUnverified(false)
-		a.adoptLegacyModelOwner(model, owner)
-	} else {
-		// The restored model no longer exists at the provider. Clear it —
-		// unless a concurrent /models selection replaced it in the
-		// meantime — then re-probe so a single-model provider auto-selects
-		// its sole model immediately instead of leaving the session with
-		// no model until the next turn.
-		if a.Provider.ModelName() == model {
-			_ = a.Provider.SetModel("")
-		}
-		a.setModelUnverified(false)
-		a.setModelOwnerLegacy(false)
-		if a.Provider.ModelName() == "" {
-			_, _ = a.Provider.ModelContextLimit(ctx)
-		}
 	}
 	// Let hosts refresh their UI: the restored model may have been cleared
 	// or replaced by sole-model auto-select. Read under onModelChangedMu so
@@ -598,18 +602,21 @@ func (a *Agent) capturePersistState() persistState {
 func (a *Agent) persistFullSnapshot(st persistState, count int, skipTokenCounts bool) bool {
 	subagentStatus, subagentSummary := a.SubagentOutcome()
 	snap := SessionSnapshot{
-		WorkingDir:      st.workingDir,
-		Model:           st.model,
-		ModelProvider:   st.modelProvider,
-		Mode:            st.mode,
-		ThinkingLevel:   st.thinking,
-		Oneshot:         st.oneshot,
-		Label:           st.label,
-		LabelRenamed:    st.labelRenamed,
-		ProjectProfile:  st.profile,
-		Todos:           st.meta.todos,
-		Messages:        st.msgs,
-		ContextLimit:    a.ContextLimit(),
+		WorkingDir:     st.workingDir,
+		Model:          st.model,
+		ModelProvider:  st.modelProvider,
+		Mode:           st.mode,
+		ThinkingLevel:  st.thinking,
+		Oneshot:        st.oneshot,
+		Label:          st.label,
+		LabelRenamed:   st.labelRenamed,
+		ProjectProfile: st.profile,
+		Todos:          st.meta.todos,
+		Messages:       st.msgs,
+		// Persist only a genuinely resolved window: an unresolved display
+		// fallback must not be saved, or the next restore pre-warms the
+		// guess as a resolved value.
+		ContextLimit:    a.ResolvedContextLimit(),
 		ParentID:        a.ParentID(),
 		SubagentStatus:  subagentStatus,
 		SubagentSummary: subagentSummary,

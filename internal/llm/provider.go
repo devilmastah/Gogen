@@ -151,6 +151,11 @@ type ModelInfo struct {
 type LLMProvider interface {
 	GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, extraTools []Tool) (Response, error)
 	GenerateResponseStream(ctx context.Context, messages []Message, allowedTools map[string]struct{}, extraTools []Tool, h *StreamHandlers) (*StreamResult, error)
+	// ModelContextLimit resolves the current model's context window (tokens)
+	// from provider metadata and the models.dev registry. A positive value
+	// is the model's window; 0 means the window could not be resolved (the
+	// registry may still be warming) and the caller must apply its own
+	// fallback — 0 must never be reported to the UI as a real window.
 	ModelContextLimit(ctx context.Context) (int, error)
 	ListModels(ctx context.Context) ([]ModelInfo, error)
 	SetModel(id string) error

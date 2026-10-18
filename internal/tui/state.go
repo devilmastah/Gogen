@@ -53,8 +53,9 @@ const (
 
 // modelChangedMsg is sent by the TUI runner when a background agent state
 // change (e.g. restore model validation) may have altered what the status
-// bar shows. Handling it as a no-op still forces a re-render, which reads
-// the live provider model.
+// bar shows. Handling it re-renders (the provider model is read live) and
+// re-probes the context indicator, whose line is cached state and would
+// otherwise keep the restored snapshot's pre-warmed limit.
 type modelChangedMsg struct{}
 
 // Model is the top-level Bubble Tea model for the TUI.

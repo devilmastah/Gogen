@@ -187,6 +187,18 @@ func (a *Agent) ContextLimit() int {
 	return a.Context.ContextLimit()
 }
 
+// ResolvedContextLimit is ContextLimit only when the window has genuinely
+// been resolved for the current model, and 0 while it is the display
+// fallback for an unresolved window. Display ("switched to … (context: N)")
+// and persistence callers use it so a guess is never presented — or saved —
+// as the model's real window.
+func (a *Agent) ResolvedContextLimit() int {
+	if a.Context == nil {
+		return 0
+	}
+	return a.Context.ResolvedContextLimit()
+}
+
 func (a *Agent) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
 	models, err := a.Provider.ListModels(ctx)
 	if err != nil {
@@ -306,7 +318,7 @@ func (a *Agent) HandleModelsCommand(ctx context.Context, input string) (string, 
 		if err := a.SelectModel(ctx, arg); err != nil {
 			return "", true, err
 		}
-		limit := a.ContextLimit()
+		limit := a.ResolvedContextLimit()
 		if limit > 0 {
 			return fmt.Sprintf("Switched to model: %s (context: %d tokens)", a.CurrentModel(), limit), true, nil
 		}

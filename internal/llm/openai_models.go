@@ -383,10 +383,13 @@ func (p *OpenAIProvider) resolvedProfiles() []*providerProfile {
 
 func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 	// Resolution order: warm in-memory cache → models.dev (disk-cached, no
-	// network) → brief /v1/models probe → 128k default. Network catalog
-	// uses a short timeout so a hung remote host cannot stall restore or
-	// context refresh; local servers still win when they answer quickly
-	// with n_ctx etc.
+	// network) → brief /v1/models probe → 0 (unknown). The catalog uses a
+	// short timeout so a hung remote host cannot stall restore or context
+	// refresh; local servers still win when they answer quickly with n_ctx
+	// etc. An unknown window is reported as 0, NOT as the 128k display
+	// fallback: the caller must be able to tell "the model's window is
+	// 128k" from "the window could not be resolved yet", so it can retry
+	// (the models.dev registry may still be warming) and display "unknown".
 	ctx, cancel := context.WithTimeout(ctx, modelsLimitLookupTimeout)
 	defer cancel()
 
@@ -418,8 +421,9 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 	if lim, ok := p.contextLimitFromModels(models); ok {
 		return lim, nil
 	}
-	// 4. Fallback — return the default.
-	return config.DefaultContextLimit, nil
+	// 4. Unresolved — 0 means "unknown" (see the contract above); the
+	// caller applies the display/compaction fallback itself.
+	return 0, nil
 }
 
 // contextLimitFromModels applies sole-model auto-select and provider JSON

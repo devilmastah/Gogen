@@ -229,7 +229,16 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) 
 }
 
 func (m *Model) handleModelChangedMsg() (tea.Model, tea.Cmd) {
-	return m, nil
+	// A background validation may have just resolved a restored session's
+	// context window (or cleared/auto-selected its model). Re-rendering
+	// alone reads the CACHED context line, which still holds the snapshot's
+	// pre-warmed fallback; re-probe the indicator so it shows the resolved
+	// window. The probe is async: the token-count cache is cold on the
+	// restore path, and tokenizing must stay off the Update thread.
+	if m.agent == nil {
+		return m, nil
+	}
+	return m, m.requestContextStats()
 }
 
 func (m *Model) handleSpinnerTick(msg spinner.TickMsg) (tea.Model, tea.Cmd) {

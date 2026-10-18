@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"gogen/internal/config"
 	"gogen/internal/debuglog"
@@ -133,6 +134,13 @@ type Manager struct {
 	mu                   sync.RWMutex
 	limitResolved        bool
 	manualContextLimit   int
+	// lastLimitAttempt is when the last probe FAILED to resolve the window.
+	// EnsureContextLimit throttles retries to limitRetryInterval so an
+	// unresolvable model (no provider n_ctx, no models.dev entry) does not
+	// pay a bounded provider probe on every round of a turn while staying
+	// unresolved (and displayed as unknown) instead of being pinned to the
+	// display fallback. Guarded by mu.
+	lastLimitAttempt time.Time
 }
 
 func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
@@ -152,6 +160,10 @@ func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 		limitResolved: settings.ContextLimit > 0,
 	}
 }
+
+// limitRetryInterval throttles re-probes of an unresolved context window
+// (see lastLimitAttempt). A var so tests can shrink it.
+var limitRetryInterval = 30 * time.Second
 
 // normalizeSettings clamps invalid values to defaults. 0 is meaningful for
 // these fields (see Settings docs): compact_threshold 0 disables
@@ -239,6 +251,9 @@ func (m *Manager) applySettingsLocked(next Settings) {
 	// A manual limit is resolved by construction; 0 returns to provider
 	// resolution (EnsureContextLimit re-probes on the next turn).
 	m.limitResolved = next.ContextLimit > 0
+	// An explicitly changed limit re-derives the state: drop any retry
+	// throttle left by the previous (failed) resolution.
+	m.lastLimitAttempt = time.Time{}
 	if next.ContextLimit > 0 {
 		m.manualContextLimit = next.ContextLimit
 	}
@@ -263,36 +278,53 @@ func (m *Manager) RefreshAfterModelChange(ctx context.Context) {
 		m.mu.Unlock()
 		return
 	}
-	m.Settings.ContextLimit = 0
+	// Keep the current value as the display fallback (a restored session's
+	// pre-warmed limit, or the previous model's window) but clear the
+	// resolved flag: the probe below must not be skipped, and if it cannot
+	// resolve the new window the value stays marked unresolved and is
+	// retried on a later turn instead of masquerading as the real window.
 	m.limitResolved = false
 	m.mu.Unlock()
 	m.resolveContextLimit(ctx)
 }
 
-// EnsureContextLimit resolves ContextLimit from the provider when not set explicitly.
-// A positive Settings.ContextLimit from GOGEN_CONTEXT_LIMIT is a manual override and
-// skips provider lookup; RefreshAfterModelChange preserves that override.
-// Provider I/O runs without holding m.mu.
+// EnsureContextLimit resolves ContextLimit from the provider until it is
+// known. A manual override (GOGEN_CONTEXT_LIMIT, or a value pinned through
+// UpdateSettings) is resolved by construction and skips the probe;
+// RefreshAfterModelChange preserves that override. An unresolved value (see
+// resolveContextLimit) is re-probed, so a window that was unknown when the
+// session started — a cold models.dev registry, a briefly unreachable
+// endpoint — is picked up on a later turn instead of being pinned to the
+// display fallback for the session's lifetime. Provider I/O runs without
+// holding m.mu.
 func (m *Manager) EnsureContextLimit(ctx context.Context) {
 	m.mu.Lock()
-	if m.Settings.ContextLimit > 0 && m.limitResolved {
-		m.mu.Unlock()
-		return
-	}
-	if m.Settings.ContextLimit > 0 {
-		m.limitResolved = true
-		m.mu.Unlock()
-		return
+	skip := m.limitResolved
+	if !skip && !m.lastLimitAttempt.IsZero() && time.Since(m.lastLimitAttempt) < limitRetryInterval {
+		// A recent probe could not resolve the window: do not pay another
+		// provider probe on every round; the throttle keeps the attempt
+		// cost bounded while the limit stays reported as unknown.
+		skip = true
 	}
 	m.mu.Unlock()
+	if skip {
+		return
+	}
 	m.resolveContextLimit(ctx)
 }
 
 // resolveContextLimit fetches the provider limit without holding m.mu, then
-// stores the result. Concurrent resolvers are safe: the first successful store
-// wins unless a manual override lands mid-flight.
+// stores the result. Concurrent resolvers are safe: the first successful
+// store wins unless a manual override lands mid-flight.
+//
+// A provider that cannot resolve the window (it returns 0 — see
+// llm.LLMProvider.ModelContextLimit) does NOT get the 128k display fallback
+// stored as if it were the real window: whatever value is on display is kept
+// and limitResolved stays false, so ContextSnapshot.LimitResolved reports
+// "unknown" (wire consumers then fall back to the model list's per-model
+// limit) and EnsureContextLimit retries later.
 func (m *Manager) resolveContextLimit(ctx context.Context) {
-	limit := config.DefaultContextLimit
+	limit := 0
 	if m.Provider != nil {
 		if n, err := m.Provider.ModelContextLimit(ctx); err == nil && n > 0 {
 			limit = n
@@ -305,17 +337,41 @@ func (m *Manager) resolveContextLimit(ctx context.Context) {
 		m.limitResolved = true
 		return
 	}
-	if m.limitResolved && m.Settings.ContextLimit > 0 {
+	if m.limitResolved {
+		// Another resolver landed a real window while this probe ran.
+		return
+	}
+	if limit <= 0 {
+		// Unknown: keep the display fallback, stay unresolved (retry after
+		// limitRetryInterval).
+		m.lastLimitAttempt = time.Now()
 		return
 	}
 	m.Settings.ContextLimit = limit
 	m.limitResolved = true
+	m.lastLimitAttempt = time.Time{}
 }
 
 // ContextLimit returns the resolved context window size.
 func (m *Manager) ContextLimit() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.Settings.ContextLimit
+}
+
+// ResolvedContextLimit returns the context window when it has actually been
+// resolved for the current model (provider probe, restored snapshot, or a
+// manual pin) and 0 when Settings.ContextLimit is only the display fallback
+// for an unresolved window. Persistence uses it so a session snapshot never
+// stores a guess — or another model's window kept during a failed refresh —
+// as the session's resolved limit, which a later restore would pre-warm as
+// fact.
+func (m *Manager) ResolvedContextLimit() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.limitResolved {
+		return 0
+	}
 	return m.Settings.ContextLimit
 }
 
@@ -414,6 +470,7 @@ func (m *Manager) SetContextLimit(limit int) {
 	defer m.mu.Unlock()
 	m.Settings.ContextLimit = limit
 	m.limitResolved = true
+	m.lastLimitAttempt = time.Time{}
 }
 
 const toolResultTruncationMarker = "\n… truncated ("

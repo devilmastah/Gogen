@@ -125,3 +125,25 @@ func TestContextIndicatorNoResetAtRoundStart(t *testing.T) {
 		t.Fatalf("expected live estimate to resume after round start, got %q", m.contextLine)
 	}
 }
+
+// TestModelChangedRefreshesContextIndicator pins the restore/resume path: a
+// background model validation that resolves the restored session's context
+// window sends modelChangedMsg. The handler must re-probe the indicator — a
+// plain re-render reads the cached context line, which still holds the
+// snapshot's pre-warmed fallback (the 128k the session was saved with).
+func TestModelChangedRefreshesContextIndicator(t *testing.T) {
+	a := newSwitchTestAgent(t)
+	m := &Model{agent: a, ctx: context.Background()}
+
+	model, cmd := m.Update(modelChangedMsg{})
+	if model == nil {
+		t.Fatal("Update returned a nil model")
+	}
+	if cmd == nil {
+		t.Fatal("modelChangedMsg must request a context-stats refresh")
+	}
+	msg := cmd()
+	if _, ok := msg.(contextStatsMsg); !ok {
+		t.Fatalf("modelChangedMsg command delivered %T, want contextStatsMsg", msg)
+	}
+}
