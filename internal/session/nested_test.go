@@ -144,6 +144,61 @@ func TestNestedPerParentCap(t *testing.T) {
 	}
 }
 
+// TestNestedChildrenTieBreakBySaveOrder pins the tie-break the per-parent cap
+// depends on. time.Now has ~15.6 ms granularity on Windows (the coarse
+// KUSER_SHARED_DATA tick), so siblings saved inside one tick carry EQUAL
+// Updated stamps; with an unstable sort over a comparator that returns 0 the
+// prune picked whoever the sort happened to leave at the tail and child-c was
+// dropped while the older child-b survived (TestNestedPerParentCap, Windows
+// CI). Equal stamps must resolve to save order: the index's insertion order.
+func TestNestedChildrenTieBreakBySaveOrder(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStoreWithOptions(true, StoreOptions{})
+	if err := s.Save("parent", nestedSnap(dir, "parent", "")); err != nil {
+		t.Fatal(err)
+	}
+	// Saved a, b, c, d in order (the ids are deliberately not alphabetical in
+	// save order, so id ordering cannot mask a broken tie-break).
+	saved := []string{"z-first", "m-second", "a-third", "b-fourth"}
+	for _, id := range saved {
+		if err := s.Save(id, nestedSnap(dir, id, "parent")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Rewrite the index with ONE shared stamp: the coarse-clock shape.
+	s.mu.Lock()
+	idx := s.readIndex(dir)
+	if idx == nil {
+		s.mu.Unlock()
+		t.Fatal("index missing after saves")
+	}
+	shared := time.Now().UTC()
+	for i := range idx.Entries {
+		if idx.Entries[i].ParentID == "parent" {
+			idx.Entries[i].Updated = shared
+		}
+	}
+	err := s.writeIndex(dir, idx)
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.Lock()
+	got := s.nestedChildrenLocked(dir, "parent")
+	s.mu.Unlock()
+	// Newest first: the reverse of save order.
+	want := []string{"b-fourth", "a-third", "m-second", "z-first"}
+	if len(got) != len(want) {
+		t.Fatalf("children = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tied children order = %v, want save order reversed %v", got, want)
+		}
+	}
+}
+
 // TestNestedParentIDRoundTrip verifies ParentID survives save → load.
 func TestNestedParentIDRoundTrip(t *testing.T) {
 	dir := t.TempDir()

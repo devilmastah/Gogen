@@ -612,13 +612,32 @@ const maxNestedPerParent = 10
 func (s *Store) nestedChildrenLocked(workingDir, parentID string) []string {
 	idx := s.readIndex(workingDir)
 	if idx != nil {
+		// The index keeps entries in append order (updateIndex replaces in
+		// place), so a higher position means "saved later" — the tie-break
+		// the coarse clock needs (see the sort below).
+		pos := make(map[string]int, len(idx.Entries))
+		for i, e := range idx.Entries {
+			pos[e.ID] = i
+		}
 		var entries []sessionIndexEntry
 		for _, e := range idx.Entries {
 			if e.ParentID == parentID {
 				entries = append(entries, e)
 			}
 		}
-		slices.SortFunc(entries, func(a, b sessionIndexEntry) int { return b.Updated.Compare(a.Updated) })
+		// Most-recently-updated first, with the per-parent cap pruning the
+		// tail. Ties break on the index's insertion order (later position =
+		// saved later = newer): time.Now has ~15.6 ms granularity on Windows
+		// (the coarse KUSER_SHARED_DATA tick), so siblings saved in one tick
+		// compare EQUAL, and the sort — unstable, with Compare returning 0 —
+		// then left them in an arbitrary order, which pruned 'child-c' while
+		// keeping the older 'child-b' (TestNestedPerParentCap on Windows CI).
+		slices.SortFunc(entries, func(a, b sessionIndexEntry) int {
+			if c := b.Updated.Compare(a.Updated); c != 0 {
+				return c
+			}
+			return pos[b.ID] - pos[a.ID]
+		})
 		ids := make([]string, len(entries))
 		for i, e := range entries {
 			ids[i] = e.ID
@@ -652,8 +671,15 @@ func (s *Store) nestedChildrenLocked(workingDir, parentID string) []string {
 	}
 	// Mirror the index path's ordering: most-recently-updated first, so the
 	// per-parent cap prunes the OLDEST children (name order from ReadDir is
-	// id-sorted, which would prune the wrong siblings).
-	slices.SortFunc(metas, func(a, b childMeta) int { return b.updated.Compare(a.updated) })
+	// id-sorted, which would prune the wrong siblings). No save order exists
+	// in this layout, so equal timestamps (the coarse Windows clock) break on
+	// the id instead: arbitrary but deterministic.
+	slices.SortFunc(metas, func(a, b childMeta) int {
+		if c := b.updated.Compare(a.updated); c != 0 {
+			return c
+		}
+		return strings.Compare(b.id, a.id)
+	})
 	for _, meta := range metas {
 		ids = append(ids, meta.id)
 	}
