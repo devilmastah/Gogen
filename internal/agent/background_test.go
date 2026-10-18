@@ -212,13 +212,15 @@ func TestBackgroundJobReapedAfterRetention(t *testing.T) {
 // TestFinishedJobCapReapsOldest verifies the finished-job cap: when a job
 // finishes over the cap, the OLDEST finished jobs are reaped immediately
 // (their status becomes "unknown"), so a burst of short-lived jobs cannot
-// pile up during the retention window. Finish order is taken from each
-// job's finishedAt — the same timestamp the cap sorts by — instead of
-// assuming the sleep durations serialize reliably (wall-clock order drifted
-// on macOS CI, and on Windows the sleeps are effectively instantaneous, so
-// processes exit within milliseconds of each other and goroutine wake-up
-// order diverges from exit order). The cap must reap the first two
-// finishers and keep the last three registered.
+// pile up during the retention window. Finish order is the cap's own total
+// order — finishedAt, then Start, then ID — instead of the sleep durations
+// (wall-clock order drifted on macOS CI, and on Windows the sleeps are
+// effectively instantaneous, so processes exit within milliseconds of each
+// other and goroutine wake-up order diverges from exit order; coarse clocks
+// make finishedAt collide outright, hence the tiebreaks). The cap's victim
+// set is a function of the finished set alone, so the first two finishers in
+// that order are reaped and the last three stay registered no matter which
+// job's wait goroutine enforces last.
 func TestFinishedJobCapReapsOldest(t *testing.T) {
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(nil, exec, nil)
@@ -264,22 +266,30 @@ func TestFinishedJobCapReapsOldest(t *testing.T) {
 	}
 
 	// Build the finish order from finishedAt — set under job.mu immediately
-	// before done closes, and the exact key enforceFinishedJobCap sorts by —
-	// so the assertion matches the cap's ordering even when processes exit
-	// within milliseconds of each other (Windows: sleeps are effectively
-	// instantaneous, so exit order follows spawn order, not sleep duration).
+	// before done closes — with the cap's Start/ID tiebreaks. This is the
+	// exact total order enforceFinishedJobCap reaps by; the outcome cannot
+	// depend on goroutine scheduling (see the function's comment).
 	type finisher struct {
-		id string
-		at time.Time
+		id    string
+		at    time.Time
+		start time.Time
 	}
 	finished := make([]finisher, 0, len(jobs))
 	for _, job := range jobs {
 		job.mu.Lock()
 		at := job.finishedAt
 		job.mu.Unlock()
-		finished = append(finished, finisher{id: job.ID, at: at})
+		finished = append(finished, finisher{id: job.ID, at: at, start: job.Start})
 	}
-	slices.SortFunc(finished, func(a, b finisher) int { return a.at.Compare(b.at) })
+	slices.SortFunc(finished, func(a, b finisher) int {
+		if c := a.at.Compare(b.at); c != 0 {
+			return c
+		}
+		if c := a.start.Compare(b.start); c != 0 {
+			return c
+		}
+		return strings.Compare(a.id, b.id)
+	})
 
 	// The cap reaps as jobs finish: the first finisher is reaped when the
 	// fourth finisher's enforcement runs, and the second finisher when the
@@ -312,6 +322,109 @@ func TestFinishedJobCapReapsOldest(t *testing.T) {
 			if err != nil || !strings.Contains(s, "FINISHED") {
 				t.Fatalf("job %s (finisher %d) should still be registered as finished; status=%q err=%v", id, i+1, s, err)
 			}
+		}
+	}
+}
+
+// finishedTestJob fabricates a registered-shape finished job for the cap
+// tests: done closed, the given finish/start timestamps, and an empty output
+// tail so status formatting works.
+func finishedTestJob(id string, finished, start time.Time) *BackgroundJob {
+	j := &BackgroundJob{
+		ID:         id,
+		Command:    "true",
+		Start:      start,
+		done:       make(chan struct{}),
+		cancel:     func() {},
+		output:     newBoundedOutputWriter(1024),
+		finishedAt: finished,
+	}
+	close(j.done)
+	return j
+}
+
+// registerCapTestJobs installs the fabricated jobs in the agent's registry.
+func registerCapTestJobs(a *Agent, jobs ...*BackgroundJob) {
+	a.bgMu.Lock()
+	a.bgJobs = make(map[string]*BackgroundJob, len(jobs))
+	for _, j := range jobs {
+		a.bgJobs[j.ID] = j
+	}
+	a.bgMu.Unlock()
+}
+
+// TestFinishedJobCapIgnoresEnforcementOrder pins the invariant behind the
+// cap's flake: the victim set is a function of the finished set, not of which
+// wait goroutine enforces last. The failing shape is the OLDEST finisher's
+// goroutine running enforcement last — the old code excluded "the calling
+// job" from the count, so it retained the oldest job and reaped newer ones
+// (and an already-reaped job's late enforcement could over-reap). Enforcing
+// here with the oldest finisher as the caller must still reap the two oldest
+// jobs.
+func TestFinishedJobCapIgnoresEnforcementOrder(t *testing.T) {
+	a := NewAgent(nil, NewExecutor(t.TempDir()), nil)
+	defer a.Close()
+	a.bgMaxFinished = 3
+
+	base := time.Now()
+	jobs := []*BackgroundJob{
+		finishedTestJob("a", base.Add(1*time.Millisecond), base),
+		finishedTestJob("b", base.Add(2*time.Millisecond), base),
+		finishedTestJob("c", base.Add(3*time.Millisecond), base),
+		finishedTestJob("d", base.Add(4*time.Millisecond), base),
+		finishedTestJob("e", base.Add(5*time.Millisecond), base),
+	}
+	registerCapTestJobs(a, jobs...)
+
+	a.enforceFinishedJobCap()
+	// A delayed enforcement from an already-reaped job (or any later one) is
+	// a no-op once the registry is at the cap: the count includes every
+	// finished job now, so it can never reap below bgMaxFinished.
+	a.enforceFinishedJobCap()
+
+	for _, j := range jobs[:2] {
+		if _, err := a.BackgroundJobStatus(j.ID); err == nil || !strings.Contains(err.Error(), "unknown background job") {
+			t.Fatalf("job %s (older finisher) should have been reaped; err=%v", j.ID, err)
+		}
+	}
+	for _, j := range jobs[2:] {
+		if s, err := a.BackgroundJobStatus(j.ID); err != nil || !strings.Contains(s, "FINISHED") {
+			t.Fatalf("job %s (newer finisher) should stay registered as FINISHED; status=%q err=%v", j.ID, s, err)
+		}
+	}
+}
+
+// TestFinishedJobCapTieBreaksDeterministically pins the ordering when
+// finishedAt collides (coarse clocks: Windows ticks at ~15ms, and two
+// processes can exit within one tick): Start, then ID must decide the victim
+// set, so two sorts of the same jobs can never disagree.
+func TestFinishedJobCapTieBreaksDeterministically(t *testing.T) {
+	a := NewAgent(nil, NewExecutor(t.TempDir()), nil)
+	defer a.Close()
+	a.bgMaxFinished = 2
+
+	base := time.Now()
+	finished := base.Add(time.Minute)
+	// Same finishedAt for all four; Start orders (d0,d1) before c1 before c2,
+	// and the ID comparison orders the two equal-Start jobs (d0 before d1).
+	jobs := []*BackgroundJob{
+		finishedTestJob("d1", finished, base),
+		finishedTestJob("d0", finished, base),
+		finishedTestJob("c1", finished, base.Add(1*time.Millisecond)),
+		finishedTestJob("c2", finished, base.Add(2*time.Millisecond)),
+	}
+	registerCapTestJobs(a, jobs...)
+
+	a.enforceFinishedJobCap()
+
+	for _, id := range []string{"d0", "d1"} {
+		if _, err := a.BackgroundJobStatus(id); err == nil || !strings.Contains(err.Error(), "unknown background job") {
+			t.Fatalf("job %s (oldest by Start) should have been reaped; err=%v", id, err)
+		}
+	}
+	for _, id := range []string{"c1", "c2"} {
+		if s, err := a.BackgroundJobStatus(id); err != nil || !strings.Contains(s, "FINISHED") {
+			t.Fatalf("job %s (newer by Start) should stay registered as FINISHED; status=%q err=%v", id, s, err)
 		}
 	}
 }

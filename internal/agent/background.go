@@ -639,7 +639,7 @@ func jobExitSummary(job *BackgroundJob) string {
 // host know the session may have drained its background work (a host that
 // kept this session resident because of THIS job can now retire it).
 func (a *Agent) onJobFinished(job *BackgroundJob) {
-	a.enforceFinishedJobCap(job)
+	a.enforceFinishedJobCap()
 	a.armJobReaper(job)
 	if !job.cancelled.Load() {
 		a.fireJobNotice(jobExitSummary(job))
@@ -649,10 +649,18 @@ func (a *Agent) onJobFinished(job *BackgroundJob) {
 
 // enforceFinishedJobCap reaps the oldest finished jobs when more than
 // bgMaxFinished jobs have finished, so the registry stays bounded even when
-// many short-lived jobs finish inside the retention window. The job that
-// just finished (keep) is excluded — its caller is the one most likely to
-// poll it next. Caller is the job's wait goroutine.
-func (a *Agent) enforceFinishedJobCap(keep *BackgroundJob) {
+// many short-lived jobs finish inside the retention window. The retained set
+// is the newest bgMaxFinished finishers, ordered by finishedAt with Start and
+// ID as total-order tiebreaks: the outcome is a function of the finished
+// SET alone, never of which wait goroutine happens to enforce last or of the
+// registry's map iteration order. (Excluding the calling job — "its caller is
+// most likely to poll it next" — made the victims scheduling-dependent: when
+// the OLDEST finisher's goroutine ran last, excluding it kept the oldest job
+// and reaped newer ones, leaving fewer than the expected oldest jobs reaped
+// and even over-reaping when an already-reaped job's goroutine enforced
+// late. In the normal case the calling job is the newest finisher and is
+// retained anyway.)
+func (a *Agent) enforceFinishedJobCap() {
 	maxFinished := a.bgMaxFinished
 	if maxFinished <= 0 {
 		maxFinished = defaultMaxFinishedBackgroundJobs
@@ -660,29 +668,39 @@ func (a *Agent) enforceFinishedJobCap(keep *BackgroundJob) {
 	type finishedJob struct {
 		job *BackgroundJob
 		at  time.Time
+		// start and id break finishedAt ties deterministically (a coarse
+		// clock — Windows ticks at ~15ms — or two processes exiting within
+		// the same tick): without them the victim set could differ between
+		// two sorts of the same jobs.
+		start time.Time
+		id    string
 	}
 	var finished []finishedJob
 	a.bgMu.Lock()
 	defer a.bgMu.Unlock()
 	for _, j := range a.bgJobs {
-		if j == keep {
-			continue
-		}
 		select {
 		case <-j.done:
 			j.mu.Lock()
 			at := j.finishedAt
 			j.mu.Unlock()
-			finished = append(finished, finishedJob{job: j, at: at})
+			finished = append(finished, finishedJob{job: j, at: at, start: j.Start, id: j.ID})
 		default:
 		}
 	}
-	// keep just finished, so the total finished count is len(finished)+1.
-	overflow := len(finished) + 1 - maxFinished
+	overflow := len(finished) - maxFinished
 	if overflow <= 0 {
 		return
 	}
-	slices.SortFunc(finished, func(a, b finishedJob) int { return a.at.Compare(b.at) })
+	slices.SortFunc(finished, func(a, b finishedJob) int {
+		if c := a.at.Compare(b.at); c != 0 {
+			return c
+		}
+		if c := a.start.Compare(b.start); c != 0 {
+			return c
+		}
+		return strings.Compare(a.id, b.id)
+	})
 	for i := 0; i < overflow && i < len(finished); i++ {
 		j := finished[i]
 		delete(a.bgJobs, j.job.ID)
