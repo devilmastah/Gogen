@@ -23,7 +23,7 @@ func TestCreateBootstrapSessionWithoutStore(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr) // no SessionStore: persistence stays off
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	if s.ws.Store != nil {
 		t.Fatal("setup: workspace store should be nil without a persistent agent store")

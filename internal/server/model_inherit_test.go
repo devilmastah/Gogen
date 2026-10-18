@@ -48,7 +48,7 @@ func newModelServer(t *testing.T) (*Server, *llmtest.MockProvider, *[]llm.LLMPro
 	a := agent.NewAgent(prov, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	var created []llm.LLMProvider
 	s.ws.ProviderFactory = perSessionModelFactory(s, &created)
 	return s, prov, &created

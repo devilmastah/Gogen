@@ -105,7 +105,7 @@ func TestWSUserTerminal(t *testing.T) {
 	t.Setenv("SHELL", "/bin/sh")
 	exec := agent.NewExecutor(t.TempDir())
 	a := agent.NewAgent(&termStreamStubProvider{}, exec, nil)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	srv := httptest.NewServer(http.HandlerFunc(s.HandleWS))
 	defer srv.Close()

@@ -66,7 +66,7 @@ func TestServerConfigProbeConcurrentWithTurn(t *testing.T) {
 	provider := &probeStreamStub{}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(provider, agent.NewExecutor(t.TempDir()), ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	rt := s.registry.first()
 
 	var wg sync.WaitGroup

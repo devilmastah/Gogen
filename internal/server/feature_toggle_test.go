@@ -238,7 +238,7 @@ func TestFeatureTogglePersistPreservesSecretsGlobalMode(t *testing.T) {
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	a.GlobalMode = true
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{OpenAIKey: "sk-global-secret"})
+	s := newTestServer(t, a, &config.Config{OpenAIKey: "sk-global-secret"})
 	s.persistConfig(s.config)
 	data, err := os.ReadFile(projectfile.GlobalConfigPath())
 	if err != nil {

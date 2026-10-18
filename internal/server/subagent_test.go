@@ -191,7 +191,7 @@ func TestSubagentChildInheritsParentModel(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	// The workspace default was the parent's model at construction
 	// ("mock-model"); now the parent switches models per-session.
 	if err := parentProv.SetModel("parent-model"); err != nil {
@@ -233,7 +233,7 @@ func TestSubagentConfiguredModelWinsOverInheritance(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestSubagentConfiguredModelFallbackToDefault(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	r := s.ws.GetRuntimeConfig()
 	r.SubagentModel = "vanished-model"
 	s.ws.SetRuntimeConfig(r)
@@ -336,7 +336,7 @@ func TestSubagentChildThinkingLevelCascade(t *testing.T) {
 			ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 			a := agent.NewAgent(parentProv, exec, ctxMgr)
 			a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-			s := NewServer(a, &config.Config{})
+			s := newTestServer(t, a, &config.Config{})
 			a.SetThinkingLevel(tc.parent)
 			r := s.ws.GetRuntimeConfig()
 			r.SubagentThinkingLevel = tc.configured
@@ -373,7 +373,7 @@ func TestSubagentChildModelFallbackToDefault(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +408,7 @@ func TestSubagentExplicitModelArgWins(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
 	}

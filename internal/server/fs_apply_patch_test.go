@@ -33,7 +33,7 @@ func TestFSApplyPatchAppliesDiff(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	diff := "--- a/greet.go\n+++ b/greet.go\n@@ -1,3 +1,4 @@\n package main\n \n+// greeting\n func main() {}\n"
 
@@ -93,7 +93,7 @@ func TestFSApplyPatchRejectsStaleDiff(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	diff := "--- a/greet.go\n+++ b/greet.go\n@@ -1,3 +1,4 @@\n package main\n \n+// greeting\n func main() {}\n"
 
@@ -148,7 +148,7 @@ func TestFSApplyPatchRejectsDeleteOnly(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	diff := "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
 
@@ -207,7 +207,7 @@ func TestFSApplyPatchWaitsForFSLock(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	diff := "--- a/greet.go\n+++ b/greet.go\n@@ -1,3 +1,4 @@\n package main\n \n+// greeting\n func main() {}\n"
 

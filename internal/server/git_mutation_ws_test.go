@@ -50,7 +50,7 @@ func TestWSEditorGitStageCommitPushRoundTrip(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	editor := dialEditor(t, startEditorTestServer(t, s))
 
 	// Stage a single path.
@@ -120,7 +120,7 @@ func TestWSEditorGitUnstage(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	editor := dialEditor(t, startEditorTestServer(t, s))
 
 	// Unstage a single path.
@@ -168,7 +168,7 @@ func TestWSEditorGitIndexLockError(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	editor := dialEditor(t, startEditorTestServer(t, s))
 
 	if err := editor.WriteJSON(WSMessage{Type: "git_stage", RequestID: "st-lock", Paths: []string{"d.txt"}}); err != nil {

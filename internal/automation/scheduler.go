@@ -141,9 +141,16 @@ func (s *Scheduler) Start(ctx context.Context) {
 // going in their own processes and are recorded by their waiter goroutine;
 // Stop does not block on them. Safe to call more than once; Start may be
 // called again afterwards (the settings toggle start/stops the scheduler).
+//
+// The stop channel is CONSUMED under the lock before it is closed: the loop
+// goroutine only clears it when it exits, so two Stops in that window (a
+// settings toggle-off followed by server shutdown, or a host that stops the
+// scheduler in both its own teardown and the shared drain) both saw the same
+// channel and the second close panicked.
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	stopCh := s.stopCh
+	s.stopCh = nil
 	s.mu.Unlock()
 	if stopCh != nil {
 		stopCh()

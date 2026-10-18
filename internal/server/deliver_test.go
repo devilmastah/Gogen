@@ -276,7 +276,7 @@ func TestJobNoticeDeliveredToSession(t *testing.T) {
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	_ = NewServer(a, &config.Config{JobNotices: "on"})
+	_ = newTestServer(t, a, &config.Config{JobNotices: "on"})
 	// The notice's delivery turn needs a provider that answers.
 	p := llmtest.NewMockProvider()
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}}

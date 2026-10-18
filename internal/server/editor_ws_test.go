@@ -43,7 +43,7 @@ func TestWSEditorEndpointFSRoundTrip(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -139,7 +139,7 @@ func TestWSEditorGitStatusRoundTrip(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	editor := dialEditor(t, startEditorTestServer(t, s))
 
 	resp := sendEditorMsg(t, editor, WSMessage{Type: "git_status", RequestID: "gs-1"})

@@ -123,7 +123,7 @@ func startCompactTestServer(t *testing.T) (*Server, *agent.Agent, *compactBlocki
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	seedCompactHistory(a)
 	srv := startWSServer(t, s)
 	conn := dialWS(t, srv, "/ws")

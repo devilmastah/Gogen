@@ -98,7 +98,7 @@ func newArgsStreamServer(t *testing.T, stub *argsStreamStub) (*Server, *agent.Ag
 	t.Helper()
 	exec := agent.NewExecutor(t.TempDir())
 	a := agent.NewAgent(stub, exec, nil)
-	return NewServer(a, &config.Config{}), a
+	return newTestServer(t, a, &config.Config{}), a
 }
 
 // collectUntil reads messages until match returns true, accumulating every

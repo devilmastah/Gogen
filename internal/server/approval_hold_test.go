@@ -26,7 +26,7 @@ func newHoldServer(t *testing.T, stub *blockingStub, dir string, holdSecs int) (
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{WebApprovalHoldSecs: holdSecs})
+	s := newTestServer(t, a, &config.Config{WebApprovalHoldSecs: holdSecs})
 	return s, a
 }
 

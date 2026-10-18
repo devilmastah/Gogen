@@ -225,7 +225,7 @@ func TestMessageToEvictedPaneDropped(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{WebMaxActiveSessions: 2})
+	s := newTestServer(t, a, &config.Config{WebMaxActiveSessions: 2})
 	srv := startWSServer(t, s)
 	defer srv.Close()
 

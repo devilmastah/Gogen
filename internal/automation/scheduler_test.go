@@ -270,6 +270,30 @@ func TestSchedulerStopPreventsFiring(t *testing.T) {
 	}
 }
 
+// TestSchedulerStopIsIdempotent pins Stop's documented "safe to call more
+// than once" contract. The loop goroutine clears the stop channel only when it
+// exits, so a second Stop inside that window used to close the same channel
+// again and panic ("close of closed channel") — reachable in production by a
+// settings toggle-off followed by server shutdown.
+func TestSchedulerStopIsIdempotent(t *testing.T) {
+	fire := &recordingFire{}
+	s, _, _ := newSchedulerTest(t, fire.Fire)
+
+	s.Start(context.Background())
+	// Two Stops back to back, before the loop goroutine has had a chance to
+	// exit and clear the channel (the window the panic needed).
+	s.Stop()
+	s.Stop()
+	<-s.Done()
+	// Stopping again after the loop exited is a no-op too.
+	s.Stop()
+
+	// Start remains restartable after any number of Stops.
+	s.Start(context.Background())
+	s.Stop()
+	<-s.Done()
+}
+
 // TestSchedulerSaturatedPoolDoesNotStallSweep pins the sweep/spawn-slot
 // decoupling: with every slot busy on a long-running fire, the sweep
 // goroutine must not block on the spawn semaphore. A stalled sweep would

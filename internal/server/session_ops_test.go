@@ -24,24 +24,11 @@ func newLifecycleServer(t *testing.T) (*Server, *agent.Agent, *session.Store) {
 	a := agent.NewAgent(prov, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{})
-	// Quiesce async writers BEFORE the caller's t.TempDir() removal (cleanups
-	// run LIFO, so this later-registered cleanup runs after the test's own and
-	// before RemoveAll). A WS read-loop goroutine can outlive the test body —
-	// session_detach's orphan eviction flushes and rewrites the store, a resume
-	// restores (and flushes) the session it swapped in — and that write lands
-	// in .gogen/sessions while the temp dir is being deleted: "TempDir
-	// RemoveAll cleanup: ... directory not empty" (the same flake class the
-	// continuation/continuable helpers fix for their own tests).
-	t.Cleanup(func() {
-		s.stopAutomations()
-		s.ShutdownSessions()
-		for _, id := range s.registry.activeIDs() {
-			if rt, ok := s.registry.get(id); ok {
-				s.registry.evictRuntime(rt)
-			}
-		}
-	})
+	// newTestServer quiesces async writers (WS read-loop handlers, delivery
+	// workers, turns) before the caller's t.TempDir() removal — a detach's
+	// orphan-eviction flush or a resume's restore write otherwise lands in
+	// .gogen/sessions while the temp dir is being deleted.
+	s := newTestServer(t, a, &config.Config{})
 	return s, a, store
 }
 
@@ -412,7 +399,7 @@ func TestTypedNewOverWS(t *testing.T) {
 	a := agent.NewAgent(prov, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	origID := a.SessionID
 	srv := startWSServer(t, s)
 
@@ -578,7 +565,7 @@ func TestDeleteFailureKeepsRuntimeRegistered(t *testing.T) {
 	a := agent.NewAgent(prov, exec, ctxMgr)
 	store := session.NewStoreWithOptions(false, session.StoreOptions{}) // disabled: Store.Delete will fail
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	origID := a.SessionID
 	pane := s.registry.first()
 
@@ -610,7 +597,7 @@ func TestPruneKeepsEvictedSession(t *testing.T) {
 	a := agent.NewAgent(prov, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{MaxCount: 2})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{WebMaxActiveSessions: 2})
+	s := newTestServer(t, a, &config.Config{WebMaxActiveSessions: 2})
 	origID := a.SessionID
 	pane := s.registry.first()
 

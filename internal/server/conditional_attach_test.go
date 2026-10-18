@@ -107,7 +107,7 @@ func newConditionalServer(t *testing.T, stub llm.LLMProvider) (*Server, *agent.A
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(stub, exec, ctxMgr)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	return s, a
 }
 

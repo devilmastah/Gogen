@@ -160,7 +160,7 @@ func newRewindServer(t *testing.T, stub *rewindStreamStub, dir string) (*Server,
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 	return s, a, store
 }
 

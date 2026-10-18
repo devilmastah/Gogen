@@ -61,7 +61,7 @@ func newEditorAIServer(t *testing.T, dir string, prov llm.LLMProvider) (*Server,
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	return NewServer(a, &config.Config{}), a
+	return newTestServer(t, a, &config.Config{}), a
 }
 
 func startEditorTestServer(t *testing.T, s *Server) *httptest.Server {

@@ -60,7 +60,7 @@ func (s *termStreamStubProvider) ModelName() string     { return "test-model" }
 func TestWSTerminalMessagesStreamAgentCommand(t *testing.T) {
 	exec := agent.NewExecutor(t.TempDir())
 	a := agent.NewAgent(&termStreamStubProvider{}, exec, nil)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	srv := httptest.NewServer(http.HandlerFunc(s.HandleWS))
 	defer srv.Close()
@@ -172,7 +172,7 @@ func (s *bgTermStreamStubProvider) ModelName() string     { return "test-model" 
 func TestWSTerminalMessagesStreamBackgroundJob(t *testing.T) {
 	exec := agent.NewExecutor(t.TempDir())
 	a := agent.NewAgent(&bgTermStreamStubProvider{}, exec, nil)
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	srv := httptest.NewServer(http.HandlerFunc(s.HandleWS))
 	defer srv.Close()

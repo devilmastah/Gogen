@@ -55,7 +55,7 @@ func TestWorkingDirChangeRequiresGlobalMode(t *testing.T) {
 		a.GlobalMode = true
 		store := session.NewStoreWithOptions(true, session.StoreOptions{})
 		a.SessionStore = store
-		s := NewServer(a, &config.Config{})
+		s := newTestServer(t, a, &config.Config{})
 		srv := startWSServer(t, s)
 		defer srv.Close()
 

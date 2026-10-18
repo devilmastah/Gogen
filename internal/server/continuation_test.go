@@ -121,30 +121,12 @@ func newContinuationServer(t *testing.T, stub *blockingStub, dir string) (*Serve
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
-	s := NewServer(a, &config.Config{})
-	// Quiesce async writers BEFORE the caller's t.TempDir() removal
-	// (cleanups run LIFO, so this later-registered cleanup runs first).
-	// ShutdownSessions cancels every in-flight stream and drains the turn
-	// goroutine's done-signal (the blocking stub honors ctx), making the
-	// turns' own flushes synchronous inside this cleanup. Marking the
-	// runtimes evicted afterwards turns the turn goroutine's final orphan
-	// check — which runs AFTER the drained done-signal — into a no-op; that
-	// check would otherwise flush/rewrite the sessions dir while RemoveAll
-	// is deleting it ("TempDir RemoveAll cleanup: directory not empty",
-	// the same flake class 861a5c1 fixed for the spawn sweep; seen on
-	// TestBackgroundChildBusy and TestReviewAgentGuards).
-	t.Cleanup(func() {
-		// Stop the automation sweep too: tests that toggled automations on
-		// leave it sweeping every few ms, and a sweep/run-record write must
-		// not race the caller's t.TempDir() removal.
-		s.stopAutomations()
-		s.ShutdownSessions()
-		for _, id := range s.registry.activeIDs() {
-			if rt, ok := s.registry.get(id); ok {
-				s.registry.evictRuntime(rt)
-			}
-		}
-	})
+	// newTestServer's drain is the quiesce this helper used to register by
+	// hand: it stops the automation sweep, cancels every in-flight stream (the
+	// blocking stub honors ctx, so its turn goroutine unwinds), flushes, and
+	// evicts the runtimes — so a turn's final flush cannot race the caller's
+	// t.TempDir() removal.
+	s := newTestServer(t, a, &config.Config{})
 	return s, a, store
 }
 

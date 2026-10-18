@@ -22,7 +22,7 @@ func TestWorkspaceDefaultModelAccessors(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(stub, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	// Initial value is the agent's model at construction.
 	if got := s.ws.DefaultModel(); got != "blocking-model" {
@@ -53,7 +53,7 @@ func TestProviderFactorySeedsResolvedDefaultModel(t *testing.T) {
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{OpenAIModel: "cfg-model"})
+	s := newTestServer(t, a, &config.Config{OpenAIModel: "cfg-model"})
 
 	// Workspace starts with no model (the agent provider has none selected).
 	if got := s.ws.DefaultModel(); got != "" {

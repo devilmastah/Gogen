@@ -45,7 +45,7 @@ func newLoginFlowServer(t *testing.T, token, pairCode string, pairExpiry time.Ti
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{WebAuthToken: token})
+	s := newTestServer(t, a, &config.Config{WebAuthToken: token})
 	if pairCode != "" {
 		s.SetPairingCode(pairCode, pairExpiry)
 	}
@@ -443,7 +443,7 @@ func TestLoginFlowBootstrapRateLimit(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	s := NewServer(a, &config.Config{WebAuthToken: token})
+	s := newTestServer(t, a, &config.Config{WebAuthToken: token})
 	s.bootstrapLimiter = newIPLimiter(1, 1) // burst 1: second attempt is throttled
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.HandleStatic(w, r)

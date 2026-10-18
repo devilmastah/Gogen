@@ -146,7 +146,7 @@ func TestLiveHarnessServer(t *testing.T) {
 		a.RestoreSessionLocal(agent.SessionSnapshot{Messages: msgs}, a.SessionID)
 	}
 	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
-	s := NewServer(a, &config.Config{})
+	s := newTestServer(t, a, &config.Config{})
 
 	// Bind a fixed port so the jsdom harness can connect.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
