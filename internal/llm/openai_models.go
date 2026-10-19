@@ -76,6 +76,12 @@ func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool
 	p.modelsMu.Unlock()
 
 	models, perProfile, err := p.fetchModelsWithProfiles(ctx, armBackoff)
+	if err != nil {
+		// The catalog client's SDK errors escape to hosts through both this
+		// fetch and the waiters on f.err: surface the provider's message
+		// once, here, so every path carries it.
+		err = surfaceAPIError(err)
+	}
 
 	p.modelsMu.Lock()
 	f.models, f.err = models, err

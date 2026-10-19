@@ -473,8 +473,10 @@ func (p *OpenAIProvider) generateResponseBody(ctx context.Context, client *opena
 	if err != nil {
 		// wrapContextWindowError classifies a context-window refusal so the
 		// agent run loop can recover in-loop (forced compaction + retry)
-		// instead of aborting the turn.
-		return Response{}, wrapContextWindowError(fmt.Errorf("openai api error: %w", err))
+		// instead of aborting the turn; surfaceAPIError keeps the
+		// provider's message in the text (openai-go >= v3.81's Error()
+		// prints only a status summary).
+		return Response{}, wrapContextWindowError(fmt.Errorf("openai api error: %w", surfaceAPIError(err)))
 	}
 
 	if len(resp.Choices) == 0 {
@@ -533,8 +535,9 @@ func (p *OpenAIProvider) generateResponseBody(ctx context.Context, client *opena
 // stays one bounded line: how far the attempt got (an interruption before
 // any rendered output means the stream died during the silent
 // pre-first-token wait — long prompt processing, backend queueing, or a
-// middlebox idle timeout) plus a short single-line cause. The raw error can
-// embed the whole response body (SDK error text) or wrap several lines.
+// middlebox idle timeout) plus a short single-line cause. The error can
+// embed the provider's message (SDK error text, via apiErrorSurface) or
+// wrap several lines.
 func streamRetryLabel(stage string, acc *streamAccumulator, err error) string {
 	cause := ""
 	if err != nil {
@@ -680,7 +683,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		debuglog.Write("llm/stream_recovery", "rate limited: skipping the non-streaming fallback", "", map[string]any{
 			"streamError": clipErrForLog(streamErr),
 		})
-		return nil, fmt.Errorf("stream error: %w", wrapContextWindowError(streamErr))
+		return nil, fmt.Errorf("stream error: %w", wrapContextWindowError(surfaceAPIError(streamErr)))
 	}
 	// The fallback re-requests the turn non-streaming (llama.cpp delivers
 	// nothing until the whole completion is done); hosts must know the
@@ -1025,7 +1028,7 @@ func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, req *roundReq
 		// refusal that also fails the fallback must reach the agent run
 		// loop still classified, so it recovers in-loop instead of
 		// aborting the turn.
-		return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", wrapContextWindowError(streamErr), fbErr)
+		return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", wrapContextWindowError(surfaceAPIError(streamErr)), surfaceAPIError(fbErr))
 	}
 	// Re-render only the suffix beyond what the failed stream already
 	// emitted, so the live bubble does not show the recovered text twice (a

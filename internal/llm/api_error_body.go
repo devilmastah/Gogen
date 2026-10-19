@@ -3,11 +3,14 @@ package llm
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/openai/openai-go/v3"
 )
 
 // apiErrorMaxMessageBytes bounds the message synthesized from an error body:
@@ -56,8 +59,9 @@ const apiErrorMaxBodyBytes = 1 << 20
 // final turn error all lose the provider's words.
 //
 // The replacement is minimal: {"error":{"message":<extracted>}}. Only the
-// message is synthesized because apierror.Error's own text prints just the
-// raw error member, so the message is all the user ever sees — and a code
+// message is synthesized because the message is all the user ever sees
+// (openai-go >= v3.81 prints just a status summary from Error(), and
+// apiErrorSurface re-surfaces the parsed message — see below), and a code
 // copied into the error object must not risk its own decode failure (vLLM
 // sends a numeric "code" where apierror.Error expects a string). Bodies the
 // SDK already renders (the object shape) pass through byte-for-byte, as do
@@ -214,4 +218,47 @@ func clipAPIErrorMessage(s string) string {
 		cut--
 	}
 	return s[:cut] + "… (truncated)"
+}
+
+// apiErrorSurface wraps an *openai.Error so the provider's message is part
+// of the error text. Since openai-go v3.81, apierror.Error.Error() prints
+// only a status summary ("OpenAI API error: 400 Bad Request") — the raw
+// body is deliberately withheld because it can carry secrets — so without
+// this wrapper the provider's words would be lost from every user-facing
+// error (turn errors, stream retry labels). The parsed Message field is the
+// SDK's own sanctioned surface for the provider's text; the original error
+// stays reachable through Unwrap, so errors.As(err, &*openai.Error) keeps
+// working.
+type apiErrorSurface struct{ err error }
+
+func (e *apiErrorSurface) Error() string {
+	var oerr *openai.Error
+	if !errors.As(e.err, &oerr) {
+		return e.err.Error()
+	}
+	msg := strings.TrimSpace(oerr.Message)
+	if msg == "" || strings.Contains(e.err.Error(), msg) {
+		return e.err.Error()
+	}
+	return e.err.Error() + ": " + clipAPIErrorMessage(msg)
+}
+
+func (e *apiErrorSurface) Unwrap() error { return e.err }
+
+// surfaceAPIError wraps err so the provider's message is part of the error
+// text (see apiErrorSurface). It is applied at the provider boundary where
+// an SDK error escapes to hosts; errors that are not an *openai.Error, or
+// whose text already carries the message, pass through unchanged.
+func surfaceAPIError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var oerr *openai.Error
+	if !errors.As(err, &oerr) {
+		return err
+	}
+	if oerr.Message == "" || strings.Contains(err.Error(), oerr.Message) {
+		return err
+	}
+	return &apiErrorSurface{err: err}
 }

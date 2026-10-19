@@ -262,8 +262,9 @@ func logFallbackResponse(model string, streamErr error, resp Response) {
 }
 
 // clipErrForLog bounds an error string for the JSON logs: stream errors can
-// embed the raw response body (the SDK error text carries it), which would
-// otherwise bloat every record with the same oversized blob.
+// embed the provider's error message (the SDK error text carries it via
+// apiErrorSurface), which would otherwise bloat every record with the same
+// oversized blob.
 func clipErrForLog(err error) string {
 	if err == nil {
 		return ""

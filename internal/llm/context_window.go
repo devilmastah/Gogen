@@ -57,13 +57,27 @@ func IsContextWindowError(err error) bool {
 	if errors.As(err, &oerr) && oerr.Code == "context_length_exceeded" {
 		return true
 	}
-	msg := strings.ToLower(err.Error())
+	msg := strings.ToLower(apiErrorText(err))
 	for _, marker := range contextWindowMarkers {
 		if strings.Contains(msg, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// apiErrorText returns the text matched against err for provider error
+// classification: the error's own text plus, for an *openai.Error, the
+// parsed provider payload. Since openai-go v3.81, Error() prints only a
+// status summary — the raw body is withheld because it can carry secrets —
+// so the marker match must read the fields explicitly (the same pattern as
+// chatTemplateKwargsRejected).
+func apiErrorText(err error) string {
+	var oerr *openai.Error
+	if !errors.As(err, &oerr) {
+		return err.Error()
+	}
+	return err.Error() + "\n" + oerr.Message + "\n" + oerr.RawJSON()
 }
 
 // wrapContextWindowError returns err wrapped so
