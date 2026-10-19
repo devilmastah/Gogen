@@ -200,6 +200,36 @@ func TestCancelKeyCancelsCompact(t *testing.T) {
 	}
 }
 
+// Cancelling a compaction clears the mirror itself, so it owns the band
+// boundary bookkeeping the result handler performs: the reserved
+// progress-strip row returns to the composer (the frame must stay exactly
+// terminal-height — a shorter frame leaves a row of the previous frame
+// unowned on screen, which is how "ghost" rows appear in the panel) and the
+// composer placeholder flips back from the queued-turn wording.
+func TestCancelKeyCompactRestoresInputBand(t *testing.T) {
+	m := dragModel(t)
+	m.SetSize(m.width, m.height)
+	s1 := m.lives.Active()
+	s1.compacting = true
+	m.compacting = true
+	s1.compactCancel = func() {}
+	m.applyComposerPlaceholder()
+	m.relayout()
+
+	if got := strings.Count(m.View().Content, "\n") + 1; got != m.height {
+		t.Fatalf("setup: frame height = %d, want %d", got, m.height)
+	}
+	queuedPlaceholder := m.textarea.Placeholder
+
+	_, _, _ = m.handleCancelKey()
+	if got := strings.Count(m.View().Content, "\n") + 1; got != m.height {
+		t.Fatalf("after cancelling the compaction the frame is %d rows, want %d (the strip's row must return to the composer)", got, m.height)
+	}
+	if m.textarea.Placeholder == queuedPlaceholder {
+		t.Fatalf("composer placeholder still reads %q after the compaction ended", queuedPlaceholder)
+	}
+}
+
 // The shared cancel handler keeps its old contracts: cancel a running
 // turn (clearing the mirror immediately — the epoch guard makes that
 // safe) and quit when idle.

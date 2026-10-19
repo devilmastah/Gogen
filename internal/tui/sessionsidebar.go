@@ -176,11 +176,6 @@ func (m *Model) rebindActivity() {
 	m.lives.Active().lastActive = m.sessionActivity[m.sessionID]
 }
 
-// buildSidebarRows merges the persisted-session index (m.savedCache) with
-// the live registry into the unified list. Saved entries come first (store
-// order, recency-sorted); live sessions overlay onto their saved row by
-// agent SessionID, and live sessions with no store entry yet get fallback
-// rows so they never disappear (the web's "creating…" pane fallback).
 // sidebarSeqOf returns the row's persistent first-seen sequence: the
 // tie-break for equal activity. Assigned once per id and never reset, so
 // the order is immune to group reassignment (a session gaining its first
@@ -198,25 +193,60 @@ func (m *Model) sidebarSeqOf(id string) int {
 	return m.sidebarSeqNext
 }
 
+// buildSidebarRows merges the persisted-session index (m.savedCache) with
+// the live registry into the unified list. Saved entries come first (store
+// order, recency-sorted); live sessions overlay onto their saved row by
+// agent SessionID, and live sessions with no store entry yet get fallback
+// rows so they never disappear (the web's "creating…" pane fallback).
+//
+// Invariant: exactly ONE row per session id. Every row renders its own
+// state dot, so a second row for the same session shows as two colored
+// indicators under one session — the symptom a duplicated store entry or a
+// duplicated live slot must never produce (see the seen map below).
 func (m *Model) buildSidebarRows() []sidebarRow {
 	if m.lives == nil {
 		return nil
 	}
 	rows := make([]sidebarRow, 0, len(m.savedCache))
 	covered := make(map[int]bool, len(m.lives.sessions)) // live sessions overlaid below
+	// seen holds every session id that already owns a row. One session is
+	// ONE row: a duplicated store entry (a re-written index, an id listed
+	// twice) or a second live slot hosting the same SessionID must never
+	// render a second row — each duplicate carries its own state dot, so
+	// the panel would show two colored indicators for a single session.
+	seen := make(map[string]bool, len(m.savedCache)+len(m.lives.sessions))
 	for _, si := range m.savedCache {
 		if si.ParentID != "" {
 			continue // nested (subagent) rows are not part of the flat list
+		}
+		if si.ID != "" {
+			if seen[si.ID] {
+				continue // duplicate store entry for a session already listed
+			}
+			seen[si.ID] = true
 		}
 		r := sidebarRow{id: si.ID, label: si.Label, msgCount: si.MessageCount, liveIdx: -1}
 		if ts, err := time.Parse(time.RFC3339Nano, si.UpdatedAt); err == nil {
 			r.updatedAt = ts
 		}
+		// Match EVERY live slot hosting this session (marking all of them
+		// covered, so none of them falls through to the fallback loop
+		// below), but render the row from ONE of them: the focused slot
+		// when several share the id, so the row's state dot reports
+		// "active"/"responding" for the session the user is looking at.
+		match := -1
 		for i, s := range m.lives.sessions {
 			if s.agent == nil || s.agent.SessionID != si.ID {
 				continue
 			}
 			covered[i] = true
+			if match < 0 || i == m.lives.active {
+				match = i
+			}
+		}
+		if match >= 0 {
+			s := m.lives.sessions[match]
+			i := match
 			r.live, r.liveIdx = true, i
 			r.focused = i == m.lives.active
 			r.streaming = s.streaming
@@ -237,7 +267,6 @@ func (m *Model) buildSidebarRows() []sidebarRow {
 				r.msgCount = s.agent.MessageCount()
 			}
 			r.lastActive = m.effectiveLastActive(s)
-			break
 		}
 		// In-process memory for a session that is no longer live (resume
 		// rebind, pane close): its row keeps the output stamp instead of
@@ -261,6 +290,14 @@ func (m *Model) buildSidebarRows() []sidebarRow {
 		if s.agent != nil && s.agent.SessionID != "" {
 			id = s.agent.SessionID
 		}
+		// A second slot for a session that already owns a row is dropped —
+		// see the seen map above. Live slots hosting a NESTED (subagent)
+		// session are not covered by the saved loop (nested entries are
+		// skipped there), so they keep their own row here.
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		r := sidebarRow{id: id, live: true, liveIdx: i, focused: i == m.lives.active,
 			streaming: s.streaming, lastActive: m.effectiveLastActive(s)}
 		if s.agent != nil {

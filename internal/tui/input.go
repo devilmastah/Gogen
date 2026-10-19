@@ -152,6 +152,15 @@ func (m *Model) handleCancelKey() (tea.Model, tea.Cmd, bool) {
 		}
 		m.compacting = false
 		m.appendChatLine(SystemStyle.Render("Compact cancelled."))
+		// This branch clears the mirror itself, so it owns the compaction
+		// boundary bookkeeping handleCompactResultMsg performs: hand the
+		// strip's reserved row back to the composer and flip the
+		// placeholder. Skipping it left the band a row short (SetSize
+		// budgeted the strip, nothing renders it) — the frame came out one
+		// row SHORTER than the terminal until the next relayout, and the
+		// composer kept the queued-turn placeholder.
+		m.applyComposerPlaceholder()
+		m.relayout()
 		return m, nil, true
 	}
 	m.flushAndQuit()
