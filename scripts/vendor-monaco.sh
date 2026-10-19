@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/internal/server/web/monaco"
-MONACO_VERSION="${MONACO_VERSION:-0.56.0}"
+MONACO_VERSION="${MONACO_VERSION:-0.57.0}"
 
 TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
@@ -74,7 +74,7 @@ Refresh:
 
 \`\`\`bash
 ./scripts/vendor-monaco.sh
-# optional: MONACO_VERSION=0.56.0 ./scripts/vendor-monaco.sh
+# optional: MONACO_VERSION=0.57.0 ./scripts/vendor-monaco.sh
 \`\`\`
 
 Commit the outputs under this directory. \`go build\` embeds them; npm is not required at build time.
