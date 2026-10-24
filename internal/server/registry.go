@@ -151,6 +151,13 @@ type sessionRuntime struct {
 	// (the subagent spawner installs the D6 forwarding approver; the board
 	// start installs a deny-when-unattended approver).
 	approverOverride agent.DeleteApprover
+	// commandApproverOverride replaces the default commandApprover when
+	// non-nil, for the same two callers and for the same reason: a nested
+	// child or a headless board session has no clients of its own, so its
+	// dangerous-command prompt must reach whoever can answer it (the parent
+	// session's tabs, or the board start's initiating tab) instead of being
+	// denied silently. Set alongside approverOverride.
+	commandApproverOverride agent.CommandApprover
 	// turnErrorHook is invoked by startTurn's error path with the turn's
 	// error (nil when no hook is installed — the normal case). The board
 	// start installs it so a failed first turn is commented on the ticket
@@ -158,13 +165,26 @@ type sessionRuntime struct {
 	turnErrorHook func(err error)
 }
 
-// pendingApproval is one in-flight delete-approval request: the channel the
-// turn's deleteApprover waits on, plus the original broadcast payload so a
-// re-attaching client can be re-notified of the pending request.
+// pendingApproval is one in-flight approval request (a file delete or a
+// blocked shell command): the channel the turn's approver waits on, plus the
+// original broadcast payload so a re-attaching client can be re-notified of
+// the pending request. kind is "delete" or "command" and selects the
+// re-notification message type; command is set for command approvals.
 type pendingApproval struct {
-	ch     chan bool
-	paths  []string
-	reason string
+	ch      chan bool
+	kind    string
+	paths   []string
+	command string
+	reason  string
+}
+
+// approvalKindOrDelete normalizes an empty kind (older callers/tests) to the
+// delete approval, the historical default.
+func approvalKindOrDelete(kind string) string {
+	if kind == "" {
+		return "delete"
+	}
+	return kind
 }
 
 // newSessionRuntime builds a runtime with the per-session turn machinery
@@ -343,28 +363,35 @@ func (rt *sessionRuntime) attachWithRole(ws *wsConn, passive bool) bool {
 	// Re-notify it of every pending approval (F2: the hold window is only
 	// actionable if the reconnected client knows the approval ids). The
 	// response routes by approvalId, so duplicate notifications are harmless.
+	type pendingNotify struct {
+		id      string
+		kind    string
+		paths   []string
+		command string
+		reason  string
+	}
 	rt.approvalMu.Lock()
-	pending := make([]struct {
-		id     string
-		paths  []string
-		reason string
-	}, 0, len(rt.approvals))
+	pending := make([]pendingNotify, 0, len(rt.approvals))
 	for id, pa := range rt.approvals {
-		pending = append(pending, struct {
-			id     string
-			paths  []string
-			reason string
-		}{id: id, paths: pa.paths, reason: pa.reason})
+		pending = append(pending, pendingNotify{
+			id:      id,
+			kind:    approvalKindOrDelete(pa.kind),
+			paths:   pa.paths,
+			command: pa.command,
+			reason:  pa.reason,
+		})
 	}
 	rt.approvalMu.Unlock()
 	for _, p := range pending {
-		_ = ws.writeJSON(WSMessage{
-			Type:       "delete_approval",
-			ApprovalID: p.id,
-			Paths:      p.paths,
-			Reason:     p.reason,
-			SessionID:  rt.agent.SessionID,
-		})
+		msg := WSMessage{ApprovalID: p.id, Reason: p.reason, SessionID: rt.agent.SessionID}
+		if p.kind == "command" {
+			msg.Type = "command_approval"
+			msg.Command = p.command
+		} else {
+			msg.Type = "delete_approval"
+			msg.Paths = p.paths
+		}
+		_ = ws.writeJSON(msg)
 	}
 	return true
 }
@@ -640,7 +667,7 @@ func (rt *sessionRuntime) deleteApprover() agent.DeleteApprover {
 		ch := make(chan bool, 1)
 
 		rt.approvalMu.Lock()
-		rt.approvals[id] = &pendingApproval{ch: ch, paths: req.Paths, reason: req.Reason}
+		rt.approvals[id] = &pendingApproval{ch: ch, kind: "delete", paths: req.Paths, reason: req.Reason}
 		rt.approvalMu.Unlock()
 
 		defer func() {
@@ -666,37 +693,113 @@ func (rt *sessionRuntime) deleteApprover() agent.DeleteApprover {
 	}
 }
 
+// commandApprover returns the session-scoped command approver. A blocked
+// shell command (a dangerous-pattern match the guard escalated) is
+// broadcast to all attached clients; the first response wins.
+//
+// With no attached client the request is DENIED fail-closed (false, nil):
+// an unattended turn must not block on a prompt nobody can answer, and by
+// default a dangerous command never runs unless a human allows it.
+func (rt *sessionRuntime) commandApprover() agent.CommandApprover {
+	return func(ctx context.Context, req agent.CommandRequest) (bool, error) {
+		if rt.clientCount() == 0 {
+			return false, nil
+		}
+		id := newApprovalID()
+		ch := make(chan bool, 1)
+
+		rt.approvalMu.Lock()
+		rt.approvals[id] = &pendingApproval{ch: ch, kind: "command", command: req.Command, reason: req.Reason}
+		rt.approvalMu.Unlock()
+
+		defer func() {
+			rt.approvalMu.Lock()
+			delete(rt.approvals, id)
+			rt.approvalMu.Unlock()
+		}()
+
+		rt.broadcast(WSMessage{
+			Type:       "command_approval",
+			ApprovalID: id,
+			Command:    req.Command,
+			Reason:     req.Reason,
+			SessionID:  rt.agent.SessionID,
+		})
+
+		select {
+		case approved := <-ch:
+			return approved, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
 // nestedDeleteApprover returns the D6 delete-approval override for a nested
-// (subagent) child runtime: approvals go to the child's own attached clients
-// (the child pane shows the modal); with none attached they route to the
-// parent's clients so a headless child can never hang an approval.
+// (subagent) child runtime: the request takes the route approvalTarget
+// resolves (the child's own clients, else the live parent's), and is denied
+// fail-closed when nobody can answer.
+func (r *sessionRegistry) nestedDeleteApprover(child *sessionRuntime, parentID string) agent.DeleteApprover {
+	return func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
+		target := r.approvalTarget(child, parentID)
+		if target == nil {
+			return false, nil
+		}
+		return target.deleteApprover()(ctx, req)
+	}
+}
+
+// nestedCommandApprover is the command-approval counterpart: a blocked shell
+// command raised by a nested (subagent) child takes the same route as its
+// delete approvals (approvalTarget), so a headless child asks the parent's
+// user instead of denying every dangerous command with "denied by user" for a
+// prompt nobody saw.
+func (r *sessionRegistry) nestedCommandApprover(child *sessionRuntime, parentID string) agent.CommandApprover {
+	return func(ctx context.Context, req agent.CommandRequest) (bool, error) {
+		target := r.approvalTarget(child, parentID)
+		if target == nil {
+			return false, nil
+		}
+		return target.commandApprover()(ctx, req)
+	}
+}
+
+// approvalTarget resolves which runtime can answer an approval raised by
+// child: the child itself when it has attached clients (its pane shows the
+// modal), else the live parent when that one has clients. nil means nobody can
+// answer, and the caller denies fail-closed.
 //
 // The parent is resolved by id AT APPROVAL TIME, never via a runtime pointer
 // captured at spawn/reopen: the parent can be orphan-evicted while its
 // background child keeps running and later reopened as a FRESH runtime under
-// the same id. An override closing over the spawn-time pointer would
-// broadcast the approval to the dead runtime's swept clients set and wait
-// forever — reports and completion notices survive that eviction via
-// deliverToParent queueing, but approvals have no queue: the waiter holds
-// the child's turn hostage, with no auto-deny armed (that machinery fires on
-// client detach, and a headless child has no client). Recovery would only be
-// interrupt_agent.
+// the same id. An approver closing over the spawn-time pointer would broadcast
+// the approval to the dead runtime's swept clients set and wait forever —
+// reports and completion notices survive that eviction via deliverToParent
+// queueing, but approvals have no queue: the waiter holds the child's turn
+// hostage, with no auto-deny armed (that machinery fires on client detach, and
+// a headless child has no client). Recovery would only be interrupt_agent.
 //
-// When neither the child nor the live parent has any attached client, the
-// request is DENIED fail-closed (false, nil): parking the approval would
-// broadcast to nobody and hang the child's turn. This matches the board
-// start's deny-when-unattended override and the last-detach auto-deny: an
-// unattended turn must not block on a destructive prompt.
-func (r *sessionRegistry) nestedDeleteApprover(child *sessionRuntime, parentID string) agent.DeleteApprover {
-	return func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
-		if child.clientCount() > 0 {
-			return child.deleteApprover()(ctx, req)
-		}
-		if parentRt, ok := r.get(parentID); ok && parentRt != child && parentRt.clientCount() > 0 {
-			return parentRt.deleteApprover()(ctx, req)
-		}
-		return false, nil
+// Parking an approval with no possible answer is why the nil case denies: it
+// matches the board start's deny-when-unattended override and the last-detach
+// auto-deny — an unattended turn must not block on a destructive prompt.
+func (r *sessionRegistry) approvalTarget(child *sessionRuntime, parentID string) *sessionRuntime {
+	if child.clientCount() > 0 {
+		return child
 	}
+	if parentRt, ok := r.get(parentID); ok && parentRt != child && parentRt.clientCount() > 0 {
+		return parentRt
+	}
+	return nil
+}
+
+// resolvedApprover prefers an installed override (subagent forwarding, board
+// start deny-when-unattended) over the runtime's own approver. Shared by both
+// approval kinds so the override precedence cannot diverge.
+func resolvedApprover[Req any](def, override func(context.Context, Req) (bool, error)) func(context.Context, Req) (bool, error) {
+	if override != nil {
+		return override
+	}
+	return def
 }
 
 // sessionRegistry owns the live sessions of the web server. The map itself

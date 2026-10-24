@@ -175,10 +175,13 @@ func (m *Model) startTurnOnWithResult(sess *liveSession, text string, onResult f
 		a = m.agent
 	}
 	approver := m.makeDeleteApprover(sess.id, sender)
+	commandApprover := m.makeCommandApprover(sess.id, sender)
 	return func() tea.Msg {
 		defer cancelFn()
+		turnCtx := agent.ContextWithDeleteApprover(streamCtx, approver)
+		turnCtx = agent.ContextWithCommandApprover(turnCtx, commandApprover)
 		out, err := a.StreamProcessInput(
-			agent.ContextWithDeleteApprover(streamCtx, approver),
+			turnCtx,
 			text,
 			adapter.Handlers(),
 		)

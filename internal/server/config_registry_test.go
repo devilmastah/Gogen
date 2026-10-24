@@ -71,6 +71,8 @@ func TestRuntimeConfigFieldErrors(t *testing.T) {
 			`Error: invalid commandSafety "maybe" (want blocklist, allowlist, or off)`},
 		{"deleteApproval", WSMessage{Type: "config", ConfigFields: []string{"deleteApproval"}, DeleteApproval: "maybe"},
 			`Error: invalid deleteApproval "maybe" (want required or off)`},
+		{"commandApproval", WSMessage{Type: "config", ConfigFields: []string{"commandApproval"}, CommandApproval: "maybe"},
+			`Error: invalid commandApproval "maybe" (want required or off)`},
 		{"commandSandbox", WSMessage{Type: "config", ConfigFields: []string{"commandSandbox"}, CommandSandbox: "maybe"},
 			`Error: invalid commandSandbox "maybe" (want off or bwrap)`},
 		{"commandIdleTimeoutSecs", WSMessage{Type: "config", ConfigFields: []string{"commandIdleTimeoutSecs"}, CommandIdleTimeoutSecs: -1},

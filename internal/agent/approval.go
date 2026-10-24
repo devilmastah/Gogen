@@ -1,6 +1,9 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // DeleteRequest describes a file deletion awaiting user approval.
 type DeleteRequest struct {
@@ -68,6 +71,57 @@ func (e *Executor) requireDeleteApproval(ctx context.Context, paths []string, re
 	}
 	if !ok {
 		return ErrDeleteDenied
+	}
+	return nil
+}
+
+// CommandRequest describes a shell command that matched a blocked-command
+// pattern and is awaiting user approval.
+type CommandRequest struct {
+	Command string
+	Reason  string // the safety pattern that matched
+}
+
+// CommandApprover decides whether a blocked command may proceed.
+type CommandApprover func(ctx context.Context, req CommandRequest) (approved bool, err error)
+
+type commandApproverKey struct{}
+
+// ContextWithCommandApprover attaches a command approval handler to ctx.
+func ContextWithCommandApprover(ctx context.Context, approver CommandApprover) context.Context {
+	if approver == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, commandApproverKey{}, approver)
+}
+
+// CommandApproverFromContext returns the command approver from ctx, if any.
+func CommandApproverFromContext(ctx context.Context) CommandApprover {
+	if ctx == nil {
+		return nil
+	}
+	approver, _ := ctx.Value(commandApproverKey{}).(CommandApprover)
+	return approver
+}
+
+// ErrCommandDenied is returned when the user declines a blocked command.
+var ErrCommandDenied = errors.New("command denied by user")
+
+// requireCommandApproval asks the user to allow a command that matched a
+// blocked-command pattern. With no approver attached (headless/automation
+// contexts) it fails closed with the original block error, so a blocked
+// command is never executed unattended.
+func (e *Executor) requireCommandApproval(ctx context.Context, command, pattern string) error {
+	approver := CommandApproverFromContext(ctx)
+	if approver == nil {
+		return &CommandBlockedError{Pattern: pattern}
+	}
+	ok, err := approver(ctx, CommandRequest{Command: command, Reason: pattern})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrCommandDenied
 	}
 	return nil
 }

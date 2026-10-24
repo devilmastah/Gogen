@@ -254,6 +254,9 @@ func TestConfigDefaults(t *testing.T) {
 	if d.DeleteApproval != "required" {
 		t.Errorf("default delete approval = %q, want required", d.DeleteApproval)
 	}
+	if d.CommandApproval != "required" {
+		t.Errorf("default command approval = %q, want required", d.CommandApproval)
+	}
 	if strings.TrimSpace(d.OpenAIModel) != "" {
 		t.Errorf("default openai model should be empty, got %q", d.OpenAIModel)
 	}

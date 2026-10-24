@@ -248,6 +248,7 @@ func (sp *subagentSpawner) finalizeForegroundChild(rt, parentRt *sessionRuntime,
 // denied fail-closed instead of being parked.
 func (rt *sessionRuntime) routeApprovalsTo(reg *sessionRegistry, parentID string) {
 	rt.approverOverride = reg.nestedDeleteApprover(rt, parentID)
+	rt.commandApproverOverride = reg.nestedCommandApprover(rt, parentID)
 }
 
 // approvalHold returns the configured delete-approval hold window. Reads

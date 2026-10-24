@@ -315,6 +315,7 @@ type WSMessage struct {
 	ApprovalID            string       `json:"approvalId,omitempty"`
 	Approved              bool         `json:"approved,omitempty"`
 	Paths                 []string     `json:"paths,omitempty"`
+	Command               string       `json:"command,omitempty"`
 	Reason                string       `json:"reason,omitempty"`
 	Mode                  string       `json:"mode,omitempty"`
 	ThinkingLevel         string       `json:"thinkingLevel,omitempty"`
@@ -424,6 +425,7 @@ type WSMessage struct {
 	CommandSafetyMode         string  `json:"commandSafety,omitempty"`
 	CommandAllowlist          string  `json:"commandAllowlist,omitempty"`
 	DeleteApproval            string  `json:"deleteApproval,omitempty"`
+	CommandApproval           string  `json:"commandApproval,omitempty"`
 	CommandSandbox            string  `json:"commandSandbox,omitempty"`
 	CommandIdleTimeoutSecs    int     `json:"commandIdleTimeoutSecs,omitempty"`
 	ContextLimitConfig        int     `json:"contextLimitConfig,omitempty"` // 0 = auto (provider resolution)

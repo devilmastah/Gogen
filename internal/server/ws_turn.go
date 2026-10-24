@@ -465,13 +465,16 @@ func (rt *sessionRuntime) runTurnBody(ctx context.Context, content string, image
 	defer rt.setTurnActive(false, time.Time{}, nil)
 	defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
 	rt.setTurnActive(true, time.Now(), o.owner)
-	// An installed approverOverride (subagent D6 forwarding, board start
-	// deny-when-unattended) replaces the default per-session approver.
-	approver := rt.deleteApprover()
-	if rt.approverOverride != nil {
-		approver = rt.approverOverride
-	}
-	appCtx := agent.ContextWithDeleteApprover(ctx, approver)
+	// An installed override (subagent D6 forwarding, board start
+	// deny-when-unattended) replaces the default per-session approver, for
+	// both approval kinds.
+	appCtx := agent.ContextWithDeleteApprover(ctx,
+		resolvedApprover(rt.deleteApprover(), rt.approverOverride))
+	// Blocked shell commands escalate to a user approval (the guard no longer
+	// hard-blocks by default); nobody-able-to-answer is denied fail-closed, so
+	// an unattended turn can never run a dangerous command.
+	appCtx = agent.ContextWithCommandApprover(appCtx,
+		resolvedApprover(rt.commandApprover(), rt.commandApproverOverride))
 	// write fans out to every attached socket and tags the source
 	// sessionId. A write failure detaches that socket (broadcast does it);
 	// it NEVER cancels the LLM call — the turn belongs to the session and

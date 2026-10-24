@@ -42,12 +42,13 @@ type Executor struct {
 	// direct field write that would race a concurrent read cannot compile.
 	// CommandGuard is immutable once built, so accessors may return the
 	// pointer after unlocking.
-	guard          *CommandGuard
-	deleteApproval bool
-	sandboxMode    string        // off, bwrap
-	maxToolOutput  int           // max bytes retained in-memory per command (0 = unbounded)
-	cmdIdleTimeout time.Duration // max no-output duration for foreground commands (0 = default)
-	liveMu         sync.RWMutex
+	guard           *CommandGuard
+	deleteApproval  bool
+	commandApproval bool          // escalate blocklist hits to a user approval (off = refuse outright)
+	sandboxMode     string        // off, bwrap
+	maxToolOutput   int           // max bytes retained in-memory per command (0 = unbounded)
+	cmdIdleTimeout  time.Duration // max no-output duration for foreground commands (0 = default)
+	liveMu          sync.RWMutex
 }
 
 func NewExecutor(wd string) *Executor {
@@ -59,11 +60,12 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 		guard = NewCommandGuard("blocklist", nil)
 	}
 	return &Executor{
-		WorkingDir:     wd,
-		guard:          guard,
-		deleteApproval: true,
-		sandboxMode:    "off",
-		PathBoundary:   "",
+		WorkingDir:      wd,
+		guard:           guard,
+		deleteApproval:  true,
+		commandApproval: true,
+		sandboxMode:     "off",
+		PathBoundary:    "",
 	}
 }
 
@@ -81,6 +83,55 @@ func (e *Executor) commandGuard() *CommandGuard {
 	e.liveMu.RLock()
 	defer e.liveMu.RUnlock()
 	return e.guard
+}
+
+// enforceCommandGuard applies the command guard to command. A blocklist
+// match is escalated to the interactive command approver (the user decides
+// whether the dangerous command may run); an allowlist violation stays a
+// hard block. The guard's "off" mode and a nil guard allow everything.
+//
+// Escalation is fail-closed: with no approver on ctx (headless automation,
+// unattended background work) the original block error is returned, so a
+// blocked command never runs unless a human explicitly allows it.
+//
+// With command_approval off (SetCommandApproval(false)) there is no escalation
+// at all: a blocklist match keeps the hard block, so a host or config that
+// wants no interactive prompt still gets the guard. Only command_safety: off
+// lets a dangerous command run.
+func (e *Executor) enforceCommandGuard(ctx context.Context, command string) error {
+	g := e.commandGuard()
+	if g == nil {
+		return nil
+	}
+	err := g.Check(command)
+	if err == nil {
+		return nil
+	}
+	var blocked *CommandBlockedError
+	if errors.As(err, &blocked) {
+		if !e.CommandApprovalRequired() {
+			return blocked
+		}
+		return e.requireCommandApproval(ctx, command, blocked.Pattern)
+	}
+	return err
+}
+
+// SetCommandApproval toggles whether a blocklisted command escalates to the
+// user for approval (web settings modal / config command_approval). Off means
+// such a command is refused with the block error, never prompted for.
+func (e *Executor) SetCommandApproval(required bool) {
+	e.liveMu.Lock()
+	e.commandApproval = required
+	e.liveMu.Unlock()
+}
+
+// CommandApprovalRequired reports whether a blocklisted command escalates to
+// an approval prompt (runtime-safe read).
+func (e *Executor) CommandApprovalRequired() bool {
+	e.liveMu.RLock()
+	defer e.liveMu.RUnlock()
+	return e.commandApproval
 }
 
 // SetDeleteApproval toggles whether destructive file operations require

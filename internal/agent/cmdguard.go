@@ -6,6 +6,18 @@ import (
 	"strings"
 )
 
+// CommandBlockedError reports that a command matched one of the
+// blockedCommandPatterns. It is distinct from the allowlist rejection so
+// the executor can escalate a blocklist hit to an interactive user approval
+// while leaving allowlist violations as hard blocks.
+type CommandBlockedError struct {
+	Pattern string // the regexp that matched
+}
+
+func (e *CommandBlockedError) Error() string {
+	return fmt.Sprintf("command blocked by safety policy (matched %q)", e.Pattern)
+}
+
 // CommandGuard controls which shell commands the agent may run.
 type CommandGuard struct {
 	Mode      string   // blocklist, allowlist, off
@@ -28,6 +40,11 @@ func NewCommandGuard(mode string, allowlist []string) *CommandGuard {
 // arbitrary developer commands, and blocking those builtins without also
 // blocking every equivalent (source, command substitution, scripts) would be
 // inconsistent security theater. Use allowlist mode for tighter control.
+//
+// A match does not hard-block: the executor escalates it to an interactive
+// user approval (see Executor.enforceCommandGuard), so the user can choose
+// to allow a specific dangerous command. Unattended contexts (no approver on
+// the context) still refuse it, fail-closed.
 var blockedCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bsudo\b`),
 	regexp.MustCompile(`(?i)\bsu\s+-`),
@@ -103,7 +120,7 @@ func rejectShellMetacharacters(command string) error {
 func (g *CommandGuard) checkBlocklist(command string) error {
 	for _, re := range blockedCommandPatterns {
 		if re.MatchString(command) {
-			return fmt.Errorf("command blocked by safety policy (matched %q)", re.String())
+			return &CommandBlockedError{Pattern: re.String()}
 		}
 	}
 	return nil

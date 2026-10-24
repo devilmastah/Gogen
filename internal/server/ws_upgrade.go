@@ -181,7 +181,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			// main-loop turnMu.Lock() (the stream holds turnMu while waiting
 			// for approval). Route by sessionId so each session's approvals
 			// resolve independently.
-			if msg.Type == "delete_approval_response" {
+			if msg.Type == "delete_approval_response" || msg.Type == "command_approval_response" {
 				if rt := s.resolveRuntime(msg.SessionID); rt != nil {
 					rt.completeApproval(msg.ApprovalID, msg.Approved)
 				}

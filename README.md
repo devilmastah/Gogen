@@ -160,6 +160,7 @@ YAML config
 
 ```yaml
 command_safety: blocklist
+command_approval: required   # required = ask before a blocklisted command; off = refuse it outright
 openai_model: gpt-4o
 mcp: on
 mcp_tool_mode: nested  # nested (default) = one `mcp` gateway tool; inline = one definition per server tool
@@ -318,6 +319,7 @@ After each agent turn, GoGen shows context usage in the CLI (dim line) and web U
 | `GOGEN_COMMAND_SAFETY` | `blocklist` | `blocklist`, `allowlist`, or `off` |
 | `GOGEN_COMMAND_ALLOWLIST` | *(empty)* | Comma-separated allowed command prefixes (allowlist mode) |
 | `GOGEN_DELETE_APPROVAL` | `required` | Set to `off` to skip delete confirmation |
+| `GOGEN_COMMAND_APPROVAL` | `required` | What a blocklisted command does: `required` asks for approval (and refuses it when nobody can be asked), `off` refuses it without prompting. Never allows a blocked command — that is `GOGEN_COMMAND_SAFETY=off` |
 
 ### Command execution
 
@@ -935,7 +937,7 @@ Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<
 
 ## Safety
 
-- **Command Guard** — Shell commands are filtered through a safety layer. In `blocklist` mode, dangerous patterns (`sudo`, `rm -rf /`, `curl | bash`) are blocked. In `allowlist` mode, only explicitly listed commands may run. Set `GOGEN_COMMAND_SAFETY=off` to disable.
+- **Command Guard** — Shell commands are filtered through a safety layer. In `blocklist` mode, dangerous patterns (`sudo`, `rm -rf /`, `curl | bash`) are not hard-blocked: the agent asks for explicit user approval before running them, and refuses them outright when nobody can be asked (unattended or headless turns). Set `GOGEN_COMMAND_APPROVAL=off` (or the Security settings entry) to keep the blocklist but skip the prompt — such commands are then refused, never prompted for. In `allowlist` mode, only explicitly listed commands may run. Set `GOGEN_COMMAND_SAFETY=off` to disable the guard entirely.
 - **Delete Approval** — File deletion requires explicit user confirmation before proceeding (unless `GOGEN_DELETE_APPROVAL=off`).
 - **Patch-First Edits** — The agent prefers `patch_file` (unified diffs) over full file rewrites to minimize accidental data loss.
 - **Syntax Checking** — After edits, syntax errors are detected via tree-sitter for supported languages.

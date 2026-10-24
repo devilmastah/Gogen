@@ -51,7 +51,7 @@ func nativeShellAvailable() bool {
 // failures wrapped with "execution error:". Prefers a native sh when one is
 // on PATH (full coreutils), falling back to the embedded interpreter.
 func (e *Executor) runCommand(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) error {
-	if err := e.checkCommandConfig(command); err != nil {
+	if err := e.checkCommandConfig(ctx, command); err != nil {
 		return err
 	}
 	if nativeShellAvailable() {
@@ -66,7 +66,7 @@ func (e *Executor) runCommand(ctx context.Context, command string, stdin io.Read
 // interpreter uses an in-memory pipe. The command guard and sandbox apply
 // exactly as they do to foreground commands.
 func (e *Executor) launchBackground(ctx context.Context, command string, stdout, stderr io.Writer) (io.WriteCloser, func() error, error) {
-	if err := e.checkCommandConfig(command); err != nil {
+	if err := e.checkCommandConfig(ctx, command); err != nil {
 		return nil, nil, err
 	}
 	if nativeShellAvailable() {
@@ -134,11 +134,9 @@ func taskkillOnCancel(cmd *exec.Cmd) {
 // checkCommandConfig applies the command guard and sandbox validation that
 // BuildCommand performs on Unix (the Windows runner has no *exec.Cmd to
 // configure).
-func (e *Executor) checkCommandConfig(command string) error {
-	if g := e.commandGuard(); g != nil {
-		if err := g.Check(command); err != nil {
-			return err
-		}
+func (e *Executor) checkCommandConfig(ctx context.Context, command string) error {
+	if err := e.enforceCommandGuard(ctx, command); err != nil {
+		return err
 	}
 	switch strings.ToLower(strings.TrimSpace(e.sandbox())) {
 	case "", "off":

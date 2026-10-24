@@ -169,6 +169,14 @@ type Config struct {
 
 	DeleteApproval string // required, off
 
+	// CommandApproval decides what a blocklisted command does when
+	// command_safety is blocklist: "required" escalates it to the session's
+	// approval prompt (and refuses it when nobody can be asked), "off" refuses
+	// it outright with the block error — the pre-escalation behavior, for
+	// setups that want no interactive prompt. It never makes a dangerous
+	// command run: turning the guard itself off is command_safety: off.
+	CommandApproval string // required, off
+
 	TreeSitter      string
 	TreeSitterLangs string
 	CLIVerbose      bool
@@ -365,6 +373,7 @@ func Defaults() Config {
 		CommandSafetyMode:         "blocklist",
 		CommandAllowlist:          "",
 		DeleteApproval:            "required",
+		CommandApproval:           "required",
 		TreeSitter:                "on",
 		TreeSitterLangs:           "",
 		CLIVerbose:                false,

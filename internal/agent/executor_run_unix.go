@@ -41,10 +41,8 @@ func configureCancelableCmd(cmd *exec.Cmd) {
 // and background commands. Unix-only: Windows runs commands through the
 // embedded shell interpreter (executor_run_windows.go) instead.
 func (e *Executor) BuildCommand(ctx context.Context, command string) (*exec.Cmd, error) {
-	if g := e.commandGuard(); g != nil {
-		if err := g.Check(command); err != nil {
-			return nil, err
-		}
+	if err := e.enforceCommandGuard(ctx, command); err != nil {
+		return nil, err
 	}
 	cmd, err := e.buildShellCommand(ctx, command)
 	if err != nil {

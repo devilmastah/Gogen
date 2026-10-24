@@ -29,7 +29,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	msg := WSMessage{
 		Type: "config",
 		ConfigFields: []string{
-			"commandSafety", "commandAllowlist", "deleteApproval", "commandSandbox", "commandIdleTimeoutSecs",
+			"commandSafety", "commandAllowlist", "deleteApproval", "commandApproval", "commandSandbox", "commandIdleTimeoutSecs",
 			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "outputSpill", "compactReserveTokens", "compactLastResort",
 			"webFetch", "webSearch", "treesitter", "preserveReasoning",
 			"sessionMaxCount", "sessionMaxAgeDays", "webApprovalHoldSecs",
@@ -38,6 +38,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		CommandSafetyMode:         "allowlist",
 		CommandAllowlist:          "ls, cat",
 		DeleteApproval:            "off",
+		CommandApproval:           "off",
 		CommandSandbox:            "bwrap",
 		CommandIdleTimeoutSecs:    45,
 		ContextLimitConfig:        20000,
@@ -76,7 +77,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
 		return len(m.ConfigFields) == 0 && m.CommandSafetyMode == "allowlist"
 	})
-	if cfg.CommandAllowlist != "ls, cat" || cfg.DeleteApproval != "off" || cfg.CommandSandbox != "bwrap" ||
+	if cfg.CommandAllowlist != "ls, cat" || cfg.DeleteApproval != "off" || cfg.CommandApproval != "off" || cfg.CommandSandbox != "bwrap" ||
 		cfg.CommandIdleTimeoutSecs != 45 ||
 		cfg.ContextLimitConfig != 20000 || cfg.CompactThreshold != 0.5 ||
 		cfg.CompactKeepRecentMessages != 3 || cfg.MaxToolResultBytes != 65536 || cfg.CompactReserveTokens != 1000 ||
@@ -97,6 +98,9 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	}
 	if s.ws.Exec.DeleteApprovalRequired() {
 		t.Fatal("delete approval should be off")
+	}
+	if s.ws.Exec.CommandApprovalRequired() {
+		t.Fatal("command approval should be off")
 	}
 	if s.ws.Exec.SandboxMode() != "bwrap" {
 		t.Fatalf("sandbox = %q, want bwrap", s.ws.Exec.SandboxMode())

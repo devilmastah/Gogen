@@ -35,6 +35,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		CommandSafetyMode:         mergeString("GOGEN_COMMAND_SAFETY", file.CommandSafety, def.CommandSafetyMode),
 		CommandAllowlist:          mergeString("GOGEN_COMMAND_ALLOWLIST", file.CommandAllowlist, def.CommandAllowlist),
 		DeleteApproval:            mergeString("GOGEN_DELETE_APPROVAL", file.DeleteApproval, def.DeleteApproval),
+		CommandApproval:           mergeString("GOGEN_COMMAND_APPROVAL", file.CommandApproval, def.CommandApproval),
 		TreeSitter:                mergeString("GOGEN_TREESITTER", file.TreeSitter, def.TreeSitter),
 		TreeSitterLangs:           mergeString("GOGEN_TREESITTER_LANGS", file.TreeSitterLangs, def.TreeSitterLangs),
 		CLIVerbose:                mergeBool("GOGEN_CLI_VERBOSE", file.CLIVerbose, def.CLIVerbose),

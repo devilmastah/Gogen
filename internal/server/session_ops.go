@@ -108,6 +108,7 @@ func (s *Server) loadOrCreateRuntime(id string) (*sessionRuntime, error) {
 		rt.parentID = p
 		rt.nested = true
 		rt.approverOverride = s.registry.nestedDeleteApprover(rt, p)
+		rt.commandApproverOverride = s.registry.nestedCommandApprover(rt, p)
 	}
 	s.registry.register(id, rt)
 	// A concurrent attach (or resume) of the same session may have

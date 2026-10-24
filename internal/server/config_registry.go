@@ -193,6 +193,29 @@ func buildConfigFields() map[string]fieldSpec {
 	f.sample = "off"
 	add(f)
 
+	// command_approval: what a blocklisted command does when command_safety
+	// is blocklist. required = ask the user (and refuse when nobody can be
+	// asked); off = refuse outright, no prompt. It never allows the command —
+	// that is command_safety: off.
+	f = strSpec("commandApproval",
+		func(r *config.Config) string { return r.CommandApproval },
+		func(r *config.Config, v string) { r.CommandApproval = v },
+		func(m *WSMessage) string { return m.CommandApproval },
+		func(m *WSMessage, v string) { m.CommandApproval = v })
+	f.normalize = func(v any) (any, string) {
+		raw := v.(string)
+		mode := strings.ToLower(strings.TrimSpace(raw))
+		if mode != "required" && mode != "off" {
+			return nil, fmt.Sprintf("Error: invalid commandApproval %q (want required or off)", raw)
+		}
+		return mode, ""
+	}
+	f.applyLive = func(s *Server, r *config.Config) {
+		s.ws.Exec.SetCommandApproval(!strings.EqualFold(r.CommandApproval, "off"))
+	}
+	f.sample = "required"
+	add(f)
+
 	f = strSpec("commandSandbox",
 		func(r *config.Config) string { return r.CommandSandbox },
 		func(r *config.Config, v string) { r.CommandSandbox = v },

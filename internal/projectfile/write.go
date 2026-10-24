@@ -115,6 +115,7 @@ type configYAML struct {
 	CommandSafety             string                        `yaml:"command_safety"`
 	CommandAllowlist          string                        `yaml:"command_allowlist,omitempty"`
 	DeleteApproval            string                        `yaml:"delete_approval"`
+	CommandApproval           string                        `yaml:"command_approval,omitempty"`
 	CommandSandbox            string                        `yaml:"command_sandbox,omitempty"`
 	CommandIdleTimeoutSecs    int                           `yaml:"command_idle_timeout_secs,omitempty"`
 	TreeSitter                string                        `yaml:"treesitter"`
@@ -209,6 +210,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		CommandSafety:             cfg.CommandSafetyMode,
 		CommandAllowlist:          cfg.CommandAllowlist,
 		DeleteApproval:            cfg.DeleteApproval,
+		CommandApproval:           omitDefaultString(cfg.CommandApproval, def.CommandApproval),
 		CommandSandbox:            omitDefaultString(cfg.CommandSandbox, def.CommandSandbox),
 		CommandIdleTimeoutSecs:    omitDefaultInt(cfg.CommandIdleTimeoutSecs, def.CommandIdleTimeoutSecs),
 		TreeSitter:                cfg.TreeSitter,

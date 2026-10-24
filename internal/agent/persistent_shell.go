@@ -263,7 +263,7 @@ func bashPersistentTimeout(args map[string]any) (time.Duration, error) {
 	return d, nil
 }
 
-func handleBashPersistent(_ context.Context, a *Agent, args map[string]any) (string, error) {
+func handleBashPersistent(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	command, err := stringArg(args, "command")
 	if err != nil {
 		return "", err
@@ -282,10 +282,8 @@ func handleBashPersistent(_ context.Context, a *Agent, args map[string]any) (str
 	if mode := strings.ToLower(strings.TrimSpace(a.Executor.sandbox())); mode != "" && mode != "off" {
 		return "", fmt.Errorf("bash_persistent is not supported with command_sandbox=%s; use execute_command", mode)
 	}
-	if g := a.Executor.commandGuard(); g != nil {
-		if err := g.Check(command); err != nil {
-			return "", err
-		}
+	if err := a.Executor.enforceCommandGuard(ctx, command); err != nil {
+		return "", err
 	}
 	shell, err := a.persistentShellFor(reset)
 	if err != nil {

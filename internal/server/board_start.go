@@ -133,6 +133,9 @@ func (s *Server) startTicketSession(ctx context.Context, item *agent.BoardItem, 
 		}
 		return rt.deleteApprover()(ctx, req)
 	}
+	// A blocked command needs no override here: commandApprover already denies
+	// fail-closed at zero attached clients (deleteApprover instead parks the
+	// request, which is why the wrapper above exists for deletes only).
 	// First-turn failure visibility: comment the error on the ticket.
 	ticketID := item.ID
 	rt.turnErrorHook = func(err error) {

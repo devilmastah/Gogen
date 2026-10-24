@@ -53,6 +53,9 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
 	exec.SetDeleteApproval(!strings.EqualFold(cfg.DeleteApproval, "off"))
+	// Blocklist matches escalate to a user approval; command_approval: off
+	// keeps the hard block instead of prompting.
+	exec.SetCommandApproval(!strings.EqualFold(cfg.CommandApproval, "off"))
 	exec.SetSandbox(cfg.CommandSandbox)
 	// The executor bounds in-memory command output at the same cap the
 	// context manager later applies to tool results; 0 (explicit "no cap")

@@ -255,8 +255,13 @@ func (m *Model) handleSubagentsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // approvals (focused + background sessions) cannot steal each other's
 // answers.
 type approvalRequest struct {
-	req agent.DeleteRequest
-	sid string // requesting live session id ("" = unknown)
+	// kind is "delete" (default) or "command". command is set for command
+	// approvals (a blocked shell command awaiting a decision); req is set
+	// for delete approvals.
+	kind    string
+	command string
+	req     agent.DeleteRequest
+	sid     string // requesting live session id ("" = unknown)
 	// turnSeq is the requesting turn's generation, stamped on FIRST
 	// delivery (handleApprovalRequestMsg, Update thread) so turn-end
 	// pruning can tell a finished turn's queued request from a resubmitted
@@ -265,6 +270,15 @@ type approvalRequest struct {
 	turnSeq uint64
 	// reply is buffered 1: a reply after the approver left is dropped.
 	reply chan bool
+}
+
+// kindOrDelete normalizes an empty kind to the historical delete approval
+// (existing tests and callers construct approvalRequest with only req).
+func (ar *approvalRequest) kindOrDelete() string {
+	if ar == nil || ar.kind == "" {
+		return "delete"
+	}
+	return ar.kind
 }
 
 // pruneQueuedApprovals drops queued delete-approvals requested by sid's
@@ -288,10 +302,12 @@ func (m *Model) pruneQueuedApprovals(sid string, seq uint64) {
 }
 
 type approvalUIState struct {
-	paths  []string
-	reason string
-	cursor int // 0 = No, 1 = Yes
-	ar     *approvalRequest
+	kind    string // "delete" or "command"
+	command string
+	paths   []string
+	reason  string
+	cursor  int // 0 = No, 1 = Yes
+	ar      *approvalRequest
 }
 
 // approvalSessionLabel names the requesting session when it is NOT the
@@ -316,28 +332,50 @@ func (m *Model) renderApprovalModal() string {
 		return ""
 	}
 
+	kind := m.approvalUI.kind
+	if kind == "" {
+		kind = "delete"
+	}
+
 	var rows []styleLine
 
 	// Title — a background session's request names its session so the
 	// answer is not misattributed to the focused transcript.
 	title := "Delete Approval Required"
+	allowLabel := "Allow delete?"
+	if kind == "command" {
+		title = "Command Approval Required"
+		allowLabel = "Allow command?"
+	}
 	if label := m.approvalSessionLabel(); label != "" {
 		title += " — " + label
 	}
 	rows = append(rows, styleLine{text: title, highlight: true})
 	rows = append(rows, styleLine{text: "", highlight: false})
 
-	// Reason
-	reason := fmt.Sprintf("Reason: %s", m.approvalUI.reason)
-	rows = append(rows, styleLine{text: reason, highlight: false})
-	rows = append(rows, styleLine{text: "", highlight: false})
+	if kind == "command" {
+		// Blocked shell command the guard escalated for a decision.
+		rows = append(rows, styleLine{text: "Command:", preStyled: true})
+		for _, l := range strings.Split(m.approvalUI.command, "\n") {
+			rows = append(rows, styleLine{text: "  " + l, preStyled: true})
+		}
+		rows = append(rows, styleLine{text: "", preStyled: true})
+		reason := fmt.Sprintf("Reason: matched safety pattern %s", m.approvalUI.reason)
+		rows = append(rows, styleLine{text: reason, highlight: false})
+		rows = append(rows, styleLine{text: "", highlight: false})
+	} else {
+		// Reason
+		reason := fmt.Sprintf("Reason: %s", m.approvalUI.reason)
+		rows = append(rows, styleLine{text: reason, highlight: false})
+		rows = append(rows, styleLine{text: "", highlight: false})
 
-	// File list
-	rows = append(rows, styleLine{text: "Files to delete:", preStyled: true})
-	for _, p := range m.approvalUI.paths {
-		rows = append(rows, styleLine{text: "  • " + p, preStyled: true})
+		// File list
+		rows = append(rows, styleLine{text: "Files to delete:", preStyled: true})
+		for _, p := range m.approvalUI.paths {
+			rows = append(rows, styleLine{text: "  • " + p, preStyled: true})
+		}
+		rows = append(rows, styleLine{text: "", preStyled: true})
 	}
-	rows = append(rows, styleLine{text: "", preStyled: true})
 
 	// Prompt + buttons (pre-styled line with inline highlights)
 	noStyle := ansiDimOn
@@ -348,7 +386,7 @@ func (m *Model) renderApprovalModal() string {
 	if m.approvalUI.cursor == 1 {
 		yesStyle = ansiHighlightOn
 	}
-	promptLine := ansiPromptOn + "Allow delete?" + ansiReset +
+	promptLine := ansiPromptOn + allowLabel + ansiReset +
 		"  [" + noStyle + "No" + ansiReset +
 		"]  [" + yesStyle + "Yes" + ansiReset + "]"
 	rows = append(rows, styleLine{text: promptLine, preStyled: true})
@@ -405,10 +443,12 @@ func (m *Model) dismissApproval(approved bool) {
 		next := m.pendingApprovals[0]
 		m.pendingApprovals = m.pendingApprovals[1:]
 		m.approvalUI = &approvalUIState{
-			paths:  next.req.Paths,
-			reason: next.req.Reason,
-			cursor: 1, // default to Yes
-			ar:     next,
+			kind:    next.kindOrDelete(),
+			command: next.command,
+			paths:   next.req.Paths,
+			reason:  next.req.Reason,
+			cursor:  1, // default to Yes
+			ar:      next,
 		}
 		m.bellIfBlurred()
 		return

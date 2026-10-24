@@ -167,6 +167,7 @@
         import {
             initDeleteApproval,
             showDeleteApproval,
+            showCommandApproval,
         } from '/components/delete-approval.js';
         // Composer input helpers (components/composer.js): the slash-command
         // suggest box and the attachment flow (file picker, paste,
@@ -2217,6 +2218,11 @@
                     // modal (it pauses input anyway) with the session tagged
                     // so the response routes correctly.
                     showDeleteApproval(data);
+                    break;
+                case 'command_approval':
+                    // A blocked shell command escalated to the user: reuse the
+                    // approval modal with the session tagged for correct routing.
+                    showCommandApproval(data);
                     break;
                 default:
                     break;
@@ -4384,6 +4390,10 @@
                     handleDeleteApproval(data);
                     return;
                 }
+                if (data.type === 'command_approval') {
+                    handleCommandApproval(data);
+                    return;
+                }
                 // Display-relay frames are connection/process-global: every
                 // attached tab may relay them (the reporter is process-wide),
                 // so they are handled before pane routing.
@@ -4513,6 +4523,7 @@
             config: handleConfig,
             context: handleContext,
             delete_approval: handleDeleteApproval,
+            command_approval: handleCommandApproval,
             board_state: handleBoardState,
             automations_state: handleAutomationsState,
             automations_runs: handleAutomationsRuns,
@@ -5852,9 +5863,11 @@
         }
 
         function handleDeleteApproval(data) {
-
             showDeleteApproval(data);
+        }
 
+        function handleCommandApproval(data) {
+            showCommandApproval(data);
         }
 
         // ── Nested (subagent) sessions ──

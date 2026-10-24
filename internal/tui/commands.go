@@ -512,6 +512,35 @@ func (m *Model) makeDeleteApprover(sessID string, send programSender) agent.Dele
 	}
 }
 
+// makeCommandApprover creates a command approver that shows the approval
+// modal for a blocked shell command the guard escalated. Like the delete
+// approver it runs on the turn's stream goroutine, so it never touches
+// Model state — it sends the request to the Update thread and blocks on its
+// own reply channel.
+func (m *Model) makeCommandApprover(sessID string, send programSender) agent.CommandApprover {
+	return func(ctx context.Context, req agent.CommandRequest) (bool, error) {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		ar := &approvalRequest{
+			kind:    "command",
+			command: req.Command,
+			req:     agent.DeleteRequest{Reason: req.Reason},
+			sid:     sessID,
+			reply:   make(chan bool, 1),
+		}
+		if send != nil {
+			send.Send(approvalRequestMsg{ar: ar})
+		}
+		select {
+		case approved := <-ar.reply:
+			return approved, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
 // approvalRequestMsg is an internal message to trigger the approval modal.
 type approvalRequestMsg struct {
 	ar *approvalRequest

@@ -44,6 +44,7 @@ type FileConfig struct {
 	CommandSafety             string                `yaml:"command_safety"`
 	CommandAllowlist          string                `yaml:"command_allowlist"`
 	DeleteApproval            string                `yaml:"delete_approval"`
+	CommandApproval           string                `yaml:"command_approval"`
 	TreeSitter                string                `yaml:"treesitter"`
 	TreeSitterLangs           string                `yaml:"treesitter_langs"`
 	CLIVerbose                bool                  `yaml:"cli_verbose"`

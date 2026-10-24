@@ -650,10 +650,12 @@ func (m *Model) handleApprovalRequestMsg(msg approvalRequestMsg) (tea.Model, tea
 			m.modalBeforeApproval = m.modal
 		}
 		m.approvalUI = &approvalUIState{
-			paths:  msg.ar.req.Paths,
-			reason: msg.ar.req.Reason,
-			cursor: 1, // default to Yes
-			ar:     msg.ar,
+			kind:    msg.ar.kindOrDelete(),
+			command: msg.ar.command,
+			paths:   msg.ar.req.Paths,
+			reason:  msg.ar.req.Reason,
+			cursor:  1, // default to Yes
+			ar:      msg.ar,
 		}
 		m.modal = ModalApproval
 		m.bellIfBlurred() // web parity: "Approval needed" notification
@@ -662,7 +664,7 @@ func (m *Model) handleApprovalRequestMsg(msg approvalRequestMsg) (tea.Model, tea
 	// An approval is already on screen: queue this one behind it. Its
 	// requester stays blocked on its own reply channel until promoted.
 	m.pendingApprovals = append(m.pendingApprovals, msg.ar)
-	m.statusMsg = "Another delete approval is queued…"
+	m.statusMsg = "Another approval is queued…"
 	return m, nil
 }
 
