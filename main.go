@@ -291,6 +291,14 @@ func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *co
 	a.ResetSessionState()
 	a.SetSessionID(session.NewID())
 	a.SetSessionOneshot(true)
+	// A one-shot run is a NEW session and must not inherit a plan mode left
+	// in the auto-restored session (restore happens in newAgent, before this
+	// function). Without this, `gogen -p "..."` in a directory whose last
+	// session was /plan'd silently runs with the read-only tool set: the
+	// model loses write_file/patch_file/execute_command and nobody sees a
+	// mode indicator in a headless run. SetMode flushes, so the fresh id is
+	// assigned first.
+	a.SetMode(agent.ModeAct)
 	a.FlushSession()
 
 	// Automation runs report their session id through this file so the

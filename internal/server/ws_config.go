@@ -135,11 +135,22 @@ func agentConfigMsg(ctx context.Context, rt *sessionRuntime) WSMessage {
 // off the read loop: ContextStats tokenization can take seconds on a large
 // uncached session, and the read loop serializes every message on the
 // connection (including cancel).
-func echoConfigOffLoop(ws *wsConn, ctx context.Context, a *agent.Agent, cfg *WSMessage) {
+//
+// The echo goes to the acting connection AND to every other client attached to
+// the same session: mode / model / thinking level are per-SESSION state that
+// every attached client renders (toolbar mirrors), so leaving the others on
+// the previous value shows a tab a state the session does not have. The mode
+// case is not cosmetic — the model's tool list follows the SERVER's mode, and
+// a stale picker makes clicking the mode the user believes is active a no-op
+// (see wsHandleSetMode).
+func echoConfigOffLoop(rt *sessionRuntime, ws *wsConn, ctx context.Context, a *agent.Agent, cfg *WSMessage) {
 	go func() {
 		accum := a.SnapshotUsageAccum()
 		applyContextStats(cfg, a.ContextStats(ctx), &accum)
 		_ = ws.writeJSON(*cfg)
+		if rt != nil {
+			rt.broadcastExcept(ws, *cfg)
+		}
 	}()
 }
 

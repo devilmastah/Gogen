@@ -75,11 +75,37 @@ func (a *Agent) ResetSessionState() {
 	a.resetSessionState(nil)
 }
 
+// resetModeToAct returns the agent to act mode without flushing: the "fresh
+// session" paths (a typed /new, the replacement session after deleting the
+// current one, a one-shot -p run) must not inherit a read-only plan mode.
+//
+// Mode is persisted per session and restored on resume, so a /plan from an
+// earlier session — or an auto-restored one at startup — would otherwise
+// carry the plan tool set into a brand-new conversation: the model silently
+// loses write_file/patch_file/execute_command while the (empty) transcript
+// says nothing about it. The web's /new path (createNewSession) already
+// builds a fresh agent, which is act by construction; this keeps the
+// in-place paths at parity.
+//
+// Deliberately NOT part of resetSessionState: ForkSession shares that core
+// and a fork IS the same work continued, so it keeps the source's mode.
+// Resume/attach also keep it — restoring a session is meant to carry its
+// state.
+func (a *Agent) resetModeToAct() {
+	a.statsMu.Lock()
+	a.Mode = ModeAct
+	a.statsMu.Unlock()
+}
+
 // resetSessionState is the shared core of ResetSessionState and ForkSession:
 // it clears all session-related state and publishes msgs as the new
 // conversation in the same sequence (nil for a fresh session, the forked
 // prefix for a fork). Keeping the reset list in one place means new state
 // added here is covered by both paths automatically.
+//
+// It deliberately leaves Mode/ThinkingLevel/model untouched: fork relies on
+// inheriting them, and the fresh-session callers reset the mode themselves
+// (resetModeToAct).
 func (a *Agent) resetSessionState(msgs []llm.Message) {
 	a.replaceMessages(msgs)
 	a.clearTurnUsage()
@@ -155,6 +181,7 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 	}
 	a.SetSessionID(newID)
 	a.ResetSessionState()
+	a.resetModeToAct()
 	if a.SessionStore != nil {
 		a.FlushSession()
 		if oldID != "" {
@@ -275,6 +302,7 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 	if wasCurrent {
 		a.SetSessionID(newSessionID)
 		a.ResetSessionState()
+		a.resetModeToAct()
 		a.FlushSession()
 		out := fmt.Sprintf("Deleted session %s (was current — started new session %s).", id, newSessionID)
 		return AppendContextBrief(ctx, a, out), SessionActionClearChat, nil

@@ -510,6 +510,31 @@ func (rt *sessionRuntime) broadcast(msg WSMessage) {
 	}
 }
 
+// broadcastExcept delivers msg to every attached socket except skip. It is the
+// shape for handlers that answer the ACTING connection directly (a per-socket
+// echo) but must keep every other client attached to the same session
+// converged on session-scoped state that all of them render — a second tab/
+// window, or a second pane on the same session, would otherwise keep showing
+// the previous value.
+//
+// A skip socket that is not attached is simply absent from the client set, so
+// the caller's own echo stays its only copy.
+func (rt *sessionRuntime) broadcastExcept(skip *wsConn, msg WSMessage) {
+	rt.clientsMu.Lock()
+	clients := make([]*wsConn, 0, len(rt.clients))
+	for c := range rt.clients {
+		if c != skip {
+			clients = append(clients, c)
+		}
+	}
+	rt.clientsMu.Unlock()
+	for _, c := range clients {
+		if err := c.writeJSON(msg); err != nil {
+			rt.detach(c)
+		}
+	}
+}
+
 // detachAllClients removes every attached socket from the session. Used when
 // a runtime is leaving the registry (session_delete, eviction): every
 // attachment must be released — not just one connection's — or the removed

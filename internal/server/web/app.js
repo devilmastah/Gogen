@@ -737,7 +737,13 @@
         const inputAreaWrap = document.getElementById('input-area');
 
         function updateModeInfo(mode) {
-            currentMode = (mode || 'act').toLowerCase();
+            // A config frame without a mode (the field is omitempty) must not
+            // repaint the picker: the fallback used to be 'act', which showed
+            // Act for a session the server still runs in plan mode — and the
+            // picker's "already active" short-circuit then made clicking Act a
+            // silent no-op. keep the last known mode instead.
+            if (!mode) return;
+            currentMode = mode.toLowerCase();
             if (!tbModeBtn) return;
             const label = currentMode === 'plan' ? 'Plan' : 'Act';
             tbModeBtn.innerHTML = `${icon('pen')} <span class="tb-mode-label">${label}</span> <span class="tb-arrow">${icon('chevron-down')}</span>`;

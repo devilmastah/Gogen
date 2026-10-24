@@ -125,7 +125,16 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 			if snap, err := store.LoadInWorkingDir(cfg.WorkingDir, latest); err == nil {
 				a.RestoreSession(snap, latest)
 				restoredModel = snap.Model
-				notices = append(notices, fmt.Sprintf("Session %s (%d msgs)", latest, len(a.Messages)))
+				notice := fmt.Sprintf("Session %s (%d msgs)", latest, len(a.Messages))
+				// The resumed mode is session state the model acts on: a
+				// session left in plan mode comes back read-only (no
+				// write_file/patch_file/execute_command). Say so instead of
+				// resuming silently — the status bar is the only other cue,
+				// and a headless -p run has none at all.
+				if mode, _ := a.ModeAndThinkingLevel(); mode == agent.ModePlan {
+					notice += " — resumed in PLAN mode (read-only; /act to edit)"
+				}
+				notices = append(notices, notice)
 			}
 		}
 	}

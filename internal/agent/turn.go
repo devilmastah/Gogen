@@ -8,8 +8,44 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gogen/internal/debuglog"
 	"gogen/internal/llm"
 )
+
+// logToolDefinitions records the exact tool set sent to the provider for this
+// round (mode + names + allowlist size). Only runs when debug logging is
+// enabled (GOGEN_DEBUG_LOG), so it costs one RLock-guarded path read per
+// round otherwise.
+//
+// A model's own report of "my tool list has no <tool>" is not evidence: models
+// (small or heavily quantized ones especially) mis-state and even invent tool
+// names. This line settles the question from the client side — what the
+// request actually carried — without needing the endpoint's logs.
+func logToolDefinitions(mode Mode, tools []llm.Tool, allowed map[string]struct{}) {
+	if !debuglog.Enabled() {
+		return
+	}
+	// Mirror the provider's filter (toolsToOpenAI) so "tools" is what the
+	// wire actually carries: a nil allowlist sends everything, otherwise a
+	// definition not named in it is dropped.
+	sent := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if allowed != nil {
+			if _, ok := allowed[t.Name]; !ok {
+				continue
+			}
+		}
+		sent = append(sent, t.Name)
+	}
+	debuglog.Write("agent/tools", "tool definitions sent to the provider", "", map[string]any{
+		"mode":  mode.String(),
+		"tools": sent,
+		"count": len(sent),
+		// definitions is the pre-filter list size (builtins + feature tools +
+		// MCP); the difference is exactly what the mode removed.
+		"definitions": len(tools),
+	})
+}
 
 // toolRoundOutcome reports how the agent loop must continue after a tool
 // round.
@@ -132,7 +168,9 @@ func (a *Agent) runTurn(ctx context.Context, h *llm.StreamHandlers, first bool) 
 	}
 
 	a.Provider.SetThinkingLevel(string(a.ThinkingLevel))
-	result, err := a.Provider.GenerateResponseStream(ctx, view, a.AllowedToolNames(), a.llmTools(), h)
+	tools, allowed := a.llmTools(), a.AllowedToolNames()
+	logToolDefinitions(a.Mode, tools, allowed)
+	result, err := a.Provider.GenerateResponseStream(ctx, view, allowed, tools, h)
 	if err != nil {
 		finishStreamUI(h)
 		if ctx.Err() != nil {

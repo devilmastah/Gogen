@@ -254,12 +254,13 @@ func wsHandleSetModel(req *wsRequest) {
 	// provider only. The workspace default (ws.Model) is only mutated by the
 	// settings modal's default-profile save (provider_save), never here, and
 	// no other session's provider is touched, so two panes can run different
-	// models concurrently. The config echo goes to this pane only (its own
-	// Mode/ThinkingLevel/Model).
+	// models concurrently. The config echo carries this session's own
+	// Mode/ThinkingLevel/Model to every client attached to IT (echoConfigOffLoop),
+	// never to another session's clients.
 	// Tokenization + echo off the read loop: ContextStats on a large
 	// uncached session takes seconds, and the read loop serializes every
 	// message (including pane switches).
-	echoConfigOffLoop(ws, ctx, a, &cfg)
+	echoConfigOffLoop(rt, ws, ctx, a, &cfg)
 	// llama.cpp endpoints: derive the new model's true reasoning-effort
 	// options from /props (+ /apply-template) and push a config update when
 	// they differ from the fallback the echo above carried (the provider
@@ -292,7 +293,15 @@ func wsHandleSetMode(req *wsRequest) {
 	if modeSet {
 		// Echo off the read loop (tokenization can take seconds on a large
 		// uncached session; the read loop serializes every message).
-		echoConfigOffLoop(ws, ctx, a, &cfg)
+		//
+		// Mode is per-SESSION state that every attached client renders in its
+		// picker, and the model's tool list follows the SERVER's mode: a
+		// second tab/window (or a second pane on the same session) left on
+		// the previous value would show "act" for a session whose tools are
+		// the read-only plan set — and its picker's "already active"
+		// short-circuit makes clicking Act a silent no-op, so the user cannot
+		// recover from that tab. Fan the echo out to every attached client.
+		echoConfigOffLoop(rt, ws, ctx, a, &cfg)
 	}
 }
 
@@ -319,7 +328,7 @@ func wsHandleSetThinkingLevel(req *wsRequest) {
 	s.decorateConfig(&cfg)
 	// Echo off the read loop (tokenization can take seconds on a large
 	// uncached session; the read loop serializes every message).
-	echoConfigOffLoop(ws, ctx, a, &cfg)
+	echoConfigOffLoop(rt, ws, ctx, a, &cfg)
 }
 
 // wsHandleConfig routes config scoped by the pane's sessionId. After a
