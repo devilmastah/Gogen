@@ -47,9 +47,17 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 	if a != nil {
 		a.SetMCPTooling(cfg.MCPActive(), cfg.MCPNested())
 	}
+	// Install the shared registry before the goroutine and before the web
+	// workspace snapshots a.MCPRegistry. Every later session copies this
+	// pointer; Publish fills it in place when the handshake finishes.
+	servers := mcp.ValidServers(cfg.MCPServers)
+	var pending *agent.PendingMCPRegistry
+	if a != nil && cfg.MCPEnabled() && len(servers) > 0 {
+		pending = agent.NewPendingMCPRegistry(mcp.MaxInitTimeout(servers))
+		a.SetMCPRegistry(pending)
+	}
 	go func() {
 		defer close(h.done)
-		servers := mcp.ValidServers(cfg.MCPServers)
 		if !cfg.MCPEnabled() {
 			if len(cfg.MCPServers) > 0 {
 				fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
@@ -66,13 +74,29 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 		m, mcpErr := newMCPManager(servers)
 		if mcpErr != nil {
 			fmt.Fprintf(os.Stderr, "MCP init error: %v\n", mcpErr)
+			if pending != nil {
+				pending.Fail(mcpErr)
+			}
 			return
 		}
 		h.mu.Lock()
 		h.mgr = m
 		h.mu.Unlock()
-		if reg := m.Registry(); reg != nil {
+		reg := m.Registry()
+		n := 0
+		if reg != nil {
+			n = len(reg.ToolNames())
+		}
+		if pending != nil {
+			if reg == nil || n == 0 {
+				pending.Fail(fmt.Errorf("MCP servers were configured but none completed its handshake; the gogen log has the spawn or initialize error"))
+			} else {
+				pending.Publish(reg)
+			}
+		} else if a != nil && reg != nil {
 			a.SetMCPRegistry(reg)
+		}
+		if a != nil && n > 0 {
 			// Report the exposure mode with the count: the registry count is
 			// what the SERVER published, while the model sees either that many
 			// definitions (inline) or the single `mcp` gateway (nested). Without
@@ -82,7 +106,7 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 			if !a.MCPNested() {
 				mode = "inline: one definition per tool"
 			}
-			fmt.Fprintf(os.Stderr, "MCP tools: %d (%s)\n", len(reg.ToolNames()), mode)
+			fmt.Fprintf(os.Stderr, "MCP tools: %d (%s)\n", n, mode)
 		}
 	}()
 	return h

@@ -178,6 +178,23 @@ func NewManager(servers []config.MCPServerConfig) (*Manager, error) {
 // initTimeoutFor resolves how long one server's initialize + tools/list may
 // take: the entry's init_timeout_secs when set (0 = default), else
 // defaultInitTimeout.
+// MaxInitTimeout is the longest initialize + tools/list budget across the
+// configured servers. Callers that wait for the background handshake (the
+// gateway, the settings test) use it so a per-server init_timeout_secs
+// override beats the package default.
+func MaxInitTimeout(servers []config.MCPServerConfig) time.Duration {
+	var max time.Duration
+	for _, s := range servers {
+		if d := initTimeoutFor(s); d > max {
+			max = d
+		}
+	}
+	if max <= 0 {
+		return defaultInitTimeout
+	}
+	return max
+}
+
 func initTimeoutFor(s config.MCPServerConfig) time.Duration {
 	if s.InitTimeoutSecs > 0 {
 		return time.Duration(s.InitTimeoutSecs) * time.Second

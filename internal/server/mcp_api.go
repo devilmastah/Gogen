@@ -16,6 +16,20 @@ import (
 // is user-initiated and shows a "Testing…" note while it runs.
 const mcpTestTimeout = 90 * time.Second
 
+// mcpProbeTimeout is the test_mcp deadline. The floor stays mcpTestTimeout
+// (a cold npx download). A server that sets init_timeout_secs higher — a
+// reverse-engineering launcher that spends that budget inside the handshake —
+// must not be reported broken by the shorter hardcoded cap.
+func mcpProbeTimeout(server config.MCPServerConfig) time.Duration {
+	timeout := mcpTestTimeout
+	if server.InitTimeoutSecs > 0 {
+		if d := time.Duration(server.InitTimeoutSecs) * time.Second; d > timeout {
+			timeout = d
+		}
+	}
+	return timeout
+}
+
 // wsHandleTestMCP runs the MCP connectivity + tools test against a
 // THROWAWAY stdio process (test_mcp) — never registered, never wired to the
 // shared registry. The reply is an mcp_test message carrying
@@ -55,7 +69,7 @@ func wsHandleTestMCP(req *wsRequest) {
 		reply := func(res MCPTestResult) {
 			_ = ws.writeJSON(WSMessage{Type: "mcp_test", MCPTestResult: &res})
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), mcpTestTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), mcpProbeTimeout(server))
 		defer cancel()
 		tools, err := s.mcpTestFn(ctx, server)
 		latency := time.Since(start).Milliseconds()
