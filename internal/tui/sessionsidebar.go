@@ -93,6 +93,19 @@ type sidebarRow struct {
 	updatedAt  time.Time // store timestamp (zero when unknown)
 	lastActive time.Time // last in-process output (zero when the session never ran here)
 	seq        int       // persistent first-seen order (tie-break)
+
+	// Nested (subagent) rows. parentID is the owning session id (empty for a
+	// top-level row) and depth is the indent level (0 for top-level): nested
+	// rows render under their parent, recursively, carrying its children with
+	// it when the parent reorders.
+	parentID string
+	depth    int
+	// childStatus is the child's persisted outcome ("", "success", "failed")
+	// and childSummary its summary — the dot state for a live child, the
+	// muted text for a settled one. Read off the child agent (or the store
+	// index) at build time, so the renderer never touches host state.
+	childStatus  string
+	childSummary string
 }
 
 // activity is the row's sort key: last OUTPUT time.
@@ -290,10 +303,14 @@ func (m *Model) buildSidebarRows() []sidebarRow {
 		if s.agent != nil && s.agent.SessionID != "" {
 			id = s.agent.SessionID
 		}
+		// A live CHILD slot renders as a nested row under its parent (see
+		// nestedRows), never as a flat row — otherwise an open child would
+		// appear twice and break the one-row-per-session invariant below.
+		if s.child != nil {
+			continue
+		}
 		// A second slot for a session that already owns a row is dropped —
-		// see the seen map above. Live slots hosting a NESTED (subagent)
-		// session are not covered by the saved loop (nested entries are
-		// skipped there), so they keep their own row here.
+		// see the seen map above.
 		if seen[id] {
 			continue
 		}
@@ -315,13 +332,176 @@ func (m *Model) buildSidebarRows() []sidebarRow {
 	}
 	// Sort by last output, newest first; ties by persistent first-seen
 	// order (deterministic regardless of group membership or store order).
+	sortSidebarRows(rows)
+	return m.appendNestedRows(rows)
+}
+
+// maxNestedDepth bounds the nested-row recursion: the subagent nesting limit's
+// own ceiling is 10, so anything deeper is a corrupt ParentID chain.
+const maxNestedDepth = 16
+
+// sortSidebarRows orders rows by last output (newest first), ties by the
+// persistent first-seen order.
+func sortSidebarRows(rows []sidebarRow) {
 	slices.SortFunc(rows, func(a, b sidebarRow) int {
 		if c := b.activity().Compare(a.activity()); c != 0 {
 			return c
 		}
 		return a.seq - b.seq
 	})
-	return rows
+}
+
+// nestedRows collects the nested (subagent) rows by parent session id. Two
+// sources, exactly like the web sidebar's collectNestedRows: the LIVE child
+// slots (authoritative for live status and the pane) first, then the children
+// still in the store — a child whose live runtime was released (retention,
+// restart) keeps its row from the persisted snapshot. Children open as panes
+// render in the same place, under their parent.
+func (m *Model) nestedRows() map[string][]sidebarRow {
+	// Fast path: buildSidebarRows runs on every render (including per token
+	// batch while streaming), and the overwhelming majority of frames have no
+	// child slot and no stored child at all — do not allocate for them.
+	hasChild := false
+	for _, s := range m.lives.sessions {
+		if s.child != nil {
+			hasChild = true
+			break
+		}
+	}
+	if !hasChild {
+		for _, si := range m.savedCache {
+			if si.ParentID != "" {
+				hasChild = true
+				break
+			}
+		}
+	}
+	if !hasChild {
+		return nil
+	}
+	out := make(map[string][]sidebarRow)
+	live := make(map[string]bool, len(m.lives.sessions))
+	for i, s := range m.lives.sessions {
+		if s.child == nil {
+			continue
+		}
+		parent := s.parentID
+		if parent == "" && s.agent != nil {
+			parent = s.agent.ParentID()
+		}
+		if parent == "" {
+			continue
+		}
+		status, summary := "", ""
+		if s.agent != nil {
+			status, summary = s.agent.SubagentOutcome()
+		}
+		r := sidebarRow{
+			id:           s.id,
+			label:        s.label,
+			live:         true,
+			focused:      i == m.lives.active,
+			streaming:    s.streaming,
+			liveIdx:      i,
+			parentID:     parent,
+			childStatus:  status,
+			childSummary: summary,
+			lastActive:   m.effectiveLastActive(s),
+		}
+		if s.agent != nil {
+			if l := s.agent.SessionLabelSnapshot(); l != "" {
+				r.label = l
+			}
+			if !s.streaming {
+				// Locked accessor: the stream goroutine owns Messages while
+				// streaming (see the flat overlay above).
+				r.msgCount = s.agent.MessageCount()
+			}
+		}
+		if r.label == "" {
+			r.label = "subagent"
+		}
+		r.seq = m.sidebarSeqOf(r.id)
+		live[s.id] = true
+		out[parent] = append(out[parent], r)
+	}
+	for _, si := range m.savedCache {
+		if si.ParentID == "" || live[si.ID] {
+			continue
+		}
+		r := sidebarRow{
+			id:           si.ID,
+			label:        si.Label,
+			liveIdx:      -1,
+			parentID:     si.ParentID,
+			msgCount:     si.MessageCount,
+			childStatus:  si.SubagentStatus,
+			childSummary: si.SubagentSummary,
+		}
+		if ts, err := time.Parse(time.RFC3339Nano, si.UpdatedAt); err == nil {
+			r.updatedAt = ts
+		}
+		if r.label == "" {
+			r.label = si.ID
+		}
+		r.seq = m.sidebarSeqOf(r.id)
+		out[si.ParentID] = append(out[si.ParentID], r)
+	}
+	for _, kids := range out {
+		sortSidebarRows(kids)
+	}
+	return out
+}
+
+// appendNestedRows interleaves each flat row's nested children directly behind
+// it, recursively (depth >= 2 renders as grandchildren). The recursion lives
+// here so a parent that reorders carries its children with it. A child whose
+// parent row is missing (a parent pruned from the store, or not listed yet)
+// still renders — at the end, top-level — so a running child can never vanish
+// from the panel.
+func (m *Model) appendNestedRows(rows []sidebarRow) []sidebarRow {
+	if m.lives == nil {
+		return rows
+	}
+	nested := m.nestedRows()
+	if len(nested) == 0 {
+		return rows
+	}
+	out := make([]sidebarRow, 0, len(rows)+len(nested))
+	placed := make(map[string]bool, len(rows))
+	var addChildren func(parentID string, depth int)
+	addChildren = func(parentID string, depth int) {
+		for _, kid := range nested[parentID] {
+			if depth > maxNestedDepth || placed[kid.id] {
+				continue // cycle guard / one row per session id
+			}
+			placed[kid.id] = true
+			kid.depth = depth
+			out = append(out, kid)
+			addChildren(kid.id, depth+1)
+		}
+	}
+	for _, r := range rows {
+		if placed[r.id] {
+			continue
+		}
+		placed[r.id] = true
+		out = append(out, r)
+		addChildren(r.id, 1)
+	}
+	// Orphans: sorted parent ids keep the output deterministic (a map walk
+	// would reorder the panel between renders).
+	orphans := make([]string, 0, len(nested))
+	for parentID := range nested {
+		if !placed[parentID] {
+			orphans = append(orphans, parentID)
+		}
+	}
+	slices.Sort(orphans)
+	for _, parentID := range orphans {
+		addChildren(parentID, 1)
+	}
+	return out
 }
 
 // seedRootLastActive pins the startup session's output time to its store
@@ -652,19 +832,27 @@ func (m *Model) renderSidebarTitle(r sidebarRow, cursor bool, inner int) string 
 	// the ✕ — and the right border — past the panel edge and widened the
 	// whole joined frame past the terminal (the inline renderer would
 	// soft-wrap and desync).
-	labelMax := inner - 5
+	// Nested (subagent) rows indent under their parent behind a tree glyph.
+	// The indent eats into the label budget in VISIBLE cells (like the pad
+	// below), so a deep chain cannot widen the panel past its column budget;
+	// the glyph is capped at 3 steps to keep the label readable.
+	indent := ""
+	if r.depth > 0 {
+		indent = strings.Repeat("  ", min(r.depth-1, 3)) + "└ "
+	}
+	labelMax := inner - 5 - cellWidth(indent)
 	if labelMax < 2 {
 		labelMax = 2
 	}
 	label := cutCells(r.label, 0, labelMax)
-	pad := inner - 4 - cellWidth(label)
+	pad := inner - 4 - cellWidth(label) - cellWidth(indent)
 	if pad < 1 {
 		pad = 1
 	}
 
 	var b strings.Builder
 	b.WriteString(ansiDimOn)
-	b.WriteString("│ " + prefix)
+	b.WriteString("│ " + prefix + indent)
 	if cursor {
 		b.WriteString(ansiHighlightOn)
 	} else {
@@ -686,7 +874,31 @@ func (m *Model) renderSidebarTitle(r sidebarRow, cursor bool, inner int) string 
 // for them either.
 func (m *Model) sidebarMeta(r sidebarRow) string {
 	dotStyle, state := "", ""
+	dot := true
 	switch {
+	case r.depth > 0 && r.live:
+		// A live child's dot carries its state (web parity): amber while the
+		// child responds, red when it failed, green when it finished, cyan
+		// while it is idle-but-continuable.
+		switch {
+		case r.streaming:
+			dotStyle, state = ansiPromptOn, "responding"
+		case r.childStatus == "failed":
+			dotStyle, state = ansiRedOn, "failed"
+		case r.childStatus == "success":
+			dotStyle, state = ansiGreenOn, "done"
+		default:
+			dotStyle, state = ansiCyanOn, "idle"
+		}
+	case r.depth > 0:
+		// A settled child (released, or restored from the store) renders a
+		// MUTED TEXT status instead of a dot, so an archived outcome never
+		// reads as an active session.
+		dot = false
+		state = "done"
+		if r.childStatus == "failed" {
+			state = "failed"
+		}
 	case r.streaming:
 		dotStyle, state = ansiPromptOn, "responding"
 	case r.live && r.focused:
@@ -696,9 +908,14 @@ func (m *Model) sidebarMeta(r sidebarRow) string {
 	}
 	var b strings.Builder
 	b.WriteString("  ")
+	if r.depth > 0 {
+		b.WriteString(strings.Repeat("  ", min(r.depth-1, 3)) + "└ ")
+	}
 	if state != "" {
-		b.WriteString(dotStyle)
-		b.WriteString("● ")
+		if dot {
+			b.WriteString(dotStyle)
+			b.WriteString("● ")
+		}
 		b.WriteString(ansiDimOn)
 		b.WriteString(state)
 	}
@@ -939,6 +1156,22 @@ func (m *Model) sidebarOpenRow(row int) tea.Cmd {
 	return m.resumeSavedRow(r.id)
 }
 
+// closeLiveSession closes one live slot, taking its continuable children with
+// it: a child whose parent is gone cannot deliver its report or wait for a
+// reply (the web host's eviction cascade, at slot scope). Child slots
+// themselves are released through the lifecycle — liveSessions.Close refuses
+// them, because dropping the slot alone would leave the lifecycle holding a
+// dead pane.
+func (m *Model) closeLiveSession(i int) error {
+	if m.lives == nil {
+		return nil
+	}
+	if s := m.lives.ByIndex(i); s != nil && s.child == nil && s.agent != nil && m.spawner != nil {
+		m.spawner.CancelAll(s.agent.SessionID)
+	}
+	return m.lives.Close(i)
+}
+
 // sidebarCloseRow closes the row's live pane — the session stays SAVED and
 // its row reappears as a saved row (web closePane). Close and delete are
 // distinct actions: this never deletes. A saved row has nothing to close;
@@ -954,6 +1187,19 @@ func (m *Model) sidebarCloseRow(row int) tea.Cmd {
 	if !r.live {
 		m.statusMsg = "Close: session is saved, not open in this TUI (d deletes it)"
 		return nil
+	}
+	if s := m.lives.sessions[r.liveIdx]; s.child != nil {
+		// A child's pane is owned by the continuable-subagent lifecycle, not
+		// by the session list: closing it RELEASES the child (its runtime is
+		// torn down, the saved session stays resumable) through the same path
+		// the retention window uses. Removing the slot here would leave the
+		// lifecycle holding a dead pane.
+		if c := s.child.childOf(); c != nil && m.spawner != nil {
+			m.spawner.ReleaseChild(c)
+			m.statusMsg = "Released " + r.label + " (still saved)"
+			m.sidebarCursor = max(0, min(m.sidebarCursor, len(m.buildSidebarRows())-1))
+			return nil
+		}
 	}
 	if s := m.lives.sessions[r.liveIdx]; s.streaming {
 		m.statusMsg = "Close: " + r.label + " is responding — cancel its turn first"
@@ -977,7 +1223,7 @@ func (m *Model) sidebarCloseRow(row int) tea.Cmd {
 			}
 		}
 		cmd := m.switchToLive(target)
-		if err := m.lives.Close(r.liveIdx); err != nil {
+		if err := m.closeLiveSession(r.liveIdx); err != nil {
 			m.statusMsg = "Close: " + err.Error()
 			return nil
 		}
@@ -985,7 +1231,7 @@ func (m *Model) sidebarCloseRow(row int) tea.Cmd {
 		m.sidebarCursor = max(0, min(m.sidebarCursor, len(m.buildSidebarRows())-1))
 		return tea.Batch(cmd, m.requestSavedSessions())
 	}
-	if err := m.lives.Close(r.liveIdx); err != nil {
+	if err := m.closeLiveSession(r.liveIdx); err != nil {
 		m.statusMsg = "Close: " + err.Error()
 		return nil
 	}
@@ -1223,8 +1469,12 @@ func (m *Model) deleteSavedRow(id string) tea.Cmd {
 //
 // Returns the new slot (always the last one).
 func (m *Model) spawnLiveSession(a *agent.Agent) *liveSession {
-	if m.cfg != nil && m.cfg.SubagentEnabled() {
-		a.SetSubagentSpawner(&tuiSubagentSpawner{cfg: m.cfg, m: m})
+	// The workspace seeds its spawner into every agent it creates, so a
+	// session built by the shared factory already has one. A session built
+	// without it (the nil-workspace path) gets the host's single spawner
+	// here — one registry per host, never one per session.
+	if m.spawner != nil && a.SubagentSpawner() == nil {
+		a.SetSubagentSpawner(m.spawner)
 	}
 	s := m.lives.Add(a, "")
 	if m.cfg != nil && m.cfg.JobNoticesEnabled() {

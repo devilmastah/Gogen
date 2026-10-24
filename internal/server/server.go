@@ -214,7 +214,11 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	a.SetTerminalEnabled(ws.terminalEnabled)
 	// The subagent spawner needs the registry, so it is installed after the
 	// server is constructed; NewSessionAgent seeds it on every later session.
-	ws.SubagentSpawner = &subagentSpawner{s: s, children: newChildRegistry()}
+	// The spawner is the host half of the shared continuable-subagent
+	// lifecycle, so the lifecycle is constructed around it (the host pointer
+	// is required up front).
+	spawner := newSubagentSpawner(s)
+	ws.SubagentSpawner = spawner
 	a.SetSubagentSpawner(ws.SubagentSpawner)
 	// A session leaving the registry takes its continuable subagent
 	// children with it (cancel + release): a child whose parent is gone
@@ -222,7 +226,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	// (session_close, delete, shutdown) plus registry-cap eviction fire it.
 	s.registry.evictHook = func(id string) {
 		if sp, ok := ws.SubagentSpawner.(*subagentSpawner); ok {
-			sp.cancelAll(id)
+			sp.CancelAll(id)
 		}
 	}
 	// Background work pins its session: an eviction that only recycles
@@ -231,7 +235,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	// terminals; this covers the children cancelAll would kill.
 	s.registry.bgWorkHook = func(id string) bool {
 		if sp, ok := ws.SubagentSpawner.(*subagentSpawner); ok {
-			return sp.children.hasLiveChildren(id)
+			return sp.HasLiveChildren(id)
 		}
 		return false
 	}

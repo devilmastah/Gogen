@@ -39,6 +39,14 @@ type mcpHandle struct {
 // or no valid servers are configured).
 func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 	h := &mcpHandle{done: make(chan struct{})}
+	// Resolve the MCP exposure policy from CONFIG, before any request is
+	// built, and never from the registry: the tool set and system prompt are
+	// part of the request prefix, so deriving them from an asynchronous attach
+	// would rewrite the prefix between turn 1 and turn 2 and invalidate the
+	// provider's prompt cache for the whole conversation.
+	if a != nil {
+		a.SetMCPTooling(cfg.MCPActive(), cfg.MCPNested())
+	}
 	go func() {
 		defer close(h.done)
 		servers := mcp.ValidServers(cfg.MCPServers)
@@ -65,7 +73,16 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 		h.mu.Unlock()
 		if reg := m.Registry(); reg != nil {
 			a.SetMCPRegistry(reg)
-			fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
+			// Report the exposure mode with the count: the registry count is
+			// what the SERVER published, while the model sees either that many
+			// definitions (inline) or the single `mcp` gateway (nested). Without
+			// the mode the line reads as "the model has 60 tools" in nested
+			// sessions, which is not true.
+			mode := "nested: the model sees the mcp gateway"
+			if !a.MCPNested() {
+				mode = "inline: one definition per tool"
+			}
+			fmt.Fprintf(os.Stderr, "MCP tools: %d (%s)\n", len(reg.ToolNames()), mode)
 		}
 	}()
 	return h

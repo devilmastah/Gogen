@@ -41,6 +41,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		DebugLog:                  mergeString("GOGEN_DEBUG_LOG", file.DebugLog, def.DebugLog),
 		DebugSession:              mergeString("GOGEN_DEBUG_SESSION", file.DebugSession, def.DebugSession),
 		MCP:                       mergeString("GOGEN_MCP", file.MCP, def.MCP),
+		MCPToolMode:               mergeString("GOGEN_MCP_TOOL_MODE", file.MCPToolMode, def.MCPToolMode),
 		DebugCompareMessages:      mergeBool("GOGEN_DEBUG_COMPARE_MESSAGES", file.DebugCompareMessages, def.DebugCompareMessages),
 		MCPServers:                mergeMCPServers(file),
 		OpenAIProviders:           mergeOpenAIProviders(file),
@@ -130,10 +131,12 @@ func mergeMCPServers(file FileConfig) []config.MCPServerConfig {
 		out := make([]config.MCPServerConfig, len(file.MCPServers))
 		for i, s := range file.MCPServers {
 			out[i] = config.MCPServerConfig{
-				Name:    s.Name,
-				Command: s.Command,
-				Args:    append([]string(nil), s.Args...),
-				Env:     cloneStringMap(s.Env),
+				Name:            s.Name,
+				Command:         s.Command,
+				Args:            append([]string(nil), s.Args...),
+				Env:             cloneStringMap(s.Env),
+				InitTimeoutSecs: s.InitTimeoutSecs,
+				ToolTimeoutSecs: s.ToolTimeoutSecs,
 			}
 		}
 		return out

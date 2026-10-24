@@ -722,7 +722,7 @@ type sessionRegistry struct {
 // Locking: the cap-eviction loop (register) calls this while holding r.mu;
 // the orphan-eviction path calls it without it. Both are safe because
 // everything consulted here is a LEAF lock — the agent's bgMu/termMu and the
-// child registry's mu — and every holder of childRegistry.mu releases it
+// continuable-child registry's mu — and every holder of that lock releases it
 // before calling back into the registry, so no reverse edge to r.mu exists
 // (see register's LOCK ORDER note).
 func (r *sessionRegistry) keepsBackgroundWork(rt *sessionRuntime) bool {
@@ -806,8 +806,8 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 	//
 	// LOCK ORDER (documented invariant): this loop takes r.mu → turnMu,
 	// r.mu → clientsMu, r.mu → stateMu, r.mu → bgMu/termMu and r.mu →
-	// childRegistry.mu — all of them LEAF locks (every holder of
-	// childRegistry.mu releases it before calling into the registry, so no
+	// continuable-child registry's mu — all of them LEAF locks (every holder
+	// of that lock releases it before calling into the registry, so no
 	// reverse edge exists) — while sessionDelete takes turnMu → r.mu
 	// (registry.remove), the reverse order. That is NOT a deadlock only
 	// because neither path ever blocks on the other's inner lock: the

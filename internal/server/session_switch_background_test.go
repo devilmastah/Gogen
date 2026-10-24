@@ -285,7 +285,7 @@ func TestSwitchKeepsSessionWithBackgroundSubagent(t *testing.T) {
 	// Releasing the child drains the parent's background work: the parent is
 	// evictable again, and the release path is what re-checks it (a
 	// background drain must not leave the runtime resident forever).
-	sp.cancelAll(sid)
+	sp.CancelAll(sid)
 	waitFor(t, 5*time.Second, func() bool {
 		_, found := s.registry.get(sid)
 		return !found

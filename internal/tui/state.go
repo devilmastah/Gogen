@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/agent"
@@ -103,6 +104,19 @@ type Model struct {
 	modal     ModalKind
 	streaming bool // mirror of lives.Active().streaming (input guards)
 	lives     *liveSessions
+	// spawner is the host's single nested-session runner (see
+	// installSubagentSpawner); nil when subagents are disabled. The Model
+	// only reads it to attach the /subagents list.
+	spawner *tuiSubagentSpawner
+	// inUpdate marks the Update goroutine while it executes a message. Host
+	// messages are posted INLINE from any other goroutine, but a host path
+	// that runs ON the loop (the quit sweep, the sidebar's close action) must
+	// post asynchronously: tea.Program.Send is an unbuffered handoff to the
+	// loop itself, so an inline send there would deadlock the program.
+	inUpdate atomic.Bool
+	// programStopped latches when the event loop exits, so host posts made by
+	// the teardown sweep are dropped instead of blocking on a dead channel.
+	programStopped atomic.Bool
 
 	// Sidebar panel (unified session list — web parity). Resize keys live
 	// in viewport/sidebar focus so they never collide with text entry.
@@ -445,22 +459,46 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 			m.contextStats = stats
 			m.contextLine = agent.FormatContextBrief(stats)
 		}
-		// Nested sessions run on this TUI's agent (feature-gated by the
-		// subagent flag; the spawner itself is harmless when the tool is
-		// not exposed).
-		if cfg != nil && cfg.SubagentEnabled() {
-			a.SetSubagentSpawner(&tuiSubagentSpawner{cfg: cfg, m: &m})
-		}
+		// Nested sessions: reuse the runner's host-level spawner when it
+		// exists (production), else build one for this Model (tests,
+		// embedded single-session hosts). Feature-gated by the subagent
+		// flag; the spawner itself is harmless when the tool is not exposed.
+		m.installSubagentSpawner()
 	}
 
 	return &m
 }
 
+// installSubagentSpawner wires nested sessions for the root agent and attaches
+// this Model's /subagents list to the spawner. One spawner per host: when the
+// runner already built it (installed on the workspace, so every session the
+// workspace creates inherits it), the Model only attaches its list — the child
+// registry must not be duplicated per Model.
+func (m *Model) installSubagentSpawner() {
+	if m.agent == nil || m.cfg == nil || !m.cfg.SubagentEnabled() {
+		return
+	}
+	if m.spawner == nil {
+		if sp, ok := m.agent.SubagentSpawner().(*tuiSubagentSpawner); ok && sp != nil {
+			m.spawner = sp
+		}
+	}
+	if m.spawner == nil {
+		m.spawner = newTUISubagentSpawner(m.cfg, m.workspace)
+		m.agent.SetSubagentSpawner(m.spawner)
+	}
+	m.spawner.setRecorder(m.recordSubagent)
+	// The sender is installed by the runner once the program exists (see
+	// TUI.Run); a Model constructed directly (tests) leaves it nil, so a
+	// background spawn reports "the terminal UI is not running" instead of
+	// blocking forever.
+}
+
 // maxRecordedSubagents bounds the /subagents list. Each record keeps the
 // child's final report (up to agent.MaxSubagentReportBytes), so an unbounded
 // list would grow for the life of a long-lived TUI process; the newest
-// entries are the ones the modal is opened for. The web host applies the
-// equivalent cap per parent (defaultMaxFinishedSubagents).
+// entries are the ones the modal is opened for. The shared lifecycle applies
+// the same cap per parent (subagents.DefaultMaxFinished).
 const maxRecordedSubagents = 32
 
 // recordSubagent appends a finished nested session to the /subagents list

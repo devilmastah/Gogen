@@ -9,6 +9,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	"gogen/internal/subagents"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -161,7 +162,7 @@ func (m *Model) handleLiveSessionsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 	case "d":
 		// Close a background session: flush + detach; it stays resumable
 		// under /resume.
-		if err := m.lives.Close(m.liveCursor); err != nil {
+		if err := m.closeLiveSession(m.liveCursor); err != nil {
 			m.statusMsg = "Close: " + err.Error()
 			return m, nil
 		}
@@ -173,12 +174,19 @@ func (m *Model) handleLiveSessionsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 }
 
 // renderSubagentsModal lists the nested (subagent) sessions finished in
-// this process, with their final reports.
+// this process, with their final reports. LIVE children come first, read from
+// the shared lifecycle registry (id, label, status, depth): the modal is the
+// tool-visible surface (list_agents parity), while the sidebar rows are the
+// pane/presentation surface.
 func (m *Model) renderSubagentsModal() string {
 	m.subagentMu.Lock()
 	list := append([]subagentRecord(nil), m.subagents...)
 	m.subagentMu.Unlock()
-	if len(list) == 0 {
+	var live []*subagents.Child[*childHandle]
+	if m.spawner != nil && m.agent != nil {
+		live = m.spawner.ChildrenOf(m.agent.SessionID)
+	}
+	if len(list) == 0 && len(live) == 0 {
 		return m.renderBorderedModal([]styleLine{
 			{text: "Subagents", highlight: true},
 			{text: "", highlight: false},
@@ -188,6 +196,19 @@ func (m *Model) renderSubagentsModal() string {
 		})
 	}
 	lines := []styleLine{{text: "Subagents", highlight: true}, {text: "", highlight: false}}
+	for _, c := range live {
+		status := c.StatusOf(m.spawner)
+		lines = append(lines, styleLine{
+			text:      "● " + c.Label + " — " + status + fmt.Sprintf(" (depth %d, %s)", c.Depth, c.ID),
+			highlight: false,
+		})
+		if line := c.LatestProgress(); line != "" {
+			lines = append(lines, styleLine{text: "  " + line, highlight: false})
+		}
+	}
+	if len(live) > 0 && len(list) > 0 {
+		lines = append(lines, styleLine{text: "", highlight: false})
+	}
 	for i, r := range list {
 		status := "✅"
 		if r.err != nil {

@@ -422,6 +422,13 @@ type deliveryRequestMsg struct {
 // wiring itself lives in startTurnOn (steering.go), which also serves
 // background sessions' queue drains.
 func (m *Model) startTurn(text, chatLine string) tea.Cmd {
+	return m.startTurnWithResult(text, chatLine, nil)
+}
+
+// startTurnWithResult is startTurn plus the turn's exact-result callback (see
+// startTurnOnWithResult): used by a focused child's targeted delivery, whose
+// reply must reach the parent verbatim.
+func (m *Model) startTurnWithResult(text, chatLine string, onResult func(string, error)) tea.Cmd {
 	// Submitting is an explicit jump to the live edge: the user's own line
 	// (and the streaming reply) must be visible even if they were reading
 	// history when they hit enter.
@@ -432,7 +439,7 @@ func (m *Model) startTurn(text, chatLine string) tea.Cmd {
 	m.applyComposerPlaceholder()
 	startProgress := m.setProgress(progressThinking, "thinking")
 	m.relayout()
-	return tea.Batch(startProgress, m.startTurnOn(m.turnSession(), text))
+	return tea.Batch(startProgress, m.startTurnOnWithResult(m.turnSession(), text, onResult))
 }
 
 // drainDeliveries starts the next queued item (system delivery or user

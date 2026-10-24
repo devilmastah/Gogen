@@ -49,7 +49,7 @@ func TestSubagentCloseChildNotifiesParent(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		_, err := (newSubagentSpawner(s)).Spawn(ctx, a, "long job", "", 0)
 		done <- err
 	}()
 
@@ -130,7 +130,7 @@ func TestSubagentDeleteFinishedChildSilent(t *testing.T) {
 	// A finished foreground child: the spawn completes, the runtime is
 	// unregistered, and the session stays saved with ParentID. Spawn
 	// returns the REPORT, not the id — find the child session in the store.
-	sp := &subagentSpawner{s: s}
+	sp := newSubagentSpawner(s)
 	if _, err := sp.Spawn(context.Background(), a, "short job", "", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -197,8 +197,8 @@ func TestSubagentDeleteFinishedRegisteredChildSilent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child != nil && child.isFinished() })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child != nil && child.IsFinished() })
 	if _, ok := s.registry.get(id); !ok {
 		t.Fatal("finished child must still be registered within the retention window")
 	}
@@ -238,7 +238,7 @@ func TestSubagentDeleteChildNotifiesParentRunning(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		_, err := (newSubagentSpawner(s)).Spawn(ctx, a, "long job", "", 0)
 		done <- err
 	}()
 	var childID string

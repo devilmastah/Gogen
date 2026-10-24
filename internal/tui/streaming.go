@@ -256,6 +256,11 @@ func (s *StreamAdapter) send(msg tea.Msg) {
 		s.sess.enqueue(msg)
 		return
 	}
+	if s.program == nil {
+		// No renderer attached (headless host, tests): the turn still runs and
+		// persists, it just has nowhere to draw.
+		return
+	}
 	s.program.Send(msg)
 }
 

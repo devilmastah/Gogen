@@ -61,12 +61,23 @@ func SystemPrompt(workingDir string) string {
 	return strings.ReplaceAll(tmpl, "{working_dir}", workingDir)
 }
 
-// mcpToolsHint is appended to the system prompt only when an MCP tool
-// registry is attached: MCP is opt-in, so a session without one must not
-// advertise tools it does not have. The tools themselves are always
-// enumerated in the model-facing definition list (llmTools) — this hint only
-// tells the model that the tool set can extend beyond the built-ins.
-const mcpToolsHint = "Additional mcp_* tools may be available."
+// The MCP hint is appended to the system prompt only when the session was
+// constructed with MCP servers configured (mcp_tool_mode aside): MCP is
+// opt-in, so a session without one must not advertise tools it does not have.
+// The hint is chosen from CONSTRUCTION-TIME state, never from the live
+// registry, because the system prompt leads the request prefix — a hint that
+// appeared when a server finished connecting would invalidate the provider's
+// cache for the whole conversation. Both texts are constants: no counts, no
+// server names, nothing that changes between turns.
+const (
+	// mcpGatewayHint is the nested-mode hint (mcp_tool_mode: nested): the MCP
+	// tools are reachable through the single `mcp` tool, whose definition
+	// carries the action contract.
+	mcpGatewayHint = "MCP tools: use the mcp tool (action=list to discover, action=describe for a schema, action=call to run one)."
+	// mcpInlineHint is the inline-mode hint: the server tools are inlined into
+	// the definition list under their mcp_* names.
+	mcpInlineHint = "Additional mcp_* tools may be available."
+)
 
 func systemPromptTemplate() string {
 	return `You are GoGen, a coding agent working in the local repository at {working_dir}.
@@ -97,31 +108,33 @@ or features. Omit unimplemented/roadmap items.`
 }
 
 // buildSystemView returns messages with the system prompt prepended (or the
-// existing first system message enriched), folding the MCP hint (only when
-// mcpTools), the project profile, the project rules, and the plan-mode suffix
+// existing first system message enriched), folding the session's MCP hint
+// (mcpHint, empty when no MCP servers are configured), the project profile, the
+// project rules, and the plan-mode suffix
 // into the system message content in a SINGLE copy of the slice. The previous
 // two-step pipeline
 // (withSystemPrompt + enrichSystemPrompt) copied the whole message slice once
 // per suffix; on long conversations that was 2-5 full shallow copies per turn
 // and per ContextStats probe. The produced view is byte-identical to the old
-// pipeline: the base system prompt, then the MCP hint (only when mcpTools),
-// then the profile suffix, then the project rules header, then the plan-mode
+// pipeline: the base system prompt, then the MCP hint (only when mcpHint is
+// set), then the profile suffix, then the project rules header, then the plan-mode
 // suffix, all on the leading system message.
 // buildSystemSuffix returns the MCP-hint / project-profile / project-rules /
 // plan-mode suffix text that buildSystemView folds into the leading system
 // message. Split out so systemPromptPrefix can construct the wire prefix
 // without copying the whole message history.
 //
-// mcpTools is the caller's "an MCP registry is attached" predicate: the MCP
-// hint is emitted only then, so the base prompt of an MCP-less session never
-// advertises mcp_* tools. The hint leads the suffix because it qualifies the
-// base prompt rather than the project-specific enrichment below it.
-func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode Mode, mcpTools bool) string {
+// mcpHint is the session's MCP hint line (a.mcpToolHint()), or "" when the
+// session has no MCP servers configured: the hint is emitted only then, so the
+// base prompt of an MCP-less session never advertises MCP tools. The hint leads
+// the suffix because it qualifies the base prompt rather than the
+// project-specific enrichment below it.
+func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode Mode, mcpHint string) string {
 	var suffix strings.Builder
 	// Suffixes in the same order enrichSystemPrompt applied them, with the
 	// MCP hint first.
-	if mcpTools {
-		suffix.WriteString("\n\n" + mcpToolsHint)
+	if mcpHint != "" {
+		suffix.WriteString("\n\n" + mcpHint)
 	}
 	if projectProfile != "" {
 		suffix.WriteString("\n\nProject profile (auto-detected):\n" + projectProfile)
@@ -135,11 +148,11 @@ func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode 
 	return suffix.String()
 }
 
-func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode, mcpTools bool) []llm.Message {
+func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode, mcpHint string) []llm.Message {
 	if len(messages) == 0 {
 		return messages
 	}
-	suffix := buildSystemSuffix(projectFilePath, guidelines, projectProfile, mode, mcpTools)
+	suffix := buildSystemSuffix(projectFilePath, guidelines, projectProfile, mode, mcpHint)
 
 	// History already carries a system message (unusual — canonical history
 	// is user/assistant/tool): keep the list and fold the suffixes into that

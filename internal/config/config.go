@@ -92,6 +92,26 @@ func Effective(v, def int) int {
 	return def
 }
 
+// MCP tool exposure modes (mcp_tool_mode).
+const (
+	// MCPToolModeNested exposes every MCP server tool through the single
+	// `mcp` gateway tool (list/describe/call) instead of inlining one
+	// definition per server tool. The model-facing tool set then has a fixed
+	// size and fixed bytes no matter how many servers connect — which is
+	// what keeps the request prefix stable for provider prompt caching — and
+	// a large catalog (a reverse-engineering server publishes dozens of
+	// tools) costs one definition instead of dozens.
+	MCPToolModeNested = "nested"
+	// MCPToolModeInline inlines every discovered MCP tool definition, the
+	// historical behavior. Cheapest for a model with one or two extra tools
+	// (native schemas, no discovery hop), at the cost of a prefix that grows
+	// with the catalog and changes when the registry attaches.
+	MCPToolModeInline = "inline"
+	// DefaultMCPToolMode is nested: the fixed tool surface and stable prefix
+	// win by default, and inline stays available as the opt-out.
+	DefaultMCPToolMode = MCPToolModeNested
+)
+
 // MCPServerConfig describes one MCP stdio server entry. Tags cover both the
 // JSON env-var form (GOGEN_MCP_SERVERS) and the YAML project-file form.
 type MCPServerConfig struct {
@@ -99,6 +119,16 @@ type MCPServerConfig struct {
 	Command string            `json:"command" yaml:"command"`
 	Args    []string          `json:"args,omitempty" yaml:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+
+	// InitTimeoutSecs bounds this server's initialize + tools/list handshake
+	// (0 = the client default). Raise it when the launcher itself is slow —
+	// `npx -y <package>` has to download the package on a cold cache.
+	InitTimeoutSecs int `json:"init_timeout_secs,omitempty" yaml:"init_timeout_secs,omitempty"`
+	// ToolTimeoutSecs is the default deadline for one tools/call on this
+	// server when the caller supplies none (0 = the client default). Raise it
+	// for servers whose tools legitimately run for minutes, e.g. a
+	// reverse-engineering engine that starts Ghidra or IDA per analysis.
+	ToolTimeoutSecs int `json:"tool_timeout_secs,omitempty" yaml:"tool_timeout_secs,omitempty"`
 }
 
 // OpenAIProviderConfig describes one registered OpenAI-compatible API
@@ -146,6 +176,11 @@ type Config struct {
 	DebugSession    string
 	MCP             string
 	MCPServers      []MCPServerConfig
+	// MCPToolMode selects how MCP server tools are exposed to the model
+	// (nested = the single `mcp` gateway tool, inline = one definition per
+	// server tool). Resolved once at session construction: the value is part
+	// of the fixed request prefix and must not change mid-session.
+	MCPToolMode string
 	// OpenAIProviders lists additional registered OpenAI-compatible API
 	// providers (see OpenAIProviderConfig). Empty means only the legacy
 	// OpenAIKey/OpenAIModel/OpenAIURL default profile exists.
@@ -336,6 +371,7 @@ func Defaults() Config {
 		DebugLog:                  "",
 		DebugSession:              "",
 		MCP:                       "off",
+		MCPToolMode:               DefaultMCPToolMode,
 		DebugCompareMessages:      false,
 		WebBind:                   "127.0.0.1:8081",
 		WebAllowedOrigins:         "",
@@ -396,6 +432,40 @@ func configOff(v string) bool {
 // Opt-in: servers in project config are not started unless mcp is explicitly enabled.
 func (c *Config) MCPEnabled() bool {
 	return c != nil && configOn(c.MCP)
+}
+
+// MCPNested reports whether MCP server tools are exposed through the single
+// `mcp` gateway tool instead of one inlined definition per server tool.
+// Empty or unknown values fall back to the default (nested); only an explicit
+// "inline" selects the historical behavior.
+func (c *Config) MCPNested() bool {
+	if c == nil {
+		return true
+	}
+	return !strings.EqualFold(strings.TrimSpace(c.MCPToolMode), MCPToolModeInline)
+}
+
+// MCPActive reports whether MCP is enabled with at least one server to start.
+// This is the CONFIG answer, deliberately independent of whether a server has
+// connected yet: the model-facing tool set and system prompt are decided from
+// it at construction, so a slow server attaching later cannot change the
+// request prefix mid-session (which would invalidate the provider's cache).
+func (c *Config) MCPActive() bool {
+	return c.MCPEnabled() && len(ValidMCPServers(c.MCPServers)) > 0
+}
+
+// ValidMCPServers keeps the server entries that can actually be spawned (name
+// and command present). It is the single definition of "usable entry", shared
+// with mcp.ValidServers (which cannot be imported here: internal/mcp depends
+// on this package).
+func ValidMCPServers(servers []MCPServerConfig) []MCPServerConfig {
+	out := make([]MCPServerConfig, 0, len(servers))
+	for _, s := range servers {
+		if strings.TrimSpace(s.Name) != "" && strings.TrimSpace(s.Command) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // BoardEnabled reports whether the project kanban board feature is active.

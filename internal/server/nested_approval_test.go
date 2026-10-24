@@ -285,8 +285,8 @@ func TestSubagentApprovalRoutesToReopenedParent(t *testing.T) {
 		return os.IsNotExist(statErr)
 	})
 	waitFor(t, 5*time.Second, func() bool {
-		c := sp.children.get(childID)
-		return c != nil && c.isFinished()
+		c := sp.Get(childID)
+		return c != nil && c.IsFinished()
 	})
 	stub.releaseN(3) // the completion notice's delivery turn on the reopened parent
 }
@@ -345,8 +345,8 @@ func TestSubagentApprovalDeniedWhenNobodyCanAnswer(t *testing.T) {
 		return false
 	})
 	waitFor(t, 5*time.Second, func() bool {
-		c := sp.children.get(childID)
-		return c != nil && c.isFinished()
+		c := sp.Get(childID)
+		return c != nil && c.IsFinished()
 	})
 	// The denial is fail-closed: the victim file must still exist, and
 	// nothing may be parked on the dead parent runtime.

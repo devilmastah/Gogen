@@ -89,6 +89,14 @@ type SessionAgentOptions struct {
 	// (the terminal tool's open/send/read/signal/list/close actions and
 	// bash_persistent). Config-only in v1, seeded at construction.
 	TerminalEnabled bool
+	// MCPConfigured reports that MCP is enabled with at least one server in
+	// the session's config (config.MCPActive), and MCPNested selects the
+	// gateway exposure mode (config.MCPNested). Both are CONFIG answers taken
+	// once at construction — never derived from the live registry — because
+	// the tool set and the system prompt are part of the request prefix and
+	// must not change when a slow server attaches mid-session.
+	MCPConfigured bool
+	MCPNested     bool
 	// SubagentSpawner runs nested sessions (nil when unavailable; the
 	// subagent tool additionally requires the feature flag).
 	SubagentSpawner SubagentSpawner
@@ -132,6 +140,7 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	a.SessionStore = persistentStore(opts.Store)
 	a.SetSessionID(id)
 	a.SetMCPRegistry(opts.MCPRegistry)
+	a.SetMCPTooling(opts.MCPConfigured, opts.MCPNested)
 	if opts.ToolHandlers != nil {
 		a.SetToolHandlers(opts.ToolHandlers)
 	}

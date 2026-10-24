@@ -21,29 +21,61 @@ import (
 // prefers the registry on name collisions too (featureToolFor), so what the
 // model sees and what actually executes always agree — and the model never
 // sees duplicate definitions for one name (several APIs reject those).
+// Two properties below are load-bearing for provider prompt caching: tool
+// definitions lead the request prefix, so any change to this list invalidates
+// the whole conversation rather than a tail slice.
+//
+//   - Nested MCP mode inlines nothing: the single `mcp` gateway tool (from
+//     featureTools) is the entire MCP surface, so the list size and its bytes
+//     do not depend on how many tools the servers publish or on whether they
+//     have connected yet.
+//   - A shadowing MCP tool REPLACES the builtin at its own index. Removing the
+//     builtin and appending the MCP definition at the end (the previous
+//     behavior) shifted every tool before it, so one name collision reordered
+//     the whole prefix.
 func (a *Agent) llmTools() []llm.Tool {
 	var mcpDefs []llm.Tool
-	mcpNames := make(map[string]struct{})
-	if a.MCPRegistry != nil {
+	if a.MCPRegistry != nil && !a.MCPNested() {
 		mcpDefs = a.MCPRegistry.Definitions()
-		for _, t := range mcpDefs {
-			mcpNames[t.Name] = struct{}{}
-		}
 	}
+	// Replacement map: MCP definition by the name it shadows. Consumed as the
+	// list is built, so the final loop only appends genuinely new tools.
+	replacements := make(map[string]llm.Tool, len(mcpDefs))
+	for _, t := range mcpDefs {
+		replacements[t.Name] = t
+	}
+	take := func(name string) (llm.Tool, bool) {
+		t, ok := replacements[name]
+		if ok {
+			delete(replacements, name)
+		}
+		return t, ok
+	}
+
 	features := a.featureTools()
 	tools := make([]llm.Tool, 0, len(BuiltinTools())+len(features)+len(mcpDefs))
 	for _, t := range BuiltinTools() {
-		if _, shadowed := mcpNames[t.Name]; shadowed {
-			continue // the MCP definition is appended below
+		if replacement, shadowed := take(t.Name); shadowed {
+			tools = append(tools, replacement) // same index, MCP schema
+			continue
 		}
 		tools = append(tools, t)
 	}
 	for _, ft := range features {
-		if _, shadowed := mcpNames[ft.Name]; !shadowed {
-			tools = append(tools, ft.Definition)
+		if replacement, shadowed := take(ft.Name); shadowed {
+			tools = append(tools, replacement)
+			continue
+		}
+		tools = append(tools, ft.Definition)
+	}
+	// Non-shadowing server tools keep the registry's (sorted) order and are
+	// appended after the builtins, so adding a server never reorders what
+	// precedes them.
+	for _, t := range mcpDefs {
+		if _, pending := replacements[t.Name]; pending {
+			tools = append(tools, t)
 		}
 	}
-	tools = append(tools, mcpDefs...)
 	return tools
 }
 
@@ -128,7 +160,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 	// ArgsStabilized is persisted and we skip already-stable messages.
 	a.stabilizeToolArgs()
 
-	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolsPresent())
+	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint())
 
 	// Pre-flight: verify the actual outgoing request fits the context
 	// window, compacting in place when it would be refused. The boundary
@@ -176,7 +208,7 @@ func (a *Agent) outgoingViewEstimate(view []llm.Message) int {
 // rebuildView builds the LLM view from canonical history (system prompt and
 // enrichment folded in), the same call prepareMessages makes.
 func (a *Agent) rebuildView() []llm.Message {
-	return buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolsPresent())
+	return buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint())
 }
 
 // preflightForcedCompact verifies that the outgoing view fits the context
@@ -841,6 +873,6 @@ func (a *Agent) systemPromptPrefix() []llm.Message {
 	return []llm.Message{{
 		Role: "system",
 		Content: SystemPrompt(a.WorkingDir) +
-			buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolsPresent()),
+			buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint()),
 	}}
 }

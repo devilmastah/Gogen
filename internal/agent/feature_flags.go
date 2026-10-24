@@ -302,6 +302,16 @@ type featureWiring struct {
 	// AllowedToolNames, and executeTool all derive from featureTools.
 	terminalEnabled atomic.Bool
 
+	// mcpConfigured / mcpNested are the MCP exposure policy, resolved ONCE at
+	// construction from the session config (never from the live registry —
+	// see SetMCPTooling). They drive three model-facing surfaces that must
+	// agree: whether the `mcp` gateway tool is registered, whether server
+	// tool definitions are inlined into llmTools, and which MCP line the
+	// system prompt carries. Being config-derived is what keeps the request
+	// prefix byte-stable while a slow server is still connecting.
+	mcpConfigured atomic.Bool
+	mcpNested     atomic.Bool
+
 	// instructionsEnabled mirrors the config agent_instructions flag
 	// (config-only, set at construction). workspaceInstructions is the
 	// rendered AGENTS.md/CLAUDE.md section for the CURRENT working dir,

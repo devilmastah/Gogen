@@ -21,6 +21,11 @@ func (m *Model) Init() tea.Cmd {
 // (kitty protocol / xterm modifyOtherKeys) is negotiated automatically, so
 // ctrl+shift+c arrives as a normal KeyPressMsg and needs no special-casing.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Host messages posted from this goroutine must go through an
+	// asynchronous handoff: tea.Program.Send writes to the very channel this
+	// loop is reading, so an inline send from here deadlocks.
+	m.inUpdate.Store(true)
+	defer m.inUpdate.Store(false)
 	return m.handleMsg(msg)
 }
 
@@ -154,6 +159,16 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case approvalRequestMsg:
 		return m.handleApprovalRequestMsg(msg)
 
+	// Continuable subagents: the parent's tool goroutine hands the Update
+	// thread the work that needs slot ownership (admission + turn start,
+	// targeted deliveries, releases) and parks on the returned channel.
+	case childSpawnMsg:
+		return m.handleChildSpawnMsg(msg)
+	case childMessageMsg:
+		return m.handleChildMessageMsg(msg)
+	case childReleaseMsg:
+		return m.handleChildReleaseMsg(msg)
+
 	// System message delivery (queue + drain when idle)
 	case deliveryRequestMsg:
 		// Deliveries are per-session steering-queue items (steering.go) and
@@ -174,13 +189,24 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if sys >= maxPendingDeliveries {
+			// Freshness wins for NOTICES: evict the oldest one. A targeted
+			// send_message delivery is a message whose reply the parent is
+			// waiting on, so it must never be evicted by a notice — when every
+			// system slot holds one, drop THIS notice instead (the web host's
+			// enqueueSystem policy).
+			victim := -1
 			for i, it := range s.steerQueue {
-				if it.system {
-					s.steerQueue = append(s.steerQueue[:i], s.steerQueue[i+1:]...)
-					m.deliveryDrops++
+				if it.system && it.child == nil {
+					victim = i
 					break
 				}
 			}
+			if victim < 0 {
+				m.deliveryDrops++
+				return m, nil
+			}
+			s.steerQueue = append(s.steerQueue[:victim], s.steerQueue[victim+1:]...)
+			m.deliveryDrops++
 		}
 		s.steerQueue = append(s.steerQueue, steerItem{id: newSteerItemID(), text: msg.text, system: true})
 		if m.lives != nil && m.lives.Active() == s {

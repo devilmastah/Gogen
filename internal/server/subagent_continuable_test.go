@@ -15,6 +15,7 @@ import (
 	"gogen/internal/llm"
 	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
+	"gogen/internal/subagents"
 )
 
 // newContinuableServer builds a server with a quick mock for the parent and
@@ -66,7 +67,7 @@ func waitForChildSpawnsSettled(t *testing.T, s *Server) {
 	waitFor(t, 5*time.Second, func() bool {
 		done := make(chan struct{})
 		go func() {
-			sp.spawnWg.Wait()
+			sp.Wait()
 			close(done)
 		}()
 		select {
@@ -161,11 +162,11 @@ func TestBackgroundSpawnCompletionNotice(t *testing.T) {
 		t.Fatal("expected a child id")
 	}
 	// The child is registered and held (orphan eviction exempt).
-	child := sp.children.get(id)
+	child := sp.Get(id)
 	if child == nil {
 		t.Fatal("child not registered")
 	}
-	if !child.rt.held.Load() {
+	if !child.Handle.held.Load() {
 		t.Fatal("child must be held")
 	}
 	// The parent receives a compact, correlated terminal event; the full
@@ -177,8 +178,8 @@ func TestBackgroundSpawnCompletionNotice(t *testing.T) {
 	if err != nil || !strings.Contains(result, "background report") {
 		t.Fatalf("GetAgentResult = %q, %v", result, err)
 	}
-	if child.statusOf() != "finished" {
-		t.Fatalf("child status = %q, want finished", child.statusOf())
+	if child.StatusOf(sp) != "finished" {
+		t.Fatalf("child status = %q, want finished", child.StatusOf(sp))
 	}
 	// The terminal-event delivery turn on the parent also completed.
 	waitFor(t, 5*time.Second, func() bool {
@@ -218,8 +219,8 @@ func TestSendMessageReplyCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "finished" })
 
 	if err := sp.SendMessage(a, id, "please elaborate"); err != nil {
 		t.Fatal(err)
@@ -276,8 +277,8 @@ func TestSendMessageFailedReplyNotifiesParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "finished" })
 
 	if err := sp.SendMessage(a, id, "please elaborate"); err != nil {
 		t.Fatal(err)
@@ -303,11 +304,11 @@ func TestSendMessageQueueFullRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
+	child := sp.Get(id)
 	// Wait until the main job actually holds the turn lock, so the
 	// deliveries queue instead of draining between sends.
 	waitFor(t, 5*time.Second, func() bool {
-		active, _ := child.rt.turnState()
+		active, _ := child.Handle.turnState()
 		return active
 	})
 	for i := 0; i < maxSystemDeliveryQueue; i++ {
@@ -322,7 +323,7 @@ func TestSendMessageQueueFullRefuses(t *testing.T) {
 	// Tear the blocked child down: release evicts its runtime and drops the
 	// queued deliveries, so the spawn goroutine can exit (the provider
 	// unwinds on cancel) instead of leaking into the package teardown.
-	sp.releaseChild(child)
+	sp.ReleaseChild(child)
 }
 
 var errFailedReply = errors.New("provider exploded")
@@ -406,16 +407,16 @@ func TestBackgroundChildBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
-	if child.busy() {
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "finished" })
+	if child.Busy(sp) {
 		t.Fatal("a quiet finished child must not be busy")
 	}
 
 	// Queued delivery: hold the child's turn lock so the delivery worker
 	// cannot get past the acquire step — the message stays queued and no
 	// turn has started.
-	child.rt.turnMu.Lock()
+	child.Handle.turnMu.Lock()
 	unlocked := false
 	unlockOnce := func() {
 		if !unlocked {
@@ -423,30 +424,26 @@ func TestBackgroundChildBusy(t *testing.T) {
 			// Release through the production helper so the parked delivery
 			// worker wakes on the release broadcast (the test simulates a
 			// held turn lock).
-			child.rt.releaseTurn()
+			child.Handle.releaseTurn()
 		}
 	}
 	t.Cleanup(unlockOnce)
 	if err := sp.SendMessage(a, id, "queued question"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return child.rt.hasPendingDeliveries() })
-	if !child.busy() {
+	waitFor(t, 5*time.Second, func() bool { return child.Handle.hasPendingDeliveries() })
+	if !child.Busy(sp) {
 		t.Fatal("a send_message delivery queued for the worker must read busy")
 	}
 
 	// Captured result: the delivery turn acquired the lock and the exact
 	// callback is armed, but setTurnActive(true) has not run yet — the
 	// acquire→start handoff. Simulated by arming the flag directly.
-	child.mu.Lock()
-	child.pendingReply = true
-	child.mu.Unlock()
-	if !child.busy() {
+	child.SetPendingReply(true)
+	if !child.Busy(sp) {
 		t.Fatal("an armed exact-result callback must read busy")
 	}
-	child.mu.Lock()
-	child.pendingReply = false
-	child.mu.Unlock()
+	child.SetPendingReply(false)
 
 	// Neutralize the queued delivery before returning: the t.Cleanup unlock
 	// (LIFO — it runs before TempDir RemoveAll) would otherwise let the
@@ -454,9 +451,9 @@ func TestBackgroundChildBusy(t *testing.T) {
 	// session writes race the temp-dir cleanup (flake: "directory not
 	// empty"). Emptying the queue makes the worker's post-acquire re-check
 	// drop the item and exit without a turn.
-	child.rt.deliverMu.Lock()
-	child.rt.pendingDeliver = nil
-	child.rt.deliverMu.Unlock()
+	child.Handle.deliverMu.Lock()
+	child.Handle.pendingDeliver = nil
+	child.Handle.deliverMu.Unlock()
 }
 
 // TestRetentionReleasesAfterQueuedDelivery pins the retention/queue
@@ -493,13 +490,13 @@ func TestRetentionReleasesAfterQueuedDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "finished" })
 
 	// Hold the child's turn lock so the delivery worker cannot get past
 	// the acquire step: the message stays queued and the turn state reads
 	// idle — exactly the state the timer must not misread.
-	child.rt.turnMu.Lock()
+	child.Handle.turnMu.Lock()
 	unlocked := false
 	unlockOnce := func() {
 		if !unlocked {
@@ -507,19 +504,19 @@ func TestRetentionReleasesAfterQueuedDelivery(t *testing.T) {
 			// Release through the production helper so the parked delivery
 			// worker wakes on the release broadcast (the test simulates a
 			// held turn lock).
-			child.rt.releaseTurn()
+			child.Handle.releaseTurn()
 		}
 	}
 	t.Cleanup(unlockOnce)
 	if err := sp.SendMessage(a, id, "queued question"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return child.rt.hasPendingDeliveries() })
+	waitFor(t, 5*time.Second, func() bool { return child.Handle.hasPendingDeliveries() })
 
 	// Outlive the retention window: the timer fires (and re-fires) while
 	// the message is still queued and must re-arm instead of releasing.
 	time.Sleep(3 * sp.retainWindow())
-	if sp.children.get(id) == nil {
+	if sp.Get(id) == nil {
 		t.Fatal("a queued send_message delivery must defer the retention release")
 	}
 
@@ -531,7 +528,7 @@ func TestRetentionReleasesAfterQueuedDelivery(t *testing.T) {
 	})
 
 	// Back to quiet: the next timer fire releases the child as designed.
-	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id) == nil })
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id) == nil })
 }
 
 // TestInterruptAgent cancels the current turn only: the child stays
@@ -547,14 +544,14 @@ func TestInterruptAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
+	child := sp.Get(id)
 	// Deliberately interrupt immediately: runCancel is installed before the
 	// child is published, so cancellation must not depend on the provider
 	// having registered its stream handle yet.
 	if err := sp.InterruptAgent(a, id); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "idle" })
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "idle" })
 	if deliveredMessages(a, "[subagent") {
 		t.Fatal("an interrupted child must not deliver a terminal event")
 	}
@@ -580,8 +577,8 @@ func TestInterruptAgent(t *testing.T) {
 	}
 	// Cleanup: the wake-up reply turn blocks on the provider — cancel and
 	// release the child so no goroutine outlives the test's temp dir.
-	sp.cancelAll(a.SessionID)
-	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id) == nil })
+	sp.CancelAll(a.SessionID)
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id) == nil })
 }
 
 // TestSubagentForkCopiesMessages pins the fork semantics: the child starts
@@ -612,7 +609,7 @@ func TestSubagentForkCopiesMessages(t *testing.T) {
 		t.Fatalf("parent message count changed: %d → %d", before, a.MessageCount())
 	}
 	// The fork's session carries the copied history (2) + job (1) + reply (1).
-	forkID := sp.children.get("") // forks are foreground: no child record
+	forkID := sp.Get("") // forks are foreground: no child record
 	_ = forkID
 	// Find the fork via the saved sessions: it persisted with ParentID.
 	list, err := s.ws.Store.List(a.WorkingDir)
@@ -698,16 +695,16 @@ func TestChildRetentionRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "finished" })
 	waitFor(t, 5*time.Second, func() bool {
 		if _, ok := s.registry.get(id); ok {
 			return false
 		}
-		if sp.children.get(id) != nil {
+		if sp.Get(id) != nil {
 			return false
 		}
-		return !child.rt.held.Load()
+		return !child.Handle.held.Load()
 	})
 	// Retention removes only the live runtime/record. The persisted terminal
 	// result remains available to the original parent.
@@ -733,8 +730,8 @@ func TestParentEvictionCancelsChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "running" })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "running" })
 
 	parentRt, ok := s.registry.get(a.SessionID)
 	if !ok {
@@ -747,7 +744,7 @@ func TestParentEvictionCancelsChildren(t *testing.T) {
 		if _, ok := s.registry.get(id); ok {
 			return false
 		}
-		return sp.children.get(id) == nil
+		return sp.Get(id) == nil
 	})
 }
 
@@ -777,8 +774,8 @@ func TestChildProgressNeverPushesToParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.IsFinished() })
 	waitForParentDeliveriesSettled(t, s, a)
 	waitFor(t, 5*time.Second, func() bool {
 		return deliveredMessages(a, "get_agent_result")
@@ -787,7 +784,7 @@ func TestChildProgressNeverPushesToParent(t *testing.T) {
 	// (visible in the child's own transcript), and the parent receives one
 	// compact terminal event for the run.
 	rejected := false
-	for _, m := range child.rt.agent.SnapshotMessages() {
+	for _, m := range child.Handle.agent.SnapshotMessages() {
 		if m.Role == "tool" && strings.Contains(m.Content, "unknown tool: report") {
 			rejected = true
 		}
@@ -838,11 +835,11 @@ func TestChildCapReleasesOldest(t *testing.T) {
 	// depends on finish timing — the implementation releases the oldest
 	// FINISHED children.)
 	waitFor(t, 5*time.Second, func() bool {
-		return len(sp.children.childrenOf(a.SessionID)) == sp.maxFinished
+		return len(sp.ChildrenOf(a.SessionID)) == sp.maxFinished
 	})
-	for _, c := range sp.children.childrenOf(a.SessionID) {
-		if !c.isFinished() {
-			t.Fatalf("surviving child %s is not finished", c.id)
+	for _, c := range sp.ChildrenOf(a.SessionID) {
+		if !c.IsFinished() {
+			t.Fatalf("surviving child %s is not finished", c.ID)
 		}
 	}
 	// Settle: each child's compact terminal event is enqueued/delivered only
@@ -882,7 +879,7 @@ func TestLiveChildCapRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) != nil })
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id1) != nil })
 
 	// A second live child would exceed the cap: refused.
 	if _, err := sp.SpawnBackground(context.Background(), a, "second job", "", 0); err == nil {
@@ -890,12 +887,12 @@ func TestLiveChildCapRefuses(t *testing.T) {
 	}
 	// The refused child was discarded (never announced, nothing
 	// persisted); the first stays registered.
-	if sp.children.get(id1) == nil {
+	if sp.Get(id1) == nil {
 		t.Fatal("the first child must stay registered")
 	}
 	// Cleanup: cancel the running child so its turn goroutine exits.
-	sp.cancelAll(a.SessionID)
-	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) == nil })
+	sp.CancelAll(a.SessionID)
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id1) == nil })
 }
 
 // TestRefusedSpawnLeavesNoSessionFile pins the cap-refusal hygiene: a
@@ -965,7 +962,7 @@ func TestRefusedSpawnLeavesNoSessionFile(t *testing.T) {
 	if started.SubagentID != id1 {
 		t.Fatalf("announced child = %q, want the admitted %q", started.SubagentID, id1)
 	}
-	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) != nil })
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id1) != nil })
 
 	// Refused by the user-facing concurrent limit.
 	if id, err := sp.SpawnBackground(context.Background(), a, "refused job", "", 0); err == nil ||
@@ -991,13 +988,13 @@ func TestRefusedSpawnLeavesNoSessionFile(t *testing.T) {
 	}
 
 	// The accepted child is untouched by both refusals.
-	if sp.children.get(id1) == nil {
+	if sp.Get(id1) == nil {
 		t.Fatal("the accepted child must stay registered")
 	}
 
 	// Cleanup: cancel the running child so its turn goroutine exits.
-	sp.cancelAll(a.SessionID)
-	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) == nil })
+	sp.CancelAll(a.SessionID)
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id1) == nil })
 }
 
 // TestConcurrentLimitFromConfig pins the user-facing concurrent-subagent
@@ -1023,7 +1020,7 @@ func TestConcurrentLimitFromConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return sp.children.get(id1) != nil && sp.children.get(id2) != nil
+		return sp.Get(id1) != nil && sp.Get(id2) != nil
 	})
 
 	// A third background child exceeds the limit: refused and released.
@@ -1041,11 +1038,11 @@ func TestConcurrentLimitFromConfig(t *testing.T) {
 		t.Fatalf("fork at a full cap must be refused with a limit error, got %v", err)
 	}
 	// The two accepted children stay registered.
-	if sp.children.get(id1) == nil || sp.children.get(id2) == nil {
+	if sp.Get(id1) == nil || sp.Get(id2) == nil {
 		t.Fatal("accepted children must stay registered")
 	}
 	// Cleanup: cancel the running children so their turn goroutines exit.
-	sp.cancelAll(a.SessionID)
+	sp.CancelAll(a.SessionID)
 }
 
 // TestConcurrentLimitCountsOnlyLiveChildren pins that FINISHED children do
@@ -1072,8 +1069,8 @@ func TestConcurrentLimitCountsOnlyLiveChildren(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		c := sp.children.get(id1)
-		return c != nil && c.isFinished()
+		c := sp.Get(id1)
+		return c != nil && c.IsFinished()
 	})
 	// The finished child no longer counts: the second spawn is allowed.
 	id2, err := sp.SpawnBackground(context.Background(), a, "second job", "", 0)
@@ -1125,20 +1122,20 @@ func TestInterruptFreesConcurrentSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id1)
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "running" })
+	child := sp.Get(id1)
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "running" })
 	// Wait until the turn is actually in flight: cancelInFlight is a
 	// no-op before the turn registers its cancel handle, so an interrupt
 	// fired at mere "running" status (set at registration) could be lost.
 	waitFor(t, 5*time.Second, func() bool {
-		active, _ := child.rt.turnState()
+		active, _ := child.Handle.turnState()
 		return active
 	})
 
 	if err := sp.InterruptAgent(a, id1); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "idle" })
+	waitFor(t, 5*time.Second, func() bool { return child.StatusOf(sp) == "idle" })
 
 	// The slot is free: a new background spawn is allowed while the
 	// interrupted child is still registered.
@@ -1146,14 +1143,14 @@ func TestInterruptFreesConcurrentSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spawn after interrupt must be allowed (an idle child holds no slot): %v", err)
 	}
-	if sp.children.get(id2) == nil {
+	if sp.Get(id2) == nil {
 		t.Fatal("the second child must stay registered")
 	}
 	// Let it finish so the foreground admission below is deterministic
 	// (with the cap at 1 a still-running id2 would refuse it).
 	waitFor(t, 5*time.Second, func() bool {
-		c := sp.children.get(id2)
-		return c != nil && c.statusOf() == "finished"
+		c := sp.Get(id2)
+		return c != nil && c.StatusOf(sp) == "finished"
 	})
 
 	// A foreground spawn is admitted at the free slot (its slot is
@@ -1183,9 +1180,9 @@ func TestInterruptFreesConcurrentSlot(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("foreground spawn did not return after cancel")
 	}
-	sp.cancelAll(a.SessionID)
+	sp.CancelAll(a.SessionID)
 	waitFor(t, 5*time.Second, func() bool {
-		return sp.children.get(id1) == nil && sp.children.get(id2) == nil
+		return sp.Get(id1) == nil && sp.Get(id2) == nil
 	})
 }
 
@@ -1206,8 +1203,8 @@ func TestForegroundCountsTowardConcurrentLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		c := sp.children.get(id1)
-		return c != nil && c.statusOf() == "running"
+		c := sp.Get(id1)
+		return c != nil && c.StatusOf(sp) == "running"
 	})
 
 	// A foreground child in flight (blocking provider, cancelled below).
@@ -1250,10 +1247,10 @@ func TestForegroundCountsTowardConcurrentLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("background spawn after the foreground child finished must be allowed: %v", err)
 	}
-	if sp.children.get(id3) == nil {
+	if sp.Get(id3) == nil {
 		t.Fatal("the second background child must stay registered")
 	}
-	sp.cancelAll(a.SessionID)
+	sp.CancelAll(a.SessionID)
 }
 
 // TestForegroundSlotReleasedOnFailure pins the deferred foreground release:
@@ -1280,10 +1277,10 @@ func TestForegroundSlotReleasedOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("background spawn after a failed foreground spawn must be allowed: %v", err)
 	}
-	if sp.children.get(id) == nil {
+	if sp.Get(id) == nil {
 		t.Fatal("the background child must stay registered")
 	}
-	sp.cancelAll(a.SessionID)
+	sp.CancelAll(a.SessionID)
 }
 
 // TestLiveGuardBoundsIdleChildren pins the internal non-finished guard:
@@ -1308,18 +1305,18 @@ func TestLiveGuardBoundsIdleChildren(t *testing.T) {
 		ids = append(ids, id)
 	}
 	for _, id := range ids {
-		c := sp.children.get(id)
-		waitFor(t, 5*time.Second, func() bool { return c.statusOf() == "running" })
+		c := sp.Get(id)
+		waitFor(t, 5*time.Second, func() bool { return c.StatusOf(sp) == "running" })
 		// The turn must be in flight before the interrupt: cancelInFlight
 		// is a no-op before the turn registers its cancel handle.
 		waitFor(t, 5*time.Second, func() bool {
-			active, _ := c.rt.turnState()
+			active, _ := c.Handle.turnState()
 			return active
 		})
 		if err := sp.InterruptAgent(a, id); err != nil {
 			t.Fatal(err)
 		}
-		waitFor(t, 5*time.Second, func() bool { return c.statusOf() == "idle" })
+		waitFor(t, 5*time.Second, func() bool { return c.StatusOf(sp) == "idle" })
 	}
 	// Active = 0 (well under the limit of 4), but non-finished = 2 = the
 	// guard: the next spawn is refused by the guard, not the user limit.
@@ -1327,30 +1324,30 @@ func TestLiveGuardBoundsIdleChildren(t *testing.T) {
 		!strings.Contains(err.Error(), "too many live subagents") {
 		t.Fatalf("spawn at the live guard must be refused by the guard, got %v", err)
 	}
-	sp.cancelAll(a.SessionID)
+	sp.CancelAll(a.SessionID)
 }
 
 // TestOnTurnResultUsesExactOutput pins that reply delivery consumes the
 // current turn's returned output, never a transcript heuristic: an older
 // assistant message cannot be re-delivered after an interrupted turn.
 func TestOnTurnResultUsesExactOutput(t *testing.T) {
-	replyEvent := subagentEvent{
-		Kind:     subagentEventReply,
+	replyEvent := subagents.Event{
+		Kind:     subagents.EventReply,
 		ChildID:  "child-1",
 		ParentID: "parent-1",
 		Label:    "subagent: test",
 		Text:     strings.Repeat("r", agent.MaxSubagentReportBytes+1000),
 	}
-	if got := replyEvent.parentMessage(); len(got) > agent.MaxSubagentReportBytes+len("… (truncated)")+len(replyEvent.Label)+32 {
+	if got := replyEvent.ParentMessage(); len(got) > agent.MaxSubagentReportBytes+len("… (truncated)")+len(replyEvent.Label)+32 {
 		t.Fatalf("typed reply event escaped the report cap: %d bytes", len(got))
 	}
-	if got := (subagentEvent{
-		Kind:     subagentEventReply,
+	if got := (subagents.Event{
+		Kind:     subagents.EventReply,
 		ChildID:  "child-1",
 		ParentID: "parent-1",
 		Label:    "subagent: test",
 		Err:      context.Canceled,
-	}).parentMessage(); !strings.Contains(got, "context canceled") {
+	}).ParentMessage(); !strings.Contains(got, "context canceled") {
 		t.Fatalf("typed no-reply event = %q", got)
 	}
 
@@ -1373,20 +1370,16 @@ func TestOnTurnResultUsesExactOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return c.isFinished() })
+	c := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return c.IsFinished() })
 
-	c.mu.Lock()
-	c.pendingReply = true
-	c.mu.Unlock()
-	c.onTurnResult("new reply", nil)
+	c.SetPendingReply(true)
+	c.OnTurnResult(sp, "new reply", nil)
 	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "new reply") })
 	waitForParentDeliveriesSettled(t, s, a)
 
-	c.mu.Lock()
-	c.pendingReply = true
-	c.mu.Unlock()
-	c.onTurnResult("", context.Canceled)
+	c.SetPendingReply(true)
+	c.OnTurnResult(sp, "", context.Canceled)
 	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "no reply") })
 	if deliveredMessages(a, "ack") {
 		t.Fatal("an interrupted reply turn must not re-deliver an older assistant message")
@@ -1445,7 +1438,7 @@ func TestBackgroundSpawnCompletionQueuedUntilParentLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
+	child := sp.Get(id)
 	if child == nil {
 		t.Fatal("child not registered")
 	}
@@ -1519,17 +1512,17 @@ func TestChildSystemNoticeDoesNotArmReplyCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.IsFinished() })
 
 	// A plain system delivery (the job notice shape; the real producer is
 	// the registry-backed jobNoticeDeliverer) runs a turn on the child — but
 	// its reaction must NOT be injected into the parent.
-	if !child.rt.deliverToSession("[job] job-1 exited with code 0 — echo hi") {
+	if !child.Handle.deliverToSession("[job] job-1 exited with code 0 — echo hi") {
 		t.Fatal("system delivery refused")
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		for _, m := range child.rt.agent.SnapshotMessages() {
+		for _, m := range child.Handle.agent.SnapshotMessages() {
 			if m.Role == "assistant" && strings.Contains(m.Content, "reaction to notice") {
 				return true
 			}
@@ -1569,8 +1562,8 @@ func TestListAgentsProgressLineBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.IsFinished() })
 
 	out, err := sp.ListAgents(a)
 	if err != nil {
@@ -1616,7 +1609,7 @@ func TestListAgentsProgressLineBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id2).statusOf() == "running" })
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id2).StatusOf(sp) == "running" })
 	out, err = sp.ListAgents(a)
 	if err != nil {
 		t.Fatal(err)
@@ -1625,8 +1618,8 @@ func TestListAgentsProgressLineBounded(t *testing.T) {
 		t.Fatalf("both children must be listed: %q", out)
 	}
 	close(blocking)
-	sp.cancelAll(a.SessionID)
-	waitFor(t, 5*time.Second, func() bool { return len(sp.children.childrenOf(a.SessionID)) == 0 })
+	sp.CancelAll(a.SessionID)
+	waitFor(t, 5*time.Second, func() bool { return len(sp.ChildrenOf(a.SessionID)) == 0 })
 }
 
 // TestEvictedChildWithArmedCaptureReleases pins the release predicate: an
@@ -1646,21 +1639,19 @@ func TestEvictedChildWithArmedCaptureReleases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := sp.children.get(id)
-	waitFor(t, 5*time.Second, func() bool { return child.isFinished() })
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.IsFinished() })
 
 	// Simulate the evicted early return: the start hook armed the exact
 	// callback but the turn never ran, so its callback never consumed it.
-	child.mu.Lock()
-	child.pendingReply = true
-	child.mu.Unlock()
-	s.registry.evictRuntime(child.rt)
+	child.SetPendingReply(true)
+	s.registry.evictRuntime(child.Handle)
 
-	if child.busy() {
+	if child.Busy(sp) {
 		t.Fatal("an evicted child must not read busy (armed capture or not)")
 	}
-	sp.maybeReleaseChild(child)
-	if sp.children.get(id) != nil {
+	sp.ReleaseChildIfQuiet(child)
+	if sp.Get(id) != nil {
 		t.Fatal("an evicted child must be released, not pinned by the armed capture")
 	}
 }

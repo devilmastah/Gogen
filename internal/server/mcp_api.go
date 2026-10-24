@@ -10,7 +10,11 @@ import (
 )
 
 // mcpTestTimeout bounds a test_mcp probe (spawn + handshake + tools/list).
-const mcpTestTimeout = 20 * time.Second
+// It is generous on purpose: the common launcher is `npx -y <package>`, which
+// has to download the package on a cold cache before it answers at all, so a
+// short bound reported a working server (e.g. rea-agents) as broken. The probe
+// is user-initiated and shows a "Testing…" note while it runs.
+const mcpTestTimeout = 90 * time.Second
 
 // wsHandleTestMCP runs the MCP connectivity + tools test against a
 // THROWAWAY stdio process (test_mcp) — never registered, never wired to the

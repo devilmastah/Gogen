@@ -35,7 +35,7 @@ func TestSubagentSpawnEndToEnd(t *testing.T) {
 	// (a real server would do this via the config WS toggle).
 	a.SetSubagentsEnabled(true)
 
-	sp := &subagentSpawner{s: s}
+	sp := newSubagentSpawner(s)
 	report, err := sp.Spawn(context.Background(), a, "investigate the parser\nand report back", "", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestSubagentParentCancelPropagates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		_, err := (newSubagentSpawner(s)).Spawn(ctx, a, "long job", "", 0)
 		done <- err
 	}()
 	time.Sleep(200 * time.Millisecond)
@@ -127,7 +127,7 @@ func TestSubagentChildPaneGetsTerminalFrames(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		_, err := (newSubagentSpawner(s)).Spawn(ctx, a, "long job", "", 0)
 		done <- err
 	}()
 
@@ -211,7 +211,7 @@ func TestSubagentChildInheritsParentModel(t *testing.T) {
 	}
 	a.SetSubagentsEnabled(true)
 
-	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+	if _, err := (newSubagentSpawner(s)).Spawn(context.Background(), a, "job", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(created) != 1 {
@@ -256,7 +256,7 @@ func TestSubagentConfiguredModelWinsOverInheritance(t *testing.T) {
 	}
 	a.SetSubagentsEnabled(true)
 
-	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+	if _, err := (newSubagentSpawner(s)).Spawn(context.Background(), a, "job", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(created) != 1 {
@@ -293,7 +293,7 @@ func TestSubagentConfiguredModelFallbackToDefault(t *testing.T) {
 	}
 	a.SetSubagentsEnabled(true)
 
-	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+	if _, err := (newSubagentSpawner(s)).Spawn(context.Background(), a, "job", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(created) != 1 {
@@ -350,7 +350,7 @@ func TestSubagentChildThinkingLevelCascade(t *testing.T) {
 			}
 			a.SetSubagentsEnabled(true)
 
-			if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+			if _, err := (newSubagentSpawner(s)).Spawn(context.Background(), a, "job", "", 0); err != nil {
 				t.Fatal(err)
 			}
 			if len(created) != 1 {
@@ -388,7 +388,7 @@ func TestSubagentChildModelFallbackToDefault(t *testing.T) {
 	}
 	a.SetSubagentsEnabled(true)
 
-	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+	if _, err := (newSubagentSpawner(s)).Spawn(context.Background(), a, "job", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(created) != 1 {
@@ -426,7 +426,7 @@ func TestSubagentExplicitModelArgWins(t *testing.T) {
 	}
 	a.SetSubagentsEnabled(true)
 
-	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "explicit-model", 0); err != nil {
+	if _, err := (newSubagentSpawner(s)).Spawn(context.Background(), a, "job", "explicit-model", 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(created) != 1 {
@@ -458,7 +458,7 @@ func TestSessionsPayloadIncludesNested(t *testing.T) {
 	defer conn.Close()
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
 
-	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+	if _, err := (newSubagentSpawner(s)).Spawn(context.Background(), a, "job", "", 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -501,7 +501,7 @@ func TestSessionsPayloadTurnActive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		_, err := (newSubagentSpawner(s)).Spawn(ctx, a, "long job", "", 0)
 		done <- err
 	}()
 	var childID string

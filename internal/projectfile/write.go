@@ -158,6 +158,7 @@ type configYAML struct {
 	WebAuthToken              string                        `yaml:"web_auth_token,omitempty"`
 	WebTLSCertFile            string                        `yaml:"web_tls_cert_file,omitempty"`
 	WebTLSKeyFile             string                        `yaml:"web_tls_key_file,omitempty"`
+	MCPToolMode               string                        `yaml:"mcp_tool_mode,omitempty"`
 	MCPServers                []config.MCPServerConfig      `yaml:"mcp_servers,omitempty"`
 	OpenAIProviders           []config.OpenAIProviderConfig `yaml:"openai_providers,omitempty"`
 }
@@ -248,6 +249,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		WebAllowedOrigins:         cfg.WebAllowedOrigins,
 		WebTLSCertFile:            cfg.WebTLSCertFile,
 		WebTLSKeyFile:             cfg.WebTLSKeyFile,
+		MCPToolMode:               omitDefaultString(cfg.MCPToolMode, def.MCPToolMode),
 		MCPServers:                cfg.MCPServers,
 		OpenAIProviders:           cfg.OpenAIProviders,
 	}
@@ -288,9 +290,11 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		out.MCPServers = make([]config.MCPServerConfig, len(cfg.MCPServers))
 		for i, s := range cfg.MCPServers {
 			out.MCPServers[i] = config.MCPServerConfig{
-				Name:    s.Name,
-				Command: s.Command,
-				Args:    append([]string(nil), s.Args...),
+				Name:            s.Name,
+				Command:         s.Command,
+				Args:            append([]string(nil), s.Args...),
+				InitTimeoutSecs: s.InitTimeoutSecs,
+				ToolTimeoutSecs: s.ToolTimeoutSecs,
 				// Env intentionally nil: persisted only with --save-config-secrets.
 			}
 		}

@@ -43,16 +43,6 @@ func (a *Agent) SetToolHandlers(handlers map[string]ToolHandler) {
 	a.toolMu.Unlock()
 }
 
-// mcpToolsPresent reports whether an MCP tool registry is attached. It is
-// the predicate behind the system-prompt MCP hint (buildSystemSuffix), so the
-// prompt and the model-facing MCP tool set (llmTools / AllowedToolNames, both
-// of which read MCPRegistry directly) agree: no registry → neither tools nor
-// hint. The registry is attached only once MCP init succeeds (mcp: on plus at
-// least one valid server), and that can land after the first turn.
-func (a *Agent) mcpToolsPresent() bool {
-	return a.MCPRegistry != nil
-}
-
 // mcpRegistryHas reports whether the attached MCP registry exposes a tool
 // with the given name (nil-safe). Distinct from isMCPTool, which detects
 // the "mcp_" name prefix; this checks the actual registered tool set, so a
@@ -131,6 +121,15 @@ func (a *Agent) featureTools() []featureTool {
 			featureTool{Name: "bash_persistent", Definition: bashPersistentToolDef(), Handler: handleBashPersistent},
 		)
 	}
+	if a.mcpGatewayEnabled() {
+		// MCP gateway (mcp_tool_mode: nested): one fixed definition that
+		// reaches every configured MCP server's tools by name. Act-mode only,
+		// matching the plan-mode gate on inlined MCP tools (isMCPTool). The
+		// definition is CONSTANT — no tool counts or server names — so the
+		// request prefix stays byte-stable across turns and sessions, which is
+		// the point of the nested mode.
+		out = append(out, featureTool{Name: mcpToolName, Definition: mcpToolDef(), Handler: handleMCP})
+	}
 	return out
 }
 
@@ -180,6 +179,10 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 			return ft.Handler(ctx, a, tc.Args)
 		}
 		if a.mcpRegistryHas(tc.Name) {
+			// A raw server tool name stays callable even in nested mode, where
+			// those definitions are not advertised: the registry really has it,
+			// and the gateway resolves to this same dispatch. Plan mode still
+			// refuses it above (isMCPTool), so this is not a gate bypass.
 			return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
 		}
 		a.toolMu.RLock()

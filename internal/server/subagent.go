@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/contextmgr"
 	sesspkg "gogen/internal/session"
+	"gogen/internal/subagents"
 )
 
 // subagentSpawner implements agent.SubagentSpawner for the web server:
@@ -20,36 +20,43 @@ import (
 // tool call blocks until the child finishes (or the parent turn is
 // cancelled, which propagates).
 //
-// When the spawner also implements agent.ContinuableSubagentSpawner (it
-// does — see subagent_continuable.go), the subagent tool gains
-// run_in_background and the continuable tools; children then stay
-// registered past their main turn (held, retention-bounded) for messaging.
+// When the spawner implements agent.ContinuableSubagentSpawner (it does) the
+// subagent tool gains run_in_background and the control tools; children then
+// stay registered past their main turn (held, retention-bounded) for
+// messaging.
+//
+// The embedded Spawner owns that continuable lifecycle (admission, caps,
+// retention, release, and the control tools — internal/subagents); this type
+// supplies the host-specific halves through subagents.Host: runtime
+// construction, turn execution, the sidebar broadcasts, and parent delivery
+// (see subagent_continuable.go).
 type subagentSpawner struct {
+	*subagents.Spawner[*sessionRuntime]
 	s *Server
 
-	// children is the continuable-child registry (see
-	// subagent_continuable.go). Non-nil for every server spawner.
-	children *childRegistry
 	// retain bounds how long a finished continuable child stays registered
-	// (0 = defaultSubagentRetain). Tests shorten it.
+	// (0 = subagents.DefaultRetain). Tests shorten it.
 	retain time.Duration
 	// maxFinished caps finished continuable children per parent
-	// (0 = defaultMaxFinishedSubagents).
+	// (0 = subagents.DefaultMaxFinished).
 	maxFinished int
 	// maxLive overrides the user-facing per-parent cap on ACTIVE subagents
 	// (0 = the configured subagent_max_concurrent limit — see
 	// concurrentLimit).
 	maxLive int
 	// maxLiveGuard overrides the internal per-parent cap on non-finished
-	// children (0 = defaultMaxLiveSubagents — see liveGuardLimit).
+	// children (0 = subagents.DefaultMaxLive).
 	maxLiveGuard int
-	// spawnWg tracks in-flight SpawnBackground goroutines. The goroutine's
-	// post-turn orphan sweep (Store.Delete → index rewrite) runs AFTER the
-	// child is unregistered, so "child gone from the registry" is not a
-	// quiescence signal: test cleanups wait on this before removing their
-	// temp dir, or the sweep's write races the cleanup ("directory not
-	// empty" in the TempDir RemoveAll).
-	spawnWg sync.WaitGroup
+}
+
+// newSubagentSpawner wires the web host to the shared continuable lifecycle.
+// The host pointer is required up front (the lifecycle calls back into it),
+// so the two are constructed in this one place — NewServer and tests both use
+// it, and a spawner built any other way has no lifecycle to drive.
+func newSubagentSpawner(s *Server) *subagentSpawner {
+	sp := &subagentSpawner{s: s}
+	sp.Spawner = subagents.New[*sessionRuntime](sp)
+	return sp
 }
 
 // truncateReport bounds the tool result returned to the parent agent.
@@ -142,15 +149,15 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, model string, depth int) (string, error) {
 	s := sp.s
 	// The foreground child holds a slot of the concurrent limit for the
-	// whole turn, exactly like a background child: acquireForeground
+	// whole turn, exactly like a background child: AcquireForeground
 	// reserves the slot atomically with the cap check (active children
 	// against the user-facing limit, non-finished against the internal
 	// guard), and the deferred release frees it on every exit path.
-	ok, guardHit := sp.children.acquireForeground(parent.SessionID, sp.concurrentLimit(), sp.liveGuardLimit())
+	ok, guardHit := sp.AcquireForeground(parent.SessionID)
 	if !ok {
-		return "", spawnCapError(sp.concurrentLimit(), guardHit)
+		return "", sp.SpawnCapError(parent.SessionID, guardHit)
 	}
-	defer sp.children.releaseForeground(parent.SessionID)
+	defer sp.ReleaseForeground(parent.SessionID)
 	childRt, label, rawJob, err := sp.newChildRuntime(ctx, parent, job, model, depth)
 	if err != nil {
 		return "", err

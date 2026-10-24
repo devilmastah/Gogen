@@ -6,6 +6,10 @@ type MCPServerEntry struct {
 	Command string            `yaml:"command"`
 	Args    []string          `yaml:"args"`
 	Env     map[string]string `yaml:"env"`
+	// InitTimeoutSecs / ToolTimeoutSecs override the MCP client's default
+	// handshake / per-call deadlines for this server (0 = default).
+	InitTimeoutSecs int `yaml:"init_timeout_secs"`
+	ToolTimeoutSecs int `yaml:"tool_timeout_secs"`
 }
 
 // OpenAIProviderEntry describes one registered OpenAI-compatible API
@@ -46,6 +50,7 @@ type FileConfig struct {
 	DebugLog                  string                `yaml:"debug_log"`
 	DebugSession              string                `yaml:"debug_session"`
 	MCP                       string                `yaml:"mcp"`
+	MCPToolMode               string                `yaml:"mcp_tool_mode"`
 	DebugCompareMessages      bool                  `yaml:"debug_compare_messages"`
 	MCPServers                []MCPServerEntry      `yaml:"mcp_servers"`
 	OpenAIProviders           []OpenAIProviderEntry `yaml:"openai_providers"`

@@ -10,6 +10,7 @@ import (
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 	llmtest "gogen/internal/llm/llmtest"
+	"gogen/internal/server"
 	"gogen/internal/session"
 )
 
@@ -30,16 +31,14 @@ func spawnTUISubagent(t *testing.T, cfg *config.Config, childModels []llm.ModelI
 	parent.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 
 	var child *llmtest.MockProvider
-	sp := &tuiSubagentSpawner{
-		cfg: cfg,
-		providerFactory: func(_ *config.Config, _ *agent.Agent) llm.LLMProvider {
-			p := llmtest.NewMockProvider()
-			p.Model = "default-model"
-			p.Models = childModels
-			p.StreamResults = []*llm.StreamResult{{Content: "report"}}
-			child = p
-			return p
-		},
+	sp := newTUISubagentSpawner(cfg, nil)
+	sp.providerFactory = func(_ *config.Config, _ *agent.Agent) llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.Model = "default-model"
+		p.Models = childModels
+		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
+		child = p
+		return p
 	}
 	report, err := sp.Spawn(context.Background(), parent, job, model, 0)
 	return child, report, err
@@ -112,13 +111,14 @@ func TestTUISubagentReportBounded(t *testing.T) {
 	models := []llm.ModelInfo{{ID: "default-model", ContextLimit: 128000}}
 	parentProv := llmtest.NewMockProvider()
 	parent := agent.NewAgent(parentProv, agent.NewExecutor(t.TempDir()), contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000}))
-	sp := &tuiSubagentSpawner{cfg: cfg, providerFactory: func(*config.Config, *agent.Agent) llm.LLMProvider {
+	sp := newTUISubagentSpawner(cfg, nil)
+	sp.providerFactory = func(*config.Config, *agent.Agent) llm.LLMProvider {
 		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.Models = models
 		p.StreamResults = []*llm.StreamResult{{Content: strings.Repeat("x", agent.MaxSubagentReportBytes+1000)}}
 		return p
-	}}
+	}
 	report, err := sp.Spawn(t.Context(), parent, "job", "", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -167,4 +167,101 @@ func TestTUISubagentParentModelFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertChildModel(t, child, "default-model")
+}
+
+// TestTUISpawnerBuildsChildrenThroughWorkspace pins that a workspace-attached
+// spawner builds its children with the SHARED lifecycle factory (web parity)
+// instead of the hand-built fallback: the child reads the workspace's live
+// feature flags, inherits the workspace's spawner, and the fallback provider
+// factory never runs.
+func TestTUISpawnerBuildsChildrenThroughWorkspace(t *testing.T) {
+	parentProv := llmtest.NewMockProvider()
+	parentProv.Model = "default-model"
+	exec := agent.NewExecutor(t.TempDir())
+	parent := agent.NewAgent(parentProv, exec, contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000}))
+	parent.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
+	cfg := &config.Config{OpenAIModel: "default-model", Subagent: "on", SubagentMaxDepth: 1}
+	ws := server.NewWorkspaceForHost(parent, cfg)
+
+	sp := newTUISubagentSpawner(cfg, ws)
+	sp.providerFactory = func(*config.Config, *agent.Agent) llm.LLMProvider {
+		t.Fatal("the hand-built child provider ran despite an attached workspace")
+		return nil
+	}
+	ws.SubagentSpawner = sp
+	// A live flag change marks the workspace: a workspace-built child reads
+	// it, while the hand-built path would have inherited the parent's value.
+	ws.SetSubagentMaxDepth(3)
+
+	child := sp.newChildAgent(parent)
+	if child == nil {
+		t.Fatal("no child agent")
+	}
+	if child.SessionID == "" || child.SessionID == parent.SessionID {
+		t.Fatalf("child session id = %q, want a fresh id", child.SessionID)
+	}
+	if got := child.SubagentMaxDepth(); got != 3 {
+		t.Fatalf("child SubagentMaxDepth = %d, want the workspace value 3 (child not built through the workspace)", got)
+	}
+	if got := child.SubagentSpawner(); got != agent.SubagentSpawner(sp) {
+		t.Fatalf("child spawner = %T, want the host's single spawner", got)
+	}
+}
+
+// TestNewWithWorkspaceInstallsOneSpawner pins the host wiring: with the
+// subagent feature on, the runner installs ONE spawner on the workspace and on
+// the root agent, and every session the workspace creates inherits that same
+// instance (so the continuable child registry cannot be duplicated per
+// session). With the feature off, no spawner is installed at all.
+func TestNewWithWorkspaceInstallsOneSpawner(t *testing.T) {
+	build := func(t *testing.T, cfg *config.Config) (*agent.Agent, *server.Workspace) {
+		t.Helper()
+		prov := llmtest.NewMockProvider()
+		prov.Model = "default-model"
+		a := agent.NewAgent(prov, agent.NewExecutor(t.TempDir()), contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
+		a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
+		return a, server.NewWorkspaceForHost(a, cfg)
+	}
+
+	t.Run("enabled", func(t *testing.T) {
+		cfg := &config.Config{OpenAIModel: "default-model", Subagent: "on"}
+		a, ws := build(t, cfg)
+		ui := NewWithWorkspace(a, cfg, ws)
+		if ui.spawner == nil {
+			t.Fatal("runner built no spawner")
+		}
+		if ws.SubagentSpawner != ui.spawner {
+			t.Fatal("workspace must carry the runner's spawner")
+		}
+		if got := a.SubagentSpawner(); got != agent.SubagentSpawner(ui.spawner) {
+			t.Fatalf("root agent spawner = %T, want the runner's", got)
+		}
+		opened := ws.NewSessionAgent(nil, session.NewID())
+		if got := opened.SubagentSpawner(); got != agent.SubagentSpawner(ui.spawner) {
+			t.Fatalf("workspace-created session spawner = %T, want the runner's", got)
+		}
+		// The Model reuses that instance (one registry) and attaches its
+		// /subagents list to it.
+		m := NewModel(a, cfg)
+		m.spawner = ui.spawner
+		m.installSubagentSpawner()
+		if m.spawner != ui.spawner {
+			t.Fatal("Model built a second spawner instead of reusing the host's")
+		}
+		if ui.spawner.record == nil {
+			t.Fatal("Model did not attach its /subagents list to the host spawner")
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		cfg := &config.Config{OpenAIModel: "default-model"}
+		a, ws := build(t, cfg)
+		ui := NewWithWorkspace(a, cfg, ws)
+		if ui.spawner != nil {
+			t.Fatal("subagents are off: the runner must not build a spawner")
+		}
+		if ws.SubagentSpawner != nil || a.SubagentSpawner() != nil {
+			t.Fatal("subagents are off: no spawner may be installed")
+		}
+	})
 }

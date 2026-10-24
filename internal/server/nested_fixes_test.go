@@ -117,7 +117,7 @@ func TestSubagentOutcomePersistedInPayload(t *testing.T) {
 		return readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "sessions" })
 	}
 
-	sp := &subagentSpawner{s: s}
+	sp := newSubagentSpawner(s)
 	// Successful spawn: status persisted as "success".
 	if _, err := sp.Spawn(context.Background(), a, "good job", "", 0); err != nil {
 		t.Fatal(err)
@@ -181,7 +181,7 @@ func TestReattachedChildRestoresRuntimePrivileges(t *testing.T) {
 	defer conn.Close()
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
 
-	sp := &subagentSpawner{s: s}
+	sp := newSubagentSpawner(s)
 	if _, err := sp.Spawn(context.Background(), a, "job", "", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestDeleteParentEvictsRegisteredChild(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		_, err := (newSubagentSpawner(s)).Spawn(ctx, a, "long job", "", 0)
 		done <- err
 	}()
 	var childID string
@@ -384,7 +384,7 @@ func TestDeleteParentUnregisteredEvictsChild(t *testing.T) {
 	// registered one — otherwise the record would linger until the
 	// retention timer).
 	waitFor(t, 5*time.Second, func() bool {
-		return sp.children.get(childID) == nil
+		return sp.Get(childID) == nil
 	})
 	if _, err := store.LoadInWorkingDir(dir, childID); err == nil {
 		t.Fatal("child file must be gone after the parent delete")

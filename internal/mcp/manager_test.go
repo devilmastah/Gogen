@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -48,37 +49,52 @@ func TestReadLoopRejectsOverlongLine(t *testing.T) {
 	}
 }
 
-// TestWithCallTimeoutHonorsCallerDeadline pins the fix for the fixed 30s cap
-// on every tools/call: a caller that supplies its own (possibly longer)
-// deadline must keep it, so a legitimately long-running MCP tool is not
-// reported as failed after mcpCallTimeout. A caller with no deadline still
-// gets the default bound.
+// TestWithCallTimeoutHonorsCallerDeadline pins the deadline policy for one
+// tools/call: a caller that supplies its own (possibly longer) deadline keeps
+// it, so a legitimately long-running MCP tool is not reported as failed early.
+// A caller with no deadline gets the client's bound, which comes from the
+// server entry (tool_timeout_secs) or the package default.
 func TestWithCallTimeoutHonorsCallerDeadline(t *testing.T) {
-	t.Run("no caller deadline applies default", func(t *testing.T) {
-		ctx, cancel := withCallTimeout(context.Background())
+	t.Run("no caller deadline applies the client default", func(t *testing.T) {
+		c := &Client{callTimeout: defaultCallTimeout}
+		ctx, cancel := c.withCallTimeout(context.Background())
 		defer cancel()
 		dl, ok := ctx.Deadline()
 		if !ok {
 			t.Fatal("expected a default deadline")
 		}
-		if remaining := time.Until(dl); remaining <= 0 || remaining > mcpCallTimeout {
-			t.Fatalf("default deadline %s out of range (want <= %s)", remaining, mcpCallTimeout)
+		if remaining := time.Until(dl); remaining <= 0 || remaining > defaultCallTimeout {
+			t.Fatalf("default deadline %s out of range (want <= %s)", remaining, defaultCallTimeout)
+		}
+	})
+
+	t.Run("server entry timeout wins over the default", func(t *testing.T) {
+		c := &Client{callTimeout: 90 * time.Minute}
+		ctx, cancel := c.withCallTimeout(context.Background())
+		defer cancel()
+		dl, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected a deadline")
+		}
+		if remaining := time.Until(dl); remaining < 89*time.Minute {
+			t.Fatalf("deadline %s does not honor the server entry timeout (90m)", remaining)
 		}
 	})
 
 	t.Run("longer caller deadline is honored", func(t *testing.T) {
-		want := time.Now().Add(10 * time.Minute)
+		want := time.Now().Add(10 * time.Hour)
 		caller, callerCancel := context.WithDeadline(context.Background(), want)
 		defer callerCancel()
 
-		ctx, cancel := withCallTimeout(caller)
+		c := &Client{callTimeout: defaultCallTimeout}
+		ctx, cancel := c.withCallTimeout(caller)
 		defer cancel()
 		got, ok := ctx.Deadline()
 		if !ok {
 			t.Fatal("expected a deadline")
 		}
 		if !got.Equal(want) {
-			t.Fatalf("deadline = %s, want the caller's %s (not capped at %s)", got, want, mcpCallTimeout)
+			t.Fatalf("deadline = %s, want the caller's %s (not capped at %s)", got, want, defaultCallTimeout)
 		}
 	})
 
@@ -87,13 +103,145 @@ func TestWithCallTimeoutHonorsCallerDeadline(t *testing.T) {
 		caller, callerCancel := context.WithDeadline(context.Background(), want)
 		defer callerCancel()
 
-		ctx, cancel := withCallTimeout(caller)
+		c := &Client{callTimeout: defaultCallTimeout}
+		ctx, cancel := c.withCallTimeout(caller)
 		defer cancel()
 		got, _ := ctx.Deadline()
 		if !got.Equal(want) {
 			t.Fatalf("deadline = %s, want %s", got, want)
 		}
 	})
+}
+
+// TestInitAndCallTimeoutResolution pins the per-server override precedence:
+// an entry value wins (in seconds), 0 (and a negative typo) falls back to the
+// generous defaults that a slow npx-launched reverse-engineering server needs.
+func TestInitAndCallTimeoutResolution(t *testing.T) {
+	tests := []struct {
+		name     string
+		entry    config.MCPServerConfig
+		wantInit time.Duration
+		wantCall time.Duration
+	}{
+		{name: "no overrides use defaults", entry: config.MCPServerConfig{Name: "rea"}, wantInit: defaultInitTimeout, wantCall: defaultCallTimeout},
+		{name: "entry overrides", entry: config.MCPServerConfig{InitTimeoutSecs: 120, ToolTimeoutSecs: 900}, wantInit: 120 * time.Second, wantCall: 900 * time.Second},
+		{name: "negative falls back to default", entry: config.MCPServerConfig{InitTimeoutSecs: -1, ToolTimeoutSecs: -5}, wantInit: defaultInitTimeout, wantCall: defaultCallTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := initTimeoutFor(tt.entry); got != tt.wantInit {
+				t.Fatalf("initTimeoutFor = %s, want %s", got, tt.wantInit)
+			}
+			if got := callTimeoutFor(tt.entry); got != tt.wantCall {
+				t.Fatalf("callTimeoutFor = %s, want %s", got, tt.wantCall)
+			}
+		})
+	}
+}
+
+// TestDefaultTimeoutsFitNativeAnalysis pins the regression these defaults
+// exist for: a reverse-engineering MCP server (REA) launches its provider on
+// demand, and both the cold `npx -y` package download at handshake time and a
+// Ghidra/IDA analysis started by one tools/call take minutes, not seconds.
+func TestDefaultTimeoutsFitNativeAnalysis(t *testing.T) {
+	if defaultCallTimeout < 5*time.Minute {
+		t.Fatalf("default call timeout %s is too short for a native-analysis tool", defaultCallTimeout)
+	}
+	if defaultInitTimeout < 30*time.Second {
+		t.Fatalf("default init timeout %s is too short for a cold npx start", defaultInitTimeout)
+	}
+}
+
+// TestRenderToolContent covers the flattening of a tools/call content array:
+// text passes through, and non-text parts (which used to be dropped, leaving
+// an empty tool result) become explicit placeholders carrying their type and
+// decoded size.
+func TestRenderToolContent(t *testing.T) {
+	tests := []struct {
+		name  string
+		parts []mcpContentPart
+		want  []string
+		omit  []string
+	}{
+		{
+			name:  "text only",
+			parts: []mcpContentPart{{Type: "text", Text: "hello"}},
+			want:  []string{"hello"},
+		},
+		{
+			name:  "text parts are joined by a newline",
+			parts: []mcpContentPart{{Type: "text", Text: "a"}, {Type: "text", Text: "b"}},
+			want:  []string{"a\nb"},
+		},
+		{
+			name:  "image becomes a sized placeholder",
+			parts: []mcpContentPart{{Type: "image", MimeType: "image/png", Data: "AAAA"}},
+			want:  []string{"[image content: image/png, 3 bytes"},
+		},
+		{
+			name:  "resource text is inlined with its uri",
+			parts: []mcpContentPart{{Type: "resource", Resource: &mcpResource{URI: "file:///tmp/a.txt", Text: "body"}}},
+			want:  []string{"file:///tmp/a.txt", "body"},
+		},
+		{
+			name:  "audio is reported, not dropped",
+			parts: []mcpContentPart{{Type: "audio", MimeType: "audio/wav", Data: "AAAA"}},
+			want:  []string{"audio", "3 bytes"},
+		},
+		{
+			name:  "unknown part type is named",
+			parts: []mcpContentPart{{Type: "blob", Data: "AAAAAAAA"}},
+			want:  []string{"[blob content: 6 bytes]"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := renderToolContent(tt.parts)
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("renderToolContent = %q, want it to contain %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderToolContentNeverEmpty pins the invariant that matters to the
+// model: a successful call always yields a non-empty tool result, so an
+// image-only or structured-only reply cannot read as "nothing happened".
+func TestRenderToolContentNeverEmpty(t *testing.T) {
+	if got := renderToolContent(nil); got != "" {
+		t.Fatalf("renderToolContent(nil) = %q, want empty (the caller substitutes a notice)", got)
+	}
+	var structured toolCallResult
+	if err := json.Unmarshal([]byte(`{"structuredContent":{"ok":true,"count":2}}`), &structured); err != nil {
+		t.Fatal(err)
+	}
+	if len(structured.StructuredContent) == 0 {
+		t.Fatal("structuredContent not captured")
+	}
+	if got := renderStructuredContent(structured.StructuredContent); !strings.Contains(got, `"ok": true`) {
+		t.Fatalf("renderStructuredContent = %q, want indented JSON", got)
+	}
+}
+
+// TestBase64DecodedLen pins the size math used in non-text placeholders
+// (padding is what makes it not exactly 3/4 of the encoded length).
+func TestBase64DecodedLen(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{"", 0},
+		{"AAAA", 3},
+		{"AAA=", 2},
+		{"AA==", 1},
+	}
+	for _, tt := range tests {
+		if got := base64DecodedLen(tt.in); got != tt.want {
+			t.Fatalf("base64DecodedLen(%q) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
 }
 
 func TestBytesTrimSpace(t *testing.T) {

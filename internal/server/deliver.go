@@ -40,7 +40,7 @@ const (
 	// deliverFromChildMessage is a send_message delivery into a child's
 	// runtime: the delivered turn's exact returned output is the reply
 	// the parent asked for, so this source arms the start hook and
-	// per-invocation result callback (backgroundChild.onTurnResult).
+	// per-invocation result callback (subagents.Child.OnTurnResult).
 	deliverFromChildMessage
 )
 

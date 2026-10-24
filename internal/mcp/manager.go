@@ -22,16 +22,29 @@ import (
 )
 
 const (
-	// mcpCallTimeout is the default bound for one MCP JSON-RPC call when the
-	// caller has not supplied its own deadline. A caller with a longer
-	// deadline (a legitimately long-running tools/call) is honored as-is
-	// rather than being capped here.
-	mcpCallTimeout = 30 * time.Second
-	// mcpInitTimeout bounds initialize + tools/list during NewManager so a
-	// hung MCP stdio server cannot stall process startup for a full
-	// mcpCallTimeout per server.
-	mcpInitTimeout         = 5 * time.Second
+	// defaultCallTimeout is the default bound for one MCP JSON-RPC call when
+	// the caller has not supplied its own deadline and the server entry does
+	// not override it (mcp_servers[].tool_timeout_secs). It is deliberately
+	// generous: a reverse-engineering MCP server spends minutes inside a
+	// native analysis engine (Ghidra/Hopper/IDA startup, binary indexing)
+	// before it produces anything, and the previous 30s cap turned those
+	// calls into spurious "context deadline exceeded" failures. A caller
+	// with its own deadline (a turn the user cancels) still wins.
+	defaultCallTimeout = 10 * time.Minute
+	// defaultInitTimeout bounds initialize + tools/list during NewManager so
+	// a hung MCP stdio server cannot stall the tool registry forever. It is
+	// generous because the common way to publish an MCP server is
+	// `npx -y <package>`, and a cold npx start downloads the package before
+	// it speaks MCP at all; the old 5s bound silently dropped such servers.
+	// Initialization runs off the startup path (startMCP), so a long bound
+	// costs no startup latency.
+	defaultInitTimeout = 60 * time.Second
+	// mcpMaxSkippedResponses is how many responses with an ID that was never
+	// issued are tolerated before the connection is declared broken.
 	mcpMaxSkippedResponses = 100
+	// maxToolsListPages bounds tools/list pagination: a server that keeps
+	// returning a nextCursor must not make tool discovery loop forever.
+	maxToolsListPages = 100
 )
 
 // mcpMaxLineBytes bounds one MCP stdio message line read by readLoop. A broken
@@ -64,6 +77,11 @@ type Client struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+
+	// callTimeout is the default deadline applied to one JSON-RPC call when
+	// the caller supplies none (server entry tool_timeout_secs, or
+	// defaultCallTimeout). Immutable after startClient.
+	callTimeout time.Duration
 
 	mu         sync.Mutex
 	writeMu    sync.Mutex
@@ -101,18 +119,16 @@ type Manager struct {
 
 // ValidServers returns entries that have both a name and a command.
 // Incomplete stubs (mcp: on with placeholder objects) are dropped so
-// NewManager is never asked to spawn empty exec.Command values.
+// NewManager is never asked to spawn empty exec.Command values, and an empty
+// result is nil so callers can test it as "no servers". The validity rule
+// itself lives in config.ValidMCPServers, which also answers
+// Config.MCPActive (the config-derived predicate behind the model-facing tool
+// set).
 func ValidServers(servers []config.MCPServerConfig) []config.MCPServerConfig {
 	if len(servers) == 0 {
 		return nil
 	}
-	out := make([]config.MCPServerConfig, 0, len(servers))
-	for _, s := range servers {
-		if strings.TrimSpace(s.Name) == "" || strings.TrimSpace(s.Command) == "" {
-			continue
-		}
-		out = append(out, s)
-	}
+	out := config.ValidMCPServers(servers)
 	if len(out) == 0 {
 		return nil
 	}
@@ -132,17 +148,23 @@ func NewManager(servers []config.MCPServerConfig) (*Manager, error) {
 			log.Printf("mcp: server %q failed to start: %v", s.Name, err)
 			continue
 		}
-		initCtx, cancel := context.WithTimeout(context.Background(), mcpInitTimeout)
+		initTimeout := initTimeoutFor(s)
+		initCtx, cancel := context.WithTimeout(context.Background(), initTimeout)
 		err = c.initialize(initCtx)
 		if err != nil {
 			cancel()
 			_ = c.Close()
+			// A slow launcher (cold `npx -y <package>`) is the common cause
+			// of a handshake timeout, so name the bound that was hit: without
+			// it the server just vanishes from the toolset with no trace.
+			log.Printf("mcp: server %q failed to initialize within %s: %v (raise mcp_servers[].init_timeout_secs if the launcher is slow)", s.Name, initTimeout, err)
 			continue
 		}
 		tools, err := c.listTools(initCtx)
 		cancel()
 		if err != nil {
 			_ = c.Close()
+			log.Printf("mcp: server %q failed to list tools: %v", s.Name, err)
 			continue
 		}
 		for _, tool := range tools {
@@ -151,6 +173,28 @@ func NewManager(servers []config.MCPServerConfig) (*Manager, error) {
 		m.clients = append(m.clients, c)
 	}
 	return m, nil
+}
+
+// initTimeoutFor resolves how long one server's initialize + tools/list may
+// take: the entry's init_timeout_secs when set (0 = default), else
+// defaultInitTimeout.
+func initTimeoutFor(s config.MCPServerConfig) time.Duration {
+	if s.InitTimeoutSecs > 0 {
+		return time.Duration(s.InitTimeoutSecs) * time.Second
+	}
+	return defaultInitTimeout
+}
+
+// callTimeoutFor resolves the default deadline for one tools/call on this
+// server: the entry's tool_timeout_secs when set (0 = default), else
+// defaultCallTimeout. A non-positive result would mean "no bound", which the
+// config layer never produces; negative values fall back to the default so a
+// typo cannot remove the safety net.
+func callTimeoutFor(s config.MCPServerConfig) time.Duration {
+	if s.ToolTimeoutSecs > 0 {
+		return time.Duration(s.ToolTimeoutSecs) * time.Second
+	}
+	return defaultCallTimeout
 }
 
 func startClient(s config.MCPServerConfig) (*Client, error) {
@@ -180,12 +224,13 @@ func startClient(s config.MCPServerConfig) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{
-		cmd:        cmd,
-		stdin:      stdin,
-		stdout:     stdoutPipe,
-		pending:    make(map[int64]chan jsonRPCResponse),
-		closed:     make(chan struct{}),
-		readerDone: make(chan struct{}),
+		cmd:         cmd,
+		stdin:       stdin,
+		stdout:      stdoutPipe,
+		callTimeout: callTimeoutFor(s),
+		pending:     make(map[int64]chan jsonRPCResponse),
+		closed:      make(chan struct{}),
+		readerDone:  make(chan struct{}),
 	}
 	go c.readLoop()
 	return c, nil
@@ -274,33 +319,63 @@ func (c *Client) initialize(ctx context.Context) error {
 	return c.notify("notifications/initialized", map[string]any{})
 }
 
+// mcpTool is one entry of a tools/list response.
+type mcpTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"inputSchema"`
+}
+
+// listTools fetches the server's full tool set, following nextCursor
+// pagination. A large catalog (REA's server publishes tools for many analysis
+// families) may be split across pages by the server; stopping at the first page would
+// hide every tool after the first batch with no trace. Pagination is bounded
+// by maxToolsListPages so a server that always returns a cursor cannot loop
+// forever, and a repeated page is deduplicated instead of registered twice.
 func (c *Client) listTools(ctx context.Context) ([]llm.Tool, error) {
-	raw, err := c.call(ctx, "tools/list", map[string]any{})
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		Tools []struct {
-			Name        string         `json:"name"`
-			Description string         `json:"description"`
-			InputSchema map[string]any `json:"inputSchema"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, err
-	}
-	out := make([]llm.Tool, 0, len(result.Tools))
-	for _, t := range result.Tools {
-		params := t.InputSchema
-		if params == nil {
-			params = map[string]any{"type": "object", "properties": map[string]any{}}
+	var out []llm.Tool
+	seen := make(map[string]struct{})
+	cursor := ""
+	for page := 0; page < maxToolsListPages; page++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
 		}
-		out = append(out, llm.Tool{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  params,
-		})
+		raw, err := c.call(ctx, "tools/list", params)
+		if err != nil {
+			return nil, err
+		}
+		var result struct {
+			Tools      []mcpTool `json:"tools"`
+			NextCursor string    `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		for _, t := range result.Tools {
+			if _, dup := seen[t.Name]; dup {
+				continue
+			}
+			seen[t.Name] = struct{}{}
+			schema := t.InputSchema
+			if schema == nil {
+				schema = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			out = append(out, llm.Tool{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  schema,
+			})
+		}
+		if result.NextCursor == "" || result.NextCursor == cursor {
+			return out, nil
+		}
+		cursor = result.NextCursor
 	}
+	// The page budget ran out with a cursor still pending: keep what was
+	// discovered (a partial toolset beats none), but say so rather than
+	// silently dropping the tail of the catalog.
+	log.Printf("mcp: tools/list still paginating after %d pages; keeping the %d tools discovered so far", maxToolsListPages, len(out))
 	return out, nil
 }
 
@@ -312,28 +387,119 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	if err != nil {
 		return "", err
 	}
-	var result struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		IsError bool `json:"isError"`
-	}
+	var result toolCallResult
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return string(raw), nil
 	}
-	var b strings.Builder
-	for i, part := range result.Content {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(part.Text)
+	out := renderToolContent(result.Content)
+	if strings.TrimSpace(out) == "" && len(result.StructuredContent) > 0 {
+		// Structured-only results (MCP 2025-06-18 servers) would otherwise
+		// reach the model as an empty tool result.
+		out = renderStructuredContent(result.StructuredContent)
 	}
-	out := b.String()
 	if result.IsError {
+		if out == "" {
+			out = "(the tool reported an error but returned no content)"
+		}
 		return out, fmt.Errorf("mcp tool error")
 	}
+	if out == "" {
+		out = "(the tool completed successfully but returned no content)"
+	}
 	return out, nil
+}
+
+// mcpResource is the embedded-resource payload of a resource content part.
+type mcpResource struct {
+	URI      string `json:"uri"`
+	MimeType string `json:"mimeType"`
+	Text     string `json:"text"`
+}
+
+// mcpContentPart is one part of a tools/call result content array. Only the
+// fields the renderer needs are decoded; unknown part types are reported by
+// type name instead of vanishing.
+type mcpContentPart struct {
+	Type     string       `json:"type"`
+	Text     string       `json:"text"`
+	MimeType string       `json:"mimeType"`
+	Data     string       `json:"data"`
+	Resource *mcpResource `json:"resource"`
+}
+
+type toolCallResult struct {
+	Content           []mcpContentPart `json:"content"`
+	StructuredContent json.RawMessage  `json:"structuredContent"`
+	IsError           bool             `json:"isError"`
+}
+
+// renderToolContent flattens a content array into the string a tool result
+// carries. Text parts pass through; every other part becomes an explicit
+// placeholder carrying its type and size, because silently dropping them
+// turned an image- or resource-only result into an empty tool result that
+// the model reads as "the tool did nothing" (and then retries). REA returns
+// screenshots and binary-analysis artifacts this way.
+func renderToolContent(parts []mcpContentPart) string {
+	var b strings.Builder
+	writePart := func(s string) {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(s)
+	}
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			writePart(part.Text)
+		case "image", "audio":
+			mime := part.MimeType
+			if mime == "" {
+				mime = "unknown type"
+			}
+			writePart(fmt.Sprintf("[%s content: %s, %d bytes — not attached to the conversation]",
+				part.Type, mime, base64DecodedLen(part.Data)))
+		case "resource":
+			switch {
+			case part.Resource == nil:
+				writePart("[resource content]")
+			case part.Resource.Text != "":
+				writePart(fmt.Sprintf("[resource %s]\n%s", part.Resource.URI, part.Resource.Text))
+			default:
+				writePart(fmt.Sprintf("[resource %s (%s) — content not inlined]", part.Resource.URI, part.Resource.MimeType))
+			}
+		default:
+			writePart(fmt.Sprintf("[%s content: %d bytes]", part.Type, base64DecodedLen(part.Data)))
+		}
+	}
+	return b.String()
+}
+
+// renderStructuredContent renders a structured-only result as indented JSON.
+func renderStructuredContent(raw json.RawMessage) string {
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, raw, "", "  "); err != nil {
+		return string(raw)
+	}
+	return pretty.String()
+}
+
+// base64DecodedLen returns the decoded byte length of a base64 payload
+// without allocating the decoded bytes; it only feeds the size in a
+// placeholder, so a non-base64 or padded value just needs to be close.
+func base64DecodedLen(data string) int {
+	if data == "" {
+		return 0
+	}
+	n := len(data) * 3 / 4
+	if strings.HasSuffix(data, "==") {
+		n -= 2
+	} else if strings.HasSuffix(data, "=") {
+		n--
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (c *Client) notify(method string, params any) error {
@@ -353,21 +519,25 @@ func (c *Client) notify(method string, params any) error {
 	return err
 }
 
-// withCallTimeout bounds an MCP request with the default mcpCallTimeout only
-// when the caller has not imposed its own deadline. A caller-provided
-// deadline is honored as-is — even when it is longer than mcpCallTimeout —
-// so a legitimately long-running tools/call is not reported as failed after
-// 30s. initialize/listTools always pass their own init deadline, so they stay
-// bounded. The returned CancelFunc is never nil; callers may defer it.
-func withCallTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+// withCallTimeout bounds an MCP request with the client's default call
+// timeout only when the caller has not imposed its own deadline. A
+// caller-provided deadline is honored as-is — even when it is longer than
+// the default — so a legitimately long-running tools/call is not reported as
+// failed early. initialize/listTools always pass their own init deadline, so
+// they stay bounded. The returned CancelFunc is never nil; callers may defer
+// it.
+func (c *Client) withCallTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, mcpCallTimeout)
+	if c.callTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.callTimeout)
 }
 
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	ctx, cancel := withCallTimeout(ctx)
+	ctx, cancel := c.withCallTimeout(ctx)
 	defer cancel()
 
 	select {

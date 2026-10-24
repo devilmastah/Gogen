@@ -117,7 +117,7 @@ While in the TUI:
 | `/think` | Set thinking/reasoning level (`off`/`low`/`medium`/`high`) or show the current level |
 | `/context` | Show context window usage (tokens used, limit, compact threshold) |
 | `/new` | Start a fresh session; previous session is saved to disk |
-| `/subagents` | Show nested (subagent) sessions that ran in this session, with their final reports (when `subagent: on`) |
+| `/subagents` | Show the nested (subagent) sessions that ran in this session, with their final reports and status (when `subagent: on`); live children also appear as nested rows in the sessions panel |
 | `/resume` | List saved sessions (with message count and label) |
 | `/resume <id>` | Restore a saved session |
 | `/resume latest` | Restore the most recent session other than the current one |
@@ -162,10 +162,13 @@ YAML config
 command_safety: blocklist
 openai_model: gpt-4o
 mcp: on
+mcp_tool_mode: nested  # nested (default) = one `mcp` gateway tool; inline = one definition per server tool
 mcp_servers:
   - name: fetch
     command: npx
     args: ["-y", "@modelcontextprotocol/server-fetch"]
+    # init_timeout_secs: 60   # handshake bound (default 60); raise for a cold npx start
+    # tool_timeout_secs: 600  # per-call default (default 600); raise for long-running tools
 board: on          # project kanban board (board tool + web board tab)
 subagent: on       # subagent tool (nested sessions)
 subagent_max_depth: 2  # max nesting; 1 (default) = subagents cannot spawn subagents
@@ -196,7 +199,8 @@ Config values follow a strict schema: unknown keys are ignored, `on`/`off`
 settings are strings, booleans are `true`/`false`, list settings are
 comma-separated strings (e.g. `command_allowlist: "go,git"`,
 `treesitter_langs: "go,python"`), integers are YAML integers, and `mcp_servers`
-is a YAML list of objects (`name`, `command`, `args`, `env`). An empty or zero
+is a YAML list of objects (`name`, `command`, `args`, `env`, and the optional
+`init_timeout_secs` / `tool_timeout_secs`). An empty or zero
 value means "use the default", with these exceptions where `0` is a real
 setting:
 
@@ -359,7 +363,90 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
-| `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env}` (overrides file) |
+| `GOGEN_MCP_TOOL_MODE` | `nested` | `nested` exposes every MCP tool through one `mcp` gateway tool; `inline` inlines one definition per server tool (also set `mcp_tool_mode` in project config) |
+| `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env, init_timeout_secs, tool_timeout_secs}` (overrides file) |
+
+Each `mcp_servers` entry may also set `init_timeout_secs` (handshake bound,
+default 60s) and `tool_timeout_secs` (default deadline for one `tools/call`,
+default 600s); `0` keeps the default. Both exist for servers whose launcher or
+tools are slow: a cold `npx -y <package>` start and a tool that runs a native
+analysis engine take minutes, not seconds. A turn you cancel still aborts the
+call immediately. Tool catalog pagination (`nextCursor`) is followed, and a
+result carrying images, resources, or only `structuredContent` reaches the
+model as a described placeholder instead of an empty tool result.
+
+#### Tool exposure: nested (default) or inline
+
+MCP servers publish their own tool catalogs; inlining them adds one definition
+per server tool to every request. `mcp_tool_mode` controls that:
+
+- **`nested`** (default) — the only MCP tool in the list is `mcp`, a gateway
+  with an action enum: `list` (names + one-line summaries, optional `query`),
+  `describe` (one tool's argument schema), and `call` (run one tool with an
+  `arguments` object). The model's tool list stays a fixed size no matter how
+  many servers connect, and the names/schemas are only materialized when the
+  model asks for them. It is act-mode only, matching the plan-mode rule for MCP
+  tools.
+- **`inline`** — every discovered `mcp_<server>_<tool>` is added to the tool
+  list with its full schema, the historical behavior. Better when a server
+  contributes only one or two tools and you would rather not pay the discovery
+  step.
+
+Nested mode also keeps the request cacheable. Provider prompt caching matches a
+byte-exact request prefix, and tool definitions plus the system prompt lead that
+prefix — so adding a definition (or letting one appear when a server finishes
+its handshake) invalidates the whole conversation. GoGen therefore decides the
+mode from **config**, before the first request, and never from the live
+registry: a slow `npx -y <package>` server connecting after turn 1 leaves the
+tool list and system prompt byte-identical. Inline mode has no such guarantee —
+its definitions are the server's and can only appear once it has answered.
+
+### Reverse engineering with REA
+
+[REA](https://github.com/morluto/rea) is an MCP server for reverse engineering:
+it inspects native binaries, JavaScript/Electron apps, .NET assemblies, Android
+APKs, firmware, and websites, and returns pseudocode, assembly, strings,
+metadata and the evidence behind each finding. Deep native analysis uses your
+own Hopper, Ghidra or IDA install (static JavaScript/.NET inspection needs no
+engine).
+
+GoGen runs REA as a normal stdio MCP server (`npx -y rea-agents mcp` is the
+same command REA publishes for manual registration), so nothing is generated by
+REA's own setup step — add the entry to `.gogen/gogen.conf`:
+
+```yaml
+mcp: on
+mcp_servers:
+  - name: rea
+    command: npx
+    args: ["-y", "rea-agents", "mcp"]
+    # A cold npx download can outlast the 60s handshake bound.
+    init_timeout_secs: 120
+    # Provider (Ghidra/Hopper/IDA) startup plus indexing is slow; raise this
+    # if a call times out on a large binary.
+    tool_timeout_secs: 1800
+```
+
+Requirements are REA's: Node.js 22.x (>=22.23.4), 24.x (>=24.22.1), or 26.12.1+,
+plus npm. Then ask for the analysis in plain English. REA publishes a tool per
+analysis family, so the default `mcp_tool_mode: nested` keeps the model's tool
+list at a fixed size: the agent discovers what it needs with `action=list` and
+runs it by name (the gateway resolves `mcp_rea_<tool>` and `<tool>` alike).
+Set `mcp_tool_mode: inline` if you would rather have every REA tool inlined as
+its own `mcp_rea_<tool>` definition.
+
+```
+> Use rea to work out how this binary computes the sound pan value
+> Inspect app.asar with rea and explain how the clipboard bridge works
+```
+
+Useful knobs on the REA side (set them in the entry's `env`, which is passed to
+the server process):
+
+| Variable | Description |
+|----------|-------------|
+| `REA_MCP_INPUT_SCHEMA_PROFILE` | `compact` (default) keeps tool schemas small in the request; `full` advertises the complete field guidance |
+| `REA_GHIDRA_STARTUP_TIMEOUT_MS` / `REA_HOPPER_STARTUP_TIMEOUT_MS` | Raise the provider's own startup deadline for large binaries (this is separate from `tool_timeout_secs`, which bounds the call from GoGen's side) |
 
 ### Agent features
 
@@ -368,7 +455,7 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_BOARD` | off | Set to `on` to enable the project kanban board (board tool + web board tab; live-toggleable from the web settings modal) |
 | `GOGEN_SUBAGENT` | off | Set to `on` to enable the subagent tool (nested sessions) |
 | `GOGEN_SUBAGENT_MAX_DEPTH` | `1` | Maximum subagent nesting depth (main agent = depth 0); `1` = subagents cannot spawn subagents; values ≤ 0 fall back to the default |
-| `GOGEN_SUBAGENT_MAX_CONCURRENT` | `4` | Maximum subagents running concurrently per session (web mode); spawning beyond it is refused. Interrupted (idle) subagents do not hold a slot. The TUI runs subagents one at a time, so it is unaffected; values ≤ 0 fall back to the default |
+| `GOGEN_SUBAGENT_MAX_CONCURRENT` | `4` | Maximum subagents running concurrently per session (web and TUI); spawning beyond it is refused. Interrupted (idle) subagents do not hold a slot; values ≤ 0 fall back to the default |
 | `GOGEN_SUBAGENT_MODEL` | *(empty)* | Default model for spawned subagents (empty = inherit the parent's model; the tool's explicit `model` argument always wins) |
 | `GOGEN_SUBAGENT_THINKING_LEVEL` | *(empty)* | Reasoning-effort level for spawned subagents (empty = inherit the parent session's live level; `off` = never send `reasoning_effort`). A level the subagent's final model does not accept is omitted at spawn time |
 | `GOGEN_BOARD_START_PROMPT` | *(empty)* | Template for the agent started from a board ticket (`{id}` `{title}` `{description}` `{priority}` `{context}`; empty = built-in default) |
@@ -604,27 +691,32 @@ mode it is fixed to the project directory and the input is hidden.
   default" button restores the built-in; a value equal to the built-in default
   is treated as unset, so the default text is never baked into the config
   file.
-- **TUI subagents are foreground-only in v1**: the TUI's `subagent` tool runs
-  the child to completion inline and returns the final report, but
-  `run_in_background` and the control tools (`subagent_fork`, `list_agents`,
-  `get_agent_result`, `wait_agent`, `send_message`, `interrupt_agent`) are
-  web-only — they depend on the web server's session registry and delivery
-  worker.
-- **A child has one logical return path** (web, like the other agent
-  harnesses): the run's final message — the `subagent` tool result for a
-  foreground child, or a compact terminal event for a background one — plus
-  one exact reply per `send_message`. Background parents use `wait_agent` to
-  block for the main run and `get_agent_result` to pull its authoritative
-  bounded report; the report remains available from the persisted child after
-  the live retention window. Children never push interim progress into the
-  parent conversation as turns; the parent checks `list_agents` (which lists
-  each child's latest progress line) and the user watches the child pane.
+- **Both frontends run the same subagent lifecycle** (shared
+  `internal/subagents`): `run_in_background` and the control tools
+  (`subagent_fork`, `list_agents`, `get_agent_result`, `wait_agent`,
+  `send_message`, `interrupt_agent`) exist in the web UI and the TUI alike.
+  A background child keeps running after the spawning tool call returns, is
+  listed and steerable from a later turn, and is cancelled with its parent
+  session (and on quit). The TUI hosts a child as a live pane in the same
+  session list: its row nests under the parent and opens into a normal
+  transcript (streaming, cancel, join mid-turn).
+- **A child has one logical return path** (like the other agent harnesses):
+  the run's final message — the `subagent` tool result for a foreground child,
+  or a compact terminal event for a background one — plus one exact reply per
+  `send_message`. Background parents use `wait_agent` to block for the main run
+  and `get_agent_result` to pull its authoritative bounded report; the report
+  remains available from the persisted child after the live retention window.
+  Children never push interim progress into the parent conversation as turns;
+  the parent checks `list_agents` (which lists each child's latest progress
+  line) and the user watches the child pane.
 - **Max concurrent subagents** (`subagent_max_concurrent`, default `4`): caps
-  how many subagents may run at the same time for one session (web mode). The
-  Agent tab's numeric input live-toggles it like the depth field; spawning
-  beyond the cap is refused with an error the agent can act on
-  (`interrupt_agent` a running child or wait for one to finish). The TUI runs
-  subagents one at a time, so the setting has no effect there.
+  how many subagents may run at the same time for one session, in both the web
+  UI and the TUI. The Agent tab's numeric input live-toggles it like the depth
+  field; spawning beyond the cap is refused with an error the agent can act on
+  (`interrupt_agent` a running child or wait for one to finish). An
+  interrupted (idle) child no longer holds a slot; a separate internal guard
+  bounds non-finished children so a spawn+interrupt loop cannot accumulate
+  runtimes.
 - **Subagent reasoning effort** (`subagent_thinking_level`): the Agent tab's
   **Subagent reasoning effort** picker sits next to the model picker and is
   model-aware — its options are the selected subagent model's accepted
@@ -808,19 +900,25 @@ The agent has access to the following tools:
 | `call_graph` | Call relationships / impact analysis for a symbol (`direction=impact`) |
 | `todo` | Manage todo items: add/list/done/remove/clear |
 | `board` | Project kanban board (when `board: on`): list/show/add/update/claim/move/block/comment/done/remove (update edits title/description/priority/context; remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
-| `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the bounded final report returns as the foreground tool result. Set `run_in_background=true` in web mode to return a child id and receive a compact terminal event. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
-| `subagent_fork` | Fork a child session seeded with a deep copy of this session's history and run one turn on it (web only, when `subagent: on`) |
-| `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth, and each child's latest progress line (web only, when `subagent: on`) |
-| `get_agent_result` | Get a background subagent's current status or authoritative final result by id; the persisted result remains available after the live child is released (web only, when `subagent: on`) |
-| `wait_agent` | Wait up to `timeout_ms` (default 60000, max 600000) for a background subagent's main run to finish; timeout/cancellation leaves the child running (web only, when `subagent: on`) |
-| `send_message` | Queue a message for a background subagent of this session — running, interrupted, or finished-but-retained. It runs after any current child turn; its exact reply is injected into this session when that turn finishes (web only, when `subagent: on`) |
-| `interrupt_agent` | Cancel the current main or follow-up turn of a live background subagent; an interrupted main run remains continuable (web only, when `subagent: on`) |
+| `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the bounded final report returns as the foreground tool result. Set `run_in_background=true` to return a child id immediately and receive a compact terminal event when it finishes. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
+| `subagent_fork` | Fork a child session seeded with a deep copy of this session's history and run one turn on it (when `subagent: on`) |
+| `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth, and each child's latest progress line (when `subagent: on`) |
+| `get_agent_result` | Get a background subagent's current status or authoritative final result by id; the persisted result remains available after the live child is released (when `subagent: on`) |
+| `wait_agent` | Wait up to `timeout_ms` (default 60000, max 600000) for a background subagent's main run to finish; timeout/cancellation leaves the child running (when `subagent: on`) |
+| `send_message` | Queue a message for a background subagent of this session — running, interrupted, or finished-but-retained. It runs after any current child turn; its exact reply is injected into this session when that turn finishes (when `subagent: on`) |
+| `interrupt_agent` | Cancel the current main or follow-up turn of a live background subagent; an interrupted main run remains continuable (when `subagent: on`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |
 | `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |
 | `background_job` | Manage a background job (`execute_command background=true`): `action=status` (output tail), `action=wait` (block until it exits; `timeout_ms` default 60s, max 10m — on timeout the job keeps running), `action=cancel`, `action=input` (write to the job's stdin), or `action=list` (every live job in this session) |
 
-Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>`. The system prompt carries the `Additional mcp_* tools may be available.` line only while such a registry is attached — with MCP off (the default) the session never advertises tools it does not have.
+With `mcp_tool_mode: nested` (the default) the model also gets one `mcp` tool —
+`action=list` (names + one-line summaries, optional `query`), `action=describe`
+(one tool's argument schema), `action=call` (run one tool with an `arguments`
+object) — which reaches every connected server's tools. With
+`mcp_tool_mode: inline`, server tools are instead listed individually.
+
+Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>` (inline mode). The system prompt carries the `Additional mcp_* tools may be available.` line only while such a registry is attached — with MCP off (the default) the session never advertises tools it does not have.
 
 ## Safety
 

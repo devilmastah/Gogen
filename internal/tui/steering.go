@@ -37,6 +37,13 @@ type steerItem struct {
 	// individually cancellable, and never dropped by the user-interrupt
 	// clear.
 	system bool
+	// child marks a TARGETED delivery into a subagent child (send_message):
+	// it is never batched with notices (its reply capture is armed per turn
+	// and must stay 1:1 with the tool call), never dropped by overflow, and
+	// its exact turn output is injected into the parent as the reply. Only
+	// this source arms the capture — a child's reaction to any other machine
+	// message must not be mistaken for a reply the parent asked for.
+	child *childHandle
 }
 
 var (
@@ -124,7 +131,17 @@ func (m *Model) enqueueSteer(text string) tea.Cmd {
 // streaming turn). The FOCUSED-session mirrors (m.streaming, progress
 // strip, chat line, composer relayout) are the caller's business — see
 // startTurn.
-func (m *Model) startTurnOn(sess *liveSession, text string) tea.Cmd {
+// startTurnOnWithResult runs a turn on sess (focused or background) with the
+// per-session wiring shared by every turn entry point (seq, cancel ctx,
+// adapter, delete approver). Callers must ensure sess is idle (no streaming
+// turn). The FOCUSED-session mirrors (m.streaming, progress strip, chat line,
+// composer relayout) are the caller's business — see startTurnWithResult.
+//
+// onResult is optional and runs on the turn's own goroutine when
+// StreamProcessInput returns, so a caller that needs the authoritative output
+// (a subagent's main run, or the exact reply to a send_message) never has to
+// infer it from the transcript. onResult must not touch Update-thread state.
+func (m *Model) startTurnOnWithResult(sess *liveSession, text string, onResult func(string, error)) tea.Cmd {
 	sess.streaming = true
 	// Bump the turn generation BEFORE the goroutine starts: every message
 	// this turn emits (and its terminal) carries the new seq, so a later
@@ -137,20 +154,43 @@ func (m *Model) startTurnOn(sess *liveSession, text string) tea.Cmd {
 	}
 	streamCtx, cancelFn := context.WithCancel(base)
 	sess.cancel = cancelFn
+	// Mirror the cancel handle onto the child handle so interrupt_agent (the
+	// parent's tool goroutine) can cancel this exact turn without touching
+	// Update-thread state.
+	child := sess.child
+	if child != nil {
+		child.setTurn(cancelFn)
+	}
 
-	adapter := NewStreamAdapter(sess.id, seq, m.program, sess)
+	// A nil program means no renderer (headless host, tests): pass a TRUE nil
+	// sender rather than a typed-nil *tea.Program, so the adapter's send path
+	// can drop rendering events instead of dereferencing a nil receiver.
+	var sender programSender
+	if m.program != nil {
+		sender = m.program
+	}
+	adapter := NewStreamAdapter(sess.id, seq, sender, sess)
 	a := sess.agent
 	if a == nil {
 		a = m.agent
 	}
-	approver := m.makeDeleteApprover(sess.id, m.program)
+	approver := m.makeDeleteApprover(sess.id, sender)
 	return func() tea.Msg {
 		defer cancelFn()
-		_, err := a.StreamProcessInput(
+		out, err := a.StreamProcessInput(
 			agent.ContextWithDeleteApprover(streamCtx, approver),
 			text,
 			adapter.Handlers(),
 		)
+		// Clear the child's in-flight turn as soon as the turn goroutine is
+		// done producing output; the sink below may resolve a waiter that
+		// reads Busy immediately afterwards.
+		if child != nil {
+			child.turnDone()
+		}
+		if onResult != nil {
+			onResult(out, err)
+		}
 		if err != nil {
 			return failOfStream(sess.id, seq, err)
 		}
@@ -176,9 +216,12 @@ func (m *Model) drainSessionQueue(s *liveSession) tea.Cmd {
 	if s == nil || s.streaming || s.compacting || len(s.steerQueue) == 0 {
 		return nil
 	}
+	// A notice run shares ONE turn (one provider request); a TARGETED
+	// send_message delivery always gets its own turn, because its reply
+	// capture is armed per delivery and must stay 1:1 with the tool call.
 	n := 1
-	if s.steerQueue[0].system {
-		for n < len(s.steerQueue) && s.steerQueue[n].system {
+	if s.steerQueue[0].system && s.steerQueue[0].child == nil {
+		for n < len(s.steerQueue) && s.steerQueue[n].system && s.steerQueue[n].child == nil {
 			n++
 		}
 	}
@@ -196,14 +239,38 @@ func (m *Model) drainSessionQueue(s *liveSession) tea.Cmd {
 		text = strings.Join(texts, "\n\n")
 		display = strings.Join(texts, "\n")
 	}
+	var onResult func(string, error)
+	if item.child != nil {
+		// Targeted delivery: arm the exact-reply capture for THIS turn and
+		// resolve it into the parent conversation when the turn ends. The
+		// queue depth is re-mirrored so Busy sees the remaining backlog.
+		h := item.child
+		if child := h.childOf(); child != nil {
+			child.BeginReply()
+		}
+		h.setQueueDepth(countQueuedChildItems(s.steerQueue, h))
+		onResult = childTurnResultSink(m.spawner, h, false)
+	}
 	focused := m.lives != nil && m.lives.Active() == s
 	if focused {
 		if item.system {
-			return m.startTurn(text, SystemStyle.Render(noticeLabel+" "+display))
+			return m.startTurnWithResult(text, SystemStyle.Render(noticeLabel+" "+display), onResult)
 		}
-		return m.startTurn(text, UserStyle.Render(userLabel)+" "+text)
+		return m.startTurnWithResult(text, UserStyle.Render(userLabel)+" "+text, onResult)
 	}
-	return m.startTurnOn(s, text)
+	return m.startTurnOnWithResult(s, text, onResult)
+}
+
+// countQueuedChildItems counts the queued targeted deliveries still waiting for
+// handle h (its own backlog), so the handle's busy mirror stays honest.
+func countQueuedChildItems(queue []steerItem, h *childHandle) int {
+	n := 0
+	for _, it := range queue {
+		if it.child == h {
+			n++
+		}
+	}
+	return n
 }
 
 // noticeTarget resolves the session a system delivery was raised for: the
@@ -216,6 +283,12 @@ func (m *Model) noticeTarget(sid string) *liveSession {
 	if sid != "" && m.lives != nil {
 		if s := m.lives.ByID(sid); s != nil {
 			return s
+		}
+		// Subagent notices name the parent by SESSION id (the lifecycle only
+		// knows session ids); slots that do not carry their session id as the
+		// routing id (the root slot "s1") resolve here.
+		if i := m.lives.indexBySessionID(sid); i >= 0 {
+			return m.lives.ByIndex(i)
 		}
 	}
 	return m.turnSession()

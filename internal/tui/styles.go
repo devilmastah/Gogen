@@ -19,6 +19,7 @@ func init() {
 		ansiPromptOn = ""
 		ansiCyanOn = ""
 		ansiGreenOn = ""
+		ansiRedOn = ""
 		ansiReset = ""
 	} else {
 		ansiHighlightOn = "\x1b[1m\x1b[38;2;0;170;170m"
@@ -26,6 +27,7 @@ func init() {
 		ansiPromptOn = "\x1b[38;2;204;170;0m"
 		ansiCyanOn = "\x1b[38;2;0;170;170m"
 		ansiGreenOn = "\x1b[38;2;0;170;0m"
+		ansiRedOn = "\x1b[38;2;200;60;60m"
 		// Only reset foreground + bold, never background.
 		// This keeps the overlay's #1a1a1a background alive past
 		// the end of styled text, preventing black gaps and bleed.
@@ -43,6 +45,7 @@ var (
 	ansiPromptOn    string // yellow
 	ansiCyanOn      string // cyan (no bold)
 	ansiGreenOn     string // green (sidebar "active" state dot)
+	ansiRedOn       string // red (failed subagent child dot)
 	ansiReset       string // \x1b[39m\x1b[22m — fg+bold only
 )
 

@@ -688,6 +688,13 @@ func (m *Model) flushAndQuit() {
 // lost even though the default agent was still covered by main's deferred
 // FlushPending.
 func (m *Model) flushAllSessions() {
+	// Every continuable child is cancelled and released first: a child whose
+	// host is going away has nobody to deliver to, and an unreleased child
+	// would keep a turn goroutine writing while the process tears the
+	// terminal down (the web host's cascade, at host scope).
+	if m.spawner != nil {
+		m.spawner.CancelAllChildren()
+	}
 	if m.agent != nil {
 		m.agent.FlushPending()
 	}

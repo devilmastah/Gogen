@@ -574,7 +574,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		// A finished continuable child's completion notice already
 		// delivered its outcome: its delete is housekeeping, no notice.
 		if sp, ok := s.ws.SubagentSpawner.(*subagentSpawner); ok {
-			if c := sp.children.get(id); c != nil && c.isFinished() {
+			if c := sp.Get(id); c != nil && c.IsFinished() {
 				notifyParent = false
 			}
 		}

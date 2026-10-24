@@ -54,6 +54,16 @@ type liveSession struct {
 	label string
 	agent *agent.Agent
 
+	// parentID is the owning session id for a NESTED (subagent) slot, empty
+	// for a user session: it is what nests the sidebar row and what makes the
+	// slot a child's pane. Immutable after admission.
+	parentID string
+	// child is the continuable-subagent handle for a child slot (nil for user
+	// sessions). The handle mirrors the few fields the parent's tool goroutine
+	// needs (turn state, queue depth, cancel), so nothing here is touched
+	// off the Update thread.
+	child *childHandle
+
 	cancel    context.CancelFunc // cancels the in-flight turn; nil when idle
 	streaming bool
 	// turnSeq is the generation of the in-flight turn: incremented on every
@@ -295,6 +305,53 @@ func (ls *liveSessions) Add(a *agent.Agent, label string) *liveSession {
 	s := &liveSession{id: nextLiveID(ls), label: label, agent: a, lastActive: time.Now()}
 	ls.sessions = append(ls.sessions, s)
 	return s
+}
+
+// AddChild registers a NESTED (subagent) child as a live session. The slot's
+// routing id IS the child's session id: every stream event, terminal and
+// notice for that child already carries it, so no extra id space is needed
+// (and session.NewID cannot collide with the "sN" slot ids). Children are
+// added unstreaming and unfocused; RunTurn starts their first turn.
+func (ls *liveSessions) AddChild(a *agent.Agent, label string, h *childHandle) *liveSession {
+	id := a.SessionID
+	if id == "" {
+		id = nextLiveID(ls)
+	}
+	s := &liveSession{
+		id:         id,
+		label:      label,
+		agent:      a,
+		parentID:   a.ParentID(),
+		child:      h,
+		lastActive: time.Now(),
+	}
+	ls.sessions = append(ls.sessions, s)
+	return s
+}
+
+// indexOf returns the slot index of s, or -1.
+func (ls *liveSessions) indexOf(s *liveSession) int {
+	for i, cur := range ls.sessions {
+		if cur == s {
+			return i
+		}
+	}
+	return -1
+}
+
+// remove drops the slot at index i, keeping the focused slot focused (a child
+// leaving the registry must not steal focus from the user's session).
+func (ls *liveSessions) remove(i int) {
+	if i < 0 || i >= len(ls.sessions) {
+		return
+	}
+	ls.sessions = append(ls.sessions[:i], ls.sessions[i+1:]...)
+	if ls.active > i {
+		ls.active--
+	}
+	if ls.active >= len(ls.sessions) && len(ls.sessions) > 0 {
+		ls.active = len(ls.sessions) - 1
+	}
 }
 
 // Switch focuses session i, flipping the adapter gates accordingly.
@@ -569,6 +626,12 @@ func (ls *liveSessions) Close(i int) error {
 	s := ls.sessions[i]
 	if i == ls.active {
 		return fmt.Errorf("session %q is focused", s.label)
+	}
+	if s.child != nil {
+		// A nested (subagent) slot is owned by the continuable lifecycle: it
+		// leaves the registry through release (retention, parent teardown, or
+		// the sidebar's close action), never by dropping the slot here.
+		return fmt.Errorf("session %q is a subagent child — release it instead", s.label)
 	}
 	if s.streaming {
 		return fmt.Errorf("session %q is streaming — cancel its turn first", s.label)

@@ -507,16 +507,25 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	// context change applies to sessions created afterwards too.
 	runtimeCfg := ws.GetRuntimeConfig()
 	opts := agent.SessionAgentOptions{
-		Provider:             ws.ProviderFactory(),
-		Executor:             ws.Exec,
-		Config:               &runtimeCfg,
-		GlobalMode:           ws.GlobalMode,
-		ProjectFilePath:      ws.ProjectFilePath,
-		ProjectGuidelines:    ws.ProjectGuidelines,
-		TestCommand:          ws.TestCommand,
-		LintCommand:          ws.LintCommand,
-		WorkingDir:           ws.GetWorkingDir(),
-		MCPRegistry:          ws.MCPRegistry,
+		Provider:          ws.ProviderFactory(),
+		Executor:          ws.Exec,
+		Config:            &runtimeCfg,
+		GlobalMode:        ws.GlobalMode,
+		ProjectFilePath:   ws.ProjectFilePath,
+		ProjectGuidelines: ws.ProjectGuidelines,
+		TestCommand:       ws.TestCommand,
+		LintCommand:       ws.LintCommand,
+		WorkingDir:        ws.GetWorkingDir(),
+		MCPRegistry:       ws.MCPRegistry,
+		// Exposure policy comes from the STARTUP config, not the runtime
+		// overlay and not the live registry. The MCP manager's lifecycle is
+		// bound to startup config (the settings modal marks `mcp` as
+		// restart-scoped), so a live toggle must not add or remove the gateway
+		// while the servers keep running (or stay stopped) underneath; and a
+		// registry-derived answer would move the request prefix mid-session,
+		// because the tool set and system prompt lead it.
+		MCPConfigured:        ws.Config.MCPActive(),
+		MCPNested:            ws.Config.MCPNested(),
 		ToolHandlers:         ws.buildToolHandlers(),
 		DebugCompareMessages: ws.DebugCompareMessages,
 		ThinkingLevel:        agent.ThinkingLevel(ws.ThinkingLevel),

@@ -31,6 +31,14 @@ type TUI struct {
 	// both frontends drive one implementation. May be nil (tests/embedders).
 	workspace *server.Workspace
 
+	// spawner is the ONE nested-session runner of this host. It is installed
+	// on the workspace (so every session the workspace creates — opened panes,
+	// resumed sessions, and the children themselves — inherits it) and on the
+	// root agent, exactly like the web server's workspace spawner. The Model
+	// attaches its /subagents list when it is built. Nil when subagents are
+	// disabled.
+	spawner *tuiSubagentSpawner
+
 	// program is the running Bubble Tea program, stored atomically: it is
 	// written in Run and read by ForceRender from the background
 	// validation goroutine.
@@ -58,6 +66,18 @@ func New(a *agent.Agent, cfg *config.Config) *TUI {
 // single-session behavior (New callers, tests).
 func NewWithWorkspace(a *agent.Agent, cfg *config.Config, ws *server.Workspace) *TUI {
 	t := &TUI{agent: a, cfg: cfg, workspace: ws}
+	// Nested sessions run through one host-level spawner, wired here rather
+	// than per Model: the workspace seeds it into every session it creates
+	// (like the web server) and the root agent gets it explicitly (it was
+	// built by setup, not by the workspace). A nil workspace keeps the
+	// per-Model fallback (tests, single-session embeds).
+	if a != nil && cfg != nil && cfg.SubagentEnabled() {
+		t.spawner = newTUISubagentSpawner(cfg, ws)
+		if ws != nil {
+			ws.SubagentSpawner = t.spawner
+		}
+		a.SetSubagentSpawner(t.spawner)
+	}
 	// Background validation (ValidateRestoredModel) may clear or
 	// auto-select a restored session's model after the UI opened; hook it
 	// so the status bar re-renders even while the terminal is idle.
@@ -112,6 +132,7 @@ func (t *TUI) Run(ctx context.Context) {
 	m := NewModel(t.agent, t.cfg)
 	m.ctx = ctx
 	m.workspace = t.workspace
+	m.spawner = t.spawner
 
 	// From here until p.Run returns, the inline renderer owns the terminal:
 	// divert every diagnostic write away from it (see divertTerminalWrites
@@ -134,6 +155,16 @@ func (t *TUI) Run(ctx context.Context) {
 
 	m.program = p
 	t.program.Store(p)
+	// The lifecycle reaches the Update thread through the program: install the
+	// sender now that it exists (before the event loop starts, so no turn can
+	// observe a half-wired spawner).
+	sender := hostSender{p: p, updating: &m.inUpdate, stopped: &m.programStopped}
+	if t.spawner != nil {
+		t.spawner.setSender(func() programSender { return sender }, &m.programStopped)
+	}
+	if m.spawner != nil && m.spawner != t.spawner {
+		m.spawner.setSender(func() programSender { return sender }, &m.programStopped)
+	}
 	// Startup notices must never hit the terminal as raw stderr writes: the
 	// inline renderer owns every row of the terminal-height frame, and an
 	// untracked line above it forces unaccounted scrolls that desync the
@@ -171,6 +202,9 @@ func (t *TUI) Run(ctx context.Context) {
 	}
 
 	_, runErr := p.Run()
+	// The loop is gone: host posts from the teardown sweep below would block
+	// forever on the program's channel.
+	m.programStopped.Store(true)
 	// The renderer has released the terminal, so restore the real stderr
 	// before anything else reports: a fatal TUI error and the teardown sweep
 	// below belong on the shell, not in the diversion sink.
