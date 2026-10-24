@@ -253,7 +253,18 @@ func TestToolCallsParallelCancelStillClosesEveryToolCall(t *testing.T) {
 
 	builtin := BuiltinToolHandlers()
 	orig := builtin["read_file"]
+	// entered is signalled by each call that starts executing. The cancel must
+	// wait for BOTH: a fixed sleep raced a loaded (or -race) runner, and a
+	// cancel that lands before the tool round begins means the round never
+	// runs — no assistant tool_calls message and no results at all, which is
+	// protocol-clean but is NOT what this test asserts (it reported the
+	// misleading "tool call c1 missing a result after cancel").
+	entered := make(chan struct{}, 2) // one slot per call in this batch
 	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]any) (string, error) {
+		select {
+		case entered <- struct{}{}:
+		default: // more calls than the buffer: never block the tool
+		}
 		// Block long enough for the cancel to land mid-flight.
 		select {
 		case <-ctx.Done():
@@ -270,7 +281,15 @@ func TestToolCallsParallelCancelStillClosesEveryToolCall(t *testing.T) {
 		defer close(done)
 		_, _ = a.StreamProcessInput(ctx, "read", nil)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(30 * time.Second):
+			cancel()
+			<-done
+			t.Fatalf("only %d of 2 parallel tool calls started before the wait timed out", i)
+		}
+	}
 	cancel()
 	<-done
 
