@@ -6,6 +6,9 @@
 /gogen-test
 /gogen_test
 
+# Test binaries produced by `go test -c` (e.g. agent.test)
+*.test
+
 # --- Profiling data ---
 *.prof
 
