@@ -152,6 +152,19 @@ func TestDefaultTimeoutsFitNativeAnalysis(t *testing.T) {
 	}
 }
 
+func TestMaxInitTimeoutUsesServerOverride(t *testing.T) {
+	got := MaxInitTimeout([]config.MCPServerConfig{
+		{Name: "fast"},
+		{Name: "rea", InitTimeoutSecs: 120},
+	})
+	if got != 120*time.Second {
+		t.Fatalf("MaxInitTimeout = %s, want 120s", got)
+	}
+	if got := MaxInitTimeout(nil); got != defaultInitTimeout {
+		t.Fatalf("MaxInitTimeout(nil) = %s, want %s", got, defaultInitTimeout)
+	}
+}
+
 // TestRenderToolContent covers the flattening of a tools/call content array:
 // text passes through, and non-text parts (which used to be dropped, leaving
 // an empty tool result) become explicit placeholders carrying their type and

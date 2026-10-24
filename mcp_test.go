@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/mcp"
 )
@@ -66,4 +67,37 @@ func TestCloseMCPAfterInitCompletes(t *testing.T) {
 	h := startMCP(nil, mcpTestConfig(t))
 	<-h.done
 	closeMCP(h) // must not block or panic
+}
+
+// TestStartMCPSharesRegistryBeforeHandshake pins the web-session bug: the
+// workspace copies a.MCPRegistry when the server is built, which is before
+// the handshake goroutine returns. The shared registry has to be installed
+// synchronously so that copy, and every later session, sees Publish.
+func TestStartMCPSharesRegistryBeforeHandshake(t *testing.T) {
+	origNew := newMCPManager
+	t.Cleanup(func() { newMCPManager = origNew })
+	started := make(chan struct{})
+	release := make(chan struct{})
+	newMCPManager = func(servers []config.MCPServerConfig) (*mcp.Manager, error) {
+		close(started)
+		<-release
+		return &mcp.Manager{}, nil
+	}
+
+	a := &agent.Agent{}
+	h := startMCP(a, mcpTestConfig(t))
+	if a.MCPRegistry == nil {
+		t.Fatal("registry must be installed before the handshake finishes")
+	}
+	if _, ok := a.MCPRegistry.(*agent.PendingMCPRegistry); !ok {
+		t.Fatalf("registry type = %T, want *agent.PendingMCPRegistry", a.MCPRegistry)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handshake constructor was not started")
+	}
+	close(release)
+	<-h.done
 }

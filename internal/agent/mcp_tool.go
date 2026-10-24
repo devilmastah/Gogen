@@ -143,9 +143,9 @@ func handleMCP(ctx context.Context, a *Agent, args map[string]any) (string, erro
 	}
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "list":
-		return a.mcpListTools(args)
+		return a.mcpListTools(ctx, args)
 	case "describe":
-		return a.mcpDescribeTool(args)
+		return a.mcpDescribeTool(ctx, args)
 	case "call":
 		return a.mcpCallTool(ctx, args)
 	case "":
@@ -157,17 +157,27 @@ func handleMCP(ctx context.Context, a *Agent, args map[string]any) (string, erro
 
 // mcpRegistryOrError returns the MCP registry, or a diagnostic that tells the
 // model what to do when a configured server has not attached (yet).
-func (a *Agent) mcpRegistryOrError() (MCPToolRegistry, error) {
+//
+// A registry installed before the handshake (PendingMCPRegistry) is shared by
+// every session. Wait here so the first list/call blocks until that handshake
+// finishes or its init timeout elapses, instead of failing instantly and
+// leaving a session that copied a nil pointer unable to ever see the tools.
+func (a *Agent) mcpRegistryOrError(ctx context.Context) (MCPToolRegistry, error) {
 	if a.MCPRegistry == nil {
 		return nil, fmt.Errorf("no MCP server is connected yet (the servers are configured but none finished its handshake); retry this call shortly, or report that MCP is unavailable if it keeps failing")
+	}
+	if w, ok := a.MCPRegistry.(MCPRegistryWaiter); ok {
+		if err := w.Wait(ctx); err != nil {
+			return nil, err
+		}
 	}
 	return a.MCPRegistry, nil
 }
 
 // mcpListTools implements action=list: sorted names with a one-line summary,
 // filtered by the optional query and bounded by mcpListLimit.
-func (a *Agent) mcpListTools(args map[string]any) (string, error) {
-	reg, err := a.mcpRegistryOrError()
+func (a *Agent) mcpListTools(ctx context.Context, args map[string]any) (string, error) {
+	reg, err := a.mcpRegistryOrError(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -222,8 +232,8 @@ func (a *Agent) mcpListTools(args map[string]any) (string, error) {
 
 // mcpDescribeTool implements action=describe: the resolved name, its
 // description, and the indented JSON input schema.
-func (a *Agent) mcpDescribeTool(args map[string]any) (string, error) {
-	reg, err := a.mcpRegistryOrError()
+func (a *Agent) mcpDescribeTool(ctx context.Context, args map[string]any) (string, error) {
+	reg, err := a.mcpRegistryOrError(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -262,7 +272,7 @@ func (a *Agent) mcpDescribeTool(args map[string]any) (string, error) {
 // (object or JSON string), and dispatch to the server. A tool error keeps the
 // server's text so the model can act on it.
 func (a *Agent) mcpCallTool(ctx context.Context, args map[string]any) (string, error) {
-	reg, err := a.mcpRegistryOrError()
+	reg, err := a.mcpRegistryOrError(ctx)
 	if err != nil {
 		return "", err
 	}
