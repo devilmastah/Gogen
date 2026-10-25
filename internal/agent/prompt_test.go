@@ -90,6 +90,14 @@ func TestMCPHintGateIsConfigDerived(t *testing.T) {
 	if hint < 0 || profile < 0 || hint > profile {
 		t.Fatalf("suffix = %q, want the MCP hint before the project profile", suffix)
 	}
+
+	plan := buildSystemSuffix("", "", "", ModePlan, mcpGatewayHint)
+	if !strings.Contains(plan, mcpGatewayHint) || !strings.Contains(plan, "MCP tools are disabled until act mode.") {
+		t.Fatalf("plan suffix = %q, want the call shape and the act-mode gate", plan)
+	}
+	if strings.Contains(suffix, "disabled until act mode") {
+		t.Fatalf("act suffix advertises the plan-mode gate: %q", suffix)
+	}
 }
 
 // TestReadFileSchemaDropsDeprecatedAlias pins the schema cleanup: the

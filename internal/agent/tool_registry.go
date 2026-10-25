@@ -122,13 +122,11 @@ func (a *Agent) featureTools() []featureTool {
 		)
 	}
 	if a.mcpGatewayEnabled() {
-		// MCP gateway (mcp_tool_mode: nested): one fixed definition that
-		// reaches every configured MCP server's tools by name. Act-mode only,
-		// matching the plan-mode gate on inlined MCP tools (isMCPTool). The
-		// definition is CONSTANT — no tool counts or server names — so the
-		// request prefix stays byte-stable across turns and sessions, which is
-		// the point of the nested mode.
-		out = append(out, featureTool{Name: mcpToolName, Definition: mcpToolDef(), Handler: handleMCP})
+		// Nested MCP (mcp_tool_mode: nested): three fixed tools. Act-mode
+		// only, matching the plan-mode gate on inlined MCP tools (isMCPTool).
+		// The definitions are constant, so the request prefix stays
+		// byte-stable across turns and sessions.
+		out = append(out, mcpGatewayFeatureTools()...)
 	}
 	return out
 }

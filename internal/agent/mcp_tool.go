@@ -10,10 +10,15 @@ import (
 	"gogen/internal/llm"
 )
 
-// The MCP gateway tool (`mcp`) is the "nested" MCP exposure mode
-// (mcp_tool_mode: nested, the default): every MCP server tool is reachable
-// through ONE model-facing definition with an action enum, instead of inlining
-// one definition per server tool.
+// Nested MCP exposure (mcp_tool_mode: nested, the default) reaches every
+// server tool through three fixed definitions — mcp_list, mcp_describe, and
+// mcp_call — instead of inlining one definition per server tool.
+//
+// Three tools, not one tool with an action enum: smaller and quantized models
+// drop a required discriminator and nest the whole call under a parameter
+// named arguments, because that word is already the tool-call envelope. The
+// tool name carries the operation, and the server tool's own parameters live
+// in input.
 //
 // Why nested is the default:
 //   - Prompt caching. A provider caches a byte-exact request prefix, and tool
@@ -21,12 +26,12 @@ import (
 //     messages). Inlining a catalog makes the prefix grow with the catalog and
 //     change whenever the registry attaches, a server reconnects, or an MCP
 //     tool shadows a builtin — every such change invalidates the whole
-//     conversation, not a tail slice. The gateway is one fixed definition, so
-//     the prefix is identical for every session regardless of how many servers
-//     exist.
+//     conversation, not a tail slice. The three gateway definitions are fixed,
+//     so the prefix is identical for every session regardless of how many
+//     servers exist.
 //   - Context budget. A reverse-engineering server publishes dozens of tools;
 //     their names, descriptions and JSON schemas are re-sent on every round.
-//     Here they cost one definition and are only materialized when the model
+//     Here they cost three definitions and are only materialized when the model
 //     asks (and the answer lands in the message tail, where it invalidates
 //     nothing before it).
 //
@@ -34,10 +39,16 @@ import (
 // live registry: that is what keeps the prefix stable while a slow
 // `npx`-launched server is still connecting.
 
-// mcpToolName is the gateway tool's name. Deliberately not prefixed with
-// "mcp_" so it never collides with an inlined server tool name and so
-// isMCPTool (plan-mode gate for the "mcp_" prefix) does not classify it.
-const mcpToolName = "mcp"
+const (
+	mcpListTool     = "mcp_list"
+	mcpDescribeTool = "mcp_describe"
+	mcpCallTool     = "mcp_call"
+)
+
+// mcpGatewayToolNames is the nested-mode tool set, in definition order.
+func mcpGatewayToolNames() []string {
+	return []string{mcpListTool, mcpDescribeTool, mcpCallTool}
+}
 
 // mcpListLimit bounds one `list` answer. A bigger catalog is reported as a
 // count with a hint to narrow the query rather than dumped whole.
@@ -72,8 +83,8 @@ func (a *Agent) MCPNested() bool {
 	return a.mcpNested.Load()
 }
 
-// mcpGatewayEnabled reports whether the `mcp` tool is part of this session's
-// tool set.
+// mcpGatewayEnabled reports whether the nested MCP tools are part of this
+// session's tool set.
 func (a *Agent) mcpGatewayEnabled() bool {
 	return a.MCPConfigured() && a.MCPNested()
 }
@@ -93,66 +104,87 @@ func (a *Agent) mcpToolHint() string {
 	}
 }
 
-// mcpToolDef is the gateway definition. Its text is CONSTANT: no tool counts,
-// no server names, no health — anything volatile here would change the request
-// prefix on every turn and defeat the caching this mode exists to protect.
-// The catalog itself is returned by the list action (in the message tail).
-func mcpToolDef() llm.Tool {
+// mcpGatewayFeatureTools is the nested-mode tool set. Each definition is
+// CONSTANT: no tool counts, no server names, no health. Anything volatile
+// here would change the request prefix on every turn.
+func mcpGatewayFeatureTools() []featureTool {
+	return []featureTool{
+		{Name: mcpListTool, Definition: mcpListToolDef(), Handler: handleMCPList},
+		{Name: mcpDescribeTool, Definition: mcpDescribeToolDef(), Handler: handleMCPDescribe},
+		{Name: mcpCallTool, Definition: mcpCallToolDef(), Handler: handleMCPCall},
+	}
+}
+
+func mcpListToolDef() llm.Tool {
 	return llm.Tool{
-		Name: mcpToolName,
-		Description: "Call the tools of connected MCP servers (reverse engineering, browser, " +
-			"issue trackers, and other external tool servers). Actions: " +
-			"list — names and one-line summaries of the available MCP tools (optional query filter); " +
-			"describe — the full argument schema of one tool; " +
-			"call — run one tool with a JSON arguments object. " +
-			"Always list before the first call so you use a name and arguments that exist. " +
-			"MCP tools are disabled in plan mode.",
+		Name: mcpListTool,
+		Description: "List the tools published by connected MCP servers. " +
+			"Returns names and a one-line summary. Optional query is a case-insensitive filter. " +
+			"Example: {\"query\":\"decompile\"}. Call this before mcp_describe or mcp_call. " +
+			"Disabled in plan mode.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"action": map[string]any{
-					"type":        "string",
-					"enum":        []string{"list", "describe", "call"},
-					"description": "list to discover tools, describe for one tool's schema, call to run one.",
-				},
 				"query": map[string]any{
 					"type":        "string",
-					"description": "list: case-insensitive filter over tool names and descriptions (e.g. \"binary\" or \"decompile\").",
-				},
-				"tool": map[string]any{
-					"type":        "string",
-					"description": "describe/call: the tool name, with or without the mcp_ prefix (e.g. mcp_rea_inspect or rea_inspect).",
-				},
-				"arguments": map[string]any{
-					"type":        "object",
-					"description": "call: the tool's arguments as an object (a JSON-encoded string is also accepted).",
+					"description": "Optional filter over tool names and descriptions (e.g. \"binary\" or \"decompile\").",
 				},
 			},
-			"required": []string{"action"},
 		},
 	}
 }
 
-// handleMCP is the gateway handler. It dispatches one action against the MCP
-// registry; the registry may still be nil (a configured server that is slow to
-// connect), which is reported as a retryable error instead of a missing tool.
-func handleMCP(ctx context.Context, a *Agent, args map[string]any) (string, error) {
-	action, err := stringArg(args, "action")
-	if err != nil {
-		return "", err
+func mcpDescribeToolDef() llm.Tool {
+	return llm.Tool{
+		Name: mcpDescribeTool,
+		Description: "Show one MCP tool's argument schema. tool is a name from mcp_list, with or without the mcp_ prefix. " +
+			"Example: {\"tool\":\"mcp_rea_xrefs\"}. Disabled in plan mode.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tool": map[string]any{
+					"type":        "string",
+					"description": "Tool name from mcp_list (e.g. mcp_rea_inspect or rea_inspect).",
+				},
+			},
+			"required": []string{"tool"},
+		},
 	}
-	switch strings.ToLower(strings.TrimSpace(action)) {
-	case "list":
-		return a.mcpListTools(ctx, args)
-	case "describe":
-		return a.mcpDescribeTool(ctx, args)
-	case "call":
-		return a.mcpCallTool(ctx, args)
-	case "":
-		return "", fmt.Errorf("missing required argument %q (list, describe, or call)", "action")
-	default:
-		return "", fmt.Errorf("unknown action %q (want list, describe, or call)", action)
+}
+
+func mcpCallToolDef() llm.Tool {
+	return llm.Tool{
+		Name: mcpCallTool,
+		Description: "Run one MCP tool. tool is a name from mcp_list. input is only that tool's own parameters. " +
+			"Example: {\"tool\":\"mcp_rea_search_strings\",\"input\":{\"pattern\":\"demo\",\"case_sensitive\":false}}. " +
+			"Do not put tool inside input. Disabled in plan mode.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tool": map[string]any{
+					"type":        "string",
+					"description": "Tool name from mcp_list (e.g. mcp_rea_search_strings or search_strings).",
+				},
+				"input": map[string]any{
+					"type":        "object",
+					"description": "That tool's own parameters. A JSON-encoded string is also accepted. Omit when the tool takes none.",
+				},
+			},
+			"required": []string{"tool"},
+		},
 	}
+}
+
+func handleMCPList(ctx context.Context, a *Agent, args map[string]any) (string, error) {
+	return a.mcpListTools(ctx, args)
+}
+
+func handleMCPDescribe(ctx context.Context, a *Agent, args map[string]any) (string, error) {
+	return a.mcpDescribeTool(ctx, args)
+}
+
+func handleMCPCall(ctx context.Context, a *Agent, args map[string]any) (string, error) {
+	return a.mcpCallTool(ctx, args)
 }
 
 // mcpRegistryOrError returns the MCP registry, or a diagnostic that tells the
@@ -174,7 +206,7 @@ func (a *Agent) mcpRegistryOrError(ctx context.Context) (MCPToolRegistry, error)
 	return a.MCPRegistry, nil
 }
 
-// mcpListTools implements action=list: sorted names with a one-line summary,
+// mcpListTools implements mcp_list: sorted names with a one-line summary,
 // filtered by the optional query and bounded by mcpListLimit.
 func (a *Agent) mcpListTools(ctx context.Context, args map[string]any) (string, error) {
 	reg, err := a.mcpRegistryOrError(ctx)
@@ -203,7 +235,7 @@ func (a *Agent) mcpListTools(ctx context.Context, args map[string]any) (string, 
 		if len(defs) == 0 {
 			return "No MCP tools are registered yet (the configured servers have not finished connecting).", nil
 		}
-		return fmt.Sprintf("No MCP tool matches %q. %d tools are available; call action=list without a query to see them.", query, len(defs)), nil
+		return fmt.Sprintf("No MCP tool matches %q. %d tools are available; call mcp_list without a query to see them.", query, len(defs)), nil
 	}
 
 	var b strings.Builder
@@ -262,9 +294,9 @@ func (a *Agent) mcpDescribeTool(ctx context.Context, args map[string]any) (strin
 	}
 	b.WriteString("\nArguments (JSON schema):\n")
 	b.Write(encoded)
-	b.WriteString("\n\nRun it with action=call, tool=")
+	b.WriteString("\n\nRun it with mcp_call, tool=")
 	b.WriteString(name)
-	b.WriteString(", arguments={...}.")
+	b.WriteString(", input={...}.")
 	return b.String(), nil
 }
 
@@ -284,7 +316,7 @@ func (a *Agent) mcpCallTool(ctx context.Context, args map[string]any) (string, e
 	if err != nil {
 		return "", err
 	}
-	callArgs, err := mcpArguments(args["arguments"])
+	callArgs, err := mcpCallInput(args)
 	if err != nil {
 		return "", err
 	}
@@ -295,9 +327,22 @@ func (a *Agent) mcpCallTool(ctx context.Context, args map[string]any) (string, e
 	return out, nil
 }
 
-// mcpArguments normalizes the `arguments` value. Models emit either an object
+// mcpCallInput reads the server tool's parameters from input. arguments is
+// accepted as the same field when input is absent: that is the payload
+// object, not a wrapper around tool or any other gateway key.
+func mcpCallInput(args map[string]any) (map[string]any, error) {
+	if _, ok := args["input"]; ok {
+		return mcpArguments(args["input"])
+	}
+	if _, ok := args["arguments"]; ok {
+		return mcpArguments(args["arguments"])
+	}
+	return map[string]any{}, nil
+}
+
+// mcpArguments normalizes one payload value. Models emit either an object
 // or a JSON-encoded string; both are accepted. Absent/null means "no
-// arguments".
+// parameters".
 func mcpArguments(raw any) (map[string]any, error) {
 	switch v := raw.(type) {
 	case nil:
@@ -311,14 +356,14 @@ func mcpArguments(raw any) (map[string]any, error) {
 		}
 		var out map[string]any
 		if err := json.Unmarshal([]byte(trimmed), &out); err != nil {
-			return nil, fmt.Errorf("arguments must be a JSON object: %w", err)
+			return nil, fmt.Errorf("input must be a JSON object: %w", err)
 		}
 		if out == nil {
 			return map[string]any{}, nil
 		}
 		return out, nil
 	default:
-		return nil, fmt.Errorf("arguments must be a JSON object, got %T", raw)
+		return nil, fmt.Errorf("input must be a JSON object, got %T", raw)
 	}
 }
 
@@ -356,9 +401,9 @@ func resolveMCPTool(reg MCPToolRegistry, want string) (llm.Tool, string, error) 
 		return byName[matchName], matchName, nil
 	}
 	if matches > 1 {
-		return llm.Tool{}, "", fmt.Errorf("tool %q is ambiguous (%d MCP tools end with it); pass the full name from action=list", want, matches)
+		return llm.Tool{}, "", fmt.Errorf("tool %q is ambiguous (%d MCP tools end with it); pass the full name from mcp_list", want, matches)
 	}
-	return llm.Tool{}, "", fmt.Errorf("unknown MCP tool %q; call action=list to see the available tools", want)
+	return llm.Tool{}, "", fmt.Errorf("unknown MCP tool %q; call mcp_list to see the available tools", want)
 }
 
 // mcpToolMatches reports whether a tool matches a lowercased query over its
