@@ -39,6 +39,7 @@
 *.swp
 *.swo
 *~
+/.cursor/rules/
 
 # --- JS tooling (web UI lint) ---
 node_modules/
