@@ -163,7 +163,7 @@ command_safety: blocklist
 command_approval: required   # required = ask before a blocklisted command; off = refuse it outright
 openai_model: gpt-4o
 mcp: on
-mcp_tool_mode: nested  # nested (default) = one `mcp` gateway tool; inline = one definition per server tool
+mcp_tool_mode: nested  # nested (default) = mcp_list, mcp_describe, mcp_call; inline = one definition per server tool
 mcp_servers:
   - name: fetch
     command: npx
@@ -365,7 +365,7 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
-| `GOGEN_MCP_TOOL_MODE` | `nested` | `nested` exposes every MCP tool through one `mcp` gateway tool; `inline` inlines one definition per server tool (also set `mcp_tool_mode` in project config) |
+| `GOGEN_MCP_TOOL_MODE` | `nested` | `nested` exposes every MCP tool through `mcp_list`, `mcp_describe`, and `mcp_call`; `inline` inlines one definition per server tool (also set `mcp_tool_mode` in project config) |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env, init_timeout_secs, tool_timeout_secs}` (overrides file) |
 
 Each `mcp_servers` entry may also set `init_timeout_secs` (handshake bound,
@@ -381,8 +381,8 @@ Servers start in the background, and GoGen installs one shared registry
 before that handshake. The first agent, web chats opened while a server is
 still connecting, and subagents all use that same registry, so a chat created
 during startup still sees the tools when the handshake finishes. In nested
-mode, `mcp` `list`, `describe`, and `call` wait for the handshake instead of
-failing on the first try. The wait is bounded by that server's
+mode, `mcp_list`, `mcp_describe`, and `mcp_call` wait for the handshake
+instead of failing on the first try. The wait is bounded by that server's
 `init_timeout_secs`. The web settings connection test uses the same budget
 when `init_timeout_secs` is longer than its 90s floor. Set `tool_timeout_secs`
 at least as high as the server's own startup budget (for example a Ghidra
@@ -393,14 +393,16 @@ launch configured for 50 minutes) so GoGen does not end the call first.
 MCP servers publish their own tool catalogs; inlining them adds one definition
 per server tool to every request. `mcp_tool_mode` controls that:
 
-- **`nested`** (default) — the only MCP tool in the list is `mcp`, a gateway
-  with an action enum: `list` (names + one-line summaries, optional `query`),
-  `describe` (one tool's argument schema), and `call` (run one tool with an
-  `arguments` object). The model's tool list stays a fixed size no matter how
-  many servers connect, and the names/schemas are only materialized when the
-  model asks for them. A call made while the handshake is still running waits
-  for it, up to `init_timeout_secs`, and then lists or runs the tools. It is
-  act-mode only, matching the plan-mode rule for MCP tools.
+- **`nested`** (default) — the model sees three fixed tools and no server
+  catalog. `mcp_list` returns names and one-line summaries (optional `query`).
+  `mcp_describe` returns one tool's argument schema (`tool`). `mcp_call` runs
+  one tool: `tool` is the name, and `input` is only that tool's own parameters
+  (`{"tool":"mcp_rea_search_strings","input":{"pattern":"demo"}}`). There is
+  no `action` parameter. The tool list stays a fixed size no matter how many
+  servers connect, and the names/schemas are only materialized when the model
+  asks for them. A call made while the handshake is still running waits for
+  it, up to `init_timeout_secs`, and then lists or runs the tools. The three
+  tools are act-mode only, matching the plan-mode rule for MCP tools.
 - **`inline`** — every discovered `mcp_<server>_<tool>` is added to the tool
   list with its full schema, the historical behavior. Better when a server
   contributes only one or two tools and you would rather not pay the discovery
@@ -444,8 +446,8 @@ mcp_servers:
 Requirements are REA's: Node.js 22.x (>=22.23.4), 24.x (>=24.22.1), or 26.12.1+,
 plus npm. Then ask for the analysis in plain English. REA publishes a tool per
 analysis family, so the default `mcp_tool_mode: nested` keeps the model's tool
-list at a fixed size: the agent discovers what it needs with `action=list` and
-runs it by name (the gateway resolves `mcp_rea_<tool>` and `<tool>` alike).
+list at a fixed size: the agent discovers what it needs with `mcp_list` and
+runs it with `mcp_call` (the gateway resolves `mcp_rea_<tool>` and `<tool>` alike).
 Set `mcp_tool_mode: inline` if you would rather have every REA tool inlined as
 its own `mcp_rea_<tool>` definition.
 
@@ -926,11 +928,11 @@ The agent has access to the following tools:
 | `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |
 | `background_job` | Manage a background job (`execute_command background=true`): `action=status` (output tail), `action=wait` (block until it exits; `timeout_ms` default 60s, max 10m — on timeout the job keeps running), `action=cancel`, `action=input` (write to the job's stdin), or `action=list` (every live job in this session) |
 
-With `mcp_tool_mode: nested` (the default) the model also gets one `mcp` tool —
-`action=list` (names + one-line summaries, optional `query`), `action=describe`
-(one tool's argument schema), `action=call` (run one tool with an `arguments`
-object) — which reaches every connected server's tools. If the handshake is
-still running, those actions wait up to that server's `init_timeout_secs`.
+With `mcp_tool_mode: nested` (the default) the model also gets `mcp_list`
+(names + one-line summaries, optional `query`), `mcp_describe` (one tool's
+argument schema), and `mcp_call` (run one tool; `input` is that tool's own
+parameters). Those three reach every connected server. If the handshake is
+still running, they wait up to that server's `init_timeout_secs`.
 With `mcp_tool_mode: inline`, server tools are instead listed individually.
 
 Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>` (inline mode). The system prompt carries the `Additional mcp_* tools may be available.` line only while such a registry is attached — with MCP off (the default) the session never advertises tools it does not have.

@@ -18,7 +18,7 @@ func TestPendingMCPRegistryListWaitsForPublish(t *testing.T) {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		out, err := handleMCP(context.Background(), a, map[string]any{"action": "list"})
+		out, err := handleMCPList(context.Background(), a, nil)
 		ch <- result{out, err}
 	}()
 
@@ -49,7 +49,7 @@ func TestPendingMCPRegistryFailSurfacesToGateway(t *testing.T) {
 	a := newGatewayAgent(t, true, true, pending)
 	pending.Fail(errors.New("rea failed to start: node not found"))
 
-	_, err := handleMCP(context.Background(), a, map[string]any{"action": "list"})
+	_, err := handleMCPList(context.Background(), a, nil)
 	if err == nil || !strings.Contains(err.Error(), "node not found") {
 		t.Fatalf("list error = %v, want the handshake failure", err)
 	}
