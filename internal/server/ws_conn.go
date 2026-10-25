@@ -208,20 +208,24 @@ func (s *Server) unregisterWSConn(conn *websocket.Conn) {
 
 // closeWSConns force-closes all tracked WebSocket connections. Safe to call
 // concurrently with register/unregister. Never blocks on a single conn.
+//
+// Close only: gorilla permits Close to race every other method, but NOT
+// SetWriteDeadline — the writeLoop sets one per frame, and setting it here from
+// a teardown goroutine is a data race on the connection's deadline state (found
+// by -race when the handler join below started calling this in tests). Closing
+// the socket is what unblocks a reader parked in ReadJSON and a writer parked
+// in WriteMessage anyway, so the deadlines bought nothing.
 func (s *Server) closeWSConns() {
 	s.wsConnsMu.Lock()
 	conns := s.wsConns
 	s.wsConns = nil
 	s.wsConnsMu.Unlock()
-	now := time.Now()
 	for _, conn := range conns {
 		if conn == nil {
 			continue
 		}
 		c := conn
 		go func() {
-			_ = c.SetReadDeadline(now)
-			_ = c.SetWriteDeadline(now)
 			_ = c.Close()
 		}()
 	}
