@@ -143,10 +143,13 @@ func (h *stubHost) deliverTexts() []string {
 	return append([]string(nil), h.delivered...)
 }
 
-func (h *stubHost) handleOf(id string) *stubHandle {
+func (h *stubHost) releaseCount(id string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.handles[id]
+	if hnd := h.handles[id]; hnd != nil {
+		return hnd.releaseCalls
+	}
+	return 0
 }
 
 func (h *stubHost) runPromptCount() int {
@@ -337,12 +340,13 @@ func TestReleaseChildIfQuietDefersWhileBusy(t *testing.T) {
 	if sp.Get(id) == nil {
 		t.Fatal("an armed reply capture was released (the reply would be lost)")
 	}
-	// Quiet: the re-armed timer releases it.
+	// Quiet: the re-armed timer releases it. Unpublish happens before the
+	// host Release call, so wait for that call too — reading the counter
+	// off the handle races the timer's write.
 	child.SetPendingReply(false)
-	waitFor(t, 5*time.Second, "quiet child released", func() bool { return sp.Get(id) == nil })
-	if got := host.handleOf(id).releaseCalls; got != 1 {
-		t.Fatalf("host release calls = %d, want exactly 1", got)
-	}
+	waitFor(t, 5*time.Second, "quiet child released", func() bool {
+		return sp.Get(id) == nil && host.releaseCount(id) == 1
+	})
 }
 
 // TestReleaseIsIdempotent pins that concurrent release requests reach the host
@@ -369,7 +373,7 @@ func TestReleaseIsIdempotent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := host.handleOf(id).releaseCalls; got != 1 {
+	if got := host.releaseCount(id); got != 1 {
 		t.Fatalf("host release calls = %d, want exactly 1", got)
 	}
 }
