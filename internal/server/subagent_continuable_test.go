@@ -324,6 +324,15 @@ func TestSendMessageQueueFullRefuses(t *testing.T) {
 	// queued deliveries, so the spawn goroutine can exit (the provider
 	// unwinds on cancel) instead of leaking into the package teardown.
 	sp.ReleaseChild(child)
+	// A queued delivery can still take the turn lock in the cancel-to-evict
+	// window and flush the child session after ReleaseChild returns. That
+	// write recreates .gogen/sessions while TempDir is removed (Linux -race:
+	// "directory not empty"). Cancel whatever turn won the race and wait
+	// until the runtime can no longer write.
+	waitFor(t, 5*time.Second, func() bool {
+		child.Handle.stream.cancelInFlight()
+		return sessionRuntimeQuiescent(child.Handle)
+	})
 }
 
 var errFailedReply = errors.New("provider exploded")
