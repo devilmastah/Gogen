@@ -434,6 +434,7 @@ type WSMessage struct {
 	MaxToolResultBytes        int     `json:"maxToolResultBytes,omitempty"`
 	CompactReserveTokens      int     `json:"compactReserveTokens,omitempty"`
 	CompactLastResort         string  `json:"compactLastResort,omitempty"` // condense (default) | error
+	SmartCompact              string  `json:"smartCompact,omitempty"`      // off (default) | on
 	WebFetch                  string  `json:"webFetch,omitempty"`
 	WebSearch                 string  `json:"webSearch,omitempty"`
 	OutputSpill               string  `json:"outputSpill,omitempty"` // on (default) | off — spill oversized tool output to the session spill dir

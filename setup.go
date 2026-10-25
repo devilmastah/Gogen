@@ -10,6 +10,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/onoff"
 	"gogen/internal/projectfile"
 	"gogen/internal/session"
 	"gogen/internal/skills"
@@ -49,6 +50,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 		MaxToolResultBytes:        cfg.MaxToolResultBytes,
 		CompactReserveTokens:      cfg.CompactReserveTokens,
 		CompactLastResort:         cfg.CompactLastResort,
+		SmartCompact:              onoff.Enabled(cfg.SmartCompact),
 	})
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))

@@ -31,6 +31,11 @@ const (
 	// that cannot fit the context window; "error" returns a diagnostic
 	// instead.
 	DefaultCompactLastResort = "condense"
+	// DefaultSmartCompact is the smart-compact switch. Off keeps compaction
+	// at a user-message boundary. On also compacts inside a long tool loop,
+	// before the next tool runs, and stops a thinking stream while there is
+	// still room to summarize.
+	DefaultSmartCompact = "off"
 	// DefaultCommandIdleTimeoutSecs is the maximum time a foreground
 	// execute_command may run without producing any output before it is
 	// killed; 0 in the config falls back to this default.
@@ -163,6 +168,12 @@ type Config struct {
 	// sidecar and the condensation is announced in-band); "error" returns
 	// a clear diagnostic instead of condensing.
 	CompactLastResort string
+	// SmartCompact compacts inside a tool loop when the conversation is
+	// over the compact threshold, then runs the tool call that was already
+	// formed. "off" (default) leaves compaction at a user-message boundary.
+	// CompactThreshold 0 wins: the mid-think cut still happens, but nothing
+	// is summarized and the cut ends the turn with a note.
+	SmartCompact string
 
 	CommandSafetyMode string // blocklist, allowlist, off
 	CommandAllowlist  string // comma-separated when allowlist mode
@@ -370,6 +381,7 @@ func Defaults() Config {
 		MaxToolResultBytes:        DefaultMaxToolResultBytes,
 		CompactReserveTokens:      DefaultCompactReserveTokens,
 		CompactLastResort:         DefaultCompactLastResort,
+		SmartCompact:              DefaultSmartCompact,
 		CommandSafetyMode:         "blocklist",
 		CommandAllowlist:          "",
 		DeleteApproval:            "required",

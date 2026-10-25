@@ -79,6 +79,10 @@ func (r *recordingSink) OnToolResult(id, name, result string, success bool) {
 func (r *recordingSink) OnMessageAppended(index int, role string) {
 	r.record("OnMessageAppended")
 }
+func (r *recordingSink) StopStream() bool {
+	r.record("StopStream")
+	return false
+}
 func (r *recordingSink) OnStreamStats(toksPerSec float64) { r.record("OnStreamStats") }
 
 var _ Sink = (*recordingSink)(nil)
@@ -123,6 +127,8 @@ func TestBuildStreamHandlersWiresEveryCallback(t *testing.T) {
 		rec.calls = nil
 		switch fn := fv.Interface().(type) {
 		case func():
+			fn()
+		case func() bool:
 			fn()
 		case func(string):
 			fn("s")

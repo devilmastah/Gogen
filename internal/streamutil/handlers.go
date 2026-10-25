@@ -50,6 +50,11 @@ type Sink interface {
 	// attach can prove the transcript is current without a history refetch.
 	// Hosts without such a model (the TUI) treat it as a no-op.
 	OnMessageAppended(index int, role string)
+	// StopStream is polled after each streamed chunk. Hosts return false.
+	// The agent chains its own budget check on top of this callback when
+	// smart compact is on; a true return ends the stream with the text
+	// accumulated so far.
+	StopStream() bool
 	// OnStreamStats reports the SpeedMeter's smoothed token rate
 	// (tokens/sec over content, thinking, and tool-args deltas). Unlike
 	// the other methods it is not a 1:1 mapping of an llm.StreamHandlers
@@ -212,6 +217,9 @@ func BuildStreamHandlers(s Sink, cfg HandlersConfig) *llm.StreamHandlers {
 		},
 		OnMessageAppended: func(index int, role string) {
 			s.OnMessageAppended(index, role)
+		},
+		StopStream: func() bool {
+			return s.StopStream()
 		},
 	}
 }

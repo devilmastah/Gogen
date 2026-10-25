@@ -109,6 +109,7 @@ While in the TUI:
 | `exit`, `quit`, `/exit`, or `/quit` | Quit |
 | `dir <path>` | Change working directory |
 | `compact` or `/compact` | Manually compact conversation history |
+| `/smartcompact` | Smart compact for a long tool loop: `on`, `off`, or bare to toggle. Applies to this run; `/save-config` stores it. Default off |
 | `/models` | List available models |
 | `/models <name>` | Switch to a different model |
 | `/plan` | Enable plan mode (read-only) |
@@ -295,6 +296,7 @@ is passed.
 | `GOGEN_OUTPUT_SPILL` | `on` | Spill oversized tool output to `.gogen/spill/` (session-scoped; global mode: `~/.local/share/gogen/spill/`) so the inline result is a head/tail preview + locator to the saved file, instead of a lossy head-only truncation (`on`/`off`) |
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
 | `GOGEN_COMPACT_LAST_RESORT` | `condense` | `condense` or `error`: what happens when a single message cannot fit the context window even after all compaction (e.g. a fresh session whose first message is bigger than the window) |
+| `GOGEN_SMART_COMPACT` | `off` | `on` or `off` (`smart_compact` in `.gogen/gogen.conf`). When on, a tool loop that crosses the compact threshold is compacted before the next tool runs, and a thinking stream stops with room left to summarize. A tool call the model has already written runs once, after the summary. Also on the web Context tab and via `/smartcompact` |
 
 When a single message is too large for the window, there is no middle history
 to summarize — the message is the head and every request would be refused.
@@ -309,6 +311,22 @@ start a fresh session (/new)") is returned instead of the raw provider
 refusal. The path is strictly last-resort — it only fires when the request is
 provably over the window after the forced compaction, and only when condensing
 the single largest message would bring it under.
+
+Smart compact stays off unless you turn it on, so the usual path is unchanged:
+auto-compaction runs when the latest message is from you. Turn it on
+(`smart_compact: on`, `GOGEN_SMART_COMPACT=on`, the Context tab, or
+`/smartcompact on`) when a model spends a long run thinking and calling tools
+without coming back. Once the conversation crosses the compact threshold, GoGen
+summarizes before the next tool runs, then executes the tool call the model
+already wrote, once. If the thinking stream itself nears the window, it stops
+at the compact reserve plus 4,000 tokens, which leaves room for the summary. A
+complete tool call still runs after that summary. A cut in the middle of the
+arguments is dropped, and the model continues from the summary and a short
+excerpt. `compact_threshold: 0` still means "never compact automatically": it
+closes the budget tier and the window-reserve tier alike. The mid-think stop
+still uses the window, but nothing is summarized, so an unfinished tool call is
+dropped and the turn ends with a note to run `/compact`, raise
+`compact_threshold`, or start a new session. A complete tool call still runs.
 
 After each agent turn, GoGen shows context usage in the CLI (dim line) and web UI (sidebar meter). Use `/context` for a detailed breakdown. When the provider returns usage stats (`prompt_tokens` from the API, including streaming with `include_usage`), the display labels this as **last request**; otherwise it falls back to a local token estimate.
 

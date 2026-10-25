@@ -32,6 +32,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		MaxToolResultBytes:        mergeIntOpt("GOGEN_MAX_TOOL_RESULT_BYTES", file.MaxToolResultBytes, def.MaxToolResultBytes),
 		CompactReserveTokens:      mergeIntOpt("GOGEN_COMPACT_RESERVE_TOKENS", file.CompactReserveTokens, def.CompactReserveTokens),
 		CompactLastResort:         mergeString("GOGEN_COMPACT_LAST_RESORT", file.CompactLastResort, def.CompactLastResort),
+		SmartCompact:              mergeString("GOGEN_SMART_COMPACT", file.SmartCompact, def.SmartCompact),
 		CommandSafetyMode:         mergeString("GOGEN_COMMAND_SAFETY", file.CommandSafety, def.CommandSafetyMode),
 		CommandAllowlist:          mergeString("GOGEN_COMMAND_ALLOWLIST", file.CommandAllowlist, def.CommandAllowlist),
 		DeleteApproval:            mergeString("GOGEN_DELETE_APPROVAL", file.DeleteApproval, def.DeleteApproval),

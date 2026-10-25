@@ -243,6 +243,11 @@ func (sk *wsStreamSink) OnToolOutputEnd(id string, success bool) {
 	}
 }
 
+// StopStream is unused here. The agent installs the smart-compact budget
+// stop on top of this callback. The web host has no separate reason to cut
+// a stream.
+func (sk *wsStreamSink) StopStream() bool { return false }
+
 // OnMessageAppended reports the index of a message the turn just appended.
 // The agent fires it for ASSISTANT rounds only (see Agent.notifyMessageAppended):
 // reporting tool results (or the synthetic image messages) could advance the

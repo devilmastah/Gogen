@@ -83,6 +83,8 @@ func TestRuntimeConfigFieldErrors(t *testing.T) {
 			"Error: compactThreshold must be between 0 and 1"},
 		{"compactLastResort", WSMessage{Type: "config", ConfigFields: []string{"compactLastResort"}, CompactLastResort: "maybe"},
 			`Error: invalid compactLastResort "maybe" (want condense or error)`},
+		{"smartCompact", WSMessage{Type: "config", ConfigFields: []string{"smartCompact"}, SmartCompact: "sometimes"},
+			`Error: invalid smartCompact "sometimes" (want on or off)`},
 		{"sessionMaxAgeDays", WSMessage{Type: "config", ConfigFields: []string{"sessionMaxAgeDays"}, SessionMaxAgeDays: -2},
 			"Error: sessionMaxAgeDays must be >= -1 (-1 = keep sessions forever)"},
 		{"compactKeepRecentMessages", WSMessage{Type: "config", ConfigFields: []string{"compactKeepRecentMessages"}, CompactKeepRecentMessages: -1},

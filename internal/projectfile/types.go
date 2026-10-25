@@ -41,6 +41,7 @@ type FileConfig struct {
 	MaxToolResultBytes        *int                  `yaml:"max_tool_result_bytes"`        // 0 = no truncation cap
 	CompactReserveTokens      *int                  `yaml:"compact_reserve_tokens"`       // 0 = reserve no tokens
 	CompactLastResort         string                `yaml:"compact_last_resort"`          // condense (default) | error
+	SmartCompact              string                `yaml:"smart_compact"`                // off (default) | on
 	CommandSafety             string                `yaml:"command_safety"`
 	CommandAllowlist          string                `yaml:"command_allowlist"`
 	DeleteApproval            string                `yaml:"delete_approval"`
