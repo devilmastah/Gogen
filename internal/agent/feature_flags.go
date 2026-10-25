@@ -305,7 +305,7 @@ type featureWiring struct {
 	// mcpConfigured / mcpNested are the MCP exposure policy, resolved ONCE at
 	// construction from the session config (never from the live registry —
 	// see SetMCPTooling). They drive three model-facing surfaces that must
-	// agree: whether the `mcp` gateway tool is registered, whether server
+	// agree: whether the nested MCP tools are registered, whether server
 	// tool definitions are inlined into llmTools, and which MCP line the
 	// system prompt carries. Being config-derived is what keeps the request
 	// prefix byte-stable while a slow server is still connecting.

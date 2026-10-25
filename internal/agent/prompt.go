@@ -53,7 +53,7 @@ func DefaultSystemPromptTemplate() string {
 // SystemPrompt returns the effective agent system prompt: the configured
 // template (empty, or equal to the built-in default → built-in) with the
 // {working_dir} placeholder substituted. This is the base prompt only: the
-// MCP hint (when a registry is attached), the project profile, the project
+// MCP hint (when the session was configured with MCP servers), the project profile, the project
 // rules, and the plan-mode suffix are appended per agent by
 // buildSystemView / systemPromptPrefix.
 func SystemPrompt(workingDir string) string {
@@ -70,10 +70,16 @@ func SystemPrompt(workingDir string) string {
 // cache for the whole conversation. Both texts are constants: no counts, no
 // server names, nothing that changes between turns.
 const (
-	// mcpGatewayHint is the nested-mode hint (mcp_tool_mode: nested): the MCP
-	// tools are reachable through the single `mcp` tool, whose definition
-	// carries the action contract.
-	mcpGatewayHint = "MCP tools: use the mcp tool (action=list to discover, action=describe for a schema, action=call to run one)."
+	// mcpGatewayHint is the nested-mode hint (mcp_tool_mode: nested). The base
+	// system prompt does not mention MCP; this constant is the only prompt
+	// text that explains the gateway, so it carries the call shape. It stays
+	// a constant: no counts, no server names, nothing that changes between
+	// turns.
+	mcpGatewayHint = "MCP servers are reached through three tools: mcp_list, mcp_describe, and mcp_call. There is no action parameter. " +
+		"mcp_list takes an optional query, for example {\"query\":\"decompile\"}. " +
+		"mcp_describe takes tool, for example {\"tool\":\"mcp_rea_xrefs\"}. " +
+		"mcp_call takes tool and input. input holds only that tool's own parameters, for example {\"tool\":\"mcp_rea_search_strings\",\"input\":{\"pattern\":\"demo\",\"case_sensitive\":false}}. " +
+		"Do not put tool inside input."
 	// mcpInlineHint is the inline-mode hint: the server tools are inlined into
 	// the definition list under their mcp_* names.
 	mcpInlineHint = "Additional mcp_* tools may be available."
@@ -144,6 +150,9 @@ func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode 
 	}
 	if mode == ModePlan {
 		suffix.WriteString(planModePromptSuffix)
+		if mcpHint != "" {
+			suffix.WriteString("\nMCP tools are disabled until act mode.")
+		}
 	}
 	return suffix.String()
 }

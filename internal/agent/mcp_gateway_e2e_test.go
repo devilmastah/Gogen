@@ -138,8 +138,8 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 
 	a := newGatewayAgent(t, true, true, mgr.Registry())
 	defs := a.llmTools()
-	if len(defs) != baselineTools+1 {
-		t.Fatalf("nested mode tool count = %d, want %d (builtins + the single gateway)", len(defs), baselineTools+1)
+	if len(defs) != baselineTools+len(mcpGatewayToolNames()) {
+		t.Fatalf("nested mode tool count = %d, want %d (builtins + the gateway tools)", len(defs), baselineTools+len(mcpGatewayToolNames()))
 	}
 	for _, def := range defs {
 		if strings.HasPrefix(def.Name, "mcp_rea_") {
@@ -148,13 +148,13 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	run := func(args map[string]any) (string, error) {
+	run := func(name string, args map[string]any) (string, error) {
 		t.Helper()
-		return a.executeTool(ctx, llm.ToolCall{ID: "c1", Name: "mcp", Args: args})
+		return a.executeTool(ctx, llm.ToolCall{ID: "c1", Name: name, Args: args})
 	}
 
 	t.Run("list", func(t *testing.T) {
-		out, err := run(map[string]any{"action": "list", "query": "screenshot"})
+		out, err := run(mcpListTool, map[string]any{"query": "screenshot"})
 		if err != nil {
 			t.Fatalf("list: %v", err)
 		}
@@ -167,7 +167,7 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 	})
 
 	t.Run("describe", func(t *testing.T) {
-		out, err := run(map[string]any{"action": "describe", "tool": "rea_say"})
+		out, err := run(mcpDescribeTool, map[string]any{"tool": "rea_say"})
 		if err != nil {
 			t.Fatalf("describe: %v", err)
 		}
@@ -177,10 +177,9 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 	})
 
 	t.Run("call by bare name", func(t *testing.T) {
-		out, err := run(map[string]any{
-			"action":    "call",
-			"tool":      "rea_say",
-			"arguments": map[string]any{"text": "hello rea"},
+		out, err := run(mcpCallTool, map[string]any{
+			"tool":  "rea_say",
+			"input": map[string]any{"text": "hello rea"},
 		})
 		if err != nil {
 			t.Fatalf("call: %v", err)
@@ -191,10 +190,9 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 	})
 
 	t.Run("call by full name with JSON-string arguments", func(t *testing.T) {
-		out, err := run(map[string]any{
-			"action":    "call",
-			"tool":      "mcp_rea_say",
-			"arguments": `{"text":"json string"}`,
+		out, err := run(mcpCallTool, map[string]any{
+			"tool":  "mcp_rea_say",
+			"input": `{"text":"json string"}`,
 		})
 		if err != nil {
 			t.Fatalf("call: %v", err)
@@ -205,7 +203,7 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 	})
 
 	t.Run("image-only result reaches the model as a placeholder", func(t *testing.T) {
-		out, err := run(map[string]any{"action": "call", "tool": "rea_screenshot"})
+		out, err := run(mcpCallTool, map[string]any{"tool": "rea_screenshot"})
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
@@ -215,7 +213,7 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 	})
 
 	t.Run("unknown tool", func(t *testing.T) {
-		if _, err := run(map[string]any{"action": "call", "tool": "nope"}); err == nil {
+		if _, err := run(mcpCallTool, map[string]any{"tool": "nope"}); err == nil {
 			t.Fatal("expected an unknown-tool error")
 		}
 	})
@@ -223,7 +221,7 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 	t.Run("plan mode refuses the gateway", func(t *testing.T) {
 		a.Mode = ModePlan
 		defer func() { a.Mode = ModeAct }()
-		if _, err := run(map[string]any{"action": "list"}); err == nil {
+		if _, err := run(mcpListTool, map[string]any{}); err == nil {
 			t.Fatal("plan mode must refuse the gateway")
 		}
 	})
@@ -236,7 +234,7 @@ func TestAgentMCPGatewayEndToEnd(t *testing.T) {
 		if len(defs) != baselineTools+e2eToolCount+2 {
 			t.Fatalf("inline mode tool count = %d, want %d (builtins + the whole catalog)", len(defs), baselineTools+e2eToolCount+2)
 		}
-		if containsName(defs, mcpToolName) {
+		if gatewayCount(defs) != 0 {
 			t.Fatal("inline mode must not register the gateway")
 		}
 		if !containsName(defs, "mcp_rea_say") {

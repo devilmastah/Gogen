@@ -142,7 +142,7 @@ func (a *Agent) AllowedToolNames() map[string]struct{} {
 	}
 	if a.Mode != ModePlan && a.MCPRegistry != nil && !a.MCPNested() {
 		// Inlined server tools are exposed (and therefore callable) only in
-		// inline mode; nested mode reaches them through the `mcp` feature tool,
+		// inline mode; nested mode reaches them through mcp_list, mcp_describe, and mcp_call,
 		// which the featureTools loop above already added.
 		for name := range a.MCPRegistry.ToolNames() {
 			out[name] = struct{}{}

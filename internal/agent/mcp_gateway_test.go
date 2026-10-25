@@ -100,6 +100,27 @@ func containsName(defs []llm.Tool, name string) bool {
 	return false
 }
 
+func gatewayCount(defs []llm.Tool) int {
+	n := 0
+	for _, name := range mcpGatewayToolNames() {
+		if containsName(defs, name) {
+			n++
+		}
+	}
+	return n
+}
+
+func gatewayAllowed(a *Agent) int {
+	n := 0
+	allowed := a.AllowedToolNames()
+	for _, name := range mcpGatewayToolNames() {
+		if _, ok := allowed[name]; ok {
+			n++
+		}
+	}
+	return n
+}
+
 // TestMCPGatewayToolGating pins the single gating policy across all three tool
 // surfaces: in nested mode the gateway is the ONLY MCP tool the model sees (its
 // fixed definition is what keeps the request prefix stable), in inline mode the
@@ -123,14 +144,18 @@ func TestMCPGatewayToolGating(t *testing.T) {
 			a := newGatewayAgent(t, tt.configured, tt.nested, reg)
 			defs := a.llmTools()
 
-			if got := containsName(defs, mcpToolName); got != tt.wantGateway {
-				t.Fatalf("gateway present = %v, want %v (tools: %v)", got, tt.wantGateway, toolNameList(defs))
+			wantCount := 0
+			if tt.wantGateway {
+				wantCount = len(mcpGatewayToolNames())
+			}
+			if got := gatewayCount(defs); got != wantCount {
+				t.Fatalf("gateway tools present = %d, want %d (tools: %v)", got, wantCount, toolNameList(defs))
 			}
 			if got := containsName(defs, "mcp_rea_analyze_binary"); got != tt.wantInlined {
 				t.Fatalf("inlined server tool present = %v, want %v (tools: %v)", got, tt.wantInlined, toolNameList(defs))
 			}
-			if _, ok := a.AllowedToolNames()[mcpToolName]; ok != tt.wantGateway {
-				t.Fatalf("gateway allowed = %v, want %v", ok, tt.wantGateway)
+			if got := gatewayAllowed(a); got != wantCount {
+				t.Fatalf("gateway tools allowed = %d, want %d", got, wantCount)
 			}
 			if _, ok := a.AllowedToolNames()["mcp_rea_analyze_binary"]; ok != tt.wantInlined {
 				t.Fatalf("inlined tool allowed = %v, want %v", ok, tt.wantInlined)
@@ -143,17 +168,19 @@ func TestMCPGatewayToolGating(t *testing.T) {
 // plan mode refuses: the gateway runs server tools, so it is act-only.
 func TestMCPGatewayDisabledInPlanMode(t *testing.T) {
 	a := newGatewayAgent(t, true, true, gatewayRegistry())
-	if _, ok := a.AllowedToolNames()[mcpToolName]; !ok {
+	if gatewayAllowed(a) != len(mcpGatewayToolNames()) {
 		t.Fatal("gateway should be allowed in act mode")
 	}
 	a.Mode = ModePlan
-	if _, ok := a.AllowedToolNames()[mcpToolName]; ok {
+	if gatewayAllowed(a) != 0 {
 		t.Fatal("gateway must not be allowed in plan mode")
 	}
-	if err := a.checkPlanMode(mcpToolName); err == nil {
-		t.Fatal("plan mode should refuse the gateway tool")
-	} else if !errors.Is(err, ErrPlanModeBlocked) {
-		t.Fatalf("error = %v, want ErrPlanModeBlocked", err)
+	for _, name := range mcpGatewayToolNames() {
+		if err := a.checkPlanMode(name); err == nil {
+			t.Fatalf("plan mode should refuse %s", name)
+		} else if !errors.Is(err, ErrPlanModeBlocked) {
+			t.Fatalf("error = %v, want ErrPlanModeBlocked", err)
+		}
 	}
 }
 
@@ -211,7 +238,7 @@ func TestMCPToolSetStableAcrossRegistryAttach(t *testing.T) {
 func TestMCPGatewayList(t *testing.T) {
 	a := newGatewayAgent(t, true, true, gatewayRegistry())
 
-	out, err := handleMCP(context.Background(), a, map[string]any{"action": "list"})
+	out, err := handleMCPList(context.Background(), a, map[string]any{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -228,7 +255,7 @@ func TestMCPGatewayList(t *testing.T) {
 	}
 
 	t.Run("query filters", func(t *testing.T) {
-		out, err := handleMCP(context.Background(), a, map[string]any{"action": "list", "query": "wasm"})
+		out, err := handleMCPList(context.Background(), a, map[string]any{"query": "wasm"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -238,7 +265,7 @@ func TestMCPGatewayList(t *testing.T) {
 	})
 
 	t.Run("query with no match", func(t *testing.T) {
-		out, err := handleMCP(context.Background(), a, map[string]any{"action": "list", "query": "nonexistent"})
+		out, err := handleMCPList(context.Background(), a, map[string]any{"query": "nonexistent"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -253,7 +280,7 @@ func TestMCPGatewayList(t *testing.T) {
 			reg.defs = append(reg.defs, llm.Tool{Name: fmt.Sprintf("mcp_srv_tool_%02d", i), Description: "x"})
 		}
 		big := newGatewayAgent(t, true, true, reg)
-		out, err := handleMCP(context.Background(), big, map[string]any{"action": "list"})
+		out, err := handleMCPList(context.Background(), big, map[string]any{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -267,7 +294,7 @@ func TestMCPGatewayList(t *testing.T) {
 
 	t.Run("registry not attached yet", func(t *testing.T) {
 		waiting := newGatewayAgent(t, true, true, nil)
-		out, err := handleMCP(context.Background(), waiting, map[string]any{"action": "list"})
+		out, err := handleMCPList(context.Background(), waiting, map[string]any{})
 		if err == nil || out != "" {
 			t.Fatalf("list with no registry = (%q, %v), want a retryable error", out, err)
 		}
@@ -282,7 +309,7 @@ func TestMCPGatewayList(t *testing.T) {
 func TestMCPGatewayDescribe(t *testing.T) {
 	a := newGatewayAgent(t, true, true, gatewayRegistry())
 
-	out, err := handleMCP(context.Background(), a, map[string]any{"action": "describe", "tool": "rea_analyze_binary"})
+	out, err := handleMCPDescribe(context.Background(), a, map[string]any{"tool": "rea_analyze_binary"})
 	if err != nil {
 		t.Fatalf("describe: %v", err)
 	}
@@ -299,10 +326,9 @@ func TestMCPGatewayCall(t *testing.T) {
 	t.Run("object arguments", func(t *testing.T) {
 		reg := gatewayRegistry()
 		a := newGatewayAgent(t, true, true, reg)
-		out, err := handleMCP(context.Background(), a, map[string]any{
-			"action":    "call",
-			"tool":      "mcp_rea_analyze_binary",
-			"arguments": map[string]any{"path": "/bin/ls"},
+		out, err := handleMCPCall(context.Background(), a, map[string]any{
+			"tool":  "mcp_rea_analyze_binary",
+			"input": map[string]any{"path": "/bin/ls"},
 		})
 		if err != nil {
 			t.Fatalf("call: %v", err)
@@ -318,10 +344,9 @@ func TestMCPGatewayCall(t *testing.T) {
 	t.Run("JSON string arguments", func(t *testing.T) {
 		reg := gatewayRegistry()
 		a := newGatewayAgent(t, true, true, reg)
-		if _, err := handleMCP(context.Background(), a, map[string]any{
-			"action":    "call",
-			"tool":      "rea_analyze_binary",
-			"arguments": `{"path":"/bin/cat"}`,
+		if _, err := handleMCPCall(context.Background(), a, map[string]any{
+			"tool":  "rea_analyze_binary",
+			"input": `{"path":"/bin/cat"}`,
 		}); err != nil {
 			t.Fatalf("call: %v", err)
 		}
@@ -333,7 +358,7 @@ func TestMCPGatewayCall(t *testing.T) {
 	t.Run("absent arguments", func(t *testing.T) {
 		reg := gatewayRegistry()
 		a := newGatewayAgent(t, true, true, reg)
-		if _, err := handleMCP(context.Background(), a, map[string]any{"action": "call", "tool": "mcp_rea_inspect_wasm"}); err != nil {
+		if _, err := handleMCPCall(context.Background(), a, map[string]any{"tool": "mcp_rea_inspect_wasm"}); err != nil {
 			t.Fatalf("call: %v", err)
 		}
 		if len(reg.calls) != 1 || len(reg.calls[0].args) != 0 {
@@ -346,7 +371,7 @@ func TestMCPGatewayCall(t *testing.T) {
 		reg.err = errors.New("analysis failed")
 		reg.out = "provider not configured"
 		a := newGatewayAgent(t, true, true, reg)
-		out, err := handleMCP(context.Background(), a, map[string]any{"action": "call", "tool": "mcp_rea_analyze_binary"})
+		out, err := handleMCPCall(context.Background(), a, map[string]any{"tool": "mcp_rea_analyze_binary"})
 		if err == nil {
 			t.Fatal("expected an error")
 		}
@@ -360,7 +385,7 @@ func TestMCPGatewayCall(t *testing.T) {
 
 	t.Run("unknown tool", func(t *testing.T) {
 		a := newGatewayAgent(t, true, true, gatewayRegistry())
-		_, err := handleMCP(context.Background(), a, map[string]any{"action": "call", "tool": "nope"})
+		_, err := handleMCPCall(context.Background(), a, map[string]any{"tool": "nope"})
 		if err == nil || !strings.Contains(err.Error(), "unknown MCP tool") {
 			t.Fatalf("error = %v, want unknown-tool", err)
 		}
@@ -372,19 +397,48 @@ func TestMCPGatewayCall(t *testing.T) {
 			{Name: "mcp_b_analyze", Parameters: map[string]any{"type": "object"}},
 		}}
 		a := newGatewayAgent(t, true, true, reg)
-		_, err := handleMCP(context.Background(), a, map[string]any{"action": "call", "tool": "analyze"})
+		_, err := handleMCPCall(context.Background(), a, map[string]any{"tool": "analyze"})
 		if err == nil || !strings.Contains(err.Error(), "ambiguous") {
 			t.Fatalf("error = %v, want ambiguity", err)
 		}
 	})
 
-	t.Run("bad action", func(t *testing.T) {
-		a := newGatewayAgent(t, true, true, gatewayRegistry())
-		if _, err := handleMCP(context.Background(), a, map[string]any{"action": "frobnicate"}); err == nil {
-			t.Fatal("expected an error for an unknown action")
+	t.Run("arguments alias", func(t *testing.T) {
+		reg := gatewayRegistry()
+		a := newGatewayAgent(t, true, true, reg)
+		if _, err := handleMCPCall(context.Background(), a, map[string]any{
+			"tool":      "mcp_rea_analyze_binary",
+			"arguments": map[string]any{"path": "/bin/alias"},
+		}); err != nil {
+			t.Fatalf("call: %v", err)
 		}
-		if _, err := handleMCP(context.Background(), a, map[string]any{}); err == nil {
-			t.Fatal("expected an error for a missing action")
+		if len(reg.calls) != 1 || reg.calls[0].args["path"] != "/bin/alias" {
+			t.Fatalf("dispatched call = %+v", reg.calls)
+		}
+	})
+
+	t.Run("input wins over arguments", func(t *testing.T) {
+		reg := gatewayRegistry()
+		a := newGatewayAgent(t, true, true, reg)
+		if _, err := handleMCPCall(context.Background(), a, map[string]any{
+			"tool":      "mcp_rea_analyze_binary",
+			"input":     map[string]any{"path": "/bin/input"},
+			"arguments": map[string]any{"path": "/bin/arguments"},
+		}); err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if len(reg.calls) != 1 || reg.calls[0].args["path"] != "/bin/input" {
+			t.Fatalf("dispatched call = %+v", reg.calls)
+		}
+	})
+
+	t.Run("missing tool", func(t *testing.T) {
+		a := newGatewayAgent(t, true, true, gatewayRegistry())
+		if _, err := handleMCPCall(context.Background(), a, map[string]any{}); err == nil {
+			t.Fatal("expected an error for a missing tool")
+		}
+		if _, err := handleMCPDescribe(context.Background(), a, map[string]any{}); err == nil {
+			t.Fatal("expected an error for a missing tool")
 		}
 	})
 }
