@@ -40,6 +40,13 @@ func drainServer(s *Server) {
 	if s == nil || s.registry == nil {
 		return
 	}
+	// Join the hijacked WebSocket handler goroutines FIRST: net/http stops
+	// tracking a connection at the upgrade, so a read loop can still be
+	// dispatching its last message (detach → orphan eviction → store flush)
+	// after the caller's srv.Close(). Waiting here makes the flush sweep below
+	// the last writer, which is what keeps a session write out of the caller's
+	// t.TempDir() removal ("directory not empty", the suite's documented flake).
+	s.WaitWSHandlers(wsHandlerDrainWait)
 	s.stopAutomations()
 	s.ShutdownSessions()
 

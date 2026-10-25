@@ -71,6 +71,13 @@ type Server struct {
 	tlsKeyFile     string
 	wsConnsMu      sync.Mutex
 	wsConns        []*websocket.Conn
+	// wsLive counts the live /ws and /ws/editor handler goroutines.
+	// net/http stops tracking a connection once the WebSocket upgrade
+	// hijacks it, so neither httptest.Server.Close nor the http server's
+	// Shutdown waits for these: a handler can still detach and flush a
+	// session after the caller believed the server was down. WaitWSHandlers
+	// closes that window for teardown paths.
+	wsLive wsHandlerTracker
 	// httpSrv is the HTTP listener this Server instance is currently serving
 	// via Start. ForceClose closes it (without waiting for hijacked WebSocket
 	// handlers) on Ctrl+C / ctx cancel. It is per-instance rather than

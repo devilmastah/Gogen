@@ -103,6 +103,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer u.cleanup()
+	// Register the handler so teardown paths can wait for this goroutine:
+	// after the upgrade, net/http no longer tracks it (see wsHandlerTracker).
+	s.wsLive.enter()
+	defer s.wsLive.leave()
 	conn := u.conn
 	ws := u.ws
 
@@ -292,6 +296,8 @@ func (s *Server) HandleWSEditor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer u.cleanup()
+	s.wsLive.enter()
+	defer s.wsLive.leave()
 	conn := u.conn
 	ws := u.ws
 
