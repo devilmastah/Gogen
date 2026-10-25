@@ -174,12 +174,8 @@ func titleFor(ev agent.TurnEvent, workDir string) string {
 // first label line (~28 glyphs at the default font). Empty when the
 // directory is unknown ("." / "" / a filesystem root).
 func projectTag(dir string) string {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return ""
-	}
-	base := filepath.Base(filepath.Clean(dir))
-	if base == "." || base == string(filepath.Separator) || base == "" {
+	base := dirBase(dir)
+	if base == "" {
 		return ""
 	}
 	return truncate(asciiOnly(base), 10)
@@ -267,6 +263,22 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(r[:n])
+}
+
+// dirBase returns the base name of a project directory for display use, or ""
+// when the directory is unknown ("", ".", or a filesystem root). Shared by
+// projectTag (the bar title) and sourceForDir (the row name) so both reject
+// the same non-identifying directories.
+func dirBase(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	base := filepath.Base(filepath.Clean(dir))
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		return ""
+	}
+	return base
 }
 
 // clamp01 clamps a ratio into the firmware's bar range (percent can exceed 1

@@ -306,20 +306,11 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 	defer s.mu.Unlock()
 	// Fast path: use the metadata index file (avoids reading every session file).
 	idx := s.readIndex(workingDir)
-	if idx != nil && len(idx.Entries) > 0 {
-		var latestID string
-		var latestUpdated time.Time
-		for _, e := range idx.Entries {
-			if e.ParentID != "" {
-				continue
-			}
-			if e.Updated.After(latestUpdated) {
-				latestUpdated = e.Updated
-				latestID = e.ID
-			}
-		}
-		if latestID != "" {
-			return latestID, nil
+	if idx != nil {
+		if id := latestNonNested(idx.Entries, func(e sessionIndexEntry) (string, string, time.Time) {
+			return e.ID, e.ParentID, e.Updated
+		}); id != "" {
+			return id, nil
 		}
 	}
 
@@ -332,18 +323,29 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 		}
 		return "", err
 	}
+	return latestNonNested(legacy, func(l legacySession) (string, string, time.Time) {
+		return l.id, l.parentID, l.updated
+	}), nil
+}
+
+// latestNonNested returns the id of the most recently updated entry whose
+// parentID is empty, or "" when the list is empty or every entry is nested.
+// Nested (subagent) sessions are excluded because they are not part of the
+// flat session list (see LatestID). Ties keep the first entry seen: only a
+// strictly later timestamp displaces the current pick.
+func latestNonNested[T any](items []T, meta func(T) (id, parentID string, updated time.Time)) string {
 	var latestID string
 	var latestUpdated time.Time
-	for _, l := range legacy {
-		if l.parentID != "" {
+	for _, item := range items {
+		id, parentID, updated := meta(item)
+		if parentID != "" {
 			continue
 		}
-		if l.updated.After(latestUpdated) {
-			latestUpdated = l.updated
-			latestID = l.id
+		if updated.After(latestUpdated) {
+			latestID, latestUpdated = id, updated
 		}
 	}
-	return latestID, nil
+	return latestID
 }
 
 // indexFile returns the path to the metadata index for a working directory.

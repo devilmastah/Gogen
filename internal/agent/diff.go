@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"strings"
 )
 
 // emptyTreeHash is the well-known SHA-1 of the empty git tree, used as the
@@ -52,11 +51,9 @@ func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (stri
 	if staged {
 		args = append(args, "--cached")
 	}
-	if strings.TrimSpace(path) != "" {
-		if _, err := e.SecurePath(path); err != nil {
-			return "", err
-		}
-		args = append(args, "--", path)
+	args, err := e.gitArgsWithPath(args, path)
+	if err != nil {
+		return "", err
 	}
 
 	text, err := e.runGitCommand(ctx, args)

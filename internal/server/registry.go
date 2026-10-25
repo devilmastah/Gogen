@@ -1032,7 +1032,9 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 // a fresh runtime. Callers must hold (or win) the runtime's turnMu so no new
 // turn can start on a runtime that is about to leave the registry; the lock
 // order is turnMu → r.mu, matching sessionDelete and the cap eviction's
-// TryLock.
+// TryLock. A caller that cannot take the lock (a released child's delivery
+// worker may hold it mid-handoff) latches rt.evicted and drains the lock with
+// drainTurnLock BEFORE calling here.
 //
 // Removal happens BEFORE the notification so the registry never contains a
 // dying-but-registered runtime: a concurrent session_attach/resume of the
@@ -1054,6 +1056,15 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 // risk (a failed save whose error was consumed by the turn-end warning is
 // retried by the next FlushSession/persistSession, exactly as before).
 func (r *sessionRegistry) evictRuntime(rt *sessionRuntime) {
+	// Claim the runtime FIRST: the evicted flag is the only guard a delivery
+	// worker re-checks after it wins the turn lock, and everything below (the
+	// flush, the Close, the registry removal) is slow enough for that worker
+	// to be mid-handoff. Latching before the flush makes it drop its queue
+	// instead of starting a delivered turn whose own start-flush would land
+	// after the runtime left the registry. Callers that must also wait out a
+	// turn that WON that handoff drain the lock themselves before calling
+	// here (see drainTurnLock and subagentSpawner.Release).
+	rt.evicted.Store(true)
 	rt.agent.FlushPending()
 	// The runtime is leaving memory: its background jobs (execute_command
 	// background=true) have no owner left to poll them, so kill them rather
@@ -1077,6 +1088,51 @@ func (r *sessionRegistry) evictRuntime(rt *sessionRuntime) {
 	// detach's auto-deny already released everything parked while a client
 	// was attached.
 	rt.autoDenyPendingApprovals()
+}
+
+// drainTurnLock waits (bounded by wait) for the runtime's turn lock and
+// releases it, cancelling whatever turn holds it on every round.
+//
+// It closes the pop→start handoff that the evicted flag alone cannot: the
+// delivery worker holds turnMu from the moment it pops a queued item until
+// the delivered turn's goroutine finishes, and it re-checks the flag only
+// AFTER winning the lock. A worker that won the lock before the flag landed
+// has therefore already started a turn whose own start-flush (the user
+// message persisted before the provider call) would otherwise run after the
+// runtime left the registry — recreating a released child's session file,
+// and in the test suite racing t.TempDir()'s removal ("TempDir RemoveAll
+// cleanup: ... directory not empty").
+//
+// Cancelling again inside the loop matters: such a delivery turn registers
+// its stream handle AFTER the caller's own cancelInFlight, so waiting
+// without cancelling would burn the whole budget and still leave it writing.
+//
+// Callers must latch rt.evicted BEFORE calling (so no new turn can start
+// while this waits) and must NOT hold the turn lock. A turn that ignores
+// cancellation costs the window once and the eviction proceeds anyway — the
+// sticky flag still refuses new turns, the same trade closeRuntime documents
+// for a stuck turn.
+func (rt *sessionRuntime) drainTurnLock(wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if rt.tryAcquireTurn(0) {
+				rt.releaseTurn()
+				return true
+			}
+			return false
+		}
+		slice := wsTurnAcquireWait
+		if slice > remaining {
+			slice = remaining
+		}
+		if rt.tryAcquireTurn(slice) {
+			rt.releaseTurn()
+			return true
+		}
+		rt.stream.cancelInFlight()
+	}
 }
 
 // fireEvictHook invokes the registry's eviction hook for id (the web server

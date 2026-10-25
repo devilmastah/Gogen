@@ -21,12 +21,9 @@ func (e *Executor) GitLog(ctx context.Context, path string, limit int) (string, 
 		limit = gitLogMaxLimit
 	}
 
-	args := []string{"log", "--oneline", "--no-decorate", "-n", strconv.Itoa(limit)}
-	if strings.TrimSpace(path) != "" {
-		if _, err := e.SecurePath(path); err != nil {
-			return "", err
-		}
-		args = append(args, "--", path)
+	args, err := e.gitArgsWithPath([]string{"log", "--oneline", "--no-decorate", "-n", strconv.Itoa(limit)}, path)
+	if err != nil {
+		return "", err
 	}
 
 	text, err := e.runGitCommand(ctx, args)

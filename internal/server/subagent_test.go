@@ -621,7 +621,12 @@ func TestSpawnParentEvictedWhileChildRuns(t *testing.T) {
 }
 
 // blockingProvider streams nothing and blocks until ctx is done.
-type blockingProvider struct{}
+type blockingProvider struct {
+	// onStream, when non-nil, runs just before the provider blocks. Test
+	// hook: lets a test count (and thereby detect) turns started on the
+	// session, and it is set before the spawn, so it needs no locking.
+	onStream func()
+}
 
 func (p *blockingProvider) Name() string { return "blocking" }
 func (p *blockingProvider) ModelName() string {
@@ -637,6 +642,9 @@ func (p *blockingProvider) GenerateResponse(context.Context, []llm.Message, map[
 	return llm.Response{}, nil
 }
 func (p *blockingProvider) GenerateResponseStream(ctx context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool, h *llm.StreamHandlers) (*llm.StreamResult, error) {
+	if p.onStream != nil {
+		p.onStream()
+	}
 	if h != nil && h.OnStreamOpened != nil {
 		h.OnStreamOpened()
 	}

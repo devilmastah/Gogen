@@ -74,6 +74,15 @@ func drainServer(s *Server) {
 
 	for _, id := range s.registry.activeIDs() {
 		if rt, ok := s.registry.get(id); ok {
+			// Claim and drain before evicting: the quiescence poll above can
+			// be won by a delivery worker that is mid pop→start handoff, and
+			// the turn it starts would flush into .gogen/sessions after the
+			// caller's t.TempDir() removal began (the flake this whole
+			// teardown exists to prevent). The drain is best-effort: a
+			// deliberately stuck test turn costs the window once, exactly as
+			// it does in the poll.
+			rt.evicted.Store(true)
+			rt.drainTurnLock(wsStreamDrainWait)
 			s.registry.evictRuntime(rt)
 		}
 	}
