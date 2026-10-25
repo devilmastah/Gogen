@@ -459,6 +459,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 
 		switch a.smartCompactBeforeTools(ctx, h, result) {
 		case smartCompactContinue:
+			finishStreamUI(h)
 			a.ghostRetries.Store(0)
 			if h.OnRecoverPartialStream != nil {
 				h.OnRecoverPartialStream()
@@ -474,6 +475,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			a.FlushSession()
 			continue
 		case smartCompactHalt:
+			finishStreamUI(h)
 			a.ghostRetries.Store(0)
 			msg := result.Content
 			if msg == "" {

@@ -103,46 +103,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 			lastRole = a.Messages[len(a.Messages)-1].Role
 		}
 		if lastRole == "user" || (lastRole == "tool" && a.smartCompactEnabled()) {
-			// Two-tier trigger. The normal tier fires at CompactBudget and
-			// honors the failure backoff. The EMERGENCY tier fires at the
-			// hard window (ContextLimit - CompactReserveTokens, where the
-			// provider refuses the request) and bypasses the backoff, so a
-			// large message arriving during backoff still gets a
-			// compaction attempt before the request is refused. The
-			// progress guard (compactionGuards.emergency) stops a hot loop
-			// of repeated failures at an unchanged message count.
-			total := a.compactionTokenTotal()
-			emergency := a.emergencyCompactDue(total)
-			if (a.shouldCompactUsingCounts() && a.compactAttemptDue()) || emergency {
-				if h != nil && h.OnCompacting != nil {
-					h.OnCompacting()
-				}
-				var pinned map[int]struct{}
-				if a.PinManager != nil {
-					pinned = a.PinManager.PinnedSet()
-				}
-				// Pass the cached per-message counts so the summarization
-				// request can be sized without re-tokenizing the middle.
-				a.statsMu.RLock()
-				counts := append([]int(nil), a.tokenCounts...)
-				a.statsMu.RUnlock()
-				keep := a.Context.CompactKeepRecentMessages()
-				if emergency {
-					// The standard split may not save enough (the preserved
-					// tail can itself be most of the deficit): lower the
-					// keep stepwise, floor 1 (the current user prompt is
-					// always preserved verbatim), so the summarized middle
-					// covers the deficit. The old messages are included in
-					// the middle — summarized, never dropped. -1 (no
-					// compactable middle) keeps the configured keep, which
-					// makes the attempt a documented no-op.
-					needed := total - a.Context.HardLimit() + emergencySummaryAllowance
-					if k := a.Context.ChooseCompactKeep(a.Messages, counts, needed); k > 0 {
-						keep = k
-					}
-				}
-				a.compactToFit(ctx, pinned, counts, keep, emergency)
-			}
+			a.compactIfDue(ctx, h)
 		}
 		// Cap oversized tool bodies in place on the live message array,
 		// spilling the full output exactly like a result arriving now (the

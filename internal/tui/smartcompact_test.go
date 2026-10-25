@@ -17,8 +17,9 @@ func TestCmdSmartCompact(t *testing.T) {
 	if !m.agent.Context.SmartCompact() {
 		t.Fatal("smart compact stayed off")
 	}
-	if !strings.Contains(strings.Join(m.chatLines, "\n"), "Smart compact: on") {
-		t.Fatalf("confirmation missing: %s", strings.Join(m.chatLines, "\n"))
+	joined := strings.Join(m.chatLines, "\n")
+	if !strings.Contains(joined, "Smart compact: on") || !strings.Contains(joined, "all live sessions") {
+		t.Fatalf("confirmation missing: %s", joined)
 	}
 
 	handled, _, _ = m.dispatchCommand("/smartcompact off")

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -143,16 +142,10 @@ func (a *Agent) smartCompactBeforeTools(ctx context.Context, h *llm.StreamHandle
 	}
 
 	complete := toolBatchExecutable(res.ToolCalls)
-	beforeN := len(a.Messages)
-	beforeBlob := summaryBlob(a.Messages)
-	a.runAutoCompact(ctx, h)
-	shrunk := len(a.Messages) < beforeN || summaryBlob(a.Messages) != beforeBlob
-	// A no-op that still counts as success (nothing to summarize, or
-	// auto-compact is off) would otherwise cut the next think immediately
-	// and compact again. Record the failure so the next cut stops.
-	if !shrunk && a.compactAttemptDue() && !a.emergencyCompactDue(a.compactionTokenTotal()) {
-		a.noteCompactFailure(errors.New("smart compact did not shrink the conversation"))
-	}
+	// Same gate as a user-message compact. A threshold of 0 or a short
+	// history does not call the summarizer and does not arm the shared
+	// backoff. A finished tool call still runs below.
+	shrunk := a.compactIfDue(ctx, h)
 	if !complete && !res.BudgetStop {
 		// The stream finished. A broken tool call takes the normal path,
 		// which reports the argument error and continues.
@@ -203,10 +196,29 @@ func (a *Agent) smartCompactGiveUp(res *llm.StreamResult) smartCompactAction {
 	return smartCompactHalt
 }
 
-func (a *Agent) runAutoCompact(ctx context.Context, h *llm.StreamHandlers) {
+// compactIfDue runs one automatic compaction when the normal gate or the
+// emergency tier says so. prepareMessages and smart compact both use it, so
+// a threshold of 0 and the failure backoff stay one policy. It reports
+// whether the history shrank. A closed gate does not record a failure.
+//
+// Two-tier trigger. The normal tier fires at CompactBudget and honors the
+// failure backoff. The emergency tier fires at the hard window
+// (ContextLimit - CompactReserveTokens, where the provider refuses the
+// request) and bypasses the backoff, so a large message arriving during
+// backoff still gets a compaction attempt before the request is refused.
+// The progress guard (compactionGuards.emergency) stops a hot loop of
+// repeated failures at an unchanged message count.
+func (a *Agent) compactIfDue(ctx context.Context, h *llm.StreamHandlers) bool {
 	if a == nil || a.Context == nil {
-		return
+		return false
 	}
+	total := a.compactionTokenTotal()
+	emergency := a.emergencyCompactDue(total)
+	if !((a.shouldCompactUsingCounts() && a.compactAttemptDue()) || emergency) {
+		return false
+	}
+	beforeN := len(a.Messages)
+	beforeBlob := summaryBlob(a.Messages)
 	if h != nil && h.OnCompacting != nil {
 		h.OnCompacting()
 	}
@@ -214,19 +226,27 @@ func (a *Agent) runAutoCompact(ctx context.Context, h *llm.StreamHandlers) {
 	if a.PinManager != nil {
 		pinned = a.PinManager.PinnedSet()
 	}
+	// Pass the cached per-message counts so the summarization request can
+	// be sized without re-tokenizing the middle.
 	a.statsMu.RLock()
 	counts := append([]int(nil), a.tokenCounts...)
 	a.statsMu.RUnlock()
-	total := a.compactionTokenTotal()
-	emergency := a.emergencyCompactDue(total)
 	keep := a.Context.CompactKeepRecentMessages()
 	if emergency {
+		// The standard split may not save enough (the preserved tail can
+		// itself be most of the deficit): lower the keep stepwise, floor 1
+		// (the current user prompt is always preserved verbatim), so the
+		// summarized middle covers the deficit. The old messages are
+		// included in the middle — summarized, never dropped. -1 (no
+		// compactable middle) keeps the configured keep, which makes the
+		// attempt a documented no-op.
 		needed := total - a.Context.HardLimit() + emergencySummaryAllowance
 		if k := a.Context.ChooseCompactKeep(a.Messages, counts, needed); k > 0 {
 			keep = k
 		}
 	}
 	a.compactToFit(ctx, pinned, counts, keep, emergency)
+	return len(a.Messages) < beforeN || summaryBlob(a.Messages) != beforeBlob
 }
 
 func (a *Agent) annotateCompactionSummary(block string) bool {

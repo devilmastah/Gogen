@@ -256,7 +256,7 @@ func cmdSmartCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		cfg.SmartCompact = state
 		m.workspace.SetRuntimeConfig(cfg)
 	}
-	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Smart compact: %s (this run; /save-config stores it)", state)))
+	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Smart compact: %s (all live sessions; /save-config stores it)", state)))
 	return true, false, nil
 }
 
