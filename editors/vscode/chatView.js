@@ -1,0 +1,1076 @@
+class ChatViewProvider {
+  constructor(host) {
+    this.host = host;
+    this.view = null;
+    this.unsubscribe = null;
+  }
+
+  resolveWebviewView(view) {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.html = chatHtml(view.webview);
+    view.webview.onDidReceiveMessage((msg) => this.onWebview(msg));
+    this.unsubscribe = this.host.subscribe((event) => this.post(event));
+    view.onDidChangeVisibility(() => {
+      if (view.visible && !this.host.sidecar) {
+        this.host.ensureStarted().catch(() => {});
+      }
+    });
+    view.onDidDispose(() => {
+      if (this.unsubscribe) {
+        this.unsubscribe();
+        this.unsubscribe = null;
+      }
+      this.view = null;
+    });
+    this.host.ensureStarted().catch(() => {});
+  }
+
+  onWebview(msg) {
+    if (!msg) {
+      return;
+    }
+    if (msg.type === "send") {
+      const text = String(msg.text || "").trim();
+      if (!text) {
+        return;
+      }
+      try {
+        this.host.sendChat(text);
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
+      return;
+    }
+    if (msg.type === "pickModel") {
+      const vscode = require("vscode");
+      vscode.commands.executeCommand("gogen.pickModel");
+      return;
+    }
+    if (msg.type === "openSettings") {
+      const vscode = require("vscode");
+      vscode.commands.executeCommand("gogen.settings");
+      return;
+    }
+    if (msg.type === "openBoard") {
+      const vscode = require("vscode");
+      vscode.commands.executeCommand("gogen.board");
+      return;
+    }
+    if (msg.type === "openWorkspace") {
+      const vscode = require("vscode");
+      vscode.commands.executeCommand("gogen.workspace");
+      return;
+    }
+    if (msg.type === "setMode") {
+      try {
+        this.host.setMode(msg.mode);
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
+      return;
+    }
+    if (msg.type === "pickThinking") {
+      this.host.pickThinking();
+      return;
+    }
+    if (msg.type === "cancel") {
+      try {
+        this.host.cancelTurn();
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
+      return;
+    }
+    if (msg.type === "compact") {
+      try {
+        this.host.compact();
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
+      return;
+    }
+    if (msg.type === "setupEndpoint") {
+      try {
+        this.host.saveProvider("default", String(msg.baseUrl || "").trim(), String(msg.apiKey || ""));
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
+      return;
+    }
+    if (msg.type === "setupModel") {
+      try {
+        this.host.pickModel(msg.provider, msg.id);
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
+      return;
+    }
+    if (msg.type === "setupMcp") {
+      this.host.enableMcpAndRestart();
+    }
+  }
+
+  post(msg) {
+    this.view?.webview.postMessage(msg);
+  }
+}
+
+function chatHtml(webview) {
+  const nonce = String(Math.random()).slice(2);
+  const csp = [
+    "default-src 'none'",
+    `style-src ${webview.cspSource} 'nonce-${nonce}'`,
+    `script-src 'nonce-${nonce}'`,
+  ].join("; ");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<style nonce="${nonce}">
+  :root {
+    color-scheme: light dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    font-family: var(--vscode-font-family);
+    font-size: 13px;
+    color: var(--vscode-foreground);
+    background: var(--vscode-sideBar-background);
+  }
+  button { font: inherit; cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  #top {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 10px 2px;
+  }
+  #brand { flex: 1; min-width: 0; }
+  .mark {
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  #status {
+    display: block;
+    margin-top: 1px;
+    font-size: 11px;
+    line-height: 1.3;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #status.error { color: var(--vscode-errorForeground); }
+  #menu-btn, .icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+  }
+  #menu-btn:hover, .icon:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+    color: var(--vscode-foreground);
+  }
+  #think.on { color: var(--vscode-textLink-foreground); }
+  #think { width: auto; padding: 0 6px; }
+  #menu {
+    position: absolute;
+    top: 36px;
+    right: 8px;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    min-width: 180px;
+    padding: 4px;
+    border-radius: 10px;
+    border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border));
+    background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+    color: var(--vscode-menu-foreground, var(--vscode-foreground));
+    box-shadow: 0 10px 28px color-mix(in srgb, #000 28%, transparent);
+  }
+  #menu[hidden] { display: none; }
+  #menu button {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    border-radius: 6px;
+    padding: 6px 8px;
+    background: transparent;
+    color: inherit;
+  }
+  #menu button:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); }
+  #stage {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  #log {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 12px 8px;
+  }
+  #log:empty {
+    align-items: center;
+    justify-content: center;
+  }
+  #log:empty::before {
+    content: "Ask about this folder.";
+    color: var(--vscode-descriptionForeground);
+    font-size: 13px;
+  }
+  .msg { white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+  .user {
+    align-self: flex-end;
+    max-width: 88%;
+    padding: 8px 10px;
+    border-radius: 14px 14px 4px 14px;
+    background: color-mix(in srgb, var(--vscode-button-background) 18%, var(--vscode-input-background));
+    border: 1px solid color-mix(in srgb, var(--vscode-button-background) 35%, transparent);
+  }
+  .assistant {
+    align-self: stretch;
+    padding: 8px 10px;
+    border-radius: 12px 12px 12px 4px;
+    background: color-mix(in srgb, var(--vscode-foreground) 7%, transparent);
+    line-height: 1.5;
+  }
+  .thinking {
+    align-self: stretch;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border-left: 2px solid color-mix(in srgb, var(--vscode-foreground) 28%, transparent);
+    color: var(--vscode-descriptionForeground);
+    background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+    font-size: 12px;
+  }
+  .thinking::before {
+    content: "Thinking";
+    display: block;
+    margin-bottom: 3px;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .tool {
+    align-self: stretch;
+    border-radius: 8px;
+    border: 1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+    background: color-mix(in srgb, var(--vscode-foreground) 8%, var(--vscode-editor-background));
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-editor-font-family);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .tool-head { padding: 4px 8px; }
+  .tool.failed .tool-head { color: var(--vscode-errorForeground); }
+  .tool-body {
+    margin: 0;
+    padding: 0 8px 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font: inherit;
+    max-height: 140px;
+    overflow: auto;
+  }
+  .tool-body:empty { display: none; }
+  body.tools-collapsed .tool-body { display: none; }
+  #tools {
+    align-self: flex-start;
+    margin: 0 10px 6px;
+    border: 0;
+    border-radius: 999px;
+    padding: 3px 10px;
+    background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+    color: var(--vscode-foreground);
+    font: inherit;
+    font-size: 11px;
+  }
+  #tools[hidden] { display: none; }
+  .notice { color: var(--vscode-descriptionForeground); font-size: 12px; }
+  #near {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin: 0 10px 6px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    font-size: 12px;
+    background: var(--vscode-inputValidation-warningBackground, var(--vscode-editorWarning-background));
+  }
+  #near[hidden] { display: none; }
+  #near span { flex: 1; }
+  #near button, #dismiss {
+    border: 0;
+    border-radius: 6px;
+    padding: 2px 8px;
+    background: transparent;
+    color: var(--vscode-foreground);
+  }
+  form { margin: 0; padding: 0 10px 10px; }
+  #box {
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    border-radius: 14px;
+    background: var(--vscode-input-background);
+  }
+  #box:focus-within { border-color: var(--vscode-focusBorder); }
+  textarea {
+    display: block;
+    width: 100%;
+    min-height: 52px;
+    max-height: 140px;
+    margin: 0;
+    padding: 10px 12px 2px;
+    border: 0;
+    resize: none;
+    outline: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1.4;
+  }
+  textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
+  #row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px 6px;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 42%;
+    height: 26px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+    color: var(--vscode-foreground);
+  }
+  .pill:hover:not(:disabled) { background: color-mix(in srgb, var(--vscode-foreground) 14%, transparent); }
+  .pill span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pill::after {
+    content: "";
+    flex: 0 0 auto;
+    border: 3px solid transparent;
+    border-top-color: currentColor;
+    transform: translateY(1px);
+    opacity: 0.7;
+  }
+  #mode, #ctx, #think, #cancel, #send { flex-shrink: 0; }
+  #model { min-width: 0; }
+  #rate {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    font-variant-numeric: tabular-nums;
+  }
+  #ctx {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    font-variant-numeric: tabular-nums;
+    cursor: default;
+  }
+  #ring {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: conic-gradient(var(--ring, var(--vscode-textLink-foreground)) var(--pct, 0%), color-mix(in srgb, var(--vscode-foreground) 16%, transparent) 0);
+  }
+  #ctx[data-tone="warning"] { color: var(--vscode-editorWarning-foreground); --ring: var(--vscode-editorWarning-foreground); }
+  #ctx[data-tone="danger"] { color: var(--vscode-errorForeground); --ring: var(--vscode-errorForeground); }
+  #cancel[hidden], #think[hidden] { display: none; }
+  #send {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  #send:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+  #setup {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: color-mix(in srgb, var(--vscode-sideBar-background) 92%, transparent);
+  }
+  #setup[hidden] { display: none; }
+  .setup-card {
+    width: min(100%, 360px);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 14px;
+    border-radius: 16px;
+    background: var(--vscode-editor-background);
+    border: 1px solid color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+  }
+  .setup-steps { display: flex; gap: 6px; }
+  .setup-steps span {
+    flex: 1;
+    padding: 4px 0;
+    border-radius: 999px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent);
+  }
+  .setup-steps .done { color: var(--vscode-foreground); }
+  .setup-steps .now {
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+  }
+  .setup-card h2 { margin: 0; font-size: 14px; font-weight: 650; }
+  .setup-card p { margin: 0; font-size: 12px; line-height: 1.4; color: var(--vscode-descriptionForeground); }
+  .setup-card label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--vscode-descriptionForeground); }
+  .setup-card input, .setup-card select {
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 8px;
+    border: 1px solid var(--vscode-input-border, transparent);
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font: inherit;
+  }
+  .setup-card button.primary {
+    align-self: flex-start;
+    padding: 6px 12px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  .setup-card button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+  #setup-note { min-height: 1.2em; }
+</style>
+</head>
+<body>
+<div id="top">
+  <div id="brand">
+    <div class="mark">gogen</div>
+    <div id="status">Starting…</div>
+  </div>
+  <button id="menu-btn" type="button" aria-label="More" aria-expanded="false" title="Settings, board, folder">
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="3.5" cy="8" r="1.15" fill="currentColor"/><circle cx="8" cy="8" r="1.15" fill="currentColor"/><circle cx="12.5" cy="8" r="1.15" fill="currentColor"/></svg>
+  </button>
+  <div id="menu" hidden>
+    <button id="settings" type="button">Settings</button>
+    <button id="board" type="button">Board</button>
+    <button id="workspace" type="button">Folder</button>
+  </div>
+</div>
+<div id="stage">
+<div id="log"></div>
+<button id="tools" type="button" hidden>Hide tools</button>
+<div id="near" hidden>
+  <span>Context is nearly full.</span>
+  <button id="compact" type="button">Compact</button>
+  <button id="dismiss" type="button">Dismiss</button>
+</div>
+<form id="form">
+  <div id="box">
+    <textarea id="input" rows="1" placeholder="Message gogen"></textarea>
+    <div id="row">
+      <button id="mode" class="pill" type="button" disabled><span id="mode-label">Act</span></button>
+      <button id="model" class="pill" type="button" disabled title="Choose a model"><span id="model-label">Choose a model</span></button>
+      <span id="rate"></span>
+      <span id="ctx" title="Context usage"><i id="ring"></i><span id="ctx-label">—</span></span>
+      <button id="think" class="icon" type="button" disabled hidden title="Thinking level">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8.1 1.8a5.7 5.7 0 1 0 6.1 7.2A4.5 4.5 0 0 1 8.1 1.8z"/></svg>
+        <span id="think-label">Off</span>
+      </button>
+      <button id="cancel" class="icon" type="button" hidden title="Cancel">
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.4" fill="currentColor"/></svg>
+      </button>
+      <button id="send" type="submit" disabled title="Send" aria-label="Send">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 2.8 3.2 7.7h2.7v5.5h2.2V7.7h2.7L8 2.8z"/></svg>
+      </button>
+    </div>
+  </div>
+</form>
+<div id="setup" hidden>
+  <div class="setup-card">
+    <div class="setup-steps">
+      <span id="setup-mark-endpoint">Endpoint</span>
+      <span id="setup-mark-model">Model</span>
+      <span id="setup-mark-mcp">MCP</span>
+    </div>
+    <div id="setup-endpoint">
+      <h2>Endpoint</h2>
+      <p>An OpenAI-compatible base URL. Leave the key blank to keep one that is already saved.</p>
+      <label>Base URL<input id="setup-url" type="url" placeholder="https://api.example.com/v1" autocomplete="off"></label>
+      <label>API key<input id="setup-key" type="password" placeholder="API key" autocomplete="off"></label>
+      <button id="setup-save-endpoint" class="primary" type="button">Continue</button>
+    </div>
+    <div id="setup-model" hidden>
+      <h2>Model</h2>
+      <p>The model for this session. A saved model is selected on its own.</p>
+      <select id="setup-models"></select>
+      <label id="setup-model-typed">Model id<input id="setup-model-id" placeholder="model id" autocomplete="off"></label>
+      <button id="setup-save-model" class="primary" type="button">Continue</button>
+    </div>
+    <div id="setup-mcp" hidden>
+      <h2>MCP</h2>
+      <p>MCP lets the agent open files in this editor. Turning it on restarts gogen.</p>
+      <button id="setup-mcp-on" class="primary" type="button">Turn on MCP</button>
+    </div>
+    <p id="setup-note"></p>
+  </div>
+</div>
+</div>
+<script nonce="${nonce}">
+const vscodeApi = acquireVsCodeApi();
+const status = document.getElementById("status");
+const log = document.getElementById("log");
+const input = document.getElementById("input");
+const send = document.getElementById("send");
+const modelBtn = document.getElementById("model");
+const modelLabel = document.getElementById("model-label");
+const modeBtn = document.getElementById("mode");
+const modeLabel = document.getElementById("mode-label");
+const thinkBtn = document.getElementById("think");
+const thinkLabel = document.getElementById("think-label");
+const cancelBtn = document.getElementById("cancel");
+const rateEl = document.getElementById("rate");
+const ctxEl = document.getElementById("ctx");
+const ctxLabel = document.getElementById("ctx-label");
+const ring = document.getElementById("ring");
+const nearEl = document.getElementById("near");
+const menu = document.getElementById("menu");
+const menuBtn = document.getElementById("menu-btn");
+const toolToggle = document.getElementById("tools");
+const savedView = vscodeApi.getState() || {};
+let toolsCollapsed = !!savedView.toolsCollapsed;
+let live = null;
+let connReady = false;
+let currentModel = "";
+let currentMode = "act";
+let contextData = null;
+let catalog = [];
+let compactDismissed = false;
+let turnActive = false;
+
+function setStatus(state, text) {
+  status.textContent = text;
+  status.className = state === "error" || state === "closed" ? "error" : "";
+  connReady = state === "ready";
+  if (state === "starting") {
+    contextData = null;
+    catalog = [];
+    compactDismissed = false;
+    paintContext();
+    setTurn(false);
+  }
+  refreshSend();
+}
+
+function formatTokens(n) {
+  if (!n || n <= 0) return "—";
+  if (n < 1000) return String(n);
+  const whole = Math.floor(n / 1000);
+  const frac = Math.floor((n % 1000) / 100);
+  return frac === 0 ? whole + "k" : whole + "." + frac + "k";
+}
+
+function formatCost(usd) {
+  if (usd < 0.01) return "$" + usd.toFixed(4);
+  if (usd < 1) return "$" + usd.toFixed(3);
+  return "$" + usd.toFixed(2);
+}
+
+function catalogLimit() {
+  const row = catalog.find((m) => m && m.id === currentModel && m.current) || catalog.find((m) => m && m.id === currentModel);
+  return (row && row.contextLimit) || 0;
+}
+
+function catalogPricing() {
+  const row = catalog.find((m) => m && m.id === currentModel && m.current) || catalog.find((m) => m && m.id === currentModel);
+  if (!row || (!row.inputPricePer1M && !row.outputPricePer1M)) return null;
+  return row;
+}
+
+function paintContext() {
+  const data = contextData || {};
+  const used = data.usedTokens || 0;
+  let limit = data.contextLimit || 0;
+  if (!limit) limit = catalogLimit();
+  let pct = 0;
+  if (limit <= 0) {
+    ctxLabel.textContent = "—";
+    ctxEl.removeAttribute("data-tone");
+    ctxEl.title = "Context usage unknown";
+  } else if (used <= 0) {
+    ctxLabel.textContent = "—/" + formatTokens(limit);
+    ctxEl.removeAttribute("data-tone");
+    ctxEl.title = "Nothing counted yet. Limit " + limit.toLocaleString() + " tokens.";
+  } else {
+    pct = Math.min(100, Math.round((used / limit) * 100));
+    ctxLabel.textContent = pct + "%";
+    if (pct >= 90) ctxEl.setAttribute("data-tone", "danger");
+    else if (pct >= 75) ctxEl.setAttribute("data-tone", "warning");
+    else ctxEl.removeAttribute("data-tone");
+    ctxEl.title = contextTitle(data, limit);
+  }
+  ring.style.setProperty("--pct", pct + "%");
+  nearEl.hidden = compactDismissed || !data.warnNearCompact;
+}
+
+function contextTitle(data, limit) {
+  const lines = ["Context"];
+  lines.push("Used: " + formatTokens(data.usedTokens));
+  lines.push("Limit: " + formatTokens(limit));
+  if (data.promptTokens) lines.push("Prompt: " + formatTokens(data.promptTokens));
+  if (data.completionTokens) lines.push("Completion: " + formatTokens(data.completionTokens));
+  if (data.cachedTokens) lines.push("Cached: " + formatTokens(data.cachedTokens));
+  if (data.compactAt) lines.push("Compact at: " + formatTokens(data.compactAt));
+  if (data.messageCount) lines.push("Messages: " + data.messageCount);
+  const prompt = data.totalPromptTokens || 0;
+  const completion = data.totalCompletionTokens || 0;
+  const cached = data.totalCachedTokens || 0;
+  const turns = data.totalTurns || 0;
+  if (turns || prompt) {
+    lines.push("Session: " + formatTokens(prompt + completion) + " · " + turns + " turns");
+    const price = catalogPricing();
+    if (price) {
+      const billable = Math.max(0, prompt - cached);
+      const cost = (billable / 1e6) * (price.inputPricePer1M || 0)
+        + (cached / 1e6) * (price.cachedPricePer1M || 0)
+        + (completion / 1e6) * (price.outputPricePer1M || 0);
+      lines.push("Est. cost: " + formatCost(cost));
+    }
+  }
+  return lines.join("\\n");
+}
+
+function setModeLabel(mode) {
+  currentMode = (mode || "act").toLowerCase() === "plan" ? "plan" : "act";
+  modeLabel.textContent = currentMode === "plan" ? "Plan" : "Act";
+  modeBtn.disabled = !connReady;
+  modeBtn.title = currentMode === "plan" ? "Plan mode. Click for Act." : "Act mode. Click for Plan.";
+}
+
+function setThink(level, efforts, unsupported) {
+  if (unsupported) {
+    thinkBtn.hidden = true;
+    return;
+  }
+  thinkBtn.hidden = false;
+  thinkBtn.disabled = !connReady;
+  const value = level || "off";
+  const label = value === "off" ? "Off" : value.charAt(0).toUpperCase() + value.slice(1);
+  thinkLabel.textContent = label;
+  thinkBtn.title = "Thinking: " + label;
+  thinkBtn.classList.toggle("on", value !== "off");
+}
+
+function setTurn(active) {
+  turnActive = !!active;
+  cancelBtn.hidden = !turnActive;
+  if (!turnActive) rateEl.textContent = "";
+}
+
+function setRate(tokensPerSec) {
+  const n = Number(tokensPerSec) || 0;
+  rateEl.textContent = turnActive && n >= 1 ? Math.round(n) + " tok/s" : "";
+}
+
+function refreshSend() {
+  send.disabled = !connReady || !currentModel;
+  modelBtn.disabled = !connReady;
+  modeBtn.disabled = !connReady;
+  thinkBtn.disabled = !connReady || thinkBtn.hidden;
+}
+
+function setModel(label, model) {
+  currentModel = model || "";
+  const text = label || "Choose a model";
+  modelLabel.textContent = text;
+  modelBtn.title = text;
+  refreshSend();
+}
+
+function fitInput() {
+  input.style.height = "0px";
+  input.style.height = Math.min(Math.max(input.scrollHeight, 52), 140) + "px";
+}
+
+function add(className, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + className;
+  el.textContent = text;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function clipTool(text) {
+  const body = String(text || "");
+  return body.length > 2000 ? body.slice(0, 2000) + "…" : body;
+}
+
+function addTool(name) {
+  const el = document.createElement("div");
+  el.className = "msg tool";
+  const head = document.createElement("div");
+  head.className = "tool-head";
+  head.textContent = name || "tool";
+  const body = document.createElement("pre");
+  body.className = "tool-body";
+  el.append(head, body);
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  refreshToolToggle();
+  return el;
+}
+
+function setToolResult(el, text, success) {
+  const head = el.querySelector(".tool-head");
+  const body = el.querySelector(".tool-body");
+  if (!success) {
+    el.classList.add("failed");
+    if (head && !head.textContent.endsWith(" failed")) head.textContent += " failed";
+  }
+  if (body) body.textContent = clipTool(text);
+  log.scrollTop = log.scrollHeight;
+}
+
+function refreshToolToggle() {
+  const count = log.querySelectorAll(".tool").length;
+  toolToggle.hidden = count === 0;
+  toolToggle.textContent = toolsCollapsed ? "Show tools" : "Hide tools";
+  document.body.classList.toggle("tools-collapsed", toolsCollapsed);
+}
+
+function renderHistory(entries) {
+  log.replaceChildren();
+  live = null;
+  const cards = new Map();
+  for (const entry of entries || []) {
+    if (entry.role === "user") {
+      if (entry.content) add("user", entry.content);
+      continue;
+    }
+    if (entry.role === "assistant") {
+      if (entry.reasoning) add("thinking", entry.reasoning);
+      if (entry.content) add("assistant", entry.content);
+      for (const call of entry.toolCalls || []) {
+        const card = addTool(call.name || "tool");
+        if (call.id) cards.set(call.id, card);
+      }
+      continue;
+    }
+    if (entry.role === "tool") {
+      const card = (entry.toolCallId && cards.get(entry.toolCallId)) || addTool("tool");
+      setToolResult(card, entry.content || "", true);
+    }
+  }
+  refreshToolToggle();
+}
+
+function ensureLive() {
+  if (!live) {
+    live = { thinking: null, answer: null, tool: null };
+  }
+  return live;
+}
+
+let setupProviders = [];
+let setupModel = "";
+let setupMcp = "";
+let setupKnown = false;
+let setupPending = "";
+
+function setupStep() {
+  if (!setupKnown) {
+    return "";
+  }
+  const endpoint = setupProviders.some((p) => p && p.baseUrl);
+  if (!endpoint) {
+    return "endpoint";
+  }
+  if (!setupModel) {
+    return "model";
+  }
+  if (String(setupMcp || "").toLowerCase() !== "on") {
+    return "mcp";
+  }
+  return "";
+}
+
+function fillSetupModels() {
+  const sel = document.getElementById("setup-models");
+  const typed = document.getElementById("setup-model-typed");
+  const has = catalog.length > 0;
+  sel.hidden = !has;
+  typed.hidden = has;
+  if (!has) {
+    return;
+  }
+  const current = sel.value;
+  sel.replaceChildren();
+  for (const model of catalog) {
+    const provider = model.provider || "default";
+    const opt = document.createElement("option");
+    opt.value = provider + "\t" + model.id;
+    opt.textContent = provider !== "default" ? provider + " · " + model.id : model.id;
+    sel.appendChild(opt);
+  }
+  if (current && Array.from(sel.options).some((opt) => opt.value === current)) {
+    sel.value = current;
+  }
+}
+
+function paintSetup() {
+  const step = setupStep();
+  document.getElementById("setup").hidden = !step;
+  const order = { endpoint: 0, model: 1, mcp: 2 };
+  for (const name of ["endpoint", "model", "mcp"]) {
+    const mark = document.getElementById("setup-mark-" + name);
+    const panel = document.getElementById("setup-" + name);
+    mark.className = step && order[name] < order[step] ? "done" : name === step ? "now" : "";
+    panel.hidden = name !== step;
+  }
+  if (step === "model") {
+    fillSetupModels();
+  }
+  if (step === "mcp") {
+    const button = document.getElementById("setup-mcp-on");
+    button.disabled = false;
+    button.textContent = "Turn on MCP";
+  }
+}
+
+function setMenu(open) {
+  menu.hidden = !open;
+  menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+window.addEventListener("message", (event) => {
+  const msg = event.data || {};
+  if (msg.type === "status") {
+    setStatus(msg.state, msg.text);
+    return;
+  }
+  if (msg.type === "workspace") {
+    const folderBtn = document.getElementById("workspace");
+    folderBtn.textContent = msg.label || "Folder";
+    folderBtn.title = msg.folder || "";
+    return;
+  }
+  if (msg.type === "config" || msg.type === "models") {
+    setModel(msg.modelLabel, msg.model);
+    if (msg.type === "models" && Array.isArray(msg.models)) catalog = msg.models;
+    if (msg.type === "config") {
+      setupKnown = true;
+      if (Array.isArray(msg.providers)) setupProviders = msg.providers;
+      setupModel = msg.model || "";
+      setupMcp = msg.mcp || "";
+      if (msg.mode) setModeLabel(msg.mode);
+      if (msg.mode || msg.model || msg.thinkingLevel || msg.reasoningEfforts || msg.reasoningEffortsUnsupported) {
+        setThink(msg.thinkingLevel || "off", msg.reasoningEfforts, !!msg.reasoningEffortsUnsupported);
+      }
+      const note = document.getElementById("setup-note");
+      if (setupPending && setupStep() === setupPending) {
+        note.textContent = setupPending === "endpoint"
+          ? "The endpoint was not saved. Check the URL."
+          : "The model was not saved.";
+      } else if (setupPending) {
+        setupPending = "";
+        note.textContent = "";
+      }
+    }
+    paintContext();
+    paintSetup();
+    return;
+  }
+  if (msg.type === "context") {
+    if (!msg.warnNearCompact) compactDismissed = false;
+    contextData = msg;
+    paintContext();
+    return;
+  }
+  if (msg.type === "stats") {
+    setRate(msg.tokensPerSec);
+    return;
+  }
+  if (msg.type === "turn") {
+    setTurn(msg.active);
+    setRate(msg.tokensPerSec);
+    return;
+  }
+  if (msg.type === "history") {
+    renderHistory(msg.entries);
+    return;
+  }
+  if (msg.type === "user") {
+    live = null;
+    add("user", msg.text);
+    return;
+  }
+  if (msg.type === "thinking") {
+    const box = ensureLive();
+    // A tool call closed the previous bubble. This stretch is a new one,
+    // placed under that call. Switching to an answer does the same.
+    if (!box.thinking) {
+      box.answer = null;
+      box.thinking = add("thinking", "");
+    }
+    box.thinking.textContent += msg.text;
+    log.scrollTop = log.scrollHeight;
+    return;
+  }
+  if (msg.type === "token") {
+    const box = ensureLive();
+    if (!box.answer) {
+      box.thinking = null;
+      box.answer = add("assistant", "");
+    }
+    box.answer.textContent += msg.text;
+    log.scrollTop = log.scrollHeight;
+    return;
+  }
+  if (msg.type === "tool") {
+    const box = ensureLive();
+    box.thinking = null;
+    box.answer = null;
+    box.tool = addTool(msg.name);
+    return;
+  }
+  if (msg.type === "toolResult") {
+    const box = ensureLive();
+    const target = box.tool || addTool(msg.name);
+    setToolResult(target, msg.text, msg.success !== false);
+    box.tool = null;
+    return;
+  }
+  if (msg.type === "notice") {
+    add("notice", msg.text);
+    return;
+  }
+  if (msg.type === "turnEnd") {
+    live = null;
+  }
+});
+
+toolToggle.addEventListener("click", () => {
+  toolsCollapsed = !toolsCollapsed;
+  vscodeApi.setState(Object.assign({}, vscodeApi.getState(), { toolsCollapsed }));
+  refreshToolToggle();
+});
+refreshToolToggle();
+modelBtn.addEventListener("click", () => vscodeApi.postMessage({ type: "pickModel" }));
+modeBtn.addEventListener("click", () => vscodeApi.postMessage({ type: "setMode", mode: currentMode === "plan" ? "act" : "plan" }));
+thinkBtn.addEventListener("click", () => vscodeApi.postMessage({ type: "pickThinking" }));
+cancelBtn.addEventListener("click", () => vscodeApi.postMessage({ type: "cancel" }));
+document.getElementById("compact").addEventListener("click", () => vscodeApi.postMessage({ type: "compact" }));
+document.getElementById("dismiss").addEventListener("click", () => { compactDismissed = true; nearEl.hidden = true; });
+document.getElementById("settings").addEventListener("click", () => vscodeApi.postMessage({ type: "openSettings" }));
+document.getElementById("board").addEventListener("click", () => vscodeApi.postMessage({ type: "openBoard" }));
+document.getElementById("workspace").addEventListener("click", () => vscodeApi.postMessage({ type: "openWorkspace" }));
+document.getElementById("setup-save-endpoint").addEventListener("click", () => {
+  const baseUrl = document.getElementById("setup-url").value.trim();
+  const note = document.getElementById("setup-note");
+  if (!baseUrl) {
+    note.textContent = "A base URL is required.";
+    return;
+  }
+  setupPending = "endpoint";
+  note.textContent = "Saving…";
+  vscodeApi.postMessage({ type: "setupEndpoint", baseUrl, apiKey: document.getElementById("setup-key").value });
+});
+document.getElementById("setup-save-model").addEventListener("click", () => {
+  const note = document.getElementById("setup-note");
+  if (catalog.length) {
+    const value = document.getElementById("setup-models").value || "";
+    const split = value.indexOf("\t");
+    if (split < 0) {
+      note.textContent = "Choose a model.";
+      return;
+    }
+    setupPending = "model";
+    note.textContent = "Saving…";
+    vscodeApi.postMessage({ type: "setupModel", provider: value.slice(0, split), id: value.slice(split + 1) });
+    return;
+  }
+  const id = document.getElementById("setup-model-id").value.trim();
+  if (!id) {
+    note.textContent = "A model id is required.";
+    return;
+  }
+  setupPending = "model";
+  note.textContent = "Saving…";
+  vscodeApi.postMessage({ type: "setupModel", provider: "default", id });
+});
+document.getElementById("setup-mcp-on").addEventListener("click", () => {
+  const button = document.getElementById("setup-mcp-on");
+  button.disabled = true;
+  button.textContent = "Restarting…";
+  document.getElementById("setup-note").textContent = "Turning MCP on and restarting gogen.";
+  vscodeApi.postMessage({ type: "setupMcp" });
+});
+menuBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setMenu(menu.hidden);
+});
+document.addEventListener("click", () => setMenu(false));
+document.getElementById("form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = input.value.trim();
+  if (!text || send.disabled) return;
+  vscodeApi.postMessage({ type: "send", text });
+  input.value = "";
+  fitInput();
+});
+input.addEventListener("input", fitInput);
+input.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    document.getElementById("form").requestSubmit();
+  }
+});
+</script>
+</body>
+</html>`;
+}
+
+module.exports = { ChatViewProvider };

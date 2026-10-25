@@ -88,6 +88,21 @@ func TestWindowsShellExitStatus(t *testing.T) {
 	}
 }
 
+// TestWindowsShellWideExitCode verifies a 32-bit Windows exit code whose
+// low byte is 0 is reported as a command failure. Truncating it into the
+// interpreter's 8-bit status used to panic the process (exit code 2).
+func TestWindowsShellWideExitCode(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell is not on PATH")
+	}
+	forceInterpreter(t)
+	ex := NewExecutor(t.TempDir())
+	_, err := ex.ExecuteCommand(context.Background(), `powershell -NoProfile -Command "exit 256"`)
+	if err == nil || !strings.Contains(err.Error(), "exit code 256") {
+		t.Fatalf("err = %v, want exit code 256", err)
+	}
+}
+
 // TestWindowsShellCommandNotFound verifies a missing binary reports the
 // shell's 127 exit status (like sh).
 func TestWindowsShellCommandNotFound(t *testing.T) {

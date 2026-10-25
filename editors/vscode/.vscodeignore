@@ -1,0 +1,5 @@
+.vscode/**
+**/*.map
+**/node_modules/**
+_check*
+*.vsix

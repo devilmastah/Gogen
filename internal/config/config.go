@@ -1,6 +1,9 @@
 package config
 
 import (
+	"encoding/json"
+	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -195,6 +198,10 @@ type Config struct {
 	DebugSession    string
 	MCP             string
 	MCPServers      []MCPServerConfig
+	// HostMCPServers are process-local servers a host appended with
+	// GOGEN_MCP_EXTRA. They start with MCPServers when mcp is on, and a
+	// saved config never includes them.
+	HostMCPServers []MCPServerConfig
 	// MCPToolMode selects how MCP server tools are exposed to the model
 	// (nested = the single `mcp` gateway tool, inline = one definition per
 	// server tool). Resolved once at session construction: the value is part
@@ -466,13 +473,25 @@ func (c *Config) MCPNested() bool {
 	return !strings.EqualFold(strings.TrimSpace(c.MCPToolMode), MCPToolModeInline)
 }
 
+// MCPServersToStart is the server list the manager spawns. Host servers are
+// included only when mcp is on, so the off switch skips them the same way it
+// skips servers from the config file.
+func (c *Config) MCPServersToStart() []MCPServerConfig {
+	if !c.MCPEnabled() {
+		return nil
+	}
+	return ValidMCPServers(append(append([]MCPServerConfig{}, c.MCPServers...), c.HostMCPServers...))
+}
+
 // MCPActive reports whether MCP is enabled with at least one server to start.
 // This is the CONFIG answer, deliberately independent of whether a server has
 // connected yet: the model-facing tool set and system prompt are decided from
 // it at construction, so a slow server attaching later cannot change the
 // request prefix mid-session (which would invalidate the provider's cache).
+// A host server counts, so a sidebar that only adds an editor bridge still
+// exposes the gateway.
 func (c *Config) MCPActive() bool {
-	return c.MCPEnabled() && len(ValidMCPServers(c.MCPServers)) > 0
+	return len(c.MCPServersToStart()) > 0
 }
 
 // ValidMCPServers keeps the server entries that can actually be spawned (name
@@ -485,6 +504,53 @@ func ValidMCPServers(servers []MCPServerConfig) []MCPServerConfig {
 		if strings.TrimSpace(s.Name) != "" && strings.TrimSpace(s.Command) != "" {
 			out = append(out, s)
 		}
+	}
+	return out
+}
+
+// HostMCPServersEnv is the process-local MCP server list a host may set.
+// It is a JSON array in the same shape as GOGEN_MCP_SERVERS. Unlike that
+// variable it is appended, and it is never written to a config file.
+const HostMCPServersEnv = "GOGEN_MCP_EXTRA"
+
+// LoadHostMCPServers reads HostMCPServersEnv. An unset or empty value is
+// no servers. Invalid JSON is ignored so a bad host value cannot wipe the
+// servers the user configured.
+func LoadHostMCPServers() []MCPServerConfig {
+	raw, ok := os.LookupEnv(HostMCPServersEnv)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var servers []MCPServerConfig
+	if err := json.Unmarshal([]byte(raw), &servers); err != nil {
+		log.Printf("warning: %s is not a valid JSON array; ignoring it: %v", HostMCPServersEnv, err)
+		return nil
+	}
+	return servers
+}
+
+// MergeHostMCPServers appends host servers after the configured list.
+// A host entry whose name is already configured is skipped, so the user's
+// server keeps that name.
+func MergeHostMCPServers(configured, extra []MCPServerConfig) []MCPServerConfig {
+	seen := make(map[string]bool, len(configured))
+	for _, s := range configured {
+		name := strings.TrimSpace(s.Name)
+		if name != "" {
+			seen[name] = true
+		}
+	}
+	var out []MCPServerConfig
+	for _, s := range extra {
+		name := strings.TrimSpace(s.Name)
+		if name != "" && seen[name] {
+			log.Printf("host MCP server %q skipped; a configured server already uses that name", name)
+			continue
+		}
+		if name != "" {
+			seen[name] = true
+		}
+		out = append(out, s)
 	}
 	return out
 }

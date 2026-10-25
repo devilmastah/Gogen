@@ -50,7 +50,7 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 	// Install the shared registry before the goroutine and before the web
 	// workspace snapshots a.MCPRegistry. Every later session copies this
 	// pointer; Publish fills it in place when the handshake finishes.
-	servers := mcp.ValidServers(cfg.MCPServers)
+	servers := mcp.ValidServers(cfg.MCPServersToStart())
 	var pending *agent.PendingMCPRegistry
 	if a != nil && cfg.MCPEnabled() && len(servers) > 0 {
 		pending = agent.NewPendingMCPRegistry(mcp.MaxInitTimeout(servers))
@@ -62,11 +62,14 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 			if len(cfg.MCPServers) > 0 {
 				fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
 			}
+			if len(config.ValidMCPServers(cfg.HostMCPServers)) > 0 {
+				fmt.Fprintf(os.Stderr, "host MCP servers were not started because mcp is off\n")
+			}
 			return
 		}
 		if len(servers) == 0 {
 			// mcp: on with no usable servers — do not start a manager.
-			if len(cfg.MCPServers) > 0 {
+			if len(cfg.MCPServers) > 0 || len(cfg.HostMCPServers) > 0 {
 				fmt.Fprintf(os.Stderr, "MCP enabled but no valid mcp_servers entries (need name + command)\n")
 			}
 			return

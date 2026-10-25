@@ -238,11 +238,25 @@ func execHandler(ctx context.Context, args []string) error {
 		}
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			return interp.NewExitStatus(uint8(ee.ExitCode()))
+			return interpreterExit(ee)
 		}
 		return err
 	}
 	return nil
+}
+
+// interpreterExit turns a failed process into a status the embedded shell
+// can return. mvdan.cc/sh stores that status in a uint8 and panics when a
+// non-nil error carries code 0. Windows exit codes are 32-bit, so a code
+// outside 1–255 (256, or any value whose low byte is 0) must stay a plain
+// Go error. A plain error is reported as a failed command and does not
+// stop the process.
+func interpreterExit(ee *exec.ExitError) error {
+	code := ee.ExitCode()
+	if code > 0 && code < 256 {
+		return interp.ExitStatus(uint8(code))
+	}
+	return fmt.Errorf("exit code %d", code)
 }
 
 // execEnvFromShell converts the interpreter's environment to exec format,

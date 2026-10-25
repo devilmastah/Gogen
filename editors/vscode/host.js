@@ -1,0 +1,925 @@
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const vscode = require("vscode");
+const { Sidecar } = require("./sidecar");
+const { resolveBinary } = require("./binary");
+const { EditorBridge } = require("./editorBridge");
+
+// GogenHost owns the one sidecar for this window. The chat, the settings
+// tab, and the board tab all talk through it, so there is one process and
+// one .gogen directory.
+class GogenHost {
+  constructor(log, context) {
+    this.log = log;
+    this.context = context;
+    this.sidecar = null;
+    this.providers = [];
+    this.catalog = [];
+    this.model = "";
+    this.modelProvider = "";
+    this.appliedSavedModel = false;
+    this.modelsRequested = false;
+    this.refreshModels = false;
+    this.board = "";
+    this.lastConfig = null;
+    this.lastStatus = null;
+    this.listeners = new Set();
+    this.modelsWait = null;
+    this.resumeDone = false;
+    this.chatted = false;
+    this.lastContext = null;
+    this.turnActive = false;
+    this.tokensPerSec = 0;
+    this.editorBridge = new EditorBridge(log, () => this.folderPath());
+    this.approvalQueue = [];
+    this.approvalSeen = new Set();
+    this.approvalShowing = false;
+  }
+
+  overrideFolder() {
+    return this.context?.workspaceState.get("gogen.workspaceOverride") || "";
+  }
+
+  knownFolders() {
+    const saved = this.context?.globalState.get("gogen.workspaces");
+    return Array.isArray(saved) ? saved.filter((f) => typeof f === "string" && f) : [];
+  }
+
+  folderPath() {
+    return this.overrideFolder() || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+  }
+
+  async rememberFolder(folder) {
+    if (!folder || !this.context) {
+      return;
+    }
+    const next = [folder].concat(this.knownFolders().filter((f) => !samePath(f, folder))).slice(0, 20);
+    await this.context.globalState.update("gogen.workspaces", next);
+  }
+
+  async setOverride(folder) {
+    if (!this.context) {
+      return;
+    }
+    await this.context.workspaceState.update("gogen.workspaceOverride", folder || "");
+  }
+
+  subscribe(fn) {
+    this.listeners.add(fn);
+    if (this.lastStatus) {
+      fn(this.lastStatus);
+    }
+    const config = this.configView();
+    if (config) {
+      fn(config);
+    }
+    if (this.catalog.length) {
+      fn(this.modelsView());
+    }
+    const folder = this.folderPath();
+    if (folder) {
+      fn({ type: "workspace", label: path.basename(folder), folder });
+    }
+    if (this.lastContext) {
+      fn(this.contextView(this.lastContext));
+    }
+    fn({ type: "turn", active: !!this.turnActive, tokensPerSec: this.tokensPerSec || 0 });
+    return () => this.listeners.delete(fn);
+  }
+
+  // configView is the last server config push, plus the chat's model label.
+  // Settings reads every field the web UI reads; the chat only uses the model.
+  configView() {
+    if (!this.lastConfig) {
+      return null;
+    }
+    return Object.assign({}, this.lastConfig, {
+      type: "config",
+      modelLabel: this.currentModelLabel(),
+    });
+  }
+
+  modelsView() {
+    return {
+      type: "models",
+      model: this.model,
+      modelProvider: this.modelProvider,
+      modelLabel: this.currentModelLabel(),
+      models: this.catalog,
+    };
+  }
+
+  emit(event) {
+    for (const fn of this.listeners) {
+      fn(event);
+    }
+  }
+
+  currentModelLabel() {
+    if (!this.model) {
+      return "Choose a model";
+    }
+    if (this.modelProvider && this.modelProvider !== "default") {
+      return this.modelProvider + " · " + this.model;
+    }
+    return this.model;
+  }
+
+  hasEndpoint() {
+    return this.providers.some((p) => p && p.baseUrl);
+  }
+
+  async ensureStarted() {
+    const folder = this.folderPath();
+    if (!folder) {
+      this.emit({ type: "status", state: "error", text: "Open a folder. That folder is gogen's working directory." });
+      throw new Error("Open a folder first");
+    }
+    if (this.sidecar || this.starting) {
+      return;
+    }
+    this.starting = true;
+    try {
+      await this.startSidecar(folder);
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  async startSidecar(folder) {
+    let executable;
+    try {
+      executable = await resolveBinary(this.log);
+    } catch (err) {
+      this.emit({ type: "status", state: "error", text: err.message || String(err) });
+      throw err;
+    }
+    const adopt = adoptConf(folder, this.knownFolders());
+    if (adopt) {
+      this.log.appendLine("adopting config " + adopt);
+    }
+    await this.editorBridge.start();
+    const env = this.editorBridge.mcpEnv(this.context.extensionPath);
+    if (adopt) {
+      env.GOGEN_ADOPT_CONF = adopt;
+    }
+    const sidecar = new Sidecar(folder, executable, this.log, env);
+    this.sidecar = sidecar;
+    this.providers = [];
+    this.catalog = [];
+    this.model = "";
+    this.modelProvider = "";
+    this.appliedSavedModel = false;
+    this.modelsRequested = false;
+    this.refreshModels = false;
+    this.lastConfig = null;
+    this.lastContext = null;
+    this.turnActive = false;
+    this.tokensPerSec = 0;
+    sidecar.onEvent((event) => this.onSidecar(event));
+    this.emit({ type: "status", state: "starting", text: "Starting gogen in " + path.basename(folder) + "…" });
+    try {
+      await sidecar.start();
+      this.emit({ type: "status", state: "ready", text: "connected · " + path.basename(folder) });
+      this.emit({ type: "workspace", label: path.basename(folder), folder });
+      this.rememberFolder(folder);
+      this.requestResume();
+    } catch (err) {
+      if (this.sidecar === sidecar) {
+        this.sidecar = null;
+      }
+      sidecar.stop();
+      this.emit({ type: "status", state: "error", text: err.message });
+      throw err;
+    }
+  }
+
+  async restart() {
+    this.resumeDone = false;
+    this.chatted = false;
+    if (this.sidecar) {
+      this.sidecar.stop();
+      this.sidecar = null;
+    }
+    await this.ensureStarted();
+  }
+
+  // onWorkspaceFoldersChanged restarts the sidecar when the first workspace
+  // folder changes. gogen's working directory is fixed at process start, so
+  // the new folder's .gogen is a different process. Adding another folder
+  // beside the first one leaves the running process where it is.
+  onWorkspaceFoldersChanged() {
+    const run = this.folderWatch || Promise.resolve();
+    this.folderWatch = run.then(() => this.applyWorkspaceFolder()).catch((err) => {
+      this.log.appendLine(String(err && err.message ? err.message : err));
+    });
+  }
+
+  async applyWorkspaceFolder() {
+    if (!this.sidecar || this.overrideFolder()) {
+      return;
+    }
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+    if (samePath(this.sidecar.folder, folder)) {
+      return;
+    }
+    this.log.appendLine("workspace is now " + (folder || "(none)"));
+    this.emit({ type: "history", entries: [] });
+    if (!folder) {
+      this.sidecar.stop();
+      this.sidecar = null;
+      this.lastConfig = null;
+      this.providers = [];
+      this.catalog = [];
+      this.model = "";
+      this.modelProvider = "";
+      this.emit({ type: "status", state: "error", text: "Open a folder. That folder is gogen's working directory." });
+      return;
+    }
+    await this.restart();
+  }
+
+  onSidecar(event) {
+    if (event.type === "status") {
+      this.lastStatus = event;
+      this.emit(event);
+      return;
+    }
+    const msg = event.msg;
+    if (!msg || typeof msg.type !== "string") {
+      return;
+    }
+    switch (msg.type) {
+      case "history":
+        this.emit({ type: "history", entries: msg.history || [] });
+        break;
+      case "thinking_token":
+        this.emit({ type: "thinking", text: msg.content || "" });
+        break;
+      case "stream":
+        this.emit({ type: "token", text: msg.content || "" });
+        break;
+      case "tool_execute":
+        this.emit({ type: "tool", name: msg.tool || "tool" });
+        break;
+      case "tool_result":
+        this.emit({
+          type: "toolResult",
+          name: msg.tool || "tool",
+          text: msg.result || "",
+          success: msg.success !== false,
+        });
+        break;
+      case "response":
+        if (msg.content) {
+          this.emit({ type: "notice", text: msg.content });
+        }
+        break;
+      case "delete_approval":
+      case "command_approval":
+        this.enqueueApproval(msg);
+        break;
+      case "turn_end":
+        this.tokensPerSec = 0;
+        this.emit({ type: "turnEnd" });
+        this.setTurn(false);
+        break;
+      case "context":
+        this.lastContext = msg;
+        this.emit(this.contextView(msg));
+        break;
+      case "stream_stats":
+        this.tokensPerSec = msg.tokensPerSec || 0;
+        this.emit({ type: "stats", tokensPerSec: this.tokensPerSec });
+        break;
+      case "session_state":
+        this.setTurn(!!msg.turnActive);
+        break;
+      case "config":
+        if (Array.isArray(msg.providers)) {
+          this.providers = msg.providers;
+        }
+        this.lastConfig = msg;
+        this.model = msg.model || "";
+        this.modelProvider = msg.modelProvider || "";
+        this.board = msg.board || this.board;
+        this.emit(this.configView());
+        if (this.mcpRestartWait && String(msg.mcp || "").toLowerCase() === "on") {
+          const finish = this.mcpRestartWait;
+          finish();
+        }
+        this.applySavedModel(this.model);
+        if (!this.modelsRequested || this.refreshModels) {
+          this.modelsRequested = true;
+          this.refreshModels = false;
+          this.requestModels();
+        }
+        break;
+      case "models":
+        this.catalog = msg.models || [];
+        if (msg.model) {
+          this.model = msg.model;
+          this.modelProvider = msg.modelProvider || "";
+        }
+        if (this.modelsWait) {
+          const done = this.modelsWait;
+          this.modelsWait = null;
+          done(this.catalog);
+        }
+        this.emit(this.modelsView());
+        break;
+      case "provider_test":
+        this.emit({ type: "providerTest", result: msg.providerTest || {} });
+        break;
+      case "mcp_test":
+        this.emit({ type: "mcpTest", result: msg.mcpTestResult || {} });
+        break;
+      case "board_state":
+        this.emit({ type: "board", state: msg.boardState || { columns: [], items: [] } });
+        break;
+      case "sessions":
+        this.resumeLatest(msg.sessions || []);
+        break;
+      case "notice":
+        if (msg.content) {
+          this.emit({ type: "notice", kind: msg.kind || "", text: msg.content });
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  requestModels() {
+    if (!this.sidecar) {
+      return Promise.resolve(this.catalog);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.modelsWait = null;
+        resolve(this.catalog);
+      }, 8000);
+      this.modelsWait = (models) => {
+        clearTimeout(timer);
+        resolve(models);
+      };
+      try {
+        this.sidecar.sendRaw({ type: "list_models" });
+      } catch (err) {
+        clearTimeout(timer);
+        this.modelsWait = null;
+        this.emit({ type: "notice", text: err.message });
+        resolve(this.catalog);
+      }
+    });
+  }
+
+  applySavedModel(current) {
+    if (current || this.appliedSavedModel || !this.sidecar) {
+      return;
+    }
+    const saved = this.providers.filter((p) => p && p.model);
+    if (saved.length !== 1) {
+      return;
+    }
+    this.appliedSavedModel = true;
+    const p = saved[0];
+    const selector = p.name && p.name !== "default" ? p.name + "/" + p.model : p.model;
+    try {
+      this.sidecar.sendRaw({ type: "set_model", model: selector });
+    } catch (err) {
+      this.appliedSavedModel = false;
+      this.emit({ type: "notice", text: err.message });
+    }
+  }
+
+  // contextView is the context frame the web toolbar already renders:
+  // the meter, the near-compact flag, and the session totals.
+  contextView(msg) {
+    return {
+      type: "context",
+      usedTokens: msg.usedTokens || 0,
+      contextLimit: msg.contextLimit || 0,
+      usedSource: msg.usedSource || "",
+      promptTokens: msg.promptTokens || 0,
+      completionTokens: msg.completionTokens || 0,
+      cachedTokens: msg.cachedTokens || 0,
+      compactAt: msg.compactAt || 0,
+      messageCount: msg.messageCount || 0,
+      warnNearCompact: !!msg.warnNearCompact,
+      totalPromptTokens: msg.totalPromptTokens || 0,
+      totalCompletionTokens: msg.totalCompletionTokens || 0,
+      totalCachedTokens: msg.totalCachedTokens || 0,
+      totalTurns: msg.totalTurns || 0,
+    };
+  }
+
+  setTurn(active) {
+    this.turnActive = !!active;
+    if (!this.turnActive) {
+      this.tokensPerSec = 0;
+    }
+    this.emit({ type: "turn", active: this.turnActive, tokensPerSec: this.tokensPerSec || 0 });
+  }
+
+  sendChat(text) {
+    this.chatted = true;
+    this.sidecar.send(text);
+    this.emit({ type: "user", text });
+    this.setTurn(true);
+  }
+
+  setMode(mode) {
+    this.sidecar.sendRaw({ type: "set_mode", mode });
+  }
+
+  setThinking(level) {
+    this.sidecar.sendRaw({ type: "set_thinking_level", thinkingLevel: level });
+  }
+
+  cancelTurn() {
+    this.sidecar.sendRaw({ type: "cancel" });
+  }
+
+  compact() {
+    this.sidecar.sendRaw({ type: "compact" });
+  }
+
+  pickThinking() {
+    return chooseThinking(this).catch((err) => {
+      this.emit({ type: "notice", text: err.message || String(err) });
+    });
+  }
+
+  requestResume() {
+    if (!this.sidecar || this.resumeDone || this.chatted) {
+      return;
+    }
+    try {
+      this.sidecar.sendRaw({ type: "list_sessions" });
+    } catch (err) {
+      this.log.appendLine(String(err && err.message ? err.message : err));
+    }
+  }
+
+  // openSession attaches the chat to a session that already exists, such as
+  // the agent a board ticket started. sessionId on this message is the
+  // target, so the sidecar must not replace it with the live session.
+  openSession(id) {
+    if (!id || !this.sidecar) {
+      return;
+    }
+    this.resumeDone = true;
+    this.sidecar.sendRaw({ type: "session_resume", sessionId: id });
+  }
+
+  // resumeLatest opens the newest saved top-level session in this folder.
+  // A fresh process would otherwise start blank even though the transcript
+  // is still on disk. The board comes back on its own from .gogen/board.
+  resumeLatest(sessions) {
+    if (this.resumeDone || this.chatted || !this.sidecar) {
+      return;
+    }
+    this.resumeDone = true;
+    const current = this.sidecar.sessionId;
+    const saved = sessions.find((s) => s && s.id && s.id !== current && !s.parentId && !s.oneshot && s.messageCount > 0);
+    if (!saved) {
+      return;
+    }
+    try {
+      this.sidecar.sendRaw({ type: "session_resume", sessionId: saved.id });
+    } catch (err) {
+      this.resumeDone = false;
+      this.emit({ type: "notice", text: err.message });
+    }
+  }
+
+  pickModel(provider, id) {
+    const name = provider || "default";
+    const selector = name !== "default" ? name + "/" + id : id;
+    this.sidecar.sendRaw({ type: "set_model", model: selector });
+    this.rememberModel(name, id);
+  }
+
+  rememberModel(provider, id) {
+    if (!id || !this.sidecar) {
+      return;
+    }
+    const name = provider || "default";
+    const known = this.providers.find((p) => p.name === name);
+    const url = (known && known.baseUrl) || "";
+    if (name !== "default" && !url) {
+      return;
+    }
+    try {
+      this.sidecar.sendRaw({
+        type: "provider_save",
+        providerOp: { name, baseUrl: url, model: id },
+      });
+    } catch (err) {
+      this.emit({ type: "notice", text: err.message });
+    }
+  }
+
+  saveProvider(name, baseUrl, apiKey, model) {
+    const op = { name, baseUrl };
+    if (apiKey) {
+      op.apiKey = apiKey;
+    }
+    if (model !== undefined) {
+      op.model = model;
+    }
+    this.refreshModels = true;
+    this.sidecar.sendRaw({ type: "provider_save", providerOp: op });
+  }
+
+  deleteProvider(name) {
+    this.refreshModels = true;
+    this.sidecar.sendRaw({ type: "provider_delete", providerOp: { name } });
+  }
+
+  testProvider(op) {
+    this.sidecar.sendRaw({ type: "test_provider", providerOp: op });
+  }
+
+  testMcp(mcpTest) {
+    this.sidecar.sendRaw({ type: "test_mcp", mcpTest });
+  }
+
+  // sendFeature writes a feature flag the way the web settings modal does:
+  // a config message with the flag fields and no configFields list.
+  sendFeature(fields) {
+    this.sidecar.sendRaw(Object.assign({ type: "config" }, fields));
+  }
+
+  // sendRuntime writes one runtime setting. configFields names it so an
+  // explicit empty or zero value is applied instead of ignored.
+  sendRuntime(field, prop, value) {
+    const msg = { type: "config", configFields: [field] };
+    msg[prop || field] = value;
+    this.sidecar.sendRaw(msg);
+  }
+
+  boardOp(boardOp) {
+    this.sidecar.sendRaw({ type: "board_op", boardOp });
+  }
+
+  enableBoard() {
+    this.sidecar.sendRaw({ type: "config", board: "on" });
+  }
+
+  // enableMcpAndRestart turns MCP on and restarts once the save is echoed.
+  // The editor bridge is decided when the process starts, so the running
+  // sidecar cannot pick the switch up itself.
+  enableMcpAndRestart() {
+    if (this.mcpRestarting || !this.sidecar) {
+      return;
+    }
+    this.mcpRestarting = true;
+    const finish = () => {
+      if (this.mcpRestartWait !== finish) {
+        return;
+      }
+      this.mcpRestartWait = null;
+      this.restart().finally(() => {
+        this.mcpRestarting = false;
+      });
+    };
+    this.mcpRestartWait = finish;
+    setTimeout(() => {
+      if (this.mcpRestartWait !== finish) {
+        return;
+      }
+      if (!this.lastConfig || String(this.lastConfig.mcp || "").toLowerCase() !== "on") {
+        this.mcpRestartWait = null;
+        this.mcpRestarting = false;
+        this.emit({ type: "notice", text: "MCP did not turn on." });
+        return;
+      }
+      finish();
+    }, 4000);
+    try {
+      this.sendRuntime("mcp", "mcp", "on");
+    } catch (err) {
+      this.mcpRestartWait = null;
+      this.mcpRestarting = false;
+      this.emit({ type: "notice", text: err.message });
+    }
+  }
+
+  // enqueueApproval shows one Allow / Deny dialog at a time. The server
+  // holds the turn until delete_approval_response or
+  // command_approval_response arrives. Esc and closing the dialog deny.
+  enqueueApproval(msg) {
+    if (!msg.approvalId || this.approvalSeen.has(msg.approvalId)) {
+      return;
+    }
+    this.approvalSeen.add(msg.approvalId);
+    this.approvalQueue.push(msg);
+    this.presentApproval();
+  }
+
+  async presentApproval() {
+    if (this.approvalShowing || this.approvalQueue.length === 0) {
+      return;
+    }
+    this.approvalShowing = true;
+    const msg = this.approvalQueue.shift();
+    const command = msg.type === "command_approval";
+    const title = command ? "GoGen wants to run a blocked command" : "GoGen wants to delete files";
+    const allow = command ? "Allow command" : "Allow delete";
+    let detail = "";
+    if (command) {
+      detail = msg.command || "";
+      if (msg.reason) {
+        detail += (detail ? "\n\n" : "") + "Matched: " + msg.reason;
+      }
+    } else {
+      const paths = Array.isArray(msg.paths) ? msg.paths : [];
+      const shown = paths.slice(0, 20);
+      detail = shown.join("\n");
+      if (paths.length > shown.length) {
+        detail += "\n… and " + (paths.length - shown.length) + " more";
+      }
+      if (msg.reason) {
+        detail += (detail ? "\n\n" : "") + "Requested by: " + msg.reason;
+      }
+    }
+    this.emit({ type: "notice", text: title });
+    let pick;
+    try {
+      pick = await vscode.window.showWarningMessage(title, { modal: true, detail }, allow, "Deny");
+    } catch (err) {
+      this.log.appendLine("approval dialog failed: " + (err && err.message ? err.message : err));
+      pick = undefined;
+    }
+    const approved = pick === allow;
+    try {
+      this.sidecar.sendRaw({
+        type: command ? "command_approval_response" : "delete_approval_response",
+        approvalId: msg.approvalId,
+        approved,
+        sessionId: msg.sessionId,
+      });
+    } catch (err) {
+      this.log.appendLine("approval response failed: " + (err && err.message ? err.message : err));
+    }
+    this.emit({ type: "notice", text: (approved ? "Allowed" : "Denied") + (command ? " the command" : " the delete") });
+    this.approvalShowing = false;
+    this.presentApproval();
+  }
+
+  dispose() {
+    if (this.sidecar) {
+      this.sidecar.stop();
+      this.sidecar = null;
+    }
+    if (this.editorBridge) {
+      this.editorBridge.stop();
+    }
+  }
+}
+
+async function chooseModel(host) {
+  await host.ensureStarted();
+  if (!host.hasEndpoint()) {
+    const open = "Open Settings";
+    const choice = await vscode.window.showInformationMessage("Save an endpoint before choosing a model.", open);
+    if (choice === open) {
+      await vscode.commands.executeCommand("gogen.settings");
+    }
+    return;
+  }
+  const models = host.catalog.length ? host.catalog : await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Loading models" },
+    () => host.requestModels(),
+  );
+  if (!models.length) {
+    vscode.window.showWarningMessage("The endpoint returned no models.");
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(models.map((m) => ({
+    label: m.id,
+    description: m.provider && m.provider !== "default" ? m.provider : "",
+    provider: m.provider || "default",
+    id: m.id,
+  })), {
+    placeHolder: host.currentModelLabel(),
+    matchOnDescription: true,
+  });
+  if (!picked) {
+    return;
+  }
+  host.pickModel(picked.provider, picked.id);
+}
+
+async function chooseThinking(host) {
+  await host.ensureStarted();
+  const cfg = host.lastConfig || {};
+  if (cfg.reasoningEffortsUnsupported) {
+    return;
+  }
+  const efforts = Array.isArray(cfg.reasoningEfforts) && cfg.reasoningEfforts.length
+    ? cfg.reasoningEfforts
+    : ["low", "medium", "high"];
+  const current = cfg.thinkingLevel || "off";
+  const items = [{ label: "Off", value: "off", description: current === "off" ? "current" : "" }];
+  for (const value of efforts) {
+    if (!value || value === "off") {
+      continue;
+    }
+    const label = value.charAt(0).toUpperCase() + value.slice(1);
+    items.push({ label, value, description: value === current ? "current" : "" });
+  }
+  const picked = await vscode.window.showQuickPick(items, { placeHolder: "Thinking level" });
+  if (!picked) {
+    return;
+  }
+  host.setThinking(picked.value);
+}
+
+async function chooseWorkspace(host) {
+  const open = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+  const items = [];
+  if (open) {
+    items.push({ label: "$(folder) Open folder", description: open, useOpen: true });
+  }
+  for (const folder of host.knownFolders()) {
+    items.push({
+      label: path.basename(folder),
+      description: folder,
+      folder,
+    });
+  }
+  items.push({ label: "$(folder-opened) Choose folder…", pick: true });
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: host.folderPath() || "GoGen workspace",
+    matchOnDescription: true,
+  });
+  if (!picked) {
+    return;
+  }
+  let folder = "";
+  if (picked.pick) {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: "Use as GoGen workspace",
+    });
+    if (!uris || !uris[0]) {
+      return;
+    }
+    folder = uris[0].fsPath;
+  } else if (!picked.useOpen) {
+    folder = picked.folder;
+  }
+  await host.setOverride(folder);
+  if (folder) {
+    await host.rememberFolder(folder);
+  }
+  await host.restart();
+}
+
+// adoptConf is a project conf the user already saved, used only when the
+// shared config file does not exist yet. Folders this window has used come
+// first, then folders VS Code has opened. The first one that actually names
+// an endpoint, a model, or a provider is the one gogen inherits.
+function adoptConf(current, known) {
+  if (!globalConfigMissing()) {
+    return "";
+  }
+  const folders = []
+    .concat(known || [])
+    .concat((vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath))
+    .concat(current ? [current] : [])
+    .concat(recentCodeFolders());
+  const seen = new Set();
+  for (const folder of folders) {
+    if (!folder) {
+      continue;
+    }
+    let key;
+    try {
+      key = path.resolve(folder);
+    } catch {
+      continue;
+    }
+    if (process.platform === "win32") {
+      key = key.toLowerCase();
+    }
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const conf = configuredConf(folder);
+    if (conf) {
+      return conf;
+    }
+  }
+  return "";
+}
+
+function configuredConf(folder) {
+  const rels = [
+    path.join(".gogen", "gogen.conf"),
+    "GOGEN.conf",
+    path.join(".gogen", "gogen.md"),
+    "GOGEN.md",
+  ];
+  for (const rel of rels) {
+    const file = path.join(folder, rel);
+    let text;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    if (confHasSettings(text)) {
+      return file;
+    }
+  }
+  return "";
+}
+
+function confHasSettings(text) {
+  const body = String(text).replace(/\r/g, "");
+  for (const key of ["openai_base_url", "openai_model", "openai_api_key"]) {
+    const m = body.match(new RegExp("^" + key + ":\\s*(.*)$", "m"));
+    if (m && yamlSet(m[1])) {
+      return true;
+    }
+  }
+  const urls = body.match(/^[ \t]*base_url:\s*(.*)$/gm) || [];
+  return urls.some((line) => yamlSet(line.replace(/^[ \t]*base_url:\s*/, "")));
+}
+
+function yamlSet(raw) {
+  const v = String(raw).split("#")[0].trim().replace(/^['"]|['"]$/g, "");
+  return v !== "" && v !== "~" && v !== "null" && v !== "[]" && v !== "{}";
+}
+
+function globalConfigMissing() {
+  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return !fs.existsSync(path.join(base, "gogen", "config.yaml"));
+}
+
+function recentCodeFolders() {
+  const file = path.join(codeUserDir(), "globalStorage", "storage.json");
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  const re = /file:\/\/\/[^"\\\s]+/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    const folder = fileURIToPath(m[0]);
+    if (folder) {
+      out.push(folder);
+    }
+  }
+  return out;
+}
+
+function codeUserDir() {
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    return path.join(appData, "Code", "User");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Code", "User");
+  }
+  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(base, "Code", "User");
+}
+
+function fileURIToPath(uri) {
+  try {
+    const parsed = new URL(uri);
+    let folder = decodeURIComponent(parsed.pathname);
+    if (process.platform === "win32" && /^\/[A-Za-z]:/.test(folder)) {
+      folder = folder.slice(1);
+    }
+    return folder;
+  } catch {
+    return "";
+  }
+}
+
+function samePath(a, b) {
+  if (!a || !b) {
+    return a === b;
+  }
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  if (process.platform === "win32") {
+    return left.toLowerCase() === right.toLowerCase();
+  }
+  return left === right;
+}
+
+module.exports = { GogenHost, chooseModel, chooseWorkspace };

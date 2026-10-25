@@ -69,6 +69,49 @@ func TestCloseMCPAfterInitCompletes(t *testing.T) {
 	closeMCP(h) // must not block or panic
 }
 
+// TestStartMCPSkipsHostServersWhenOff pins the off switch in front of a
+// host-appended server: the manager is not started, and the note is the
+// off branch in startMCP.
+func TestStartMCPSkipsHostServersWhenOff(t *testing.T) {
+	origNew := newMCPManager
+	t.Cleanup(func() { newMCPManager = origNew })
+	newMCPManager = func(servers []config.MCPServerConfig) (*mcp.Manager, error) {
+		t.Fatal("mcp off must not start host servers")
+		return nil, nil
+	}
+	cfg := &config.Config{
+		MCP:            "off",
+		HostMCPServers: []config.MCPServerConfig{{Name: "vscode", Command: "node"}},
+	}
+	h := startMCP(nil, cfg)
+	<-h.done
+}
+
+// TestStartMCPStartsHostServersWhenOn starts a host server when mcp is on
+// even if the config file lists none, and tells the session the gateway is on.
+func TestStartMCPStartsHostServersWhenOn(t *testing.T) {
+	origNew := newMCPManager
+	t.Cleanup(func() { newMCPManager = origNew })
+	var got []config.MCPServerConfig
+	newMCPManager = func(servers []config.MCPServerConfig) (*mcp.Manager, error) {
+		got = append([]config.MCPServerConfig(nil), servers...)
+		return &mcp.Manager{}, nil
+	}
+	a := &agent.Agent{}
+	cfg := &config.Config{
+		MCP:            "on",
+		HostMCPServers: []config.MCPServerConfig{{Name: "vscode", Command: "node"}},
+	}
+	h := startMCP(a, cfg)
+	<-h.done
+	if !a.MCPConfigured() {
+		t.Fatal("a host server with mcp on should expose the gateway")
+	}
+	if len(got) != 1 || got[0].Name != "vscode" {
+		t.Fatalf("started servers = %+v, want vscode", got)
+	}
+}
+
 // TestStartMCPSharesRegistryBeforeHandshake pins the web-session bug: the
 // workspace copies a.MCPRegistry when the server is built, which is before
 // the handshake goroutine returns. The shared registry has to be installed

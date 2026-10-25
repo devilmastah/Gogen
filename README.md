@@ -153,7 +153,7 @@ out.
 
 ## Configuration
 
-Settings load from **CLI flags**, **environment variables**, and **`.gogen/gogen.conf`** (pure YAML). Precedence: **env > CLI flags > .conf > defaults**.
+Settings load from **CLI flags**, **environment variables**, **`.gogen/gogen.conf`** (pure YAML), and the global file **`~/.config/gogen/config.yaml`**. Precedence: **env > CLI flags > project conf > global config > defaults**. A folder with no conf inherits the global file, so a model and endpoint carry from one project to the next. A field the project file sets still wins. When the global file does not exist yet, a host may set `GOGEN_ADOPT_CONF` to a project conf already saved from the web UI or the CLI. That file is the base under the current project, and the newest saved session's model is copied onto it when the conf itself names no model. The result is written as the global file. A settings change writes the shared values to the global file and rewrites the project file with only the keys it already had. `working_dir`, `test_command`, and `lint_command` stay in the project. `--global` still uses the global file *instead of* the project `.gogen/` (one board, one session store).
 
 ### Project config (`.gogen/gogen.conf`)
 
@@ -385,6 +385,7 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
 | `GOGEN_MCP_TOOL_MODE` | `nested` | `nested` exposes every MCP tool through `mcp_list`, `mcp_describe`, and `mcp_call`; `inline` inlines one definition per server tool (also set `mcp_tool_mode` in project config) |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env, init_timeout_secs, tool_timeout_secs}` (overrides file) |
+| `GOGEN_MCP_EXTRA` | *(empty)* | JSON array in the same shape, appended for this process only. A host uses it for its own server (the VS Code editor bridge). It is not saved. `mcp` off does not start it. A name that is already configured is skipped. |
 
 Each `mcp_servers` entry may also set `init_timeout_secs` (handshake bound,
 default 60s) and `tool_timeout_secs` (default deadline for one `tools/call`,

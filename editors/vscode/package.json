@@ -1,0 +1,82 @@
+{
+  "name": "gogen-ai",
+  "displayName": "gogen-ai",
+  "description": "Sidebar chat for the gogen coding agent. The open folder is the working directory.",
+  "version": "0.1.0",
+  "publisher": "gogen",
+  "license": "AGPL-3.0-only",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gompa/Gogen.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gompa/Gogen/issues"
+  },
+  "homepage": "https://github.com/gompa/Gogen",
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "categories": ["Machine Learning", "Other"],
+  "activationEvents": [
+    "onView:gogen.chat",
+    "onCommand:gogen.pickModel",
+    "onCommand:gogen.workspace",
+    "onCommand:gogen.settings",
+    "onCommand:gogen.board",
+    "onCommand:gogen.restart"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "gogen",
+          "title": "GoGen",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "gogen": [
+        {
+          "type": "webview",
+          "id": "gogen.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "gogen.pickModel",
+        "title": "GoGen: Choose Model"
+      },
+      {
+        "command": "gogen.workspace",
+        "title": "GoGen: Workspace"
+      },
+      {
+        "command": "gogen.settings",
+        "title": "GoGen: Settings"
+      },
+      {
+        "command": "gogen.board",
+        "title": "GoGen: Board"
+      },
+      {
+        "command": "gogen.restart",
+        "title": "GoGen: Restart sidecar"
+      }
+    ],
+    "configuration": {
+      "title": "GoGen",
+      "properties": {
+        "gogen.executable": {
+          "type": "string",
+          "default": "gogen",
+          "description": "gogen binary to launch with --web. An absolute path works when the binary is not on PATH."
+        }
+      }
+    }
+  }
+}
