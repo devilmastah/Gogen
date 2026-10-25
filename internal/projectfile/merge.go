@@ -16,23 +16,6 @@ import (
 // environment variable is not set, so env vars cannot be overridden by flags.
 func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 	def := config.Defaults()
-	return mergeOver(&def, pf, flags)
-}
-
-// MergeOver layers a project file over an already-merged base. Project mode
-// passes the global config (itself merged over the built-in defaults) as
-// base, so a folder with no conf inherits it and a field the project file
-// sets still wins. Precedence is env, then flags, then the project file,
-// then base.
-func MergeOver(base *config.Config, pf *ProjectFile, flags FlagOverrides) *config.Config {
-	if base == nil {
-		def := config.Defaults()
-		base = &def
-	}
-	return mergeOver(base, pf, flags)
-}
-
-func mergeOver(def *config.Config, pf *ProjectFile, flags FlagOverrides) *config.Config {
 	var file FileConfig
 	if pf != nil {
 		file = pf.Config
@@ -62,8 +45,8 @@ func mergeOver(def *config.Config, pf *ProjectFile, flags FlagOverrides) *config
 		MCP:                       mergeString("GOGEN_MCP", file.MCP, def.MCP),
 		MCPToolMode:               mergeString("GOGEN_MCP_TOOL_MODE", file.MCPToolMode, def.MCPToolMode),
 		DebugCompareMessages:      mergeBool("GOGEN_DEBUG_COMPARE_MESSAGES", file.DebugCompareMessages, def.DebugCompareMessages),
-		MCPServers:                mergeMCPServers(file, def.MCPServers),
-		OpenAIProviders:           mergeOpenAIProviders(file, def.OpenAIProviders),
+		MCPServers:                mergeMCPServers(file),
+		OpenAIProviders:           mergeOpenAIProviders(file),
 		TestCommand:               mergeString("", file.TestCommand, ""),
 		LintCommand:               mergeString("", file.LintCommand, ""),
 		WebBind:                   mergeString("GOGEN_WEB_BIND", file.WebBind, def.WebBind),
@@ -133,7 +116,7 @@ func mergeOver(def *config.Config, pf *ProjectFile, flags FlagOverrides) *config
 	return cfg
 }
 
-func mergeMCPServers(file FileConfig, fallback []config.MCPServerConfig) []config.MCPServerConfig {
+func mergeMCPServers(file FileConfig) []config.MCPServerConfig {
 	if _, ok := os.LookupEnv("GOGEN_MCP_SERVERS"); ok {
 		raw := os.Getenv("GOGEN_MCP_SERVERS")
 		if strings.TrimSpace(raw) == "" {
@@ -160,15 +143,14 @@ func mergeMCPServers(file FileConfig, fallback []config.MCPServerConfig) []confi
 		}
 		return out
 	}
-	return fallback
+	return nil
 }
 
 // mergeOpenAIProviders merges the registered OpenAI-compatible provider
 // list: the GOGEN_OPENAI_PROVIDERS JSON env var wins when set, otherwise the
 // file's openai_providers list is used (converted to config entries).
-// An explicitly empty env value clears the list. A nil file list inherits
-// fallback (the global config's providers in project mode).
-func mergeOpenAIProviders(file FileConfig, fallback []config.OpenAIProviderConfig) []config.OpenAIProviderConfig {
+// An explicitly empty env value clears the list.
+func mergeOpenAIProviders(file FileConfig) []config.OpenAIProviderConfig {
 	if _, ok := os.LookupEnv("GOGEN_OPENAI_PROVIDERS"); ok {
 		raw := os.Getenv("GOGEN_OPENAI_PROVIDERS")
 		if strings.TrimSpace(raw) == "" {
@@ -193,7 +175,7 @@ func mergeOpenAIProviders(file FileConfig, fallback []config.OpenAIProviderConfi
 		}
 		return out
 	}
-	return fallback
+	return nil
 }
 
 // mergeCompactKeepRecentMessages merges the compact_keep_recent_messages

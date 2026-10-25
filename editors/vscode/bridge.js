@@ -12,7 +12,7 @@ const token = process.env.GOGEN_VSCODE_BRIDGE_TOKEN || "";
 const tools = [
   {
     name: "open_file",
-    description: "Open a file in the VS Code editor for the user. Path may be relative to the working directory or absolute. Line and column are 1-based.",
+    description: "Open a file in the VS Code editor for the user. Path may be relative to the working directory or absolute, and must stay inside the open workspace. A path outside it asks the user, and a denial leaves the file closed. Line and column are 1-based.",
     inputSchema: {
       type: "object",
       properties: {
@@ -25,7 +25,7 @@ const tools = [
   },
   {
     name: "reveal_file",
-    description: "Show a file or directory in the VS Code explorer. Path may be relative to the working directory or absolute.",
+    description: "Show a file or directory in the VS Code explorer. Path may be relative to the working directory or absolute, and must stay inside the open workspace. A path outside it asks the user, and a denial leaves it hidden.",
     inputSchema: {
       type: "object",
       properties: {
@@ -36,7 +36,7 @@ const tools = [
   },
   {
     name: "editor_state",
-    description: "Read what the user is looking at in VS Code: the active file, the cursor, the selection, and diagnostics. Pass path to read diagnostics for that file instead of the active one.",
+    description: "Read what the user is looking at in VS Code: the active file, the cursor, the selection, and diagnostics. Pass path to read diagnostics for that file instead of the active one. A path outside the open workspace asks the user.",
     inputSchema: {
       type: "object",
       properties: {
@@ -79,7 +79,10 @@ async function dispatch(line) {
     write({
       jsonrpc: "2.0",
       id: req.id,
-      error: { code: -32000, message: err && err.message ? err.message : String(err) },
+      error: {
+        code: err && Number.isInteger(err.code) ? err.code : -32000,
+        message: err && err.message ? err.message : String(err),
+      },
     });
   }
 }
@@ -90,14 +93,18 @@ async function answer(req) {
       return {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "gogen-vscode", version: "0.1.0" },
+        serverInfo: { name: "gogen-vscode", version: "0.1.3" },
       };
     case "tools/list":
       return { tools };
     case "tools/call":
       return callTool(req.params || {});
-    default:
-      throw new Error("unknown method " + req.method);
+    default: {
+      // -32601 is "method not found". A failed tool call stays -32000.
+      const err = new Error("unknown method " + req.method);
+      err.code = -32601;
+      throw err;
+    }
   }
 }
 

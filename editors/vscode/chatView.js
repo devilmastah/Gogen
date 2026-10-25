@@ -1,3 +1,5 @@
+const vscode = require("vscode");
+
 class ChatViewProvider {
   constructor(host) {
     this.host = host;
@@ -43,22 +45,18 @@ class ChatViewProvider {
       return;
     }
     if (msg.type === "pickModel") {
-      const vscode = require("vscode");
       vscode.commands.executeCommand("gogen.pickModel");
       return;
     }
     if (msg.type === "openSettings") {
-      const vscode = require("vscode");
       vscode.commands.executeCommand("gogen.settings");
       return;
     }
     if (msg.type === "openBoard") {
-      const vscode = require("vscode");
       vscode.commands.executeCommand("gogen.board");
       return;
     }
     if (msg.type === "openWorkspace") {
-      const vscode = require("vscode");
       vscode.commands.executeCommand("gogen.workspace");
       return;
     }
@@ -782,6 +780,7 @@ function refreshToolToggle() {
 }
 
 function renderHistory(entries) {
+  // A full history frame follows clear_chat. Replacing the log is the clear.
   log.replaceChildren();
   live = null;
   const cards = new Map();

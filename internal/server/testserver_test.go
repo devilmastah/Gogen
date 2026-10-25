@@ -1,7 +1,6 @@
 package server
 
 import (
-	"os"
 	"testing"
 	"time"
 
@@ -22,11 +21,6 @@ import (
 // after them, right before the temp dir goes away.
 func newTestServer(t *testing.T, a *agent.Agent, cfg *config.Config) *Server {
 	t.Helper()
-	// A settings save in project mode writes the global config. Keep that
-	// write inside the test's temp dir unless the test already chose one.
-	if os.Getenv("XDG_CONFIG_HOME") == "" {
-		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	}
 	s := NewServer(a, cfg)
 	t.Cleanup(func() { drainServer(s) })
 	return s

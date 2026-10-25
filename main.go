@@ -137,16 +137,6 @@ func main() {
 // session flush, MCP shutdown, profiling stop) is registered here so it runs
 // on both the success and error paths; main only translates a returned error
 // into a non-zero exit code.
-// seedKeepsSecrets reports whether a new global file should keep secrets
-// from the current project conf or from the adopted project conf. An
-// existing global file is not rewritten, so its secrets are not consulted.
-func seedKeepsSecrets(pf, base *projectfile.ProjectFile, adoptDir string) bool {
-	if pf != nil && pf.Path != "" && projectfile.ConfigFileHasSecrets(pf.Path) {
-		return true
-	}
-	return adoptDir != "" && base != nil && base.Path != "" && projectfile.ConfigFileHasSecrets(base.Path)
-}
-
 func run() error {
 	// The `gogen automation` subcommand tree (internal/automation) talks
 	// straight to the file store: no agent, no API key, no mode setup.
@@ -202,42 +192,13 @@ func run() error {
 		CLIVerbose: verboseOverride,
 		WebBind:    opts.host,
 	}
-	var cfg *config.Config
-	if isGlobalMode {
-		cfg = projectfile.Merge(pf, fileFlags)
-	} else {
-		// The global file is the base under the project conf. A folder
-		// with no conf inherits it; a field the project file sets wins.
-		// When the global file does not exist yet, a host may point
-		// GOGEN_ADOPT_CONF at a project conf the user already saved
-		// from the web UI or the CLI. That file is the base instead.
-		baseFile := projectfile.LoadGlobalConfig()
-		adoptDir := ""
-		if baseFile == nil {
-			if dir, adopted, ok := projectfile.LoadAdoptConf(); ok {
-				baseFile = adopted
-				adoptDir = dir
-			}
-		}
-		base := projectfile.Merge(baseFile, projectfile.FlagOverrides{})
-		cfg = projectfile.MergeOver(base, pf, fileFlags)
-		// The chosen model lives on the newest session when the conf
-		// itself never stored one. The current folder is tried first.
-		session.ApplyLatestSavedModel(cfg, workingDir)
-		if adoptDir != "" {
-			session.ApplyLatestSavedModel(cfg, adoptDir)
-		}
-		seedOpts := projectfile.WriteOptions{IncludeSecrets: seedKeepsSecrets(pf, baseFile, adoptDir)}
-		if err := projectfile.SeedGlobalConfig(cfg, seedOpts); err != nil {
-			log.Printf("global config seed: %v", err)
-		}
-	}
+	cfg := projectfile.Merge(pf, fileFlags)
 	if pf != nil {
 		cfg.ProjectGuidelines = pf.Guidelines
 		cfg.ProjectFilePath = pf.Path
 	}
 	// A host may append servers for this process only (the VS Code editor
-	// bridge). They are not part of the file that was just seeded.
+	// bridge). They are not written to the config file.
 	cfg.HostMCPServers = config.MergeHostMCPServers(cfg.MCPServers, config.LoadHostMCPServers())
 
 	if handleSaveConfigFlag(opts, isGlobalMode, workingDir, cfg, pf) {

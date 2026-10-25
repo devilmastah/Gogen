@@ -18,8 +18,11 @@ const TABS = [
 const ON_OFF = [["off", "Off"], ["on", "On"]];
 
 // Server-backed settings, in the same order as the web settings modal.
-// Editor, chat layout, and appearance stay out: those live in the browser,
-// not in gogen.conf, and VS Code already owns the editor.
+// The sidebar is its own UI. The web page's editor, chat layout, and
+// appearance stay out: they are not gogen settings, and VS Code already
+// owns its editor. A setting that only this sidebar understands can live
+// here. Keep the overlap with the web list as small as the shared gogen
+// settings allow.
 const FIELDS = [
   { tab: "agent", kind: "feature", key: "board", label: "Project board", options: ON_OFF },
   { tab: "agent", kind: "runtime", field: "boardStartPrompt", label: "Board agent prompt", control: "textarea", rows: 6, reset: true, when: "board", note: "Template for the agent started from a board ticket. Placeholders: {id} {title} {description} {priority} {context}. Empty = built-in default." },
@@ -366,15 +369,12 @@ function build() {
         el.type = "password";
         el.placeholder = field.placeholder || "";
         el.autocomplete = "new-password";
-      } else if (field.control === "number" || field.kind === "feature" && field.control === "number") {
+      } else if (field.control === "number") {
         el = document.createElement("input");
         el.type = "number";
         if (field.min !== undefined) el.min = String(field.min);
         if (field.max !== undefined) el.max = String(field.max);
         if (field.step !== undefined) el.step = String(field.step);
-      } else if (field.control === "number") {
-        el = document.createElement("input");
-        el.type = "number";
       } else {
         el = document.createElement("input");
         el.type = "text";
@@ -637,7 +637,7 @@ function renderMcp() {
     title.textContent = s.name || "";
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = (s.command || "") + (s.args && s.args.length ? " " + s.args.join(" ") : "") + (s.envSet ? " · env saved" : "");
+    meta.textContent = (s.command || "") + (s.args && s.args.length ? " " + s.args.join(" ") : "") + (s.envSet ? " · env saved" : "") + (s.host ? " · this process" : "");
     const test = document.createElement("button");
     test.type = "button";
     test.className = "quiet";

@@ -513,6 +513,11 @@ func ValidMCPServers(servers []MCPServerConfig) []MCPServerConfig {
 // variable it is appended, and it is never written to a config file.
 const HostMCPServersEnv = "GOGEN_MCP_EXTRA"
 
+// WebListenEnv is the listen address for this process only. A host may set
+// it so the VS Code sidebar can bind a free port. It is not a config value:
+// Merge ignores it, and a settings save keeps the user's web_bind.
+const WebListenEnv = "GOGEN_WEB_LISTEN"
+
 // LoadHostMCPServers reads HostMCPServersEnv. An unset or empty value is
 // no servers. Invalid JSON is ignored so a bad host value cannot wipe the
 // servers the user configured.

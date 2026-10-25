@@ -425,10 +425,9 @@ func (s *Server) configFilePath() string {
 }
 
 // persistConfig writes the effective config so a live toggle survives a
-// restart. Global mode writes the global config file. Project mode writes
-// the shared settings there too, and rewrites .gogen/gogen.conf with only
-// the keys that file already had. The write is best-effort (log on
-// failure) — the live toggle is already applied to the running process.
+// restart. Project mode writes .gogen/gogen.conf; global mode writes the
+// global config file. The write is best-effort (log on failure) — the live
+// toggle is already applied to the running process.
 //
 // Secrets (openai_api_key, MCP server env) are preserved when the EXISTING
 // file already contains them: the toggle rewrite must never drop a key the
@@ -436,7 +435,29 @@ func (s *Server) configFilePath() string {
 // without it). Keys that only ever came from the environment stay out of
 // the file, exactly as before.
 func (s *Server) persistConfig(cfg *config.Config) {
-	s.persist(cfg, false)
+	var err error
+	if s.ws.GlobalMode {
+		err = projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{
+			IncludeSecrets: projectfile.ConfigFileHasSecrets(projectfile.GlobalConfigPath()),
+		})
+	} else {
+		path := projectfile.DefaultSavePath(s.ws.GetWorkingDir())
+		includeSecrets := projectfile.ConfigFileHasSecrets(path)
+		if !includeSecrets {
+			// The user's config may live in a .md front matter with no
+			// .gogen/gogen.conf yet: creating a key-less .conf here would
+			// shadow the .md's key (a .conf takes precedence on load).
+			if cfgPath, ok := projectfile.DiscoverConfigPath(s.ws.GetWorkingDir()); ok {
+				includeSecrets = projectfile.ConfigFileHasSecrets(cfgPath)
+			}
+		}
+		err = projectfile.SaveConfig(path, "", cfg, "", projectfile.WriteOptions{
+			IncludeSecrets: includeSecrets,
+		})
+	}
+	if err != nil {
+		log.Printf("config save failed: %v", err)
+	}
 }
 
 // persistConfigForced writes the effective config with secrets forced on.
@@ -449,40 +470,14 @@ func (s *Server) persistConfigForced(cfg *config.Config) {
 	if s == nil || s.ws == nil || cfg == nil {
 		return
 	}
-	s.persist(cfg, true)
-}
-
-// persist writes a live settings change. Global mode writes the global
-// file, as before. Project mode writes the shared settings to the global
-// file so the next folder inherits them, and rewrites the project file
-// with only the keys it already had so an inherited value is not copied
-// into the folder. working_dir, test_command, and lint_command stay out
-// of the global file.
-func (s *Server) persist(cfg *config.Config, forceSecrets bool) {
-	if s == nil || s.ws == nil || cfg == nil {
-		return
-	}
-	include := forceSecrets || projectfile.ConfigFileHasSecrets(projectfile.GlobalConfigPath())
-	save := projectfile.SaveGlobalConfig
-	if !s.ws.GlobalMode {
-		// Project mode strips working_dir, test_command, and lint_command.
-		// Global mode keeps them: that file is the whole workspace.
-		save = projectfile.SaveSharedConfig
-	}
-	if err := save(cfg, projectfile.WriteOptions{IncludeSecrets: include}); err != nil {
-		log.Printf("config save failed: %v", err)
-	}
+	var err error
 	if s.ws.GlobalMode {
-		return
+		err = projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{IncludeSecrets: true})
+	} else {
+		path := projectfile.DefaultSavePath(s.ws.GetWorkingDir())
+		err = projectfile.SaveConfig(path, "", cfg, "", projectfile.WriteOptions{IncludeSecrets: true})
 	}
-	path := projectfile.DefaultSavePath(s.ws.GetWorkingDir())
-	includeProject := forceSecrets || projectfile.ConfigFileHasSecrets(path)
-	if !includeProject {
-		if cfgPath, ok := projectfile.DiscoverConfigPath(s.ws.GetWorkingDir()); ok {
-			includeProject = projectfile.ConfigFileHasSecrets(cfgPath)
-		}
-	}
-	if err := projectfile.SavePinnedProjectConfig(path, cfg, projectfile.WriteOptions{IncludeSecrets: includeProject}); err != nil {
+	if err != nil {
 		log.Printf("config save failed: %v", err)
 	}
 }

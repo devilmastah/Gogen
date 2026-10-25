@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Lint the hand-maintained web UI JavaScript (app.js, editor.js) with a
-# zero-dependency Node script — no npm, no eslint. Runs only when `node` is
-# available; `make check` stays green on machines without node.
+# Lint the hand-maintained web UI JavaScript and the VS Code sidebar
+# scripts with a zero-dependency Node script — no npm, no eslint. Runs only
+# when `node` is available; `make check` stays green on machines without node.
 #
-# The repo deliberately has NO npm dependency: there is no package.json and
-# nothing to install.
+# This script installs nothing. editors/vscode/package.json exists so the
+# sidebar can be packaged. It is not an npm dependency of gogen.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

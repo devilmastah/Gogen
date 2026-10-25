@@ -55,6 +55,18 @@ func wsHandleTestMCP(req *wsRequest) {
 				break
 			}
 		}
+		// A host server is running from the startup config, not the file.
+		// Resolve it here so the probe can use its command without the
+		// client ever receiving the env values.
+		if !found && s.ws.Config != nil && s.ws.Config.MCPEnabled() {
+			for _, m := range s.ws.Config.HostMCPServers {
+				if m.Name == mcpReq.Name {
+					server = m
+					found = true
+					break
+				}
+			}
+		}
 		if !found {
 			writeNoticeError(ws, "mcp", fmt.Sprintf("Error: MCP server %q is not configured", mcpReq.Name))
 			return
@@ -85,22 +97,33 @@ func wsHandleTestMCP(req *wsRequest) {
 	}()
 }
 
-// mcpEntries projects the configured MCP server list for the client: name,
-// command, args, and envSet — env values (which can hold secrets) are never
-// pushed.
+// mcpEntries projects the MCP servers for the client: the configured list,
+// plus a host server that this process actually started. Env values (which
+// can hold secrets) are never pushed. mcp off leaves the host server out,
+// because it was not started.
 func (s *Server) mcpEntries() []MCPEntry {
 	r := s.ws.GetRuntimeConfig()
-	if len(r.MCPServers) == 0 {
-		return nil
-	}
 	out := make([]MCPEntry, 0, len(r.MCPServers))
 	for _, m := range r.MCPServers {
-		out = append(out, MCPEntry{
-			Name:    m.Name,
-			Command: m.Command,
-			Args:    append([]string(nil), m.Args...),
-			EnvSet:  len(m.Env) > 0,
-		})
+		out = append(out, mcpEntry(m, false))
+	}
+	if s.ws.Config != nil && s.ws.Config.MCPEnabled() {
+		for _, m := range config.ValidMCPServers(s.ws.Config.HostMCPServers) {
+			out = append(out, mcpEntry(m, true))
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
+}
+
+func mcpEntry(m config.MCPServerConfig, host bool) MCPEntry {
+	return MCPEntry{
+		Name:    m.Name,
+		Command: m.Command,
+		Args:    append([]string(nil), m.Args...),
+		EnvSet:  len(m.Env) > 0,
+		Host:    host,
+	}
 }

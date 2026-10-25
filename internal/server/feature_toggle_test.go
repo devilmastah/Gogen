@@ -48,19 +48,16 @@ func TestFeatureToggleViaConfigWS(t *testing.T) {
 	// Workspace + agent flags flipped (sweep runs in a goroutine).
 	waitForCond(t, 5*time.Second, func() bool { return s.ws.GetBoardEnabled() && a.BoardEnabled() })
 
-	// A folder with no conf persists the toggle in the global config, so
-	// the next folder inherits it. yaml.v3 emits on/off values quoted
+	// Persisted for the next start. yaml.v3 emits on/off values quoted
 	// (`board: "on"`), which parses identically to the unquoted spelling.
+	cfgPath := filepath.Join(dir, ".gogen", "gogen.conf")
 	waitForCond(t, 5*time.Second, func() bool {
-		data, err := os.ReadFile(projectfile.GlobalConfigPath())
+		data, err := os.ReadFile(cfgPath)
 		if err != nil {
 			return false
 		}
 		return strings.Contains(string(data), "board: on") || strings.Contains(string(data), `board: "on"`)
 	})
-	if _, err := os.Stat(filepath.Join(dir, ".gogen", "gogen.conf")); !os.IsNotExist(err) {
-		t.Fatalf("toggle must not create a project config: %v", err)
-	}
 
 	// Toggle back off; the config push reflects it.
 	if err := conn.WriteJSON(WSMessage{Type: "config", Board: "off", SessionID: sid}); err != nil {
@@ -188,7 +185,6 @@ func TestFeatureTogglePersistPreservesSecrets(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(seed), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	stub := newBlockingStub()
 	s, _, _ := newContinuationServer(t, stub, dir)
 	// The in-memory effective config carries the same key the file has (a
@@ -209,23 +205,16 @@ func TestFeatureTogglePersistPreservesSecrets(t *testing.T) {
 // stays false when the file has no secrets).
 func TestFeatureTogglePersistKeepsEnvSecretsOut(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	stub := newBlockingStub()
 	s, _, _ := newContinuationServer(t, stub, dir)
 	s.config = &config.Config{OpenAIKey: "sk-env-only", Board: "on"}
 	s.persistConfig(s.config)
-	if _, err := os.Stat(filepath.Join(dir, ".gogen", "gogen.conf")); !os.IsNotExist(err) {
-		t.Fatalf("inherited settings must not create a project config: %v", err)
-	}
-	data, err := os.ReadFile(projectfile.GlobalConfigPath())
+	data, err := os.ReadFile(filepath.Join(dir, ".gogen", "gogen.conf"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), "sk-env-only") {
 		t.Fatalf("env-only key must not be persisted:\n%s", data)
-	}
-	if !strings.Contains(string(data), "board:") {
-		t.Fatalf("shared setting was not written to the global config:\n%s", data)
 	}
 }
 

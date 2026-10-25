@@ -46,7 +46,8 @@ The TUI starts with your project as the working directory. Try prompts like:
 ```
 
 Prefer a browser? Run with `--web` (http://127.0.0.1:8081). For a single
-prompt without any UI, use `-p`:
+prompt without any UI, use `-p`. The VS Code plugin starts gogen on a free
+port for that window, and that port is not saved as `web_bind`.
 
 ```bash
 OPENAI_API_KEY=sk-... ./gogen --web
@@ -153,7 +154,7 @@ out.
 
 ## Configuration
 
-Settings load from **CLI flags**, **environment variables**, **`.gogen/gogen.conf`** (pure YAML), and the global file **`~/.config/gogen/config.yaml`**. Precedence: **env > CLI flags > project conf > global config > defaults**. A folder with no conf inherits the global file, so a model and endpoint carry from one project to the next. A field the project file sets still wins. When the global file does not exist yet, a host may set `GOGEN_ADOPT_CONF` to a project conf already saved from the web UI or the CLI. That file is the base under the current project, and the newest saved session's model is copied onto it when the conf itself names no model. The result is written as the global file. A settings change writes the shared values to the global file and rewrites the project file with only the keys it already had. `working_dir`, `test_command`, and `lint_command` stay in the project. `--global` still uses the global file *instead of* the project `.gogen/` (one board, one session store).
+Settings load from **CLI flags**, **environment variables**, and **`.gogen/gogen.conf`** (pure YAML). Precedence: **env > CLI flags > .conf > defaults**.
 
 ### Project config (`.gogen/gogen.conf`)
 

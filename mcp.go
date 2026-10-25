@@ -44,15 +44,19 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 	// part of the request prefix, so deriving them from an asynchronous attach
 	// would rewrite the prefix between turn 1 and turn 2 and invalidate the
 	// provider's prompt cache for the whole conversation.
+	// One list for the tool flag and the processes. MCPServersToStart is empty
+	// when mcp is off, and it already keeps only entries with a name and a
+	// command. The manager checks its argument again so a direct caller
+	// cannot spawn a blank command.
+	servers := cfg.MCPServersToStart()
 	if a != nil {
-		a.SetMCPTooling(cfg.MCPActive(), cfg.MCPNested())
+		a.SetMCPTooling(len(servers) > 0, cfg.MCPNested())
 	}
 	// Install the shared registry before the goroutine and before the web
 	// workspace snapshots a.MCPRegistry. Every later session copies this
 	// pointer; Publish fills it in place when the handshake finishes.
-	servers := mcp.ValidServers(cfg.MCPServersToStart())
 	var pending *agent.PendingMCPRegistry
-	if a != nil && cfg.MCPEnabled() && len(servers) > 0 {
+	if a != nil && len(servers) > 0 {
 		pending = agent.NewPendingMCPRegistry(mcp.MaxInitTimeout(servers))
 		a.SetMCPRegistry(pending)
 	}
@@ -62,7 +66,7 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 			if len(cfg.MCPServers) > 0 {
 				fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
 			}
-			if len(config.ValidMCPServers(cfg.HostMCPServers)) > 0 {
+			if len(cfg.HostMCPServers) > 0 {
 				fmt.Fprintf(os.Stderr, "host MCP servers were not started because mcp is off\n")
 			}
 			return

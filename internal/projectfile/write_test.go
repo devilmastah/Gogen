@@ -53,6 +53,34 @@ func TestMergeWebBindPrecedence(t *testing.T) {
 	}
 }
 
+// TestWebListenEnvIsNotSaved pins the sidebar's free port: GOGEN_WEB_LISTEN
+// selects the listener for this process and stays out of the merged config,
+// so a later save cannot store it as web_bind.
+func TestWebListenEnvIsNotSaved(t *testing.T) {
+	os.Unsetenv("GOGEN_WEB_BIND")
+	t.Setenv(config.WebListenEnv, "127.0.0.1:53244")
+	pf := &ProjectFile{Config: FileConfig{WebBind: "0.0.0.0:9090"}}
+	if got := Merge(pf, FlagOverrides{}).WebBind; got != "0.0.0.0:9090" {
+		t.Fatalf("file web_bind = %q, want 0.0.0.0:9090 with %s set", got, config.WebListenEnv)
+	}
+	if got := Merge(nil, FlagOverrides{}).WebBind; got != config.Defaults().WebBind {
+		t.Fatalf("default web_bind = %q, want %q with %s set", got, config.Defaults().WebBind, config.WebListenEnv)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gogen.conf")
+	cfg := Merge(nil, FlagOverrides{})
+	if err := SaveConfig(path, "", cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "53244") || strings.Contains(string(data), "web_bind") {
+		t.Fatalf("saved config contains the process listen address:\n%s", data)
+	}
+}
+
 // TestSaveConfigOmitsDefaults verifies that options added by the
 // runtime-config / feature-flag work are NOT written when they equal the
 // built-in default: a config file must never bake in a default, so future

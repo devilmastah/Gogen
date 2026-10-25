@@ -205,14 +205,16 @@ type MCPTestTool struct {
 	Description string `json:"description,omitempty"`
 }
 
-// MCPEntry is one configured MCP server in the config push: name, command,
-// args, and whether env values are set — the env values themselves are
-// never pushed.
+// MCPEntry is one MCP server in the config push: name, command, args, and
+// whether env values are set. The env values themselves are never pushed.
+// Host is a process-local server (GOGEN_MCP_EXTRA) that is running in this
+// process. It is not in the config file.
 type MCPEntry struct {
 	Name    string   `json:"name"`
 	Command string   `json:"command"`
 	Args    []string `json:"args,omitempty"`
 	EnvSet  bool     `json:"envSet,omitempty"`
+	Host    bool     `json:"host,omitempty"`
 }
 
 type HistoryEntry struct {

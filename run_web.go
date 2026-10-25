@@ -28,7 +28,9 @@ import (
 func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredModel, tokenStatePath string) error {
 	// Determine the listen address first so we can check for loopback
 	// and resolve the auth token before creating the server.
-	addr := cfg.WebBind
+	// WebListenEnv is this process's bind only. Leaving cfg.WebBind alone
+	// keeps a settings save from storing the sidebar's free port.
+	addr := processListenAddr(cfg.WebBind)
 	var isLoopback bool
 	if addr == "" {
 		addr = "127.0.0.1:8081"
@@ -151,6 +153,16 @@ func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredMod
 	// Start returns nil on graceful context cancellation and a real error
 	// when the listener fails — propagate it to main's error path.
 	return <-errCh
+}
+
+// processListenAddr is the address this process binds. When WebListenEnv
+// is set, that value wins for the listener and is not written back onto
+// the config.
+func processListenAddr(cfgBind string) string {
+	if v := strings.TrimSpace(os.Getenv(config.WebListenEnv)); v != "" {
+		return v
+	}
+	return cfgBind
 }
 
 // displayAddrFor rewrites an unspecified bind host (0.0.0.0 / ::) to

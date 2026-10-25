@@ -1,5 +1,4 @@
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const vscode = require("vscode");
 const { Sidecar } = require("./sidecar");
@@ -155,15 +154,9 @@ class GogenHost {
       this.emit({ type: "status", state: "error", text: err.message || String(err) });
       throw err;
     }
-    const adopt = adoptConf(folder, this.knownFolders());
-    if (adopt) {
-      this.log.appendLine("adopting config " + adopt);
-    }
+    copyTemplateConf(folder, executable, this.log);
     await this.editorBridge.start();
     const env = this.editorBridge.mcpEnv(this.context.extensionPath);
-    if (adopt) {
-      env.GOGEN_ADOPT_CONF = adopt;
-    }
     const sidecar = new Sidecar(folder, executable, this.log, env);
     this.sidecar = sidecar;
     this.providers = [];
@@ -189,7 +182,7 @@ class GogenHost {
       if (this.sidecar === sidecar) {
         this.sidecar = null;
       }
-      sidecar.stop();
+      await sidecar.stop();
       this.emit({ type: "status", state: "error", text: err.message });
       throw err;
     }
@@ -199,8 +192,9 @@ class GogenHost {
     this.resumeDone = false;
     this.chatted = false;
     if (this.sidecar) {
-      this.sidecar.stop();
+      const old = this.sidecar;
       this.sidecar = null;
+      await old.stop();
     }
     await this.ensureStarted();
   }
@@ -227,8 +221,9 @@ class GogenHost {
     this.log.appendLine("workspace is now " + (folder || "(none)"));
     this.emit({ type: "history", entries: [] });
     if (!folder) {
-      this.sidecar.stop();
+      const old = this.sidecar;
       this.sidecar = null;
+      await old.stop();
       this.lastConfig = null;
       this.providers = [];
       this.catalog = [];
@@ -252,6 +247,8 @@ class GogenHost {
     }
     switch (msg.type) {
       case "history":
+        // clear_chat is not forwarded. The server sends this history frame
+        // right after it, and the chat replaces the transcript from here.
         this.emit({ type: "history", entries: msg.history || [] });
         break;
       case "thinking_token":
@@ -611,6 +608,9 @@ class GogenHost {
   // enqueueApproval shows one Allow / Deny dialog at a time. The server
   // holds the turn until delete_approval_response or
   // command_approval_response arrives. Esc and closing the dialog deny.
+  // Closing the window drops this queue. The server then waits out its own
+  // approval hold, the same as the web UI when the page goes away. dispose
+  // does not send a denial: the socket is already closing.
   enqueueApproval(msg) {
     if (!msg.approvalId || this.approvalSeen.has(msg.approvalId)) {
       return;
@@ -672,6 +672,7 @@ class GogenHost {
 
   dispose() {
     if (this.sidecar) {
+      // Unload cannot wait here. stop still force-kills if the process lingers.
       this.sidecar.stop();
       this.sidecar = null;
     }
@@ -782,131 +783,75 @@ async function chooseWorkspace(host) {
   await host.restart();
 }
 
-// adoptConf is a project conf the user already saved, used only when the
-// shared config file does not exist yet. Folders this window has used come
-// first, then folders VS Code has opened. The first one that actually names
-// an endpoint, a model, or a provider is the one gogen inherits.
-function adoptConf(current, known) {
-  if (!globalConfigMissing()) {
-    return "";
+// copyTemplateConf copies a config that sits beside the gogen executable
+// into the opened folder when that folder has no conf of its own. gogen
+// then loads and saves the project file the way a normal project session
+// does. A folder that already has a conf is left alone, and the file
+// beside the executable is never rewritten.
+function copyTemplateConf(folder, executable, log) {
+  if (!folder || !executable) {
+    return;
   }
-  const folders = []
-    .concat(known || [])
-    .concat((vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath))
-    .concat(current ? [current] : [])
-    .concat(recentCodeFolders());
-  const seen = new Set();
-  for (const folder of folders) {
-    if (!folder) {
-      continue;
-    }
-    let key;
-    try {
-      key = path.resolve(folder);
-    } catch {
-      continue;
-    }
-    if (process.platform === "win32") {
-      key = key.toLowerCase();
-    }
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    const conf = configuredConf(folder);
-    if (conf) {
-      return conf;
-    }
+  if (projectHasConf(folder)) {
+    return;
   }
-  return "";
+  const found = templateConf(path.dirname(executable));
+  if (!found) {
+    return;
+  }
+  const dest = templateDest(folder, found.rel);
+  if (samePath(found.file, dest)) {
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(found.file, dest);
+  } catch (err) {
+    log.appendLine("config copy failed: " + (err.message || String(err)));
+    return;
+  }
+  log.appendLine("copied config into " + dest);
 }
 
-function configuredConf(folder) {
-  const rels = [
-    path.join(".gogen", "gogen.conf"),
-    "GOGEN.conf",
-    path.join(".gogen", "gogen.md"),
-    "GOGEN.md",
-  ];
+const projectConfRels = [
+  path.join(".gogen", "gogen.conf"),
+  "GOGEN.conf",
+  path.join(".gogen", "gogen.md"),
+  "GOGEN.md",
+];
+
+function projectHasConf(folder) {
+  return projectConfRels.some((rel) => isNonEmptyFile(path.join(folder, rel)));
+}
+
+// templateConf looks beside the executable. gogen.conf in that directory
+// is the file a person drops next to the program. The other names are the
+// ones gogen itself searches, so a template kept in the program's .gogen
+// folder is found too.
+function templateConf(exeDir) {
+  const rels = ["gogen.conf"].concat(projectConfRels);
   for (const rel of rels) {
-    const file = path.join(folder, rel);
-    let text;
-    try {
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      continue;
-    }
-    if (confHasSettings(text)) {
-      return file;
+    const file = path.join(exeDir, rel);
+    if (isNonEmptyFile(file)) {
+      return { file, rel };
     }
   }
-  return "";
+  return null;
 }
 
-function confHasSettings(text) {
-  const body = String(text).replace(/\r/g, "");
-  for (const key of ["openai_base_url", "openai_model", "openai_api_key"]) {
-    const m = body.match(new RegExp("^" + key + ":\\s*(.*)$", "m"));
-    if (m && yamlSet(m[1])) {
-      return true;
-    }
+function templateDest(folder, rel) {
+  if (rel.endsWith(".conf")) {
+    return path.join(folder, ".gogen", "gogen.conf");
   }
-  const urls = body.match(/^[ \t]*base_url:\s*(.*)$/gm) || [];
-  return urls.some((line) => yamlSet(line.replace(/^[ \t]*base_url:\s*/, "")));
+  return path.join(folder, rel);
 }
 
-function yamlSet(raw) {
-  const v = String(raw).split("#")[0].trim().replace(/^['"]|['"]$/g, "");
-  return v !== "" && v !== "~" && v !== "null" && v !== "[]" && v !== "{}";
-}
-
-function globalConfigMissing() {
-  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return !fs.existsSync(path.join(base, "gogen", "config.yaml"));
-}
-
-function recentCodeFolders() {
-  const file = path.join(codeUserDir(), "globalStorage", "storage.json");
-  let raw;
+function isNonEmptyFile(file) {
   try {
-    raw = fs.readFileSync(file, "utf8");
+    const info = fs.statSync(file);
+    return info.isFile() && info.size > 0;
   } catch {
-    return [];
-  }
-  const out = [];
-  const re = /file:\/\/\/[^"\\\s]+/g;
-  let m;
-  while ((m = re.exec(raw))) {
-    const folder = fileURIToPath(m[0]);
-    if (folder) {
-      out.push(folder);
-    }
-  }
-  return out;
-}
-
-function codeUserDir() {
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(appData, "Code", "User");
-  }
-  if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "Code", "User");
-  }
-  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return path.join(base, "Code", "User");
-}
-
-function fileURIToPath(uri) {
-  try {
-    const parsed = new URL(uri);
-    let folder = decodeURIComponent(parsed.pathname);
-    if (process.platform === "win32" && /^\/[A-Za-z]:/.test(folder)) {
-      folder = folder.slice(1);
-    }
-    return folder;
-  } catch {
-    return "";
+    return false;
   }
 }
 

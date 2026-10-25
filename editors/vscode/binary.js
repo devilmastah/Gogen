@@ -98,6 +98,8 @@ async function downloadBinary(log) {
       const body = await getBuffer(file.browser_download_url);
       const checksums = (await getBuffer(sums.browser_download_url)).toString("utf8");
       const hash = crypto.createHash("sha256").update(body).digest("hex");
+      // checksums.txt comes from the same release. A match means the bytes
+      // were not damaged. It does not prove the release itself is authentic.
       if (!checksumMatches(checksums, asset, hash)) {
         throw new Error("The downloaded gogen did not match its checksum.");
       }

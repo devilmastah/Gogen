@@ -57,21 +57,6 @@ func SaveGlobalConfig(cfg *config.Config, opts WriteOptions) error {
 	return writeConfigFile(GlobalConfigPath(), []byte(yamlBody), opts)
 }
 
-// SaveSharedConfig writes cfg to the global config file with the fields
-// that belong to a project cleared. working_dir, test_command, and
-// lint_command stay in the project file. Seed and a live settings save
-// both go through here, so a shared write cannot keep a folder path.
-func SaveSharedConfig(cfg *config.Config, opts WriteOptions) error {
-	if cfg == nil {
-		return fmt.Errorf("config is nil")
-	}
-	shared := *cfg
-	shared.WorkingDir = ""
-	shared.TestCommand = ""
-	shared.LintCommand = ""
-	return SaveGlobalConfig(&shared, opts)
-}
-
 // writeConfigFile writes a config body. A file that embeds a secret must
 // not be world-readable: mode 0600. WriteFileAtomic preserves a
 // pre-existing mode, so an earlier 0644 save would survive the rewrite;
@@ -93,72 +78,6 @@ func writeConfigFile(path string, body []byte, opts WriteOptions) error {
 		}
 	}
 	return nil
-}
-
-// SeedGlobalConfig writes cfg to the global config file when that file does
-// not exist yet, so the next folder with no conf of its own inherits these
-// settings. SaveSharedConfig clears the project-only fields. An existing
-// global file is left alone. A config with no endpoint and no model does
-// not create the file.
-func SeedGlobalConfig(cfg *config.Config, opts WriteOptions) error {
-	if cfg == nil {
-		return fmt.Errorf("config is nil")
-	}
-	if _, err := os.Stat(GlobalConfigPath()); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	// A folder with no endpoint and no model must not create the shared
-	// file. The first start in a folder that has them is what publishes
-	// them for every later folder.
-	if cfg.OpenAIModel == "" && cfg.OpenAIURL == "" && cfg.OpenAIKey == "" && len(cfg.OpenAIProviders) == 0 {
-		return nil
-	}
-	return SaveSharedConfig(cfg, opts)
-}
-
-// SavePinnedProjectConfig rewrites an existing project config with only the
-// keys it already contained, taking their new values from cfg. Keys the
-// project file did not set are not added, so an inherited global setting
-// does not get frozen into the folder. A missing file is left missing.
-func SavePinnedProjectConfig(path string, cfg *config.Config, opts WriteOptions) error {
-	if cfg == nil {
-		return fmt.Errorf("config is nil")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	var pinned map[string]any
-	if err := yaml.Unmarshal(data, &pinned); err != nil {
-		return fmt.Errorf("read project config: %w", err)
-	}
-	if len(pinned) == 0 {
-		return nil
-	}
-	full, err := buildConfigYAML(cfg, opts)
-	if err != nil {
-		return err
-	}
-	var doc map[string]any
-	if err := yaml.Unmarshal([]byte(full), &doc); err != nil {
-		return fmt.Errorf("read effective config: %w", err)
-	}
-	out := make(map[string]any, len(pinned))
-	for key := range pinned {
-		if v, ok := doc[key]; ok {
-			out[key] = v
-		}
-	}
-	body, err := yaml.Marshal(out)
-	if err != nil {
-		return fmt.Errorf("marshal project config: %w", err)
-	}
-	return writeConfigFile(path, body, opts)
 }
 
 // configYAML is the YAML projection of the effective config written by

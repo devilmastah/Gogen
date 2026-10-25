@@ -30,15 +30,19 @@ class Sidecar {
   }
 
   async start() {
-    this.stop();
+    await this.stop();
     this.sessionId = "";
     this.port = await freePort();
     const addr = `127.0.0.1:${this.port}`;
-    this.log.appendLine(`starting ${this.executable} --web --host ${addr}`);
+    // GOGEN_WEB_LISTEN is this process only. --host would become web_bind
+    // and a settings save would store the free port.
+    this.log.appendLine(`starting ${this.executable} --web, listen ${addr}`);
     this.log.appendLine(`cwd ${this.folder}`);
-    const proc = spawn(this.executable, ["--web", "--host", addr], {
+    const env = Object.assign({}, process.env, this.env || {});
+    env.GOGEN_WEB_LISTEN = addr;
+    const proc = spawn(this.executable, ["--web"], {
       cwd: this.folder,
-      env: this.env ? Object.assign({}, process.env, this.env) : process.env,
+      env,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -152,14 +156,50 @@ class Sidecar {
     }
   }
 
+  // stop closes the chat socket and waits until the process has exited, so
+  // the next start is not writing the same .gogen at the same time. A process
+  // that ignores the first kill is force-killed.
   stop() {
     this.closeSocket();
     const proc = this.proc;
     this.proc = null;
-    if (proc) {
-      proc.kill();
-    }
+    return waitForExit(proc, 3000);
   }
+}
+
+function waitForExit(proc, ms) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    let timer;
+    const finish = () => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        finish();
+      }
+    }, ms);
+    proc.once("exit", finish);
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      finish();
+      return;
+    }
+    try {
+      proc.kill();
+    } catch {
+      finish();
+    }
+  });
 }
 
 function freePort() {
