@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -103,7 +104,8 @@ func TestWindowsShellCommandNotFound(t *testing.T) {
 // process tree (taskkill /T).
 func TestWindowsShellTimeoutKillsTree(t *testing.T) {
 	forceInterpreter(t)
-	exec := NewExecutor(t.TempDir())
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	start := time.Now()
@@ -114,6 +116,29 @@ func TestWindowsShellTimeoutKillsTree(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("timeout kill took %s, want prompt tree kill", elapsed)
+	}
+	// taskkill has returned, but Windows can keep the killed console
+	// host's working-directory handle for a moment. TempDir's RemoveAll
+	// then fails with "being used by another process".
+	waitUntilDirUnlocked(t, dir)
+}
+
+// waitUntilDirUnlocked removes dir once no process still has it as its
+// working directory. A missing directory counts as unlocked: TempDir's
+// own cleanup treats that as success.
+func waitUntilDirUnlocked(t *testing.T, dir string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var err error
+	for {
+		err = os.Remove(dir)
+		if err == nil || os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("working dir still locked after tree kill: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

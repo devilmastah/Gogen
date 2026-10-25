@@ -325,8 +325,9 @@ func TestGenerateResponseStreamStallSignal(t *testing.T) {
 	// test binary): the chunk cadence sits 50x below the window and the
 	// stream outlasts it, so a watchdog tick must land mid-stream and still
 	// find the clock freshly reset. A tight window flakes when a 10ms sleep
-	// stretches under CPU contention. The silent gap is a real Sleep (it
-	// never returns early), so it still fires deterministically.
+	// stretches under CPU contention. The silent phase is held open until
+	// the signal fires: a fixed sleep races the watchdog ticker, and a tick
+	// delivered after the next chunk resets the clock counts as no stall.
 	const (
 		stallAfter = 500 * time.Millisecond
 		chunkGap   = stallAfter / 50 // 10ms between chunks
@@ -340,17 +341,23 @@ func TestGenerateResponseStreamStallSignal(t *testing.T) {
 	// pending ticker tick while racing the closed stop channel), and a
 	// straggler must not be read as a continuous-phase fire.
 	var silentStalls, continuousStalls atomic.Int32
+	// held keeps the silent phase open until the test has seen the stall
+	// (or given up). Closing it lets the rest of the stream through.
+	held := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
 		if phase.Load() == 0 {
-			// One chunk, then a silent stretch well past the stall
-			// threshold, then the rest: the watchdog must fire.
+			// One chunk, then silence until the test releases the gap.
 			_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"one "}}]}`+"\n\n")
 			if fl != nil {
 				fl.Flush()
 			}
-			time.Sleep(2 * stallAfter)
+			select {
+			case <-held:
+			case <-r.Context().Done():
+				return
+			}
 			_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"two"}}]}`+"\n\n"+
 				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n"+"data: [DONE]\n\n")
 			if fl != nil {
@@ -378,17 +385,38 @@ func TestGenerateResponseStreamStallSignal(t *testing.T) {
 	p := newTestOpenAIProvider(srv)
 
 	// Phase A: the silent gap must produce at least one stall signal and a
-	// complete stream (the signal never interrupts).
-	res, err := p.GenerateResponseStream(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, nil,
-		&StreamHandlers{OnStreamStall: func() { silentStalls.Add(1) }})
-	if err != nil {
-		t.Fatal(err)
+	// complete stream (the signal never interrupts). The call blocks in the
+	// handler until held is closed, so the wait below observes the signal
+	// while the round is still live.
+	type streamOut struct {
+		res *StreamResult
+		err error
 	}
-	if res.Content != "one two" {
-		t.Fatalf("content = %q, want %q", res.Content, "one two")
+	done := make(chan streamOut, 1)
+	go func() {
+		res, err := p.GenerateResponseStream(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, nil,
+			&StreamHandlers{OnStreamStall: func() { silentStalls.Add(1) }})
+		done <- streamOut{res, err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for silentStalls.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	close(held)
+	var out streamOut
+	select {
+	case out = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream did not finish after the stall gap")
+	}
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	if out.res.Content != "one two" {
+		t.Fatalf("content = %q, want %q", out.res.Content, "one two")
 	}
 	if n := silentStalls.Load(); n < 1 {
-		t.Fatalf("OnStreamStall fired %d times during a %v gap (threshold %v), want >= 1", n, 2*stallAfter, stallAfter)
+		t.Fatalf("OnStreamStall fired %d times while the stream was held silent (threshold %v), want >= 1", n, stallAfter)
 	}
 
 	// Phase B: continuous chunks — no stall signal.
