@@ -193,7 +193,12 @@ func TestSpawnBackgroundCompletionContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := sp.Get(id)
-	waitFor(t, 5*time.Second, "child finished", func() bool { return child.IsFinished() })
+	// IsFinished flips inside child.Finish, before Finished and before the
+	// parent notice is posted. The notice is the last step of that path, so
+	// waiting for it is what makes the announcement counts stable.
+	waitFor(t, 5*time.Second, "terminal event", func() bool {
+		return child.IsFinished() && len(host.deliverTexts()) == 1
+	})
 
 	host.mu.Lock()
 	started, finished := len(host.started), len(host.finished)
