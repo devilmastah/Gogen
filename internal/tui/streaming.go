@@ -408,6 +408,10 @@ func (s *StreamAdapter) OnToolOutputEnd(id string, success bool) {}
 // pair above.
 func (s *StreamAdapter) OnMessageAppended(index int, role string) {}
 
+// StopStream is unused: the agent installs the smart-compact budget stop
+// on top of this callback. The TUI has no separate reason to cut a stream.
+func (s *StreamAdapter) StopStream() bool { return false }
+
 func (s *StreamAdapter) OnToolResult(id, name, result string, success bool) {
 	s.send(streamToolResultMsg{id: id, name: name, result: result, success: success, sid: s.owner, seq: s.seq})
 }

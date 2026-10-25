@@ -256,6 +256,10 @@ func (sk *wsStreamSink) OnToolOutputEnd(id string, success bool) {
 // because live messages carried no index at all. The index goes in Content
 // because WSMessage.Index has omitempty and message index 0 is valid (the
 // same convention as user_acked); role is informational.
+// StopStream is unused: the agent installs the smart-compact budget stop
+// on top of this callback. The web host has no separate reason to cut a stream.
+func (sk *wsStreamSink) StopStream() bool { return false }
+
 func (sk *wsStreamSink) OnMessageAppended(index int, role string) {
 	if index < 0 {
 		return
