@@ -294,8 +294,12 @@ func TestSendMessageFailedReplyNotifiesParent(t *testing.T) {
 // send_message fails with an actionable error instead of silently dropping
 // an older queued message whose reply the parent is waiting on.
 func TestSendMessageQueueFullRefuses(t *testing.T) {
+	// Every provider call is one started turn: the main job (1) and — after
+	// the release below — anything the delivery worker manages to start.
+	var streamCalls atomic.Int32
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		return &blockingProvider{} // the child's main job never finishes
+		// The child's main job never finishes.
+		return &blockingProvider{onStream: func() { streamCalls.Add(1) }}
 	})
 	sp := continuableSpawner(t, s)
 	sp.retain = time.Hour
@@ -324,6 +328,17 @@ func TestSendMessageQueueFullRefuses(t *testing.T) {
 	// queued deliveries, so the spawn goroutine can exit (the provider
 	// unwinds on cancel) instead of leaking into the package teardown.
 	sp.ReleaseChild(child)
+	// ... and the drop must happen in the eviction's critical section, not by
+	// racing it: the delivery worker is parked on the turn lock the main job
+	// is about to release, and a worker that wins that handoff starts a
+	// delivered turn whose own start-flush lands in .gogen/sessions after the
+	// runtime left the registry ("TempDir RemoveAll cleanup: ...
+	// directory not empty" in CI). Release claims the runtime before its
+	// outcome flush and drains the turn lock before evicting, so no further
+	// turn may start on the released child.
+	requireNever(t, 200*time.Millisecond,
+		"a queued send_message delivery started a turn on the released child",
+		func() bool { return streamCalls.Load() > 1 })
 }
 
 var errFailedReply = errors.New("provider exploded")
@@ -383,6 +398,66 @@ func TestSessionRuntimeQuiescentCoversDeliveryHandoff(t *testing.T) {
 		t.Fatal("the quiescence probe left the turn lock held")
 	}
 	rt.releaseTurn()
+}
+
+// TestDrainTurnLockWaitsOutHandoff pins the eviction-side drain
+// (sessionRuntime.drainTurnLock) that Release and the test teardown use: a
+// delivery worker can win the turn lock in the pop→start handoff before the
+// evicted flag lands, and the turn it starts persists its user message before
+// the provider call. Evicting without waiting let that flush land after the
+// runtime left the registry — a session file re-created post-teardown, which
+// the suite sees as "TempDir RemoveAll cleanup: ... directory not empty".
+func TestDrainTurnLockWaitsOutHandoff(t *testing.T) {
+	rt := &sessionRuntime{stream: &wsConnStream{}}
+	rt.evicted.Store(true) // callers latch first, so no new turn can start
+
+	// The handoff: the delivery worker owns the turn lock while the turn
+	// goroutine it just spawned is starting.
+	rt.turnMu.Lock()
+	drained := make(chan bool, 1)
+	go func() { drained <- rt.drainTurnLock(5 * time.Second) }()
+	select {
+	case ok := <-drained:
+		t.Fatalf("drain reported %v while a turn still held the lock", ok)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The blocked turn reaches its end and releases: the drain must report the
+	// runtime quiet, not give up.
+	rt.releaseTurn()
+	select {
+	case ok := <-drained:
+		if !ok {
+			t.Fatal("drain gave up instead of waiting out the handoff")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain did not return after the turn released the lock")
+	}
+
+	// It must hand the lock back: the worker's own drop path needs it to see
+	// the evicted flag and discard the queue.
+	if !rt.turnMu.TryLock() {
+		t.Fatal("drain left the turn lock held")
+	}
+	rt.releaseTurn()
+}
+
+// TestDrainTurnLockGivesUpOnStuckTurn pins the bound: a turn that ignores
+// cancellation (a stuck tool) must cost the window once and let the eviction
+// proceed — the sticky evicted flag still refuses new turns.
+func TestDrainTurnLockGivesUpOnStuckTurn(t *testing.T) {
+	rt := &sessionRuntime{stream: &wsConnStream{}}
+	rt.evicted.Store(true)
+	rt.turnMu.Lock()
+	defer rt.releaseTurn()
+
+	start := time.Now()
+	if rt.drainTurnLock(100 * time.Millisecond) {
+		t.Fatal("drain reported a held turn lock as quiet")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("drain took %v, want it bounded by the ~100ms budget", elapsed)
+	}
 }
 
 // TestBackgroundChildBusy pins the release-safety predicate: a quiet child

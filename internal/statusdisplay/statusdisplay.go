@@ -24,7 +24,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -550,12 +549,8 @@ func noteResult(c Config, key string, err error) {
 // DefaultSource. Spaces become dashes and the tag is capped so the name fits
 // the firmware's 31-char source field.
 func sourceForDir(dir string) string {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return ""
-	}
-	base := filepath.Base(filepath.Clean(dir))
-	if base == "." || base == string(filepath.Separator) || base == "" {
+	base := dirBase(dir)
+	if base == "" {
 		return ""
 	}
 	base = asciiOnly(base)

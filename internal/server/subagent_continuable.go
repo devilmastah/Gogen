@@ -104,6 +104,14 @@ func (sp *subagentSpawner) ArmReplyCapture(c *subagents.Child[*sessionRuntime]) 
 // released, so the host half only unwinds the runtime.
 func (sp *subagentSpawner) Release(c *subagents.Child[*sessionRuntime], cancelledMidRun bool) {
 	rt := c.Handle
+	// Claim the runtime before anything else: the evicted flag is the only
+	// guard the delivery worker re-checks once it wins the turn lock, and the
+	// writes below (the outcome flush, the cancel, the drain) leave it plenty
+	// of time to be mid-handoff. Without the early claim it reads the runtime
+	// as live, pops one of the queued send_message deliveries and starts a
+	// delivered turn — whose own start-flush then lands after the eviction,
+	// writing into a released (possibly already deleted) child's session.
+	rt.evicted.Store(true)
 	// A child released while its main job is running was cancelled (parent
 	// teardown / cap): record the failed outcome BEFORE the drain, so the
 	// cancelled turn's final flush persists it with the transcript. Finished
@@ -125,6 +133,13 @@ func (sp *subagentSpawner) Release(c *subagents.Child[*sessionRuntime], cancelle
 	}
 	rt.stream.cancelInFlight() // active delivery turns unwind; queued ones are discarded by eviction
 	rt.held.Store(false)
+	// Drain the turn lock before evicting: the cancelled turn's own final
+	// flush, and any delivery turn that already won the pop→start handoff
+	// before the claim above, belong to a runtime that is still ours. Letting
+	// them run past the eviction left a session file re-created after the
+	// child was released (in the suite: "TempDir RemoveAll cleanup: ...
+	// directory not empty").
+	rt.drainTurnLock(wsStreamDrainWait)
 	sp.s.registry.evictRuntime(rt)
 	// Releasing a child is an explicit teardown of its session: its own
 	// children (grandchildren) are cancelled and released in turn.

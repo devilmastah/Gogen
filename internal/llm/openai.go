@@ -782,17 +782,7 @@ func (p *OpenAIProvider) reasoningEffortResolution(ref ModelRef) (efforts []stri
 		ref = p.refForModelID(ref.ID)
 	}
 	ref = ref.Normalized()
-	registryKnown := false
-	var registryEfforts []string
-	if p.modelInfo != nil {
-		for _, u := range p.modelsDevURLsFor(ref) {
-			if _, _, efforts, _, err := p.modelInfo.Resolve(u, ref.ID); err == nil {
-				registryKnown = true
-				registryEfforts = efforts
-				break
-			}
-		}
-	}
+	registryEfforts, _, registryKnown := p.firstModelsDevEntry(ref)
 	if registryKnown && len(registryEfforts) > 0 {
 		return append([]string(nil), registryEfforts...), false
 	}
@@ -812,13 +802,29 @@ func (p *OpenAIProvider) reasoningEffortResolution(ref ModelRef) (efforts []stri
 // (resolved against its owning profile's registry entry), or "" when the
 // model is unknown. Only cached map lookup — never blocks.
 func (p *OpenAIProvider) ModelDescription(ref ModelRef) string {
+	_, desc, _ := p.firstModelsDevEntry(ref)
+	return desc
+}
+
+// firstModelsDevEntry returns the first models.dev entry that resolves for
+// ref (trying each URL modelsDevURLsFor yields, in order): its accepted
+// reasoning efforts and its description. ok reports that an entry was found
+// at all — an entry may legitimately carry an EMPTY effort set
+// (toggle/budget-only models), which is not the same as "unknown".
+//
+// It is the un-predicated sibling of lookupModelsDevInfo, which additionally
+// requires a usable context limit or cost before accepting an entry. Callers
+// that only need what the registry says about a model (its description, its
+// accepted efforts) use this one, so the two acceptance rules stay distinct
+// instead of being re-implemented per caller.
+func (p *OpenAIProvider) firstModelsDevEntry(ref ModelRef) (efforts []string, desc string, ok bool) {
 	if p == nil || p.modelInfo == nil || !ref.Valid() {
-		return ""
+		return nil, "", false
 	}
 	for _, u := range p.modelsDevURLsFor(ref) {
-		if _, _, _, desc, err := p.modelInfo.Resolve(u, ref.ID); err == nil {
-			return desc
+		if _, _, e, d, err := p.modelInfo.Resolve(u, ref.ID); err == nil {
+			return e, d, true
 		}
 	}
-	return ""
+	return nil, "", false
 }

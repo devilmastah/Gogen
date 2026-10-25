@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"gogen/internal/treesitter"
@@ -95,15 +94,7 @@ func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix,
 	}
 
 	var defs []string
-	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
-		if !treesitter.ReferenceSearchSupported(path) {
-			return nil
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-
+	err := e.walkReadableFiles(ctx, searchRoot, relPrefix, glob, skips, true, func(path, rel string, content []byte) error {
 		defList, err := treesitter.ListDefinitions(path, content)
 		if err != nil {
 			return nil

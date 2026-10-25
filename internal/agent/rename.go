@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 
@@ -65,15 +64,7 @@ func (e *Executor) RenameSymbol(ctx context.Context, oldName, newName, subpath, 
 func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glob, oldName, newName string, dryRun bool, skips *walkSkips) ([]FileChange, error) {
 	var changes []FileChange
 
-	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
-		if !treesitter.ReferenceSearchSupported(path) {
-			return nil
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-
+	err := e.walkReadableFiles(ctx, searchRoot, relPrefix, glob, skips, true, func(path, rel string, content []byte) error {
 		refs, err := treesitter.FindSymbolReferences(path, content, oldName)
 		if err != nil || len(refs) == 0 {
 			return nil
@@ -131,12 +122,7 @@ func (e *Executor) renameWithText(ctx context.Context, searchRoot, relPrefix, gl
 
 	var changes []FileChange
 
-	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-
+	err := e.walkReadableFiles(ctx, searchRoot, relPrefix, glob, skips, false, func(path, rel string, content []byte) error {
 		// Check for matches
 		matches := re.FindAllIndex(content, -1)
 		if len(matches) == 0 {

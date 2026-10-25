@@ -111,18 +111,6 @@ Docs: verify claims against code. Only document what exists — no invented conf
 or features. Omit unimplemented/roadmap items.`
 }
 
-// buildSystemView returns messages with the system prompt prepended (or the
-// existing first system message enriched), folding the session's MCP hint
-// (mcpHint, empty when no MCP servers are configured), the project profile, the
-// project rules, and the plan-mode suffix
-// into the system message content in a SINGLE copy of the slice. The previous
-// two-step pipeline
-// (withSystemPrompt + enrichSystemPrompt) copied the whole message slice once
-// per suffix; on long conversations that was 2-5 full shallow copies per turn
-// and per ContextStats probe. The produced view is byte-identical to the old
-// pipeline: the base system prompt, then the MCP hint (only when mcpHint is
-// set), then the profile suffix, then the project rules header, then the plan-mode
-// suffix, all on the leading system message.
 // buildSystemSuffix returns the MCP-hint / project-profile / project-rules /
 // plan-mode suffix text that buildSystemView folds into the leading system
 // message. Split out so systemPromptPrefix can construct the wire prefix
@@ -153,6 +141,18 @@ func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode 
 	return suffix.String()
 }
 
+// buildSystemView returns messages with the system prompt prepended (or the
+// existing first system message enriched), folding the session's MCP hint
+// (mcpHint, empty when no MCP servers are configured), the project profile, the
+// project rules, and the plan-mode suffix
+// into the system message content in a SINGLE copy of the slice. The previous
+// two-step pipeline
+// (withSystemPrompt + enrichSystemPrompt) copied the whole message slice once
+// per suffix; on long conversations that was 2-5 full shallow copies per turn
+// and per ContextStats probe. The produced view is byte-identical to the old
+// pipeline: the base system prompt, then the MCP hint (only when mcpHint is
+// set), then the profile suffix, then the project rules header, then the plan-mode
+// suffix, all on the leading system message.
 func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode, mcpHint string) []llm.Message {
 	if len(messages) == 0 {
 		return messages

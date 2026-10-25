@@ -1,18 +1,12 @@
 package agent
 
-import (
-	"context"
-	"strings"
-)
+import "context"
 
 // GitStatus returns a summary of working tree status.
 func (e *Executor) GitStatus(ctx context.Context, path string) (string, error) {
-	args := []string{"status", "--short"}
-	if strings.TrimSpace(path) != "" {
-		if _, err := e.SecurePath(path); err != nil {
-			return "", err
-		}
-		args = append(args, "--", path)
+	args, err := e.gitArgsWithPath([]string{"status", "--short"}, path)
+	if err != nil {
+		return "", err
 	}
 
 	text, err := e.runGitCommand(ctx, args)

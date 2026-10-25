@@ -35,6 +35,21 @@ func gitError(subcmd, text string, cause error) error {
 	return fmt.Errorf("git %s failed: %s", subcmd, text)
 }
 
+// gitArgsWithPath scopes args to path as a git pathspec (the "--" separator
+// keeps a path that looks like a revision or an option from being interpreted
+// as one). The path is validated against the workspace first, so no read-only
+// git command can be pointed outside it. An empty path leaves args untouched
+// (the command then covers the whole repository).
+func (e *Executor) gitArgsWithPath(args []string, path string) ([]string, error) {
+	if strings.TrimSpace(path) == "" {
+		return args, nil
+	}
+	if _, err := e.SecurePath(path); err != nil {
+		return nil, err
+	}
+	return append(args, "--", path), nil
+}
+
 // GitStage stages files for commit.
 // When paths is empty, it uses `git add -A` to stage everything.
 func (e *Executor) GitStage(ctx context.Context, paths []string) (string, error) {

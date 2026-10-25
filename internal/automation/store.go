@@ -199,32 +199,13 @@ func storeFileBody[T any](key string, items []T) []byte {
 }
 
 // writeFileAtomic writes data via a temp file in the target directory and a
-// rename, so a crash mid-write can never leave a truncated store behind.
+// rename, so a crash mid-write can never leave a truncated store behind. It
+// goes through the shared atomic writer (which also fsyncs, so a power loss
+// cannot revert the store to its previous contents) and keeps the store
+// files private at 0600 unless an existing file already carries another
+// mode.
 func writeFileAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create store dir %s: %w", dir, err)
-	}
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
-	if err != nil {
-		return fmt.Errorf("temp file for %s: %w", path, err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write %s: %w", tmpName, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", tmpName, err)
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return fmt.Errorf("chmod %s: %w", tmpName, err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename %s: %w", tmpName, err)
-	}
-	return nil
+	return ioutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // List returns all automations sorted by creation time (oldest first).
