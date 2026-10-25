@@ -62,26 +62,24 @@ func SystemPrompt(workingDir string) string {
 }
 
 // The MCP hint is appended to the system prompt only when the session was
-// constructed with MCP servers configured (mcp_tool_mode aside): MCP is
-// opt-in, so a session without one must not advertise tools it does not have.
-// The hint is chosen from CONSTRUCTION-TIME state, never from the live
-// registry, because the system prompt leads the request prefix — a hint that
-// appeared when a server finished connecting would invalidate the provider's
-// cache for the whole conversation. Both texts are constants: no counts, no
-// server names, nothing that changes between turns.
+// constructed with MCP servers configured AND the current mode exposes them:
+// MCP is opt-in, so a session without one must not advertise tools it does not
+// have, and plan mode does not mention MCP at all, because it withholds every
+// MCP tool — a mode that cannot see them gains nothing from being told how to
+// call them. The hint is chosen from CONSTRUCTION-TIME state and the mode,
+// never from the live registry, because the system prompt leads the request
+// prefix — a hint that appeared when a server finished connecting would
+// invalidate the provider's cache for the whole conversation. Both texts are
+// constants: no counts, no server names, nothing that changes between turns.
 const (
-	// mcpGatewayHint is the nested-mode hint (mcp_tool_mode: nested). The base
-	// system prompt does not mention MCP; this constant is the only prompt
-	// text that explains the gateway, so it carries the call shape. It stays
-	// a constant: no counts, no server names, nothing that changes between
-	// turns.
-	mcpGatewayHint = "MCP servers are reached through three tools: mcp_list, mcp_describe, and mcp_call. There is no action parameter. " +
-		"mcp_list takes an optional query, for example {\"query\":\"decompile\"}. " +
-		"mcp_describe takes tool, for example {\"tool\":\"mcp_rea_xrefs\"}. " +
-		"mcp_call takes tool and input. input holds only that tool's own parameters, for example {\"tool\":\"mcp_rea_search_strings\",\"input\":{\"pattern\":\"demo\",\"case_sensitive\":false}}. " +
-		"Do not put tool inside input."
+	// mcpGatewayHint is the nested-mode hint (mcp_tool_mode: nested): the three
+	// gateway tools in one line, in the same shape as mcpInlineHint. The call
+	// contract lives in each tool's definition, so this stays a pointer.
+	mcpGatewayHint = "MCP tools: use mcp_list to discover, mcp_describe for one tool's schema, " +
+		"and mcp_call to run one (input holds only that tool's own parameters)."
 	// mcpInlineHint is the inline-mode hint: the server tools are inlined into
-	// the definition list under their mcp_* names.
+	// the definition list under their mcp_* names, and the set itself comes
+	// from the live registry, so one line names the family the model will see.
 	mcpInlineHint = "Additional mcp_* tools may be available."
 )
 
@@ -131,9 +129,10 @@ or features. Omit unimplemented/roadmap items.`
 // without copying the whole message history.
 //
 // mcpHint is the session's MCP hint line (a.mcpToolHint()), or "" when the
-// session has no MCP servers configured: the hint is emitted only then, so the
-// base prompt of an MCP-less session never advertises MCP tools. The hint leads
-// the suffix because it qualifies the base prompt rather than the
+// session has no MCP servers configured or the current mode withholds them: the
+// hint is emitted only when there is something to describe, so the base prompt
+// of an MCP-less or plan-mode session never advertises MCP tools. The hint
+// leads the suffix because it qualifies the base prompt rather than the
 // project-specific enrichment below it.
 func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode Mode, mcpHint string) string {
 	var suffix strings.Builder
@@ -150,9 +149,6 @@ func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode 
 	}
 	if mode == ModePlan {
 		suffix.WriteString(planModePromptSuffix)
-		if mcpHint != "" {
-			suffix.WriteString("\nMCP tools are disabled until act mode.")
-		}
 	}
 	return suffix.String()
 }

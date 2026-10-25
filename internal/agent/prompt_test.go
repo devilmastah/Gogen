@@ -24,7 +24,7 @@ func TestSystemPromptTemplate(t *testing.T) {
 			t.Errorf("system prompt missing %q", want)
 		}
 	}
-	if strings.Contains(p, mcpGatewayHint) || strings.Contains(p, mcpInlineHint) {
+	if strings.Contains(p, mcpInlineHint) || strings.Contains(p, "MCP tools: ") {
 		t.Error("base system prompt advertises MCP tools with no MCP servers configured")
 	}
 }
@@ -39,20 +39,24 @@ func TestMCPHintGateIsConfigDerived(t *testing.T) {
 	t.Cleanup(resetPromptConfigForTest)
 	msgs := []llm.Message{{Role: "user", Content: "hi"}}
 
-	t.Run("hint text follows the exposure mode", func(t *testing.T) {
+	t.Run("hint text follows the exposure mode and the mode", func(t *testing.T) {
 		tests := []struct {
 			name       string
 			configured bool
 			nested     bool
+			mode       Mode
 			want       string
 		}{
-			{name: "no MCP servers", configured: false, nested: true, want: ""},
-			{name: "nested mode", configured: true, nested: true, want: mcpGatewayHint},
-			{name: "inline mode", configured: true, nested: false, want: mcpInlineHint},
+			{name: "no MCP servers", configured: false, nested: true, mode: ModeAct, want: ""},
+			{name: "nested act", configured: true, nested: true, mode: ModeAct, want: mcpGatewayHint},
+			{name: "inline act", configured: true, nested: false, mode: ModeAct, want: mcpInlineHint},
+			// Plan mode withholds every MCP tool, so it carries no MCP line.
+			{name: "nested plan", configured: true, nested: true, mode: ModePlan, want: ""},
+			{name: "inline plan", configured: true, nested: false, mode: ModePlan, want: ""},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				a := &Agent{WorkingDir: t.TempDir(), Messages: msgs}
+				a := &Agent{WorkingDir: t.TempDir(), Messages: msgs, Mode: tt.mode}
 				a.SetMCPTooling(tt.configured, tt.nested)
 				p := a.systemPromptPrefix()
 				if p == nil {
@@ -63,7 +67,28 @@ func TestMCPHintGateIsConfigDerived(t *testing.T) {
 						t.Fatalf("hint %q present = %v, want %v\n%q", hint, present, hint == tt.want, p[0].Content)
 					}
 				}
+				// Nothing MCP-shaped survives into a plan-mode prompt: no hint,
+				// no gate line, no tool names.
+				if tt.mode == ModePlan {
+					for _, gone := range []string{mcpGatewayHint, mcpInlineHint, "MCP tools", "mcp_list", "mcp_call"} {
+						if strings.Contains(p[0].Content, gone) {
+							t.Fatalf("plan-mode prompt still carries %q: %q", gone, p[0].Content)
+						}
+					}
+				}
 			})
+		}
+	})
+
+	t.Run("act mode never carries the plan gate", func(t *testing.T) {
+		a := &Agent{WorkingDir: t.TempDir(), Messages: msgs, Mode: ModeAct}
+		a.SetMCPTooling(true, true)
+		p := a.systemPromptPrefix()
+		if p == nil {
+			t.Fatal("systemPromptPrefix returned nil")
+		}
+		if strings.Contains(p[0].Content, "disabled until act mode") {
+			t.Fatalf("act-mode prompt carries the plan gate: %q", p[0].Content)
 		}
 	})
 
@@ -91,12 +116,12 @@ func TestMCPHintGateIsConfigDerived(t *testing.T) {
 		t.Fatalf("suffix = %q, want the MCP hint before the project profile", suffix)
 	}
 
-	plan := buildSystemSuffix("", "", "", ModePlan, mcpGatewayHint)
-	if !strings.Contains(plan, mcpGatewayHint) || !strings.Contains(plan, "MCP tools are disabled until act mode.") {
-		t.Fatalf("plan suffix = %q, want the call shape and the act-mode gate", plan)
+	plan := buildSystemSuffix("", "", "", ModePlan, "")
+	if strings.Contains(plan, "MCP tools") || strings.Contains(plan, "mcp_") {
+		t.Fatalf("plan suffix mentions MCP: %q", plan)
 	}
 	if strings.Contains(suffix, "disabled until act mode") {
-		t.Fatalf("act suffix advertises the plan-mode gate: %q", suffix)
+		t.Fatalf("act suffix advertises a plan-mode gate: %q", suffix)
 	}
 }
 

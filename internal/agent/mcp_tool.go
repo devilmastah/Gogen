@@ -89,13 +89,18 @@ func (a *Agent) mcpGatewayEnabled() bool {
 	return a.MCPConfigured() && a.MCPNested()
 }
 
-// mcpToolHint returns the system-prompt line that tells the model how to reach
-// MCP tools, or "" when the session has no MCP servers configured. The text
-// depends only on construction-time state (never on the live registry), so the
-// prompt prefix stays byte-stable for the whole session.
+// mcpToolHint returns the system-prompt line that describes MCP exposure, or
+// "" when the prompt should carry none. The text depends only on
+// construction-time state and the mode (never on the live registry), so the
+// prompt prefix stays byte-stable within a mode.
+//
+// Plan mode gets nothing at all: it withholds every MCP tool — nested and
+// inlined alike — so a line describing how to call them would describe tools
+// the model cannot see, and a line naming the gate would spend prompt on a
+// capability that is absent from the request anyway.
 func (a *Agent) mcpToolHint() string {
 	switch {
-	case !a.MCPConfigured():
+	case !a.MCPConfigured(), a.Mode == ModePlan:
 		return ""
 	case a.MCPNested():
 		return mcpGatewayHint
@@ -116,63 +121,34 @@ func mcpGatewayFeatureTools() []featureTool {
 }
 
 func mcpListToolDef() llm.Tool {
-	return llm.Tool{
-		Name: mcpListTool,
-		Description: "List the tools published by connected MCP servers. " +
-			"Returns names and a one-line summary. Optional query is a case-insensitive filter. " +
-			"Example: {\"query\":\"decompile\"}. Call this before mcp_describe or mcp_call. " +
-			"Disabled in plan mode.",
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"query": map[string]any{
-					"type":        "string",
-					"description": "Optional filter over tool names and descriptions (e.g. \"binary\" or \"decompile\").",
-				},
-			},
-		},
-	}
+	return toolDef(mcpListTool,
+		"List the tools of connected MCP servers: a name plus a one-line summary each; "+
+			"call this before mcp_describe or mcp_call.",
+		toolSchema(map[string]any{
+			"query": toolProp("string", "Optional case-insensitive filter over tool names and descriptions"),
+		}),
+	)
 }
 
 func mcpDescribeToolDef() llm.Tool {
-	return llm.Tool{
-		Name: mcpDescribeTool,
-		Description: "Show one MCP tool's argument schema. tool is a name from mcp_list, with or without the mcp_ prefix. " +
-			"Example: {\"tool\":\"mcp_rea_xrefs\"}. Disabled in plan mode.",
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"tool": map[string]any{
-					"type":        "string",
-					"description": "Tool name from mcp_list (e.g. mcp_rea_inspect or rea_inspect).",
-				},
-			},
-			"required": []string{"tool"},
-		},
-	}
+	return toolDef(mcpDescribeTool,
+		"Describe one MCP server tool: its full argument schema. tool is a name from "+
+			"mcp_list.",
+		toolSchema(map[string]any{
+			"tool": toolProp("string", "Tool name from mcp_list"),
+		}, "tool"),
+	)
 }
 
 func mcpCallToolDef() llm.Tool {
-	return llm.Tool{
-		Name: mcpCallTool,
-		Description: "Run one MCP tool. tool is a name from mcp_list. input is only that tool's own parameters. " +
-			"Example: {\"tool\":\"mcp_rea_search_strings\",\"input\":{\"pattern\":\"demo\",\"case_sensitive\":false}}. " +
-			"Do not put tool inside input. Disabled in plan mode.",
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"tool": map[string]any{
-					"type":        "string",
-					"description": "Tool name from mcp_list (e.g. mcp_rea_search_strings or search_strings).",
-				},
-				"input": map[string]any{
-					"type":        "object",
-					"description": "That tool's own parameters. A JSON-encoded string is also accepted. Omit when the tool takes none.",
-				},
-			},
-			"required": []string{"tool"},
-		},
-	}
+	return toolDef(mcpCallTool,
+		"Run one MCP server tool. tool is a name from mcp_list; input carries only that "+
+			"tool's own parameters, never the tool name.",
+		toolSchema(map[string]any{
+			"tool":  toolProp("string", "Tool name from mcp_list"),
+			"input": toolProp("object", "That tool's own parameters; omit when the tool takes none"),
+		}, "tool"),
+	)
 }
 
 func handleMCPList(ctx context.Context, a *Agent, args map[string]any) (string, error) {
