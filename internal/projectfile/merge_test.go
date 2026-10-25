@@ -662,3 +662,23 @@ func TestMergeCompactLastResort(t *testing.T) {
 		t.Fatalf("env should override the file: %q, want condense", got)
 	}
 }
+
+// smart_compact follows the same env > file > defaults rule and defaults
+// to off, so a config that never mentions it keeps today's compaction.
+func TestMergeSmartCompact(t *testing.T) {
+	os.Unsetenv("GOGEN_SMART_COMPACT")
+	if got := Merge(nil, FlagOverrides{}).SmartCompact; got != config.DefaultSmartCompact {
+		t.Fatalf("absent key merged to %q, want default %q", got, config.DefaultSmartCompact)
+	}
+	pf, err := ParseContent("GOGEN.md", "---\nsmart_compact: on\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Merge(pf, FlagOverrides{}).SmartCompact; got != "on" {
+		t.Fatalf("file value merged to %q, want on", got)
+	}
+	t.Setenv("GOGEN_SMART_COMPACT", "off")
+	if got := Merge(pf, FlagOverrides{}).SmartCompact; got != "off" {
+		t.Fatalf("env should override the file: %q, want off", got)
+	}
+}

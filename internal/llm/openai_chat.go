@@ -839,12 +839,27 @@ func (p *OpenAIProvider) retryStreamChat(ctx context.Context, req *roundRequest,
 	return result, nil
 }
 
+// budgetStopAttempt returns the text accumulated so far as a successful
+// partial round. A nil or empty build (the stream stopped before any
+// finish reason) is still a budget stop, not an error the retry ladder
+// should regenerate.
+func budgetStopAttempt(acc *streamAccumulator) streamAttempt {
+	res, err := acc.buildResult()
+	if err != nil || res == nil {
+		return streamAttempt{result: &StreamResult{FinishReason: "budget", BudgetStop: true}, acc: acc}
+	}
+	res.BudgetStop = true
+	if res.FinishReason == "" {
+		res.FinishReason = "budget"
+	}
+	return streamAttempt{result: res, acc: acc}
+}
+
 // streamChatAttempt performs ONE streaming chat-completion request,
-// forwarding live delivery callbacks (OnToken/OnThinkingToken/tool-call
-// deltas) as chunks arrive. It never recovers: failures come back in
-// streamAttempt for GenerateResponseStream to run the retry/fallback ladder.
-// req is the round's request, already converted and serialized once by
-// GenerateResponseStream (the retry path re-enters here with the same req).
+// forwarding live delivery callbacks as chunks arrive. It never recovers:
+// failures come back in streamAttempt for GenerateResponseStream to run
+// the retry ladder. A budget stop is a successful partial result, so it
+// does not enter that ladder.
 func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, req *roundRequest, h *StreamHandlers) streamAttempt {
 	onToken := h.OnToken
 	onThinking := h.OnThinkingToken
@@ -945,6 +960,15 @@ func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, req *roundReques
 		}
 		if stop := acc.processChunk(stream.Current(), onToken, onThinking, h); stop {
 			break
+		}
+		if ctx.Err() != nil {
+			return streamAttempt{acc: acc, err: ctx.Err()}
+		}
+		// A budget stop is a finished partial round, not a transport
+		// failure: return what was generated and do not enter the retry
+		// ladder (that ladder would start the thinking over).
+		if h.StopStream != nil && h.StopStream() {
+			return budgetStopAttempt(acc)
 		}
 		if acc.stopPending && grace > 0 {
 			if stopGrace == nil {

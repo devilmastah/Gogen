@@ -112,6 +112,7 @@ type configYAML struct {
 	MaxToolResultBytes        int                           `yaml:"max_tool_result_bytes"`
 	CompactReserveTokens      int                           `yaml:"compact_reserve_tokens"`
 	CompactLastResort         string                        `yaml:"compact_last_resort,omitempty"`
+	SmartCompact              string                        `yaml:"smart_compact,omitempty"`
 	CommandSafety             string                        `yaml:"command_safety"`
 	CommandAllowlist          string                        `yaml:"command_allowlist,omitempty"`
 	DeleteApproval            string                        `yaml:"delete_approval"`
@@ -207,6 +208,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		MaxToolResultBytes:        cfg.MaxToolResultBytes,
 		CompactReserveTokens:      cfg.CompactReserveTokens,
 		CompactLastResort:         omitDefaultString(cfg.CompactLastResort, def.CompactLastResort),
+		SmartCompact:              omitDefaultString(cfg.SmartCompact, def.SmartCompact),
 		CommandSafety:             cfg.CommandSafetyMode,
 		CommandAllowlist:          cfg.CommandAllowlist,
 		DeleteApproval:            cfg.DeleteApproval,

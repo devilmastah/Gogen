@@ -92,11 +92,17 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 		view = a.Messages
 	} else {
 		a.Context.EnsureContextLimit(ctx)
-		// Only compact at conversation boundaries (when the
-		// most recent message is from the user).  Compacting
-		// mid-tool-loop can drop assistant tool-call messages
-		// whose results are still pending, confusing the LLM.
-		if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" {
+		// Compact at a user-message boundary. Compacting while a tool
+		// call is still pending can drop that call. A tool result means
+		// the call already finished. Smart compact (off by default) also
+		// compacts then, once the conversation is over the compact budget,
+		// so a long tool loop does not start another think against a full
+		// window. Off keeps the user-message boundary only.
+		lastRole := ""
+		if len(a.Messages) > 0 {
+			lastRole = a.Messages[len(a.Messages)-1].Role
+		}
+		if lastRole == "user" || (lastRole == "tool" && a.smartCompactEnabled()) {
 			// Two-tier trigger. The normal tier fires at CompactBudget and
 			// honors the failure backoff. The EMERGENCY tier fires at the
 			// hard window (ContextLimit - CompactReserveTokens, where the

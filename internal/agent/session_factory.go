@@ -6,6 +6,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/onoff"
 	"gogen/internal/skills"
 )
 
@@ -116,6 +117,7 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 			MaxToolResultBytes:        opts.Config.MaxToolResultBytes,
 			CompactReserveTokens:      opts.Config.CompactReserveTokens,
 			CompactLastResort:         opts.Config.CompactLastResort,
+			SmartCompact:              onoff.Enabled(opts.Config.SmartCompact),
 		}
 	}
 	ctxMgr := contextmgr.NewManager(opts.Provider, settings)

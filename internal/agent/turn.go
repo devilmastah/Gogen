@@ -420,6 +420,8 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	// on. The deferred event reads the named result so a failed turn reports
 	// its error.
 	h = a.observeStreamHandlers(h)
+	var resetSmartCompact func()
+	h, resetSmartCompact = a.armSmartCompactStream(h)
 	a.fireTurnEvent(a.newTurnEvent(TurnPhaseStarted))
 	defer func() {
 		ev := a.newTurnEvent(TurnPhaseEnded)
@@ -440,6 +442,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	// tool-call branch); the turn-start reset covers the first round.
 	a.ghostRetries.Store(0)
 	for first := true; ; first = false {
+		resetSmartCompact()
 		result, err := a.runTurn(ctx, h, first)
 		if err != nil {
 			// Phase 3: a provider context-window refusal recovers in-loop
@@ -452,6 +455,40 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 				return "", terminal
 			}
 			return "", err
+		}
+
+		switch a.smartCompactBeforeTools(ctx, h, result) {
+		case smartCompactContinue:
+			a.ghostRetries.Store(0)
+			if h.OnRecoverPartialStream != nil {
+				h.OnRecoverPartialStream()
+			}
+			a.appendMessage(llm.Message{
+				Role:      "assistant",
+				Content:   result.Content,
+				Reasoning: result.Reasoning,
+				CreatedAt: time.Now().Truncate(time.Millisecond),
+				Model:     result.Model,
+			})
+			a.notifyMessageAppended(h, "assistant")
+			a.FlushSession()
+			continue
+		case smartCompactHalt:
+			a.ghostRetries.Store(0)
+			msg := result.Content
+			if msg == "" {
+				msg = smartCompactStuckMessage
+			}
+			a.appendMessage(llm.Message{
+				Role:      "assistant",
+				Content:   msg,
+				Reasoning: result.Reasoning,
+				CreatedAt: time.Now().Truncate(time.Millisecond),
+				Model:     result.Model,
+			})
+			a.notifyMessageAppended(h, "assistant")
+			a.FlushSession()
+			return msg, nil
 		}
 
 		if len(result.ToolCalls) == 0 {

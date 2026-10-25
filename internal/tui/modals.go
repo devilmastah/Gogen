@@ -1276,6 +1276,7 @@ func (m *Model) renderHelpModal() string {
 			{"/open", "Open a new live session"},
 			{"/switch", "Switch live sessions"},
 			{"/compact", "Compact history"},
+			{"/smartcompact", "Smart compact on, off, or toggle"},
 			{"/queue", "Queued messages (per-item cancel)"},
 			{"/verbose", "Toggle verbose output"},
 			{"/save-config", "Write config to .gogen/"},

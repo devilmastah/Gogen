@@ -105,6 +105,11 @@ type Settings struct {
 	// the summarizer; "error" makes the caller return a diagnostic instead.
 	// normalizeSettings clamps any other value to "condense".
 	CompactLastResort string
+	// SmartCompact compacts during a tool loop, before the next tool runs,
+	// once the conversation is over the compact budget. It also stops a
+	// thinking stream while there is still room to summarize. Off (the
+	// default) leaves compaction at a user-message boundary.
+	SmartCompact bool
 }
 
 // DefaultSettings returns defaults; ContextLimit 0 means resolve from the provider at runtime.
@@ -402,6 +407,37 @@ func (m *Manager) CompactLastResort() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.Settings.CompactLastResort
+}
+
+// SmartCompact reports whether compaction also runs inside a tool loop.
+func (m *Manager) SmartCompact() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings.SmartCompact
+}
+
+// SmartCompactStopAt is the in-flight token count at which a thinking
+// stream should stop so a summary still fits. It is the context window
+// minus the reserve and the summary output allowance. 0 means the window
+// is not known yet, so the stream is left alone.
+func (m *Manager) SmartCompactStopAt() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	limit := m.Settings.ContextLimit
+	if limit <= 0 {
+		return 0
+	}
+	stop := limit - m.Settings.CompactReserveTokens - summaryOutputAllowance
+	if stop < 1 {
+		return 1
+	}
+	return stop
 }
 
 // ChooseCompactKeep returns the number of recent messages to preserve

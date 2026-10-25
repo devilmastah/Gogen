@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
+	"gogen/internal/onoff"
 	"gogen/internal/session"
 
 	tea "charm.land/bubbletea/v2"
@@ -52,6 +53,10 @@ var tuiCommands = []tuiCommand{
 	{match: exactAny("help", "/help"), run: cmdHelp},
 	{match: exactAny("exit", "/exit", "quit", "/quit"), run: cmdExit},
 	{match: exactAny("compact", "/compact"), run: cmdCompact},
+	{match: func(input, trimmed string) bool {
+		return trimmed == "smartcompact" || trimmed == "/smartcompact" ||
+			strings.HasPrefix(trimmed, "smartcompact ") || strings.HasPrefix(trimmed, "/smartcompact ")
+	}, run: cmdSmartCompact},
 	{match: exactAny("verbose", "/verbose"), run: cmdVerbose},
 	{match: exactAny("subagents", "/subagents"), run: cmdSubagents},
 	// Mode commands: mirror HandleModeCommand's accepted forms.
@@ -205,6 +210,54 @@ func cmdCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		return compactResultMsg{agent: a, err: err, seq: seq}
 	}
 	return true, false, tea.Batch(m.spinner.Tick, compactCmd)
+}
+
+func cmdSmartCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	fields := strings.Fields(trimmed)
+	var want *bool
+	if len(fields) >= 2 {
+		on, ok := onoff.Parse(fields[1])
+		if !ok {
+			m.appendChatLine(SystemStyle.Render("Smart compact: use on or off"))
+			return true, false, nil
+		}
+		want = &on
+	}
+	if m.agent == nil || m.agent.Context == nil {
+		m.appendChatLine(SystemStyle.Render("Smart compact is unavailable in this session"))
+		return true, false, nil
+	}
+	next := !m.agent.Context.SmartCompact()
+	if want != nil {
+		next = *want
+	}
+	state := "off"
+	if next {
+		state = "on"
+	}
+	apply := func(a *agent.Agent) {
+		if a != nil {
+			a.SetSmartCompact(next)
+		}
+	}
+	if m.lives != nil {
+		for _, sess := range m.lives.sessions {
+			if sess != nil {
+				apply(sess.agent)
+			}
+		}
+	}
+	apply(m.agent)
+	if m.cfg != nil {
+		m.cfg.SmartCompact = state
+	}
+	if m.workspace != nil {
+		cfg := m.workspace.GetRuntimeConfig()
+		cfg.SmartCompact = state
+		m.workspace.SetRuntimeConfig(cfg)
+	}
+	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Smart compact: %s (this run; /save-config stores it)", state)))
+	return true, false, nil
 }
 
 func cmdVerbose(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {

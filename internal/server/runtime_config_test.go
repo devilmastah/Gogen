@@ -30,7 +30,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		Type: "config",
 		ConfigFields: []string{
 			"commandSafety", "commandAllowlist", "deleteApproval", "commandApproval", "commandSandbox", "commandIdleTimeoutSecs",
-			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "outputSpill", "compactReserveTokens", "compactLastResort",
+			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "outputSpill", "compactReserveTokens", "compactLastResort", "smartCompact",
 			"webFetch", "webSearch", "treesitter", "preserveReasoning",
 			"sessionMaxCount", "sessionMaxAgeDays", "webApprovalHoldSecs",
 			"subagentModel", "subagentThinkingLevel", "boardStartPrompt", "systemPrompt", "subagentPrompt",
@@ -48,6 +48,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		OutputSpill:               "off",
 		CompactReserveTokens:      1000,
 		CompactLastResort:         "error",
+		SmartCompact:              "on",
 		WebFetch:                  "off",
 		WebSearch:                 "off",
 		TreeSitter:                "off",
@@ -81,7 +82,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		cfg.CommandIdleTimeoutSecs != 45 ||
 		cfg.ContextLimitConfig != 20000 || cfg.CompactThreshold != 0.5 ||
 		cfg.CompactKeepRecentMessages != 3 || cfg.MaxToolResultBytes != 65536 || cfg.CompactReserveTokens != 1000 ||
-		cfg.CompactLastResort != "error" ||
+		cfg.CompactLastResort != "error" || cfg.SmartCompact != "on" ||
 		cfg.OutputSpill != "off" ||
 		cfg.WebFetch != "off" || cfg.WebSearch != "off" || cfg.TreeSitter != "off" ||
 		cfg.PreserveReasoning != "on" || cfg.SessionMaxCount != 4 || cfg.SessionMaxAgeDays != 9 ||
@@ -110,7 +111,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	}
 	snap := a.Context.SettingsSnapshot()
 	if snap.ContextLimit != 20000 || snap.CompactThreshold != 0.5 || snap.CompactKeepRecentMessages != 3 ||
-		snap.MaxToolResultBytes != 65536 || snap.CompactReserveTokens != 1000 || snap.CompactLastResort != "error" {
+		snap.MaxToolResultBytes != 65536 || snap.CompactReserveTokens != 1000 || snap.CompactLastResort != "error" || !snap.SmartCompact {
 		t.Fatalf("context settings = %+v, want applied values", snap)
 	}
 	if s.ws.Store.MaxCount() != 4 || s.ws.Store.MaxAgeDays() != 9 {

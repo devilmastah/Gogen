@@ -352,6 +352,17 @@ func buildConfigFields() map[string]fieldSpec {
 	f.sample = "error"
 	add(f)
 
+	f = strSpec("smartCompact",
+		func(r *config.Config) string { return r.SmartCompact },
+		func(r *config.Config, v string) { r.SmartCompact = v },
+		func(m *WSMessage) string { return m.SmartCompact },
+		func(m *WSMessage, v string) { m.SmartCompact = v })
+	f.normalize = onOffNormalize("smartCompact")
+	f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.SmartCompact = onoff.Enabled(r.SmartCompact) }
+	f.applyLive = contextApplyLive(f.setContext)
+	f.sample = "on"
+	add(f)
+
 	// --- web features -----------------------------------------------------
 	f = strSpec("webFetch",
 		func(r *config.Config) string { return r.WebFetch },

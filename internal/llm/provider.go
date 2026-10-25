@@ -103,6 +103,12 @@ type StreamHandlers struct {
 	// image user message) are deliberately not reported: a trailing mark
 	// stays conservative and only costs the unoptimized fallback.
 	OnMessageAppended func(index int, role string)
+	// StopStream is checked after each streamed chunk. When it returns true
+	// the provider returns the text accumulated so far with BudgetStop set
+	// and a nil error. It does not cancel the turn context: a cancelled
+	// stream drops the partial text and the retry ladder would start the
+	// thinking over.
+	StopStream func() bool
 }
 
 // StreamResult holds the final accumulated response from a streamed call.
@@ -123,6 +129,10 @@ type StreamResult struct {
 	// for results built outside the streaming accumulator (test stubs, the
 	// non-streaming fallback).
 	FinishReason string
+	// BudgetStop is set when StopStream ended the stream early so the
+	// caller can compact before continuing. The result is still the
+	// partial generation; the error is nil so the stream is not retried.
+	BudgetStop bool
 }
 
 // ModelInfo describes a model available from the provider endpoint.
