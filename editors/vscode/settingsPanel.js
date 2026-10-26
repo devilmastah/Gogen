@@ -1,4 +1,5 @@
 const vscode = require("vscode");
+const { webviewNonce } = require("./webviewNonce");
 
 let panel = null;
 
@@ -213,7 +214,7 @@ function effortsFor(host, modelId) {
 }
 
 function settingsHtml(webview) {
-  const nonce = String(Math.random()).slice(2);
+  const nonce = webviewNonce();
   const csp = [
     "default-src 'none'",
     `style-src ${webview.cspSource} 'nonce-${nonce}'`,
@@ -495,15 +496,31 @@ function renderChips(entry, modelId, level) {
   }
 }
 
+function textInput(id, placeholder, type, autocomplete) {
+  const input = document.createElement("input");
+  input.id = id;
+  input.type = type || "text";
+  input.placeholder = placeholder;
+  if (autocomplete) input.setAttribute("autocomplete", autocomplete);
+  return input;
+}
+
 function buildProviders(panel) {
   const warn = document.createElement("p");
   warn.className = "note";
-  warn.innerHTML = "API keys are stored in <span id=\\"configPath\\"></span>. A blank key keeps the stored one. The default profile cannot be deleted.";
+  const where = document.createElement("span");
+  where.id = "configPath";
+  warn.append("API keys are stored in ", where, ". A blank key keeps the stored one. The default profile cannot be deleted.");
   const list = document.createElement("div");
   list.id = "providerList";
   const form = document.createElement("div");
   form.id = "providerForm";
-  form.innerHTML = '<input id="pName" type="text" placeholder="Name"><input id="pUrl" type="text" placeholder="Base URL (https://…/v1)"><input id="pKey" type="password" placeholder="API key (blank keeps stored)" autocomplete="new-password"><input id="pModel" type="text" placeholder="Default model (optional)">';
+  form.append(
+    textInput("pName", "Name"),
+    textInput("pUrl", "Base URL (https://…/v1)"),
+    textInput("pKey", "API key (blank keeps stored)", "password", "new-password"),
+    textInput("pModel", "Default model (optional)"),
+  );
   const actions = document.createElement("div");
   actions.className = "actions";
   const test = document.createElement("button");
@@ -584,7 +601,12 @@ function buildMcp(panel) {
   list.id = "mcpList";
   const form = document.createElement("div");
   form.id = "mcpForm";
-  form.innerHTML = '<input id="mName" type="text" placeholder="Name (for a saved server)"><input id="mCmd" type="text" placeholder="Command (e.g. npx)"><input id="mArgs" type="text" placeholder="Args (space-separated)"><input id="mEnv" type="text" placeholder="Env KEY=VALUE (space-separated)">';
+  form.append(
+    textInput("mName", "Name (for a saved server)"),
+    textInput("mCmd", "Command (e.g. npx)"),
+    textInput("mArgs", "Args (space-separated)"),
+    textInput("mEnv", "Env KEY=VALUE (space-separated)"),
+  );
   const actions = document.createElement("div");
   actions.className = "actions";
   const test = document.createElement("button");

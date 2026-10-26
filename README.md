@@ -599,6 +599,7 @@ are live-editable in **Settings → Tools**.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections); also `web_bind` in `.gogen/gogen.conf` (the settings modal's web-bind field persists it for the next start) |
+| `GOGEN_WEB_LISTEN` | *(unset)* | Listen address for this process only. When set, it wins over `--host` and `web_bind`, and a settings save does not write it. The VS Code sidebar uses it for the window's free port |
 | `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and persisted (`.gogen/web_token`) when `--web --host` is used without one — startup prints a short-lived pairing link + QR; also `web_auth_token` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults; also `web_allowed_origins` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS; also `web_tls_cert_file` in `.gogen/gogen.conf` |

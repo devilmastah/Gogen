@@ -172,11 +172,6 @@ function withGitignoreEntries(text, entries) {
   return next;
 }
 
-// withGitignoreEntry appends a .gogen/ line, keeping the file's newline.
-function withGitignoreEntry(text) {
-  return withGitignoreEntries(text, [".gogen/"]);
-}
-
 // copiedIntoGogen reports whether dest landed inside folder/.gogen.
 function copiedIntoGogen(folder, dest) {
   const rel = path.relative(folder, dest);
@@ -189,7 +184,6 @@ module.exports = {
   templateDest,
   gitignoreIgnoresGogen,
   gitignoreEntries,
-  withGitignoreEntry,
   withGitignoreEntries,
   copiedIntoGogen,
   isNonEmptyFile,

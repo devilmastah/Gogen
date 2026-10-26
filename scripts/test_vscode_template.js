@@ -12,7 +12,6 @@ const {
   templateDest,
   gitignoreIgnoresGogen,
   gitignoreEntries,
-  withGitignoreEntry,
   withGitignoreEntries,
   copiedIntoGogen,
 } = require(path.join(__dirname, "..", "editors", "vscode", "templateCopy"));
@@ -63,9 +62,9 @@ try {
   check("comment", gitignoreIgnoresGogen("# .gogen\n"), false);
   check("later un-ignore", gitignoreIgnoresGogen(".gogen/\n!.gogen/\n"), false);
   check("later ignore", gitignoreIgnoresGogen("!.gogen\n.gogen/\n"), true);
-  check("append", withGitignoreEntry("node_modules\n"), "node_modules\n.gogen/\n");
-  check("append bare", withGitignoreEntry("node_modules"), "node_modules\n.gogen/\n");
-  check("append crlf", withGitignoreEntry("node_modules\r\n"), "node_modules\r\n.gogen/\r\n");
+  check("append", withGitignoreEntries("node_modules\n", [".gogen/"]), "node_modules\n.gogen/\n");
+  check("append bare", withGitignoreEntries("node_modules", [".gogen/"]), "node_modules\n.gogen/\n");
+  check("append crlf", withGitignoreEntries("node_modules\r\n", [".gogen/"]), "node_modules\r\n.gogen/\r\n");
 
   const conf = path.join(project, ".gogen", "gogen.conf");
   const rootMd = path.join(project, "GOGEN.md");

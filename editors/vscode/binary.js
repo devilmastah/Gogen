@@ -6,12 +6,21 @@ const https = require("https");
 const path = require("path");
 const { execFile } = require("child_process");
 const vscode = require("vscode");
-const { RELEASE_REPO, assetFor, checksumMatches } = require("./binaryCore");
+const {
+  RELEASE_REPO,
+  maxDownloadBytes,
+  assetFor,
+  checksumMatches,
+  executableName,
+  declaredTooLarge,
+  appendCapped,
+} = require("./binaryCore");
 
-// resolveBinary returns the gogen program to launch. An absolute
-// gogen.executable that exists wins. Otherwise a name on PATH wins. When
-// neither is there, the user picks an existing program or a folder to
-// download the latest release into. The chosen path is saved in user settings.
+// resolveBinary returns the gogen program to launch. The user setting
+// wins. A workspace value is ignored. An absolute path that exists wins.
+// Otherwise a name on PATH wins. When neither is there, the user picks an
+// existing program or a folder to download the latest release into. The
+// chosen path is saved in user settings.
 async function resolveBinary(log) {
   const configured = configuredName();
   if (path.isAbsolute(configured)) {
@@ -40,9 +49,7 @@ async function resolveBinary(log) {
 }
 
 function configuredName() {
-  const value = vscode.workspace.getConfiguration("gogen").get("executable");
-  const text = typeof value === "string" ? value.trim() : "";
-  return text || "gogen";
+  return executableName(vscode.workspace.getConfiguration("gogen").inspect("executable"));
 }
 
 function lookPath(name) {
@@ -125,26 +132,72 @@ function getBuffer(url, headers, redirects) {
       reject(new Error("download redirected too many times"));
       return;
     }
+    let settled = false;
+    const fail = (err) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(err);
+    };
+    const done = (body) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(body);
+    };
     const req = https.get(url, { headers: Object.assign({ "user-agent": "gogen-vscode" }, extra) }, (res) => {
+      // A reset while the body arrives is an error on the response, not the
+      // request. After a redirect or a rejected status the socket is drained
+      // and a later error belongs to that close, not to this download.
+      let handed = false;
+      res.on("error", (err) => {
+        if (handed) {
+          return;
+        }
+        res.destroy();
+        fail(err);
+      });
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        handed = true;
         res.resume();
-        resolve(getBuffer(res.headers.location, extra, hops + 1));
+        done(getBuffer(res.headers.location, extra, hops + 1));
         return;
       }
       if (res.statusCode !== 200) {
+        handed = true;
         res.resume();
-        reject(new Error("download failed (" + res.statusCode + ")"));
+        fail(new Error("download failed (" + res.statusCode + ")"));
+        return;
+      }
+      if (declaredTooLarge(res.headers["content-length"], maxDownloadBytes)) {
+        handed = true;
+        res.resume();
+        fail(new Error("download is too large"));
         return;
       }
       const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => resolve(Buffer.concat(chunks)));
+      let size = 0;
+      res.on("data", (chunk) => {
+        if (settled) {
+          return;
+        }
+        try {
+          size = appendCapped(chunks, size, chunk, maxDownloadBytes);
+        } catch (err) {
+          res.destroy();
+          req.destroy();
+          fail(err);
+        }
+      });
+      res.on("end", () => done(Buffer.concat(chunks)));
     });
     req.setTimeout(120000, () => {
       req.destroy();
-      reject(new Error("download timed out"));
+      fail(new Error("download timed out"));
     });
-    req.on("error", reject);
+    req.on("error", fail);
   });
 }
 

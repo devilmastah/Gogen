@@ -57,7 +57,8 @@ func wsHandleTestMCP(req *wsRequest) {
 		}
 		// A host server is running from the startup config, not the file.
 		// Resolve it here so the probe can use its command without the
-		// client ever receiving the env values.
+		// client ever receiving the env values. Config is never reassigned
+		// after construction, so this read is race-free.
 		if !found && s.ws.Config != nil && s.ws.Config.MCPEnabled() {
 			for _, m := range s.ws.Config.HostMCPServers {
 				if m.Name == mcpReq.Name {
@@ -110,7 +111,10 @@ func (s *Server) mcpEntries() []MCPEntry {
 	if s.ws.Config != nil && s.ws.Config.MCPEnabled() {
 		// The page reads the raw host list, not the slice the manager was
 		// given. ValidMCPServers is that same usable-entry rule, so a blank
-		// command is not shown as a server this process started.
+		// command is not shown as a server this process started. The
+		// configured rows above come from GetRuntimeConfig. These host rows
+		// come from Config, which is never reassigned after construction,
+		// so the unlocked read is race-free.
 		for _, m := range config.ValidMCPServers(s.ws.Config.HostMCPServers) {
 			out = append(out, mcpEntry(m, true))
 		}

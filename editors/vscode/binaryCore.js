@@ -5,6 +5,11 @@
 
 const RELEASE_REPO = "gompa/Gogen";
 
+// maxDownloadBytes is the largest body the sidebar will hold for a release
+// asset. A current Windows binary is under 100MB. The cap leaves room for a
+// larger build and stops a response that never ends.
+const maxDownloadBytes = 256 * 1024 * 1024;
+
 function assetFor(platform, arch) {
   const cpu = arch === "arm64" ? "arm64" : arch === "x64" ? "amd64" : "";
   if (!cpu) {
@@ -22,6 +27,15 @@ function assetFor(platform, arch) {
   return "";
 }
 
+// executableName is the program named in user settings. A workspace or
+// folder value is ignored, so a repository cannot choose the binary.
+// An empty user value uses the name on PATH.
+function executableName(inspected) {
+  const value = inspected && inspected.globalValue;
+  const text = typeof value === "string" ? value.trim() : "";
+  return text || "gogen";
+}
+
 function checksumMatches(text, name, hash) {
   const want = String(hash || "").toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(want)) {
@@ -36,4 +50,36 @@ function checksumMatches(text, name, hash) {
   return false;
 }
 
-module.exports = { RELEASE_REPO, assetFor, checksumMatches };
+// declaredTooLarge reports whether a Content-Length header is over the cap.
+// A missing or non-numeric header is not large; the bytes still have a cap.
+function declaredTooLarge(header, limit) {
+  if (Array.isArray(header)) {
+    header = header[0];
+  }
+  if (header == null || header === "") {
+    return false;
+  }
+  const n = Number(header);
+  return Number.isFinite(n) && n > limit;
+}
+
+// appendCapped keeps a download chunk when the total stays within the cap.
+// The chunk is not stored once the total would pass it.
+function appendCapped(chunks, size, chunk, limit) {
+  const next = size + chunk.length;
+  if (next > limit) {
+    throw new Error("download is too large");
+  }
+  chunks.push(chunk);
+  return next;
+}
+
+module.exports = {
+  RELEASE_REPO,
+  maxDownloadBytes,
+  assetFor,
+  checksumMatches,
+  executableName,
+  declaredTooLarge,
+  appendCapped,
+};

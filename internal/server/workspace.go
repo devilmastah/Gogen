@@ -22,8 +22,12 @@ import (
 // model/thinking-level state, E6) seeded from the workspace default model
 // and thinking level (D1 — the model is per-session).
 type Workspace struct {
-	Exec   *agent.Executor
-	Store  *session.Store
+	Exec  *agent.Executor
+	Store *session.Store
+	// Config is the startup config. It is set once in newWorkspaceFromAgent
+	// and never reassigned, so a plain-field read is race-free. The live
+	// overlay is GetRuntimeConfig. Host MCP servers stay on this pointer:
+	// a settings save replaces the overlay and does not carry them.
 	Config *config.Config
 
 	GlobalMode bool

@@ -7,6 +7,7 @@ The chat is the GoGen sidebar. **GoGen: Settings** and **GoGen: Board** open as 
 ## Requirements
 
 - Visual Studio Code 1.99 or newer
+- A trusted folder. In Restricted Mode the sidebar stays off, because GoGen runs commands in that folder
 - A gogen program, or a network connection to download one
 
 ## First launch
@@ -55,7 +56,7 @@ With MCP on, the agent can open a file, reveal it in the explorer, and read the 
 
 One window runs one gogen process, in the folder VS Code has open. **GoGen: Workspace** points that process at another folder and restarts it there. The chat resumes that folder's latest session, and the board is that folder's board. Opening the folder again later picks up the same `.gogen` directory.
 
-`gogen.executable` is the program the sidebar launches. Leave it as `gogen` to use `PATH`.
+`gogen.executable` is the program the sidebar launches. Leave it as `gogen` to use `PATH`. It is a user setting. A folder's `.vscode/settings.json` cannot change it.
 
 ## License
 

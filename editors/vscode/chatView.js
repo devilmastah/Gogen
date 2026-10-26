@@ -1,4 +1,5 @@
 const vscode = require("vscode");
+const { webviewNonce } = require("./webviewNonce");
 
 class ChatViewProvider {
   constructor(host) {
@@ -38,11 +39,17 @@ class ChatViewProvider {
       if (!text) {
         return;
       }
-      try {
-        this.host.sendChat(text);
-      } catch (err) {
-        this.post({ type: "notice", text: err.message });
-      }
+      this.host.ensureStarted().then(() => {
+        try {
+          this.host.sendChat(text);
+        } catch (err) {
+          this.post({ type: "notice", text: err.message });
+          this.post({ type: "restoreInput", text });
+        }
+      }).catch((err) => {
+        this.post({ type: "notice", text: err.message || String(err) });
+        this.post({ type: "restoreInput", text });
+      });
       return;
     }
     if (msg.type === "pickModel") {
@@ -120,7 +127,7 @@ class ChatViewProvider {
 }
 
 function chatHtml(webview) {
-  const nonce = String(Math.random()).slice(2);
+  const nonce = webviewNonce();
   const csp = [
     "default-src 'none'",
     `style-src ${webview.cspSource} 'nonce-${nonce}'`,
@@ -973,6 +980,13 @@ window.addEventListener("message", (event) => {
       hidePathAsk(msg.id);
     } else {
       showPathAsk(msg);
+    }
+    return;
+  }
+  if (msg.type === "restoreInput") {
+    if (!input.value) {
+      input.value = msg.text || "";
+      fitInput();
     }
     return;
   }

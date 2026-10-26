@@ -28,7 +28,6 @@ class GogenHost {
     this.appliedSavedModel = false;
     this.modelsRequested = false;
     this.refreshModels = false;
-    this.board = "";
     this.lastConfig = null;
     this.lastStatus = null;
     this.listeners = new Set();
@@ -44,6 +43,7 @@ class GogenHost {
     this.approvalQueue = [];
     this.approvalSeen = new Set();
     this.approvalShowing = false;
+    this.starting = null;
   }
 
   overrideFolder() {
@@ -140,20 +140,34 @@ class GogenHost {
   }
 
   async ensureStarted() {
+    if (!vscode.workspace.isTrusted) {
+      if (this.sidecar) {
+        const old = this.sidecar;
+        this.sidecar = null;
+        await old.stop();
+      }
+      const text = "Trust this folder before GoGen starts. GoGen runs commands in the open folder.";
+      this.emit({ type: "status", state: "error", text });
+      throw new Error(text);
+    }
+    if (this.starting) {
+      return this.starting;
+    }
+    if (this.sidecar) {
+      return;
+    }
     const folder = this.folderPath();
     if (!folder) {
       this.emit({ type: "status", state: "error", text: "Open a folder. That folder is gogen's working directory." });
       throw new Error("Open a folder first");
     }
-    if (this.sidecar || this.starting) {
-      return;
-    }
-    this.starting = true;
-    try {
-      await this.startSidecar(folder);
-    } finally {
-      this.starting = false;
-    }
+    const run = this.startSidecar(folder).finally(() => {
+      if (this.starting === run) {
+        this.starting = null;
+      }
+    });
+    this.starting = run;
+    return run;
   }
 
   async startSidecar(folder) {
@@ -201,10 +215,14 @@ class GogenHost {
   async restart() {
     this.resumeDone = false;
     this.chatted = false;
+    const pending = this.starting;
     if (this.sidecar) {
       const old = this.sidecar;
       this.sidecar = null;
       await old.stop();
+    }
+    if (pending) {
+      await pending.catch(() => {});
     }
     await this.ensureStarted();
   }
@@ -310,7 +328,6 @@ class GogenHost {
         this.lastConfig = msg;
         this.model = msg.model || "";
         this.modelProvider = msg.modelProvider || "";
-        this.board = msg.board || this.board;
         this.emit(this.configView());
         if (this.mcpRestartWait && String(msg.mcp || "").toLowerCase() === "on") {
           const finish = this.mcpRestartWait;
@@ -680,9 +697,12 @@ class GogenHost {
   // enqueueApproval shows one Allow / Deny dialog at a time. The server
   // holds the turn until delete_approval_response or
   // command_approval_response arrives. Esc and closing the dialog deny.
-  // Closing the window drops this queue. The server then waits out its own
-  // approval hold, the same as the web UI when the page goes away. dispose
-  // does not send a denial: the socket is already closing.
+  // approvalSeen blocks a second frame for an id that is queued or on
+  // screen. The id is dropped once that dialog is answered, so a later
+  // re-notify can ask again and the set does not grow for the life of the
+  // window. Closing the window drops this queue. The server then waits out
+  // its own approval hold, the same as the web UI when the page goes away.
+  // dispose does not send a denial: the socket is already closing.
   enqueueApproval(msg) {
     if (!msg.approvalId || this.approvalSeen.has(msg.approvalId)) {
       return;
@@ -739,6 +759,7 @@ class GogenHost {
     }
     this.emit({ type: "notice", text: (approved ? "Allowed" : "Denied") + (command ? " the command" : " the delete") });
     this.approvalShowing = false;
+    this.approvalSeen.delete(msg.approvalId);
     this.presentApproval();
   }
 

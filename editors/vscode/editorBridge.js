@@ -1,14 +1,15 @@
 "use strict";
 
 const crypto = require("crypto");
-const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const vscode = require("vscode");
+const { resolvePath, insideRoots } = require("./pathCore");
 
 // pathGate is the one outside-path question in flight. The bridge child
 // handles one tools/call at a time, so one question is enough. ask answers
-// it. signal aborts it when gogen cancels the call.
+// it. signal aborts it when gogen cancels the call. A finished call clears
+// the slot only when it still owns it.
 let pathGate = {
   ask: async () => false,
   signal: null,
@@ -130,13 +131,15 @@ class EditorBridge {
         send(res, 400, { ok: false, text: "bad request" });
         return;
       }
-      pathGate.ask = this.askOutside;
-      pathGate.signal = ac.signal;
+      const gate = { ask: this.askOutside, signal: ac.signal };
+      pathGate = gate;
       this.dispatch(body)
         .then((text) => send(res, 200, { ok: true, text }))
         .catch((err) => send(res, 200, { ok: false, text: err && err.message ? err.message : String(err) }))
         .finally(() => {
-          pathGate.signal = null;
+          if (pathGate === gate) {
+            pathGate.signal = null;
+          }
         });
     });
   }
@@ -196,11 +199,7 @@ async function allowPath(folder, raw) {
 }
 
 function insideWorkspace(folder, file) {
-  const target = realPath(file);
-  return workspaceRoots(folder).some((root) => {
-    const base = realPath(root);
-    return target === base || target.startsWith(base + path.sep);
-  });
+  return insideRoots(workspaceRoots(folder), file);
 }
 
 function workspaceRoots(folder) {
@@ -209,40 +208,6 @@ function workspaceRoots(folder) {
     roots.push(folder);
   }
   return roots;
-}
-
-function realPath(file) {
-  const resolved = path.resolve(file);
-  try {
-    return pathKey(fs.realpathSync(resolved));
-  } catch {
-    // A missing file still has to be judged by the parent that does exist,
-    // so a symlink out of the workspace is not accepted.
-    try {
-      return pathKey(path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved)));
-    } catch {
-      return pathKey(resolved);
-    }
-  }
-}
-
-function pathKey(file) {
-  const normal = path.normalize(file);
-  return process.platform === "win32" ? normal.toLowerCase() : normal;
-}
-
-function resolvePath(folder, raw) {
-  const text = String(raw || "").trim();
-  if (!text) {
-    throw new Error("path is required");
-  }
-  if (path.isAbsolute(text)) {
-    return path.normalize(text);
-  }
-  if (!folder) {
-    throw new Error("open a folder before using a relative path");
-  }
-  return path.resolve(folder, text);
 }
 
 async function openFile(folder, args) {

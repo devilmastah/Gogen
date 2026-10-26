@@ -1,4 +1,5 @@
 const vscode = require("vscode");
+const { webviewNonce } = require("./webviewNonce");
 
 let panel = null;
 
@@ -101,7 +102,7 @@ function onMessage(host, msg) {
 }
 
 function boardHtml(webview) {
-  const nonce = String(Math.random()).slice(2);
+  const nonce = webviewNonce();
   const csp = [
     "default-src 'none'",
     `style-src ${webview.cspSource} 'nonce-${nonce}'`,

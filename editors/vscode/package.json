@@ -2,7 +2,7 @@
   "name": "gogen-ai",
   "displayName": "gogen-ai",
   "description": "Sidebar chat for the gogen coding agent. The open folder is the working directory.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "gogen",
   "license": "AGPL-3.0-only",
   "icon": "media/icon.png",
@@ -26,6 +26,12 @@
     "onCommand:gogen.board",
     "onCommand:gogen.restart"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "GoGen runs commands and edits files in the open folder. Trust the folder to start it."
+    }
+  },
   "main": "./extension.js",
   "contributes": {
     "viewsContainers": {
@@ -73,8 +79,9 @@
       "properties": {
         "gogen.executable": {
           "type": "string",
+          "scope": "machine",
           "default": "gogen",
-          "description": "gogen binary to launch with --web. An absolute path works when the binary is not on PATH."
+          "description": "gogen binary to launch with --web. An absolute path works when the binary is not on PATH. Stored in user settings. A workspace cannot override it."
         }
       }
     }
