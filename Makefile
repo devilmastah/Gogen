@@ -80,6 +80,7 @@ test-vscode:
 	node scripts/test_vscode_bridge_cancel.js
 	node scripts/test_vscode_path.js
 	node scripts/test_vscode_nonce.js
+	node scripts/test_vscode_editor_bridge.js
 
 # Runs the hand-maintained web UI regression tests (scripts/test_*.js):
 # jsdom harnesses that load the REAL index.html + app.js +

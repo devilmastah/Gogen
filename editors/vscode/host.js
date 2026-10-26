@@ -203,11 +203,17 @@ class GogenHost {
       this.rememberFolder(folder);
       this.requestResume();
     } catch (err) {
-      if (this.sidecar === sidecar) {
+      // A restart stops this start on purpose, so the failure it causes is
+      // not a startup error and must not flash the status line: the next
+      // start owns it. Only the start that is still current reports.
+      const current = this.sidecar === sidecar;
+      if (current) {
         this.sidecar = null;
       }
       await sidecar.stop();
-      this.emit({ type: "status", state: "error", text: err.message });
+      if (current) {
+        this.emit({ type: "status", state: "error", text: err.message });
+      }
       throw err;
     }
   }
