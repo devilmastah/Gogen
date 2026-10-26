@@ -186,16 +186,20 @@ func run() error {
 		}
 	}
 
-	cfg := projectfile.Merge(pf, projectfile.FlagOverrides{
+	fileFlags := projectfile.FlagOverrides{
 		WorkingDir: workingDir,
 		OpenAIURL:  opts.url,
 		CLIVerbose: verboseOverride,
 		WebBind:    opts.host,
-	})
+	}
+	cfg := projectfile.Merge(pf, fileFlags)
 	if pf != nil {
 		cfg.ProjectGuidelines = pf.Guidelines
 		cfg.ProjectFilePath = pf.Path
 	}
+	// A host may append servers for this process only (the VS Code editor
+	// bridge). They are not written to the config file.
+	cfg.HostMCPServers = config.MergeHostMCPServers(cfg.MCPServers, config.LoadHostMCPServers())
 
 	if handleSaveConfigFlag(opts, isGlobalMode, workingDir, cfg, pf) {
 		return nil

@@ -21,6 +21,8 @@ func TestMCPActive(t *testing.T) {
 		{name: "mcp on with a placeholder entry", cfg: &Config{MCP: "on", MCPServers: []MCPServerConfig{{Name: "rea"}}}},
 		{name: "mcp on with a server", cfg: &Config{MCP: "on", MCPServers: []MCPServerConfig{server}}, want: true},
 		{name: "mcp on, one valid one placeholder", cfg: &Config{MCP: "on", MCPServers: []MCPServerConfig{{Name: "blank"}, server}}, want: true},
+		{name: "mcp on with only a host server", cfg: &Config{MCP: "on", HostMCPServers: []MCPServerConfig{{Name: "vscode", Command: "node"}}}, want: true},
+		{name: "mcp off ignores a host server", cfg: &Config{MCP: "off", HostMCPServers: []MCPServerConfig{{Name: "vscode", Command: "node"}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

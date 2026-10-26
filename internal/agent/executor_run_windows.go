@@ -222,7 +222,7 @@ func execHandler(ctx context.Context, args []string) error {
 	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, err)
-		return interp.NewExitStatus(127)
+		return interp.ExitStatus(127)
 	}
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Path = path
@@ -238,11 +238,32 @@ func execHandler(ctx context.Context, args []string) error {
 		}
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			return interp.NewExitStatus(uint8(ee.ExitCode()))
+			return interpreterExit(ee)
 		}
 		return err
 	}
 	return nil
+}
+
+// interpreterExit turns a failed process into a status the embedded shell
+// can return. mvdan.cc/sh stores that status in a uint8 and panics when a
+// non-nil error carries code 0 (Runner.Run, interp/api.go). Windows exit
+// codes are 32-bit, so a code outside 1–255 (256, or any value whose low
+// byte is 0) stays a plain Go error. Returning ExitStatus(1) would keep
+// the script running and hide the real code.
+//
+// In mvdan.cc/sh/v3 v3.14.1, the version in go.mod, a handler error that
+// is not an ExitStatus is fatal. fromHandlerError calls exitStatus.fatal,
+// which sets exiting (interp/api.go). Runner.stmt calls Runner.stop and
+// returns before the next statement when exiting is set (interp/runner.go),
+// so the rest of the script is skipped. Runner.Run returns the error.
+// gogen stays alive. Codes 1–255 are an ExitStatus, and the script continues.
+func interpreterExit(ee *exec.ExitError) error {
+	code := ee.ExitCode()
+	if code > 0 && code < 256 {
+		return interp.ExitStatus(uint8(code))
+	}
+	return fmt.Errorf("exit code %d", code)
 }
 
 // execEnvFromShell converts the interpreter's environment to exec format,

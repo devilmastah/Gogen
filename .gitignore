@@ -8,6 +8,7 @@
 
 # Test binaries produced by `go test -c` (e.g. agent.test)
 *.test
+*.vsix
 
 # --- Profiling data ---
 *.prof
@@ -25,6 +26,7 @@
 # Not tracked for now: planning / review docs are scratch. Already-tracked
 # markdown (README.md, vendored READMEs and licenses) is unaffected.
 *.md
+!editors/vscode/README.md
 
 # --- Scratch work ---
 # tmp/ holds ad-hoc probes and repro scripts; not part of the module surface.

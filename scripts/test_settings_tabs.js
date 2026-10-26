@@ -126,6 +126,17 @@ async function main() {
     mcp: 'on',
   });
   check('MCP server list renders inside the MCP panel', !!document.querySelector('#settings-tab-mcp .mcp-server-list .provider-row'));
+  window.applyServerConfig({
+    mcpServers: [
+      { name: 'fetch', command: 'npx', args: ['-y', '@modelcontextprotocol/server-fetch'], envSet: true },
+      { name: 'vscode', command: 'node', host: true },
+    ],
+    mcp: 'on',
+  });
+  const mcpRows = [...document.querySelectorAll('#settings-tab-mcp .mcp-server-list .provider-row')];
+  const mcpRow = (name) => mcpRows.find((row) => row.textContent.includes(name));
+  check('configured MCP row keeps Test', mcpRow('fetch') && mcpRow('fetch').querySelector('button') && mcpRow('fetch').querySelector('button').textContent === 'Test');
+  check('host MCP row has no Test button', mcpRow('vscode') && !mcpRow('vscode').querySelector('button'));
 
   // ── Subagent model picker ──
   window.closeModal(settingsOverlay);

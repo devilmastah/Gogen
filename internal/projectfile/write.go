@@ -23,24 +23,8 @@ func SaveConfig(cfgPath, guidelinesPath string, cfg *config.Config, guidelines s
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+	if err := writeConfigFile(cfgPath, []byte(yamlBody), opts); err != nil {
 		return err
-	}
-	// A config that embeds a secret (--save-config-secrets) must not be
-	// world-readable: write it 0600. WriteFileAtomic preserves a pre-existing
-	// file mode on overwrite, so an earlier 0644 save would survive the
-	// rewrite; force the restrictive mode whenever a secret is persisted.
-	perm := os.FileMode(0o644)
-	if opts.IncludeSecrets {
-		perm = 0o600
-	}
-	if err := ioutil.WriteFileAtomic(cfgPath, []byte(yamlBody), perm); err != nil {
-		return err
-	}
-	if opts.IncludeSecrets {
-		if err := os.Chmod(cfgPath, 0o600); err != nil {
-			return fmt.Errorf("config: restrict permissions on %s: %w", cfgPath, err)
-		}
 	}
 
 	if guidelinesPath == "" {
@@ -66,11 +50,18 @@ func SaveGlobalConfig(cfg *config.Config, opts WriteOptions) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
 	}
-	path := GlobalConfigPath()
 	yamlBody, err := buildConfigYAML(cfg, opts)
 	if err != nil {
 		return err
 	}
+	return writeConfigFile(GlobalConfigPath(), []byte(yamlBody), opts)
+}
+
+// writeConfigFile writes a config body. A file that embeds a secret must
+// not be world-readable: mode 0600. WriteFileAtomic preserves a
+// pre-existing mode, so an earlier 0644 save would survive the rewrite;
+// chmod forces 0600 whenever a secret is persisted.
+func writeConfigFile(path string, body []byte, opts WriteOptions) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -78,7 +69,7 @@ func SaveGlobalConfig(cfg *config.Config, opts WriteOptions) error {
 	if opts.IncludeSecrets {
 		perm = 0o600
 	}
-	if err := ioutil.WriteFileAtomic(path, []byte(yamlBody), perm); err != nil {
+	if err := ioutil.WriteFileAtomic(path, body, perm); err != nil {
 		return err
 	}
 	if opts.IncludeSecrets {

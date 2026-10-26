@@ -27,6 +27,45 @@ func newMCPTestWorkspace(t *testing.T, cfg *config.Config) *Workspace {
 	}
 }
 
+// TestMCPEntriesListsRunningHostServer pins the settings list: configured
+// servers stay, a host server is appended only when mcp was on at startup,
+// and an entry with no command is left out.
+func TestMCPEntriesListsRunningHostServer(t *testing.T) {
+	fetch := config.MCPServerConfig{Name: "fetch", Command: "npx", Env: map[string]string{"TOKEN": "secret"}}
+	vscode := config.MCPServerConfig{Name: "vscode", Command: "node", Args: []string{"bridge.js"}, Env: map[string]string{"GOGEN_VSCODE_BRIDGE_TOKEN": "secret"}}
+	blank := config.MCPServerConfig{Name: "blank"}
+	tests := []struct {
+		name    string
+		mcp     string
+		wantLen int
+		host    bool
+	}{
+		{name: "mcp on lists the host server", mcp: "on", wantLen: 2, host: true},
+		{name: "mcp off leaves the host server out", mcp: "off", wantLen: 1, host: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.MCP = tt.mcp
+			cfg.MCPServers = []config.MCPServerConfig{fetch}
+			cfg.HostMCPServers = []config.MCPServerConfig{vscode, blank}
+			s := &Server{ws: newMCPTestWorkspace(t, &cfg)}
+			got := s.mcpEntries()
+			if len(got) != tt.wantLen {
+				t.Fatalf("entries = %+v, want %d", got, tt.wantLen)
+			}
+			if got[0].Name != "fetch" || got[0].Host || !got[0].EnvSet {
+				t.Fatalf("configured entry = %+v", got[0])
+			}
+			if tt.host {
+				if got[1].Name != "vscode" || !got[1].Host || !got[1].EnvSet || len(got[1].Args) != 1 {
+					t.Fatalf("host entry = %+v", got[1])
+				}
+			}
+		})
+	}
+}
+
 // TestSessionAgentMCPToolingFromStartupConfig pins where the model-facing MCP
 // decision comes from: the STARTUP config (which is what built the MCP
 // manager), not the runtime overlay and not the live registry.

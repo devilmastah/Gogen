@@ -88,6 +88,26 @@ func TestWindowsShellExitStatus(t *testing.T) {
 	}
 }
 
+// TestWindowsShellWideExitCode verifies a 32-bit Windows exit code whose
+// low byte is 0 is reported as a command failure and the rest of the script
+// does not run. Truncating it into the interpreter's 8-bit status used to
+// panic the process (exit code 2). The skip is mvdan.cc/sh/v3 v3.14.1:
+// fromHandlerError treats a non-ExitStatus error as fatal.
+func TestWindowsShellWideExitCode(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell is not on PATH")
+	}
+	forceInterpreter(t)
+	ex := NewExecutor(t.TempDir())
+	out, err := ex.ExecuteCommand(context.Background(), `powershell -NoProfile -Command "exit 256"; echo still-running`)
+	if err == nil || !strings.Contains(err.Error(), "exit code 256") {
+		t.Fatalf("err = %v, want exit code 256", err)
+	}
+	if strings.Contains(out, "still-running") {
+		t.Fatalf("output = %q, want the rest of the script skipped", out)
+	}
+}
+
 // TestWindowsShellCommandNotFound verifies a missing binary reports the
 // shell's 127 exit status (like sh).
 func TestWindowsShellCommandNotFound(t *testing.T) {

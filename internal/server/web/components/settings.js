@@ -425,19 +425,21 @@ function renderMCPServerList(servers) {
         row.className = 'provider-row';
         const info = document.createElement('span');
         info.className = 'provider-row-info';
-        info.textContent = s.name + '  ·  ' + s.command + (s.args && s.args.length ? '  ' + s.args.join(' ') : '') + (s.envSet ? '  ·  env •••' : '');
+        info.textContent = s.name + '  ·  ' + s.command + (s.args && s.args.length ? '  ' + s.args.join(' ') : '') + (s.envSet ? '  ·  env •••' : '') + (s.host ? '  ·  this process' : '');
         row.appendChild(info);
         const actions = document.createElement('span');
         actions.className = 'provider-row-actions';
-        const testBtn = document.createElement('button');
-        testBtn.type = 'button';
-        testBtn.textContent = 'Test';
-        testBtn.title = 'Test connectivity and list tools';
-        testBtn.addEventListener('click', () => {
-            showMCPTest('Testing ' + s.name + '…', '');
-            sendMCPTest({ name: s.name });
-        });
-        actions.appendChild(testBtn);
+        if (!s.host) {
+            const testBtn = document.createElement('button');
+            testBtn.type = 'button';
+            testBtn.textContent = 'Test';
+            testBtn.title = 'Test connectivity and list tools';
+            testBtn.addEventListener('click', () => {
+                showMCPTest('Testing ' + s.name + '…', '');
+                sendMCPTest({ name: s.name });
+            });
+            actions.appendChild(testBtn);
+        }
         row.appendChild(actions);
         mcpServerListEl.appendChild(row);
     }

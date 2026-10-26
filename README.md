@@ -46,7 +46,8 @@ The TUI starts with your project as the working directory. Try prompts like:
 ```
 
 Prefer a browser? Run with `--web` (http://127.0.0.1:8081). For a single
-prompt without any UI, use `-p`:
+prompt without any UI, use `-p`. The VS Code plugin starts gogen on a free
+port for that window, and that port is not saved as `web_bind`.
 
 ```bash
 OPENAI_API_KEY=sk-... ./gogen --web
@@ -87,7 +88,7 @@ CGO_ENABLED=0 go build -o gogen-nocgo .
 | Flag | Description |
 |------|-------------|
 | `--web` | Run in web mode (listens on `:8081`) |
-| `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; falls back to `GOGEN_WEB_BIND` or `127.0.0.1:8081`) |
+| `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; falls back to `GOGEN_WEB_BIND` or `127.0.0.1:8081`). `GOGEN_WEB_LISTEN`, when set, is the address for this process only: it wins over `--host` and `web_bind`, and a settings save does not write it |
 | `--dir <path>` | Set the working directory |
 | `--global` | Ignore project `.gogen/`, use `~/.config/gogen/` instead |
 | `--url <url>` | Override OpenAI API base URL (e.g., for local LLMs or proxies) |
@@ -385,6 +386,7 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
 | `GOGEN_MCP_TOOL_MODE` | `nested` | `nested` exposes every MCP tool through `mcp_list`, `mcp_describe`, and `mcp_call`; `inline` inlines one definition per server tool (also set `mcp_tool_mode` in project config) |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env, init_timeout_secs, tool_timeout_secs}` (overrides file) |
+| `GOGEN_MCP_EXTRA` | *(empty)* | JSON array in the same shape, appended for this process only. A host uses it for its own server (the VS Code editor bridge). It is not saved. `mcp` off does not start it. A name that is already configured is skipped. |
 
 Each `mcp_servers` entry may also set `init_timeout_secs` (handshake bound,
 default 60s) and `tool_timeout_secs` (default deadline for one `tools/call`,
@@ -597,6 +599,7 @@ are live-editable in **Settings → Tools**.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections); also `web_bind` in `.gogen/gogen.conf` (the settings modal's web-bind field persists it for the next start) |
+| `GOGEN_WEB_LISTEN` | *(unset)* | Listen address for this process only. When set, it wins over `--host` and `web_bind`, and a settings save does not write it. The VS Code sidebar uses it for the window's free port |
 | `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and persisted (`.gogen/web_token`) when `--web --host` is used without one — startup prints a short-lived pairing link + QR; also `web_auth_token` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults; also `web_allowed_origins` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS; also `web_tls_cert_file` in `.gogen/gogen.conf` |

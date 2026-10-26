@@ -2,7 +2,7 @@
 'use strict';
 
 // Zero-dependency lint for the hand-maintained web UI JS (app.js,
-// editor.js, components/*.js).
+// editor.js, components/*.js) and the VS Code sidebar scripts.
 // Runs with plain `node` — no npm, no eslint. Checks:
 //   1. Syntax (`node --check`).
 //   2. No stray debug logging: console.log/debug/info/trace are flagged;
@@ -24,9 +24,16 @@ const componentFiles = fs.existsSync(`${WEB}/components`)
       .map((f) => `${WEB}/components/${f}`)
       .sort()
   : [];
+const vscodeDir = 'editors/vscode';
+const vscodeFiles = fs.existsSync(vscodeDir)
+  ? fs.readdirSync(vscodeDir)
+      .filter((f) => f.endsWith('.js'))
+      .map((f) => `${vscodeDir}/${f}`)
+      .sort()
+  : [];
 const FILES = process.argv.slice(2).length > 0
   ? process.argv.slice(2)
-  : [`${WEB}/app.js`, `${WEB}/editor.js`, ...componentFiles];
+  : [`${WEB}/app.js`, `${WEB}/editor.js`, ...componentFiles, ...vscodeFiles];
 
 let problems = 0;
 

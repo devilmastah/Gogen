@@ -1,4 +1,4 @@
-.PHONY: fmt tidy outdated update test test-debug vet staticcheck gocyclo vuln build-nocgo lint-web test-web check
+.PHONY: fmt tidy outdated update test test-debug vet staticcheck gocyclo vuln build-nocgo lint-web test-vscode test-web check
 
 fmt:
 	@unformatted=$$(gofmt -l .); \
@@ -71,6 +71,15 @@ build-nocgo:
 # `node` is installed; `make check` stays green on machines without node.
 lint-web:
 	./scripts/lint-web.sh
+
+# Sidebar helpers that do not need jsdom. The Linux CI job runs these.
+# The jsdom web suite stays in test-web and is not part of CI.
+test-vscode:
+	node scripts/test_vscode_binary.js
+	node scripts/test_vscode_template.js
+	node scripts/test_vscode_bridge_cancel.js
+	node scripts/test_vscode_path.js
+	node scripts/test_vscode_nonce.js
 
 # Runs the hand-maintained web UI regression tests (scripts/test_*.js):
 # jsdom harnesses that load the REAL index.html + app.js +
