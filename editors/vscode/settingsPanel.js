@@ -75,7 +75,6 @@ const FIELDS = [
 
   { tab: "mcp", kind: "runtime", field: "mcp", label: "MCP (restart)", options: ON_OFF, note: "MCP changes take effect after a restart." },
 
-  { tab: "server", kind: "runtime", field: "webBind", label: "Web bind (restart)" },
   { tab: "server", kind: "runtime", field: "webAllowedOrigins", label: "Allowed origins (restart)" },
   { tab: "server", kind: "runtime", field: "webAuthToken", label: "Auth token (restart)", control: "password", secret: "webAuthTokenSet", placeholder: "Auth token" },
   { tab: "server", kind: "runtime", field: "webTLSCertFile", label: "TLS cert file (restart)" },
@@ -638,17 +637,19 @@ function renderMcp() {
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.textContent = (s.command || "") + (s.args && s.args.length ? " " + s.args.join(" ") : "") + (s.envSet ? " · env saved" : "") + (s.host ? " · this process" : "");
-    const test = document.createElement("button");
-    test.type = "button";
-    test.className = "quiet";
-    test.textContent = "Test";
-    test.addEventListener("click", () => {
-      setNote("mcpNote", "Testing " + s.name + "…");
-      vscodeApi.postMessage({ type: "testMcp", name: s.name });
-    });
     const actions = document.createElement("div");
     actions.className = "actions";
-    actions.appendChild(test);
+    if (!s.host) {
+      const test = document.createElement("button");
+      test.type = "button";
+      test.className = "quiet";
+      test.textContent = "Test";
+      test.addEventListener("click", () => {
+        setNote("mcpNote", "Testing " + s.name + "…");
+        vscodeApi.postMessage({ type: "testMcp", name: s.name });
+      });
+      actions.appendChild(test);
+    }
     row.append(title, meta, actions);
     list.appendChild(row);
   }

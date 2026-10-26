@@ -5,6 +5,7 @@
 // that can call the VS Code API.
 
 const http = require("http");
+const { version } = require("./package.json");
 
 const bridgeHost = process.env.GOGEN_VSCODE_BRIDGE || "";
 const token = process.env.GOGEN_VSCODE_BRIDGE_TOKEN || "";
@@ -48,6 +49,11 @@ const tools = [
 
 let chain = Promise.resolve();
 let buffer = "";
+// One tools/call is in flight at a time. A cancel has to abort that HTTP
+// request even while dispatch is waiting on it, so it is not queued behind
+// the call. An id cancelled before the request is registered is remembered.
+const inflight = new Map();
+const cancelledIDs = new Set();
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -56,11 +62,39 @@ process.stdin.on("data", (chunk) => {
   while ((nl = buffer.indexOf("\n")) >= 0) {
     const line = buffer.slice(0, nl).trim();
     buffer = buffer.slice(nl + 1);
-    if (line) {
-      chain = chain.then(() => dispatch(line)).catch(() => {});
+    if (!line) {
+      continue;
     }
+    if (cancelLine(line)) {
+      continue;
+    }
+    chain = chain.then(() => dispatch(line)).catch(() => {});
   }
 });
+
+function cancelLine(line) {
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (!msg || msg.method !== "notifications/cancelled") {
+    return false;
+  }
+  const id = msg.params && msg.params.requestId;
+  if (id === undefined || id === null) {
+    return true;
+  }
+  const key = String(id);
+  const abort = inflight.get(key);
+  if (abort) {
+    abort();
+  } else {
+    cancelledIDs.add(key);
+  }
+  return true;
+}
 
 async function dispatch(line) {
   let req;
@@ -93,12 +127,12 @@ async function answer(req) {
       return {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "gogen-vscode", version: "0.1.3" },
+        serverInfo: { name: "gogen-vscode", version },
       };
     case "tools/list":
       return { tools };
     case "tools/call":
-      return callTool(req.params || {});
+      return callTool(req.id, req.params || {});
     default: {
       // -32601 is "method not found". A failed tool call stays -32000.
       const err = new Error("unknown method " + req.method);
@@ -108,15 +142,21 @@ async function answer(req) {
   }
 }
 
-function callTool(params) {
+function callTool(id, params) {
   const name = params.name || "";
   const args = params.arguments || {};
+  const key = String(id);
+  if (cancelledIDs.has(key)) {
+    cancelledIDs.delete(key);
+    return Promise.reject(new Error("the call was cancelled"));
+  }
   return new Promise((resolve, reject) => {
     if (!bridgeHost || !token) {
       reject(new Error("the VS Code bridge is not connected"));
       return;
     }
     const body = Buffer.from(JSON.stringify({ name, arguments: args }));
+    let cancelled = false;
     const req = http.request(
       {
         host: "127.0.0.1",
@@ -133,6 +173,7 @@ function callTool(params) {
         const chunks = [];
         res.on("data", (chunk) => chunks.push(chunk));
         res.on("end", () => {
+          inflight.delete(key);
           let payload;
           try {
             payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
@@ -147,11 +188,23 @@ function callTool(params) {
         });
       },
     );
-    req.on("error", (err) => reject(err));
-    req.setTimeout(10000, () => {
+    const abort = () => {
+      cancelled = true;
+      inflight.delete(key);
       req.destroy();
-      reject(new Error("the VS Code bridge timed out"));
+    };
+    inflight.set(key, abort);
+    req.on("error", (err) => {
+      inflight.delete(key);
+      if (cancelled) {
+        reject(new Error("the call was cancelled"));
+        return;
+      }
+      reject(err);
     });
+    // The wait is gogen's tool-call deadline. When that passes, gogen sends
+    // notifications/cancelled and abort() runs. This process does not time
+    // the request itself.
     req.end(body);
   });
 }

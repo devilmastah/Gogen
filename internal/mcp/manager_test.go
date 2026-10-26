@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -416,5 +417,57 @@ func TestRegistryAddCollisionKeepsFirst(t *testing.T) {
 	r.add("other", "ping", llm.Tool{Name: "mcp_other_ping"}, nil)
 	if entry, ok := r.tools["mcp_other_ping"]; !ok || entry.tool != "ping" {
 		t.Fatalf("non-colliding tool missing or wrong: %+v", entry)
+	}
+}
+
+type bufWriteCloser struct{ bytes.Buffer }
+
+func (b *bufWriteCloser) Close() error { return nil }
+
+// TestCallCancelNotifiesServer pins the signal the VS Code bridge uses to
+// close a path-approval dialog. A timed-out or cancelled call tells the
+// server to stop, and the notification carries no JSON-RPC id.
+func TestCallCancelNotifiesServer(t *testing.T) {
+	stdin := &bufWriteCloser{}
+	c := &Client{
+		stdin:   stdin,
+		pending: map[int64]chan jsonRPCResponse{},
+		closed:  make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.call(ctx, "tools/call", map[string]string{"name": "open_file"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	lines := strings.Split(strings.TrimSpace(stdin.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("wrote %d lines, want the call and a cancel:\n%s", len(lines), stdin.String())
+	}
+	var note struct {
+		Method string `json:"method"`
+		ID     *int64 `json:"id"`
+		Params struct {
+			RequestID int64  `json:"requestId"`
+			Reason    string `json:"reason"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &note); err != nil {
+		t.Fatalf("cancel line: %v", err)
+	}
+	if note.Method != "notifications/cancelled" || note.ID != nil {
+		t.Fatalf("cancel = method %q id %v, want notifications/cancelled and no id", note.Method, note.ID)
+	}
+	if note.Params.RequestID == 0 || note.Params.Reason != "cancelled" {
+		t.Fatalf("cancel params = %+v", note.Params)
+	}
+	var req struct {
+		ID *int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &req); err != nil {
+		t.Fatalf("call line: %v", err)
+	}
+	if req.ID == nil || *req.ID != note.Params.RequestID {
+		t.Fatalf("requestId = %d, call id = %v", note.Params.RequestID, req.ID)
 	}
 }

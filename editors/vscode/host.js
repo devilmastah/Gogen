@@ -4,6 +4,14 @@ const vscode = require("vscode");
 const { Sidecar } = require("./sidecar");
 const { resolveBinary } = require("./binary");
 const { EditorBridge } = require("./editorBridge");
+const {
+  projectConfRels,
+  templateSources,
+  templateDest,
+  gitignoreEntries,
+  withGitignoreEntries,
+  isNonEmptyFile,
+} = require("./templateCopy");
 
 // GogenHost owns the one sidecar for this window. The chat, the settings
 // tab, and the board tab all talk through it, so there is one process and
@@ -30,7 +38,9 @@ class GogenHost {
     this.lastContext = null;
     this.turnActive = false;
     this.tokensPerSec = 0;
-    this.editorBridge = new EditorBridge(log, () => this.folderPath());
+    this.editorBridge = new EditorBridge(log, () => this.folderPath(), (file, signal) => this.askOutsidePath(file, signal));
+    this.pathAsk = null;
+    this.pathAskSeq = 0;
     this.approvalQueue = [];
     this.approvalSeen = new Set();
     this.approvalShowing = false;
@@ -154,7 +164,7 @@ class GogenHost {
       this.emit({ type: "status", state: "error", text: err.message || String(err) });
       throw err;
     }
-    copyTemplateConf(folder, executable, this.log);
+    await copyTemplateConf(folder, executable, this.log);
     await this.editorBridge.start();
     const env = this.editorBridge.mcpEnv(this.context.extensionPath);
     const sidecar = new Sidecar(folder, executable, this.log, env);
@@ -605,6 +615,68 @@ class GogenHost {
     }
   }
 
+  // askOutsidePath shows the chat dialog for one path outside the workspace.
+  // The notification is the same wait, so a background window still shows it.
+  // Both close when the user answers or when gogen cancels the tool call.
+  askOutsidePath(file, signal) {
+    const id = ++this.pathAskSeq;
+    let endNote = () => {};
+    const gate = new Promise((resolve) => {
+      endNote = resolve;
+    });
+    vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "GoGen is waiting for a path outside this workspace",
+      },
+      () => gate,
+    );
+    return new Promise((resolve, reject) => {
+      let ended = false;
+      const finish = (err, allow) => {
+        if (ended) {
+          return;
+        }
+        ended = true;
+        if (this.pathAsk && this.pathAsk.id === id) {
+          this.pathAsk = null;
+        }
+        endNote();
+        this.emit({ type: "pathApproval", id, hide: true });
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(allow);
+      };
+      this.pathAsk = { id, path: file, finish };
+      this.emit({ type: "pathApproval", id, path: file });
+      if (signal) {
+        const onAbort = () => finish(new Error("the path approval ended"));
+        if (signal.aborted) {
+          onAbort();
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+      }
+    });
+  }
+
+  answerPath(id, allow) {
+    const ask = this.pathAsk;
+    if (!ask || ask.id !== id) {
+      return;
+    }
+    ask.finish(null, allow === true);
+  }
+
+  replayPathApproval() {
+    const ask = this.pathAsk;
+    if (ask) {
+      this.emit({ type: "pathApproval", id: ask.id, path: ask.path });
+    }
+  }
+
   // enqueueApproval shows one Allow / Deny dialog at a time. The server
   // holds the turn until delete_approval_response or
   // command_approval_response arrives. Esc and closing the dialog deny.
@@ -783,76 +855,109 @@ async function chooseWorkspace(host) {
   await host.restart();
 }
 
-// copyTemplateConf copies a config that sits beside the gogen executable
-// into the opened folder when that folder has no conf of its own. gogen
-// then loads and saves the project file the way a normal project session
-// does. A folder that already has a conf is left alone, and the file
-// beside the executable is never rewritten.
-function copyTemplateConf(folder, executable, log) {
+// copyTemplateConf offers a config and guidelines file that sit beside the
+// gogen executable when the opened folder has no conf of its own. The user
+// chooses the copy, or the chat setup. Bytes are copied as they are. A
+// folder that already has a conf is left alone, and the file beside the
+// executable is never rewritten. Closing the question skips the copy.
+async function copyTemplateConf(folder, executable, log) {
   if (!folder || !executable) {
     return;
   }
   if (projectHasConf(folder)) {
     return;
   }
-  const found = templateConf(path.dirname(executable));
-  if (!found) {
+  const sources = templateSources(path.dirname(executable)).filter((found) => {
+    return !samePath(found.file, templateDest(folder, found.rel));
+  });
+  if (sources.length === 0) {
     return;
   }
-  const dest = templateDest(folder, found.rel);
-  if (samePath(found.file, dest)) {
+  const copy = "Copy config and guidelines";
+  const setup = "Start setup";
+  let choice;
+  try {
+    choice = await vscode.window.showInformationMessage(
+      "This folder has no GoGen config yet",
+      {
+        modal: true,
+        detail: "Copy the config and guidelines from beside the gogen program, or set this folder up in the chat.\n\n" + sources.map((found) => found.rel).join("\n"),
+      },
+      copy,
+      setup,
+    );
+  } catch (err) {
+    log.appendLine("config copy ask failed: " + (err && err.message ? err.message : err));
+    return;
+  }
+  if (choice !== copy) {
+    log.appendLine("config copy skipped; setup will run in the chat");
+    return;
+  }
+  const copied = [];
+  for (const found of sources) {
+    const dest = templateDest(folder, found.rel);
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(found.file, dest);
+    } catch (err) {
+      log.appendLine("config copy failed: " + (err.message || String(err)));
+      continue;
+    }
+    log.appendLine("copied config into " + dest);
+    copied.push(dest);
+  }
+  if (copied.length > 0) {
+    await offerGogenGitignore(folder, copied, log);
+  }
+}
+
+// offerGogenGitignore asks before adding the copied paths to a .gitignore
+// that is already in the folder. .gogen/ covers a guidelines file inside
+// that directory. A guidelines file outside it is added on its own line.
+// A folder with no .gitignore is left as it is.
+async function offerGogenGitignore(folder, copied, log) {
+  const ignorePath = path.join(folder, ".gitignore");
+  let text;
+  try {
+    text = fs.readFileSync(ignorePath, "utf8");
+  } catch {
+    return;
+  }
+  const entries = gitignoreEntries(folder, copied, text);
+  if (entries.length === 0) {
+    return;
+  }
+  const add = "Add to .gitignore";
+  let choice;
+  try {
+    choice = await vscode.window.showInformationMessage(
+      "GoGen copied files that git does not ignore",
+      {
+        modal: true,
+        detail: "Add these so the copy, including any keys, stays out of git?\n\n" + entries.join("\n"),
+      },
+      "Leave it",
+      add,
+    );
+  } catch (err) {
+    log.appendLine("gitignore ask failed: " + (err && err.message ? err.message : err));
+    return;
+  }
+  if (choice !== add) {
     return;
   }
   try {
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.copyFileSync(found.file, dest);
+    fs.writeFileSync(ignorePath, withGitignoreEntries(text, entries));
   } catch (err) {
-    log.appendLine("config copy failed: " + (err.message || String(err)));
+    log.appendLine("gitignore update failed: " + (err.message || String(err)));
     return;
   }
-  log.appendLine("copied config into " + dest);
+  log.appendLine("added " + entries.join(", ") + " to " + ignorePath);
 }
-
-const projectConfRels = [
-  path.join(".gogen", "gogen.conf"),
-  "GOGEN.conf",
-  path.join(".gogen", "gogen.md"),
-  "GOGEN.md",
-];
 
 function projectHasConf(folder) {
   return projectConfRels.some((rel) => isNonEmptyFile(path.join(folder, rel)));
-}
-
-// templateConf looks beside the executable. gogen.conf in that directory
-// is the file a person drops next to the program. The other names are the
-// ones gogen itself searches, so a template kept in the program's .gogen
-// folder is found too.
-function templateConf(exeDir) {
-  const rels = ["gogen.conf"].concat(projectConfRels);
-  for (const rel of rels) {
-    const file = path.join(exeDir, rel);
-    if (isNonEmptyFile(file)) {
-      return { file, rel };
-    }
-  }
-  return null;
-}
-
-function templateDest(folder, rel) {
-  if (rel.endsWith(".conf")) {
-    return path.join(folder, ".gogen", "gogen.conf");
-  }
-  return path.join(folder, rel);
-}
-
-function isNonEmptyFile(file) {
-  try {
-    const info = fs.statSync(file);
-    return info.isFile() && info.size > 0;
-  } catch {
-    return false;
-  }
 }
 
 function samePath(a, b) {

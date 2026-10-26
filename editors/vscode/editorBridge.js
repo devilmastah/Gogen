@@ -6,13 +6,22 @@ const http = require("http");
 const path = require("path");
 const vscode = require("vscode");
 
+// pathGate is the one outside-path question in flight. The bridge child
+// handles one tools/call at a time, so one question is enough. ask answers
+// it. signal aborts it when gogen cancels the call.
+let pathGate = {
+  ask: async () => false,
+  signal: null,
+};
+
 // EditorBridge is the loopback listener the stdio MCP server calls. The
 // token stays in this process and in that server's environment. It is not
 // written to a config file and it is not logged.
 class EditorBridge {
-  constructor(log, folderPath) {
+  constructor(log, folderPath, askOutside) {
     this.log = log;
     this.folderPath = folderPath;
+    this.askOutside = askOutside || (async () => false);
     this.token = crypto.randomBytes(32).toString("hex");
     this.server = null;
     this.port = 0;
@@ -90,6 +99,14 @@ class EditorBridge {
     const chunks = [];
     let size = 0;
     let tooBig = false;
+    const ac = new AbortController();
+    // 'close' also fires after a normal response. Abort only when the client
+    // went away before we answered, which is gogen cancelling the tool call.
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        ac.abort();
+      }
+    });
     req.on("data", (chunk) => {
       size += chunk.length;
       if (size > maxBody) {
@@ -113,9 +130,14 @@ class EditorBridge {
         send(res, 400, { ok: false, text: "bad request" });
         return;
       }
+      pathGate.ask = this.askOutside;
+      pathGate.signal = ac.signal;
       this.dispatch(body)
         .then((text) => send(res, 200, { ok: true, text }))
-        .catch((err) => send(res, 200, { ok: false, text: err && err.message ? err.message : String(err) }));
+        .catch((err) => send(res, 200, { ok: false, text: err && err.message ? err.message : String(err) }))
+        .finally(() => {
+          pathGate.signal = null;
+        });
     });
   }
 
@@ -156,20 +178,18 @@ function send(res, status, payload) {
 
 // allowPath resolves a model-supplied path and keeps it inside the folders
 // the user has open. A path outside those folders asks once for this call.
-// Esc or Deny leaves it closed. The active editor is not passed through here.
+// Deny leaves it closed. The question ends when gogen cancels the tool call.
+// The active editor is not passed through here.
 async function allowPath(folder, raw) {
   const file = resolvePath(folder, raw);
   if (insideWorkspace(folder, file)) {
     return file;
   }
-  const allow = "Allow";
-  const pick = await vscode.window.showWarningMessage(
-    "GoGen wants to use a path outside this workspace",
-    { modal: true, detail: file },
-    allow,
-    "Deny",
-  );
-  if (pick !== allow) {
+  if (pathGate.signal && pathGate.signal.aborted) {
+    throw new Error("the path approval ended");
+  }
+  const allow = await pathGate.ask(file, pathGate.signal);
+  if (!allow) {
     throw new Error("path is outside the workspace");
   }
   return file;

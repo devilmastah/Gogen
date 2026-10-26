@@ -88,7 +88,7 @@ CGO_ENABLED=0 go build -o gogen-nocgo .
 | Flag | Description |
 |------|-------------|
 | `--web` | Run in web mode (listens on `:8081`) |
-| `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; falls back to `GOGEN_WEB_BIND` or `127.0.0.1:8081`) |
+| `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; falls back to `GOGEN_WEB_BIND` or `127.0.0.1:8081`). `GOGEN_WEB_LISTEN`, when set, is the address for this process only: it wins over `--host` and `web_bind`, and a settings save does not write it |
 | `--dir <path>` | Set the working directory |
 | `--global` | Ignore project `.gogen/`, use `~/.config/gogen/` instead |
 | `--url <url>` | Override OpenAI API base URL (e.g., for local LLMs or proxies) |

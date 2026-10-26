@@ -111,6 +111,13 @@ type jsonRPCError struct {
 	Message string `json:"message"`
 }
 
+// cancelledParams is the MCP notifications/cancelled body. requestId is the
+// JSON-RPC id of the call the client is abandoning.
+type cancelledParams struct {
+	RequestID int64  `json:"requestId"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // Manager owns MCP server processes.
 type Manager struct {
 	clients []*Client
@@ -591,6 +598,13 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 
 	select {
 	case <-ctx.Done():
+		// The server is still inside the call. Tell it to stop. The VS Code
+		// bridge closes its path-approval dialog when this arrives. A server
+		// that ignores the notification is unchanged.
+		_ = c.notify("notifications/cancelled", cancelledParams{
+			RequestID: id,
+			Reason:    "cancelled",
+		})
 		return nil, ctx.Err()
 	case <-c.closed:
 		return nil, fmt.Errorf("mcp client closed")

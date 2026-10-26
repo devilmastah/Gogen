@@ -46,8 +46,10 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 	// provider's prompt cache for the whole conversation.
 	// One list for the tool flag and the processes. MCPServersToStart is empty
 	// when mcp is off, and it already keeps only entries with a name and a
-	// command. The manager checks its argument again so a direct caller
-	// cannot spawn a blank command.
+	// command. len(servers) > 0 is the same answer as MCPActive for this
+	// list. The workspace calls MCPActive because it does not hold the list,
+	// and calling it here would walk the servers again. The manager checks
+	// its argument again so a direct caller cannot spawn a blank command.
 	servers := cfg.MCPServersToStart()
 	if a != nil {
 		a.SetMCPTooling(len(servers) > 0, cfg.MCPNested())

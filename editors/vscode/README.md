@@ -29,7 +29,7 @@ You describe the change in the composer. Replies, thinking, and tool calls are s
 
 A delete, and a command the safety rules block, asks in an editor dialog. Closing that dialog denies the request.
 
-When the folder has no config of its own yet, the sidebar copies one that sits beside the gogen program into `.gogen/gogen.conf`. A folder that already has a config keeps it. Saving settings writes that folder's file and leaves the file beside the program unchanged. A global config under `~/.config/gogen` is used only when gogen itself is started in global mode.
+When the folder has no config of its own yet, the sidebar asks whether to copy the config and guidelines that sit beside the gogen program, or to set the folder up in the chat. A copied config lands in `.gogen/gogen.conf`. A guidelines file keeps the same path it has beside the program. If the folder's `.gitignore` does not already ignore what was copied, the sidebar asks before adding it. `.gogen/` covers a guidelines file inside that directory. A guidelines file outside it, such as `GOGEN.md`, is added on its own line. A folder that already has a config keeps it. Saving settings writes that folder's file and leaves the file beside the program unchanged. A global config under `~/.config/gogen` is used only when gogen itself is started in global mode.
 
 ## Board
 
@@ -49,7 +49,7 @@ Optional features stay off until you turn them on. The command guard still block
 
 ## Files in the editor
 
-With MCP on, the agent can open a file, reveal it in the explorer, and read the tab you already have open. A path outside the VS Code workspace, and outside the folder gogen is running in, asks you once for that call.
+With MCP on, the agent can open a file, reveal it in the explorer, and read the tab you already have open. A path outside the VS Code workspace, and outside the folder gogen is running in, asks you once in the chat for that call. The question and its notification close when you answer, or when gogen ends the tool call.
 
 ## Working folder
 

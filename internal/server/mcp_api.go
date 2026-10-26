@@ -108,6 +108,9 @@ func (s *Server) mcpEntries() []MCPEntry {
 		out = append(out, mcpEntry(m, false))
 	}
 	if s.ws.Config != nil && s.ws.Config.MCPEnabled() {
+		// The page reads the raw host list, not the slice the manager was
+		// given. ValidMCPServers is that same usable-entry rule, so a blank
+		// command is not shown as a server this process started.
 		for _, m := range config.ValidMCPServers(s.ws.Config.HostMCPServers) {
 			out = append(out, mcpEntry(m, true))
 		}

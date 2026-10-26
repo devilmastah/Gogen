@@ -13,6 +13,7 @@ class ChatViewProvider {
     view.webview.html = chatHtml(view.webview);
     view.webview.onDidReceiveMessage((msg) => this.onWebview(msg));
     this.unsubscribe = this.host.subscribe((event) => this.post(event));
+    this.host.replayPathApproval();
     view.onDidChangeVisibility(() => {
       if (view.visible && !this.host.sidecar) {
         this.host.ensureStarted().catch(() => {});
@@ -106,6 +107,10 @@ class ChatViewProvider {
     }
     if (msg.type === "setupMcp") {
       this.host.enableMcpAndRestart();
+      return;
+    }
+    if (msg.type === "pathAnswer") {
+      this.host.answerPath(msg.id, msg.allow === true);
     }
   }
 
@@ -480,9 +485,59 @@ function chatHtml(webview) {
   }
   .setup-card button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
   #setup-note { min-height: 1.2em; }
+  #path-ask {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: color-mix(in srgb, var(--vscode-sideBar-background) 35%, transparent);
+  }
+  #path-ask[hidden] { display: none; }
+  .path-card {
+    width: 100%;
+    max-width: 360px;
+    padding: 14px;
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    border-radius: 8px;
+    background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+    box-shadow: 0 8px 24px color-mix(in srgb, black 35%, transparent);
+  }
+  .path-card h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  #path-ask-file {
+    margin: 0 0 12px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 12px;
+  }
+  .path-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .path-actions button {
+    padding: 4px 12px;
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 4px;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+  }
+  .path-actions button.primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
 </style>
 </head>
 <body>
+<div id="path-ask" hidden role="dialog" aria-modal="true" aria-labelledby="path-ask-title">
+  <div class="path-card">
+    <h2 id="path-ask-title">GoGen wants to use a path outside this workspace</h2>
+    <p id="path-ask-file"></p>
+    <div class="path-actions">
+      <button id="path-deny" type="button">Deny</button>
+      <button id="path-allow" type="button" class="primary">Allow</button>
+    </div>
+  </div>
+</div>
 <div id="top">
   <div id="brand">
     <div class="mark">gogen</div>
@@ -884,8 +939,43 @@ function setMenu(open) {
   menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
+const pathAsk = document.getElementById("path-ask");
+let pathAskID = null;
+
+function showPathAsk(msg) {
+  pathAskID = msg.id;
+  document.getElementById("path-ask-file").textContent = msg.path || "";
+  pathAsk.hidden = false;
+  document.getElementById("path-deny").focus();
+}
+
+function hidePathAsk(id) {
+  if (id !== undefined && id !== null && id !== pathAskID) {
+    return;
+  }
+  pathAsk.hidden = true;
+  pathAskID = null;
+}
+
+function answerPath(allow) {
+  const id = pathAskID;
+  if (id === null) {
+    return;
+  }
+  hidePathAsk(id);
+  vscodeApi.postMessage({ type: "pathAnswer", id, allow });
+}
+
 window.addEventListener("message", (event) => {
   const msg = event.data || {};
+  if (msg.type === "pathApproval") {
+    if (msg.hide) {
+      hidePathAsk(msg.id);
+    } else {
+      showPathAsk(msg);
+    }
+    return;
+  }
   if (msg.type === "status") {
     setStatus(msg.state, msg.text);
     return;
@@ -1065,6 +1155,14 @@ input.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     document.getElementById("form").requestSubmit();
+  }
+});
+document.getElementById("path-allow").addEventListener("click", () => answerPath(true));
+document.getElementById("path-deny").addEventListener("click", () => answerPath(false));
+pathAsk.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    answerPath(false);
   }
 });
 </script>

@@ -13,14 +13,10 @@ func TestProcessListenAddr(t *testing.T) {
 			t.Fatalf("listen = %q, want the config bind", got)
 		}
 	})
-	t.Run("host env wins and is not written back", func(t *testing.T) {
+	t.Run("host env wins", func(t *testing.T) {
 		t.Setenv(config.WebListenEnv, "  127.0.0.1:53244  ")
-		cfgBind := "0.0.0.0:9090"
-		if got := processListenAddr(cfgBind); got != "127.0.0.1:53244" {
+		if got := processListenAddr("0.0.0.0:9090"); got != "127.0.0.1:53244" {
 			t.Fatalf("listen = %q, want the host port", got)
-		}
-		if cfgBind != "0.0.0.0:9090" {
-			t.Fatalf("config bind changed to %q", cfgBind)
 		}
 	})
 }
