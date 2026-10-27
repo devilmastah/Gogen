@@ -14,7 +14,7 @@
 // Run: node scripts/test_webfetch_url_link.js
 const fs = require('fs');
 const path = require('path');
-const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
+const { JSDOM } = require(require('node:path').join(__dirname, '..', 'tmp', 'gogen-jsdom', 'node_modules', 'jsdom'));
 const { loadAppJs, installEditorStubs } = require('./web-harness');
 
 const ROOT = path.join(__dirname, '..');

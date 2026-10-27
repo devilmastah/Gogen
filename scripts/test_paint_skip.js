@@ -15,7 +15,7 @@
 // Run: node scripts/test_paint_skip.js
 const fs = require('fs');
 const path = require('path');
-const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
+const { JSDOM } = require(require('node:path').join(__dirname, '..', 'tmp', 'gogen-jsdom', 'node_modules', 'jsdom'));
 const { ROOT, stripModuleSyntax } = require('./web-harness');
 
 const raf = (w) => new Promise((r) => w.requestAnimationFrame(r));

@@ -17,7 +17,7 @@
 // Run: node scripts/test_status_display_relay.js
 const fs = require('fs');
 const path = require('path');
-const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
+const { JSDOM } = require(require('node:path').join(__dirname, '..', 'tmp', 'gogen-jsdom', 'node_modules', 'jsdom'));
 const { ROOT, stripModuleSyntax } = require('./web-harness');
 
 let failures = 0;

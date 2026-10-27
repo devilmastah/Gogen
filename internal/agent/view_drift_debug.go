@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"hash/fnv"
 	"strings"
-	"unicode/utf8"
 
 	"gogen/internal/debuglog"
 	"gogen/internal/llm"
