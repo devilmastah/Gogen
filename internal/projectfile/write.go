@@ -93,175 +93,103 @@ func writeConfigFile(path string, body []byte, opts WriteOptions) error {
 // their key when the value equals the built-in default (buildConfigYAML
 // normalizes them): a config file never bakes in a default.
 type configYAML struct {
-	OpenAIAPIKey              string                        `yaml:"openai_api_key,omitempty"`
-	OpenAIModel               string                        `yaml:"openai_model"`
-	OpenAIBaseURL             string                        `yaml:"openai_base_url"`
-	WorkingDir                string                        `yaml:"working_dir"`
-	ContextLimit              int                           `yaml:"context_limit"`
-	CompactThreshold          float64                       `yaml:"compact_threshold"`
-	CompactKeepRecentMessages int                           `yaml:"compact_keep_recent_messages"`
-	MaxToolResultBytes        int                           `yaml:"max_tool_result_bytes"`
-	CompactReserveTokens      int                           `yaml:"compact_reserve_tokens"`
-	CompactLastResort         string                        `yaml:"compact_last_resort,omitempty"`
-	SmartCompact              string                        `yaml:"smart_compact,omitempty"`
-	CommandSafety             string                        `yaml:"command_safety"`
-	CommandAllowlist          string                        `yaml:"command_allowlist,omitempty"`
-	DeleteApproval            string                        `yaml:"delete_approval"`
-	CommandApproval           string                        `yaml:"command_approval,omitempty"`
-	CommandSandbox            string                        `yaml:"command_sandbox,omitempty"`
-	CommandIdleTimeoutSecs    int                           `yaml:"command_idle_timeout_secs,omitempty"`
-	TreeSitter                string                        `yaml:"treesitter"`
-	TreeSitterLangs           string                        `yaml:"treesitter_langs,omitempty"`
-	TestCommand               string                        `yaml:"test_command,omitempty"`
-	LintCommand               string                        `yaml:"lint_command,omitempty"`
-	CLIVerbose                bool                          `yaml:"cli_verbose"`
-	DebugLog                  string                        `yaml:"debug_log,omitempty"`
-	DebugSession              string                        `yaml:"debug_session,omitempty"`
-	MCP                       string                        `yaml:"mcp"`
-	PreserveReasoning         string                        `yaml:"preserve_reasoning,omitempty"`
-	Board                     string                        `yaml:"board,omitempty"`
-	Subagent                  string                        `yaml:"subagent,omitempty"`
-	SubagentMaxDepth          int                           `yaml:"subagent_max_depth,omitempty"`
-	SubagentMaxConcurrent     int                           `yaml:"subagent_max_concurrent,omitempty"`
-	SubagentModel             string                        `yaml:"subagent_model,omitempty"`
-	SubagentThinkingLevel     string                        `yaml:"subagent_thinking_level,omitempty"`
-	ReviewAgent               string                        `yaml:"review_agent,omitempty"`
-	ReviewAgentModel          string                        `yaml:"review_agent_model,omitempty"`
-	ReviewAgentThinkingLevel  string                        `yaml:"review_agent_thinking_level,omitempty"`
-	BoardStartPrompt          string                        `yaml:"board_start_prompt,omitempty"`
-	BoardReviewPrompt         string                        `yaml:"board_review_prompt,omitempty"`
-	SystemPrompt              string                        `yaml:"system_prompt,omitempty"`
-	SubagentPrompt            string                        `yaml:"subagent_prompt,omitempty"`
-	AgentInstructions         string                        `yaml:"agent_instructions,omitempty"`
-	Skills                    string                        `yaml:"skills,omitempty"`
-	Terminal                  string                        `yaml:"terminal,omitempty"`
-	JobNotices                string                        `yaml:"job_notices,omitempty"`
-	Automations               string                        `yaml:"automations,omitempty"`
-	StatusDisplay             string                        `yaml:"status_display,omitempty"`
-	StatusDisplayHost         string                        `yaml:"status_display_host,omitempty"`
-	StatusDisplayToken        string                        `yaml:"status_display_token,omitempty"`
-	StatusDisplaySource       string                        `yaml:"status_display_source,omitempty"`
-	OutputSpill               string                        `yaml:"output_spill,omitempty"`
-	SessionMaxCount           int                           `yaml:"session_max_count,omitempty"`
-	SessionMaxAgeDays         int                           `yaml:"session_max_age_days,omitempty"`
-	WebMaxActiveSessions      int                           `yaml:"web_max_active_sessions,omitempty"`
-	WebApprovalHoldSecs       int                           `yaml:"web_approval_hold_secs,omitempty"`
-	WebBind                   string                        `yaml:"web_bind,omitempty"`
-	WebAllowedOrigins         string                        `yaml:"web_allowed_origins,omitempty"`
-	WebAuthToken              string                        `yaml:"web_auth_token,omitempty"`
-	WebTLSCertFile            string                        `yaml:"web_tls_cert_file,omitempty"`
-	WebTLSKeyFile             string                        `yaml:"web_tls_key_file,omitempty"`
-	MCPToolMode               string                        `yaml:"mcp_tool_mode,omitempty"`
-	MCPServers                []config.MCPServerConfig      `yaml:"mcp_servers,omitempty"`
-	OpenAIProviders           []config.OpenAIProviderConfig `yaml:"openai_providers,omitempty"`
-}
-
-// omitDefaultString returns "" when v equals the built-in default def, so
-// the yaml omitempty tag drops the key entirely. Used for options added by
-// the runtime-config / feature-flag work: a config file must never bake in
-// a default value, so future default changes reach users who did not
-// customize without them editing anything (the same rule preserve_reasoning
-// already follows). Reload of an omitted key resolves to the same default
-// via the merge path, so omission is transparent today. Legacy fields keep
-// their historical always-write convention.
-func omitDefaultString(v, def string) string {
-	if v == def {
-		return ""
-	}
-	return v
-}
-
-// omitDefaultInt is omitDefaultString for int fields (0 = omitted by
-// omitempty). Negative sentinel values (session_max_age_days -1 = keep
-// sessions forever) differ from the default and are preserved.
-func omitDefaultInt(v, def int) int {
-	if v == def {
-		return 0
-	}
-	return v
+	OpenAIAPIKey              string  `yaml:"openai_api_key,omitempty"`
+	OpenAIModel               string  `yaml:"openai_model"`
+	OpenAIBaseURL             string  `yaml:"openai_base_url"`
+	WorkingDir                string  `yaml:"working_dir"`
+	ContextLimit              int     `yaml:"context_limit"`
+	CompactThreshold          float64 `yaml:"compact_threshold"`
+	CompactKeepRecentMessages int     `yaml:"compact_keep_recent_messages"`
+	MaxToolResultBytes        int     `yaml:"max_tool_result_bytes"`
+	CompactReserveTokens      int     `yaml:"compact_reserve_tokens"`
+	CompactLastResort         string  `yaml:"compact_last_resort,omitempty"`
+	SmartCompact              string  `yaml:"smart_compact,omitempty"`
+	CommandSafety             string  `yaml:"command_safety"`
+	CommandAllowlist          string  `yaml:"command_allowlist,omitempty"`
+	DeleteApproval            string  `yaml:"delete_approval"`
+	CommandApproval           string  `yaml:"command_approval,omitempty"`
+	CommandSandbox            string  `yaml:"command_sandbox,omitempty"`
+	CommandIdleTimeoutSecs    int     `yaml:"command_idle_timeout_secs,omitempty"`
+	TreeSitter                string  `yaml:"treesitter"`
+	TreeSitterLangs           string  `yaml:"treesitter_langs,omitempty"`
+	TestCommand               string  `yaml:"test_command,omitempty"`
+	LintCommand               string  `yaml:"lint_command,omitempty"`
+	CLIVerbose                bool    `yaml:"cli_verbose"`
+	DebugLog                  string  `yaml:"debug_log,omitempty"`
+	DebugSession              string  `yaml:"debug_session,omitempty"`
+	MCP                       string  `yaml:"mcp"`
+	PreserveReasoning         string  `yaml:"preserve_reasoning,omitempty"`
+	Board                     string  `yaml:"board,omitempty"`
+	Subagent                  string  `yaml:"subagent,omitempty"`
+	SubagentMaxDepth          int     `yaml:"subagent_max_depth,omitempty"`
+	SubagentMaxConcurrent     int     `yaml:"subagent_max_concurrent,omitempty"`
+	SubagentModel             string  `yaml:"subagent_model,omitempty"`
+	SubagentThinkingLevel     string  `yaml:"subagent_thinking_level,omitempty"`
+	ReviewAgent               string  `yaml:"review_agent,omitempty"`
+	ReviewAgentModel          string  `yaml:"review_agent_model,omitempty"`
+	ReviewAgentThinkingLevel  string  `yaml:"review_agent_thinking_level,omitempty"`
+	BoardStartPrompt          string  `yaml:"board_start_prompt,omitempty"`
+	BoardReviewPrompt         string  `yaml:"board_review_prompt,omitempty"`
+	SystemPrompt              string  `yaml:"system_prompt,omitempty"`
+	SubagentPrompt            string  `yaml:"subagent_prompt,omitempty"`
+	AgentInstructions         string  `yaml:"agent_instructions,omitempty"`
+	Skills                    string  `yaml:"skills,omitempty"`
+	Terminal                  string  `yaml:"terminal,omitempty"`
+	JobNotices                string  `yaml:"job_notices,omitempty"`
+	Automations               string  `yaml:"automations,omitempty"`
+	StatusDisplay             string  `yaml:"status_display,omitempty"`
+	StatusDisplayHost         string  `yaml:"status_display_host,omitempty"`
+	StatusDisplayToken        string  `yaml:"status_display_token,omitempty"`
+	StatusDisplaySource       string  `yaml:"status_display_source,omitempty"`
+	OutputSpill               string  `yaml:"output_spill,omitempty"`
+	SessionMaxCount           int     `yaml:"session_max_count,omitempty"`
+	SessionMaxAgeDays         int     `yaml:"session_max_age_days,omitempty"`
+	WebMaxActiveSessions      int     `yaml:"web_max_active_sessions,omitempty"`
+	WebApprovalHoldSecs       int     `yaml:"web_approval_hold_secs,omitempty"`
+	WebBind                   string  `yaml:"web_bind,omitempty"`
+	WebAllowedOrigins         string  `yaml:"web_allowed_origins,omitempty"`
+	WebAuthToken              string  `yaml:"web_auth_token,omitempty"`
+	WebTLSCertFile            string  `yaml:"web_tls_cert_file,omitempty"`
+	WebTLSKeyFile             string  `yaml:"web_tls_key_file,omitempty"`
+	// The web content group (fetch/search) is read from the file and settable
+	// from the settings modal, and used to be MISSING here: a save rewrote the
+	// config without those keys, silently erasing the user's choices (and the
+	// search API key, which --save-config-secrets must persist).
+	WebFetch             string                        `yaml:"web_fetch,omitempty"`
+	WebSearch            string                        `yaml:"web_search,omitempty"`
+	WebSearchBackend     string                        `yaml:"web_search_backend,omitempty"`
+	WebSearchAPIKey      string                        `yaml:"web_search_api_key,omitempty"`
+	WebAllowedDomains    string                        `yaml:"web_allowed_domains,omitempty"`
+	WebFetchMode         string                        `yaml:"web_fetch_mode,omitempty"`
+	MCPToolMode          string                        `yaml:"mcp_tool_mode,omitempty"`
+	DebugCompareMessages bool                          `yaml:"debug_compare_messages,omitempty"`
+	MCPServers           []config.MCPServerConfig      `yaml:"mcp_servers,omitempty"`
+	OpenAIProviders      []config.OpenAIProviderConfig `yaml:"openai_providers,omitempty"`
 }
 
 // buildConfigYAML renders the effective config as a YAML document. Secrets
 // (openai_api_key, web_auth_token, MCP server env, provider api_key) are
 // included only when opts.IncludeSecrets is set; preserve_reasoning is
 // omitted when it is the default "auto"; the runtime-config / feature-flag
-// options are omitted when they equal their built-in default
-// (omitDefaultString / omitDefaultInt).
+// options are omitted when they equal their built-in default (the settings
+// table's omitDefault flag, see settings.go).
 func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 	def := config.Defaults()
-	out := configYAML{
-		OpenAIModel:               cfg.OpenAIModel,
-		OpenAIBaseURL:             cfg.OpenAIURL,
-		WorkingDir:                cfg.WorkingDir,
-		ContextLimit:              cfg.ContextLimit,
-		CompactThreshold:          cfg.CompactThreshold,
-		CompactKeepRecentMessages: cfg.CompactKeepRecentMessages,
-		MaxToolResultBytes:        cfg.MaxToolResultBytes,
-		CompactReserveTokens:      cfg.CompactReserveTokens,
-		CompactLastResort:         omitDefaultString(cfg.CompactLastResort, def.CompactLastResort),
-		SmartCompact:              omitDefaultString(cfg.SmartCompact, def.SmartCompact),
-		CommandSafety:             cfg.CommandSafetyMode,
-		CommandAllowlist:          cfg.CommandAllowlist,
-		DeleteApproval:            cfg.DeleteApproval,
-		CommandApproval:           omitDefaultString(cfg.CommandApproval, def.CommandApproval),
-		CommandSandbox:            omitDefaultString(cfg.CommandSandbox, def.CommandSandbox),
-		CommandIdleTimeoutSecs:    omitDefaultInt(cfg.CommandIdleTimeoutSecs, def.CommandIdleTimeoutSecs),
-		TreeSitter:                cfg.TreeSitter,
-		TreeSitterLangs:           cfg.TreeSitterLangs,
-		TestCommand:               cfg.TestCommand,
-		LintCommand:               cfg.LintCommand,
-		CLIVerbose:                cfg.CLIVerbose,
-		DebugLog:                  cfg.DebugLog,
-		DebugSession:              cfg.DebugSession,
-		MCP:                       cfg.MCP,
-		Board:                     omitDefaultString(cfg.Board, def.Board),
-		Subagent:                  omitDefaultString(cfg.Subagent, def.Subagent),
-		SubagentMaxDepth:          omitDefaultInt(cfg.SubagentMaxDepth, def.SubagentMaxDepth),
-		SubagentMaxConcurrent:     omitDefaultInt(cfg.SubagentMaxConcurrent, def.SubagentMaxConcurrent),
-		SubagentModel:             cfg.SubagentModel,
-		SubagentThinkingLevel:     cfg.SubagentThinkingLevel,
-		ReviewAgent:               omitDefaultString(cfg.ReviewAgent, def.ReviewAgent),
-		ReviewAgentModel:          cfg.ReviewAgentModel,
-		ReviewAgentThinkingLevel:  cfg.ReviewAgentThinkingLevel,
-		BoardStartPrompt:          cfg.BoardStartPrompt,
-		BoardReviewPrompt:         cfg.BoardReviewPrompt,
-		SystemPrompt:              cfg.SystemPrompt,
-		SubagentPrompt:            cfg.SubagentPrompt,
-		AgentInstructions:         omitDefaultString(cfg.AgentInstructions, def.AgentInstructions),
-		Skills:                    omitDefaultString(cfg.Skills, def.Skills),
-		Terminal:                  omitDefaultString(cfg.Terminal, def.Terminal),
-		JobNotices:                omitDefaultString(cfg.JobNotices, def.JobNotices),
-		Automations:               omitDefaultString(cfg.Automations, def.Automations),
-		StatusDisplay:             omitDefaultString(cfg.StatusDisplay, def.StatusDisplay),
-		StatusDisplayHost:         omitDefaultString(cfg.StatusDisplayHost, def.StatusDisplayHost),
-		StatusDisplaySource:       omitDefaultString(cfg.StatusDisplaySource, def.StatusDisplaySource),
-		OutputSpill:               omitDefaultString(cfg.OutputSpill, def.OutputSpill),
-		SessionMaxCount:           omitDefaultInt(cfg.SessionMaxCount, def.SessionMaxCount),
-		SessionMaxAgeDays:         omitDefaultInt(cfg.SessionMaxAgeDays, def.SessionMaxAgeDays),
-		WebMaxActiveSessions:      omitDefaultInt(cfg.WebMaxActiveSessions, def.WebMaxActiveSessions),
-		WebApprovalHoldSecs:       omitDefaultInt(cfg.WebApprovalHoldSecs, def.WebApprovalHoldSecs),
-		WebBind:                   omitDefaultString(cfg.WebBind, def.WebBind),
-		WebAllowedOrigins:         cfg.WebAllowedOrigins,
-		WebTLSCertFile:            cfg.WebTLSCertFile,
-		WebTLSKeyFile:             cfg.WebTLSKeyFile,
-		MCPToolMode:               omitDefaultString(cfg.MCPToolMode, def.MCPToolMode),
-		MCPServers:                cfg.MCPServers,
-		OpenAIProviders:           cfg.OpenAIProviders,
-	}
-	if opts.IncludeSecrets && cfg.OpenAIKey != "" {
-		out.OpenAIAPIKey = cfg.OpenAIKey
-	}
-	if opts.IncludeSecrets && cfg.WebAuthToken != "" {
-		// The auth token is a secret (like openai_api_key): persisted only
-		// with --save-config-secrets / a forced provider save.
-		out.WebAuthToken = cfg.WebAuthToken
-	}
-	if opts.IncludeSecrets && cfg.StatusDisplayToken != "" {
-		// Same secret rule as web_auth_token: a display token entered in
-		// the settings modal survives a restart (the modal save forces the
-		// secret write), but it is never echoed by a plain save.
-		out.StatusDisplayToken = cfg.StatusDisplayToken
-	}
+	// One loop over the settings table (settings.go): every row that has a
+	// configYAML field is written here, with its own omission rule and secret
+	// gate. The saved key ORDER is the struct's field order — the loop fills
+	// fields by name and never reorders — so existing config files keep their
+	// layout.
+	out := configYAML{}
+	writeSettings(&out, cfg, &def, opts.IncludeSecrets)
+	// openai_api_key, web_auth_token, status_display_token and
+	// web_search_api_key are all written by the loop above via their
+	// `secret` flag: persisted only with --save-config-secrets (a forced
+	// provider/modal save sets it), never echoed by a plain save.
+	// The two list settings (and preserve_reasoning below) are the rows the
+	// settings table marks writeSpecial: their persistence needs more than a
+	// value copy, so they are handled here rather than by the generic loop.
+	out.OpenAIProviders = cfg.OpenAIProviders
 	if !opts.IncludeSecrets && len(cfg.OpenAIProviders) > 0 {
 		// Copy without api_key so provider keys are never persisted without
 		// --save-config-secrets. The slice shares its backing array with
@@ -279,6 +207,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 	if mode := strings.ToLower(strings.TrimSpace(cfg.PreserveReasoning)); mode != "" && mode != "auto" {
 		out.PreserveReasoning = mode
 	}
+	out.MCPServers = cfg.MCPServers
 	if !opts.IncludeSecrets && len(cfg.MCPServers) > 0 {
 		// Copy without env so secrets are never persisted. The slice shares
 		// its backing array with cfg, so a fresh copy is required.
