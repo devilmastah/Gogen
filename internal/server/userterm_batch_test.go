@@ -107,8 +107,8 @@ func TestWSUserTerminalOutputBatched(t *testing.T) {
 	// against the file's own bytes.
 	text := strings.ReplaceAll(got.String(), "\r\n", "\n")
 	if !strings.Contains(text, payload.String()) {
-		t.Fatalf("received output does not contain the full burst in order: got %d bytes, want at least %d; frames: %v",
-			len(text), payload.Len(), pump.terminalFrameTypes())
+		t.Fatalf("received output does not contain the full burst in order: got %d bytes, want at least %d; %s; frames: %v",
+			len(text), payload.Len(), burstDivergence(text, payload.String()), pump.terminalFrameTypes())
 	}
 
 	// One pty read delivers at most 4096 bytes, so the payload needs at least
@@ -156,4 +156,41 @@ func TestUserTerminalFlushOutputDeliversPendingBatch(t *testing.T) {
 	}
 	ut.FlushOutput()
 	out.waitContains(t, "flush-marker", 10*time.Second)
+}
+
+// burstDivergence reports WHERE the received text stops matching the emitted
+// burst, so a platform-specific failure (macOS losing the tail when the pty
+// master was severed too early, a dropped chunk) says which byte and what the
+// bytes around it were, instead of only a byte count.
+func burstDivergence(text, want string) string {
+	probe := want
+	if len(probe) > 200 {
+		probe = probe[:200]
+	}
+	start := strings.Index(text, probe)
+	if start < 0 {
+		return "the burst's first 200 bytes are not present at all"
+	}
+	i := 0
+	for i < len(want) && start+i < len(text) && text[start+i] == want[i] {
+		i++
+	}
+	lo := i - 20
+	if lo < 0 {
+		lo = 0
+	}
+	wantHi := i + 20
+	if wantHi > len(want) {
+		wantHi = len(want)
+	}
+	textHi := start + i + 20
+	if textHi > len(text) {
+		textHi = len(text)
+	}
+	origin := "truncated after"
+	if start+i >= len(text) {
+		origin = "text ended"
+	}
+	return fmt.Sprintf("burst starts at %d, %d of its bytes match (%s byte %d): want[%d:%d]=%q got[%d:%d]=%q",
+		start, i, origin, i, lo, wantHi, want[lo:wantHi], start+lo, textHi, text[start+lo:textHi])
 }

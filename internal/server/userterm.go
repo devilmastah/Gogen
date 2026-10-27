@@ -25,11 +25,23 @@ import (
 // it.
 var userTermOutputBatch = 16 * time.Millisecond
 
-// userTermReadDrainWait bounds how long the exit path waits for the read
-// goroutine to hand over its final chunk before flushing (see waitLoop). The
-// master is closed first, which unblocks Read, so the normal wait is
-// instantaneous; the bound exists only so a stuck pty cannot delay the exit
+// userTermDrainGrace is how long the exit path lets the read goroutine drain
+// the pty BEFORE severing the master.
+//
+// Closing the master DISCARDS whatever the pty still holds — a BSD/macOS close
+// flushes the output queue, and Linux drops it too. The exit path used to close
+// first, so the tail of a command that wrote right up to the shell's exit (the
+// last line of a `cat` burst, the shell's own exit message) was lost: on macOS
+// (larger pty buffers) that truncated TestWSUserTerminalOutputBatched. Draining
+// first costs nothing in the normal case — the shell closing the slave side
+// makes Read return EOF/EIO as soon as the buffer is empty — and the bound
+// keeps a grandchild that still holds the slave open from delaying the exit
 // report.
+const userTermDrainGrace = 250 * time.Millisecond
+
+// userTermReadDrainWait bounds how long the exit path waits for the read
+// goroutine to hand over its final chunk AFTER the master was severed (the
+// grandchild case above), and bounds the flush that follows.
 const userTermReadDrainWait = 2 * time.Second
 
 // ptyHandle is the platform-specific interactive channel for a user shell.
@@ -193,26 +205,40 @@ func (u *UserTerminal) waitLoop(cmd *exec.Cmd) {
 			code = -1
 		}
 	}
-	// Give the read goroutine a moment to drain final output (e.g. the shell's
-	// own "exit" line) before we sever the master.
+	// Give the shell's final output a moment to reach the pty buffer.
 	time.Sleep(50 * time.Millisecond)
 	u.mu.Lock()
 	u.code = code
 	u.closed = true
-	if u.pty != nil {
-		_ = u.pty.Close() // unblocks a read still parked in the master
-		u.pty = nil
-	}
-	batch, readDone := u.batch, u.readDone
+	// Snapshot, but do NOT close the master yet: disabling writes above means
+	// the read goroutine is the only remaining consumer, and it must drain the
+	// pty before the master is severed (see userTermDrainGrace).
+	handle, batch, readDone := u.pty, u.batch, u.readDone
 	u.mu.Unlock()
-	// Wait for the read goroutine to hand over its last chunk before flushing:
-	// it is the only producer, so flushing earlier could strand that chunk in
-	// a later timer flush (i.e. behind user_term_exit) or lose it to the
-	// socket teardown.
+	// Drain BEFORE severing: it is the only producer, so flushing earlier
+	// could strand its last chunk in a later timer flush (i.e. behind
+	// user_term_exit) or lose it to the socket teardown.
 	select {
 	case <-readDone:
-	case <-time.After(userTermReadDrainWait):
+	case <-time.After(userTermDrainGrace):
+		// A grandchild still holds the slave open, so Read is parked: sever
+		// the master to unblock it and give the goroutine its drained chunks.
+		if handle != nil {
+			_ = handle.Close()
+		}
+		select {
+		case <-readDone:
+		case <-time.After(userTermReadDrainWait):
+		}
 	}
+	// Release the master (idempotent: Close on an already-closed file reports
+	// ErrClosed) so no descriptor outlives the shell.
+	u.mu.Lock()
+	if u.pty != nil {
+		_ = u.pty.Close()
+		u.pty = nil
+	}
+	u.mu.Unlock()
 	if batch != nil {
 		// Flush, then close: the flush delivers what the read loop produced,
 		// the close stops the flush timer so no frame can be emitted after the
