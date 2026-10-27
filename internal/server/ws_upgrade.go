@@ -24,6 +24,12 @@ func (s *Server) wsUpgrader() websocket.Upgrader {
 	}
 }
 
+// wsMaxFrameBytes bounds one inbound WebSocket frame on both endpoints. It
+// covers the largest legitimate message the protocol defines — four image
+// data URLs at the per-image cap (see validateImageInputs) plus an ample
+// prompt and its JSON envelope — and nothing larger.
+const wsMaxFrameBytes = maxImagesPerMessage*maxImageDataURLBytes + (4 << 20)
+
 // upgradedWS bundles the result of a shared WebSocket handshake: the raw
 // connection (for ReadJSON in the read loop), the wrapped wsConn (for
 // writes), and the cleanup the handler must defer.
@@ -46,6 +52,14 @@ var errWSUpgrade = errors.New("websocket upgrade failed")
 // writer drain its queue) → unregister → raw close → release the connection
 // slot. Callers must defer the cleanup.
 func (s *Server) upgradeWS(w http.ResponseWriter, r *http.Request) (*upgradedWS, error) {
+	// Host check first: it is the cheapest rejection and it is the one that
+	// stops a DNS-rebinding page from reaching a token-less loopback server
+	// with a token it does not have (see checkWSHost).
+	if s.loopbackBind && !checkWSHost(r, s.allowedOrigins) {
+		log.Printf("ws upgrade refused: Host %q does not name this loopback listener", r.Host)
+		http.Error(w, "forbidden host", http.StatusForbidden)
+		return nil, errWSUpgrade
+	}
 	if !s.checkAuth(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, errWSUpgrade
@@ -75,6 +89,12 @@ func (s *Server) upgradeWS(w http.ResponseWriter, r *http.Request) (*upgradedWS,
 	// the read deadline elapses, ReadJSON fails, and the handler tears down —
 	// which closes the write side too. This is what surfaces half-open
 	// connections that would otherwise freeze the UI silently.
+	// Bound one inbound frame. gorilla buffers an entire frame before
+	// ReadJSON decodes it, and the per-field checks (image size, prompt
+	// length) only run after that, so without a limit a single frame can
+	// reserve gigabytes. Sized to the largest legitimate message: the image
+	// cap the session accepts plus room for a long prompt.
+	conn.SetReadLimit(wsMaxFrameBytes)
 	if err := conn.SetReadDeadline(time.Now().Add(wsReadTimeout)); err != nil {
 		log.Printf("websocket set read deadline: %v", err)
 	}
@@ -87,7 +107,11 @@ func (s *Server) upgradeWS(w http.ResponseWriter, r *http.Request) (*upgradedWS,
 
 	ws := newWSConn(conn)
 	cleanup := func() {
+		// closeSend, then give the writer a bounded moment to flush the frames
+		// already queued, and only then close the raw socket. Closing first cut
+		// the writer off mid-queue (see drainQueued).
 		ws.closeSend()
+		ws.waitDrained(wsQuitDrainWait)
 		s.unregisterWSConn(conn)
 		_ = conn.Close()
 		if release != nil {
@@ -160,18 +184,23 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	defer s.registry.detachAll(ws)
 
 	// Interactive user shell for this connection, killed on disconnect. The
-	// shell itself is spawned after the config/history handshake below so
-	// connection setup never depends on pty availability.
+	// holder is created eagerly but the shell itself is spawned LAZILY, on the
+	// first user_term_request (wsHandleUserTermRequest → spawnUserTerminal):
+	// spawning it here cost a pty plus a shell process for every connection,
+	// including the ones that never open the terminal panel (the connection
+	// limiter allows 32 of them). The holder stays empty until then, which the
+	// input/resize handlers already treat as "no shell".
 	userTermHolder := &userTermHolder{}
 	defer func() {
 		if ut := userTermHolder.get(); ut != nil {
+			// Flush pending batched output BEFORE the socket's send path
+			// closes (u.cleanup's closeSend runs after this defer, LIFO), or
+			// the last userTermOutputBatch of terminal output dies in the
+			// batcher. Then kill the shell.
+			ut.FlushOutput()
 			ut.Close()
 		}
 	}()
-
-	// Spawn the user shell after the handshake so a pty failure (sandboxed
-	// or headless environments) can never delay the config/history messages.
-	s.spawnUserTerminal(ws, userTermHolder)
 
 	incoming := make(chan WSMessage, 8)
 	go func() {

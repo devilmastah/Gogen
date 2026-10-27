@@ -42,9 +42,8 @@ func (s *Server) broadcastStatusDisplay(row []byte, clear bool, source string) {
 	if !clear {
 		msg.StatusDisplayRow = string(row)
 	}
-	for _, id := range s.registry.activeIDs() {
-		if rt, ok := s.registry.get(id); ok {
-			rt.broadcast(msg)
-		}
-	}
+	// Server-wide payload (one display row, last-writer-wins across
+	// sessions): broadcastAll sends it once per socket, so a socket attached
+	// to several panes does not relay the same row twice.
+	s.registry.broadcastAll(msg)
 }

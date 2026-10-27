@@ -100,11 +100,9 @@ func (s *Server) broadcastBoardState() {
 	if err != nil {
 		return
 	}
-	for _, id := range s.registry.activeIDs() {
-		if rt, ok := s.registry.get(id); ok {
-			rt.broadcast(WSMessage{Type: "board_state", BoardState: snap})
-		}
-	}
+	// broadcastAll, not broadcast: the board is process-wide and a socket
+	// attached to several panes must receive ONE frame (see registry.broadcastAll).
+	s.registry.broadcastAll(WSMessage{Type: "board_state", BoardState: snap})
 }
 
 // broadcastBoardNotice toasts a board mutation to every attached client of
@@ -117,9 +115,5 @@ func (s *Server) broadcastBoardNotice(msg string) {
 	if msg == "" {
 		return
 	}
-	for _, id := range s.registry.activeIDs() {
-		if rt, ok := s.registry.get(id); ok {
-			rt.broadcast(WSMessage{Type: "notice", Kind: "board", Success: true, Content: msg})
-		}
-	}
+	s.registry.broadcastAll(WSMessage{Type: "notice", Kind: "board", Success: true, Content: msg})
 }

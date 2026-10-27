@@ -445,7 +445,15 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 // mutators swallow them, matching their historical behavior. Callers must hold
 // s.mu so the read-modify-write of index.json cannot interleave with another
 // mutator.
-func (s *Store) mutateIndex(workingDir string, createIfMissing bool, mutate func(idx *sessionIndex) bool) error {
+// mutateIndex applies mutate to the session index and rewrites it. Callers
+// hold s.mu, so the read-modify-write is atomic WITHIN this process; across
+// processes it is not (two hosts saving at once used to drop one entry).
+//
+// mergeOnDisk makes the upsert path resilient to that: after mutate, entries
+// that another process added to the index since it was read are appended
+// instead of being overwritten. Only the upsert passes it — the delete paths
+// must NOT, or a tombstone would resurrect the entry it removed.
+func (s *Store) mutateIndex(workingDir string, createIfMissing, mergeOnDisk bool, mutate func(idx *sessionIndex) bool) error {
 	if !s.enabled {
 		return nil
 	}
@@ -459,11 +467,40 @@ func (s *Store) mutateIndex(workingDir string, createIfMissing bool, mutate func
 	if !mutate(idx) {
 		return nil
 	}
+	if mergeOnDisk {
+		s.mergeIndexEntriesFromDisk(workingDir, idx)
+	}
 	if err := s.writeIndex(workingDir, idx); err != nil {
 		return err
 	}
 	s.invalidateListCache(workingDir)
 	return nil
+}
+
+// mergeIndexEntriesFromDisk appends the index entries this process did not
+// know about (another host saved a session while our copy was in memory).
+//
+// An entry whose session file is gone is dropped instead of merged: that is
+// the cross-process tombstone case (the other host deleted the session), and
+// resurrecting it would list a session that cannot be resumed.
+func (s *Store) mergeIndexEntriesFromDisk(workingDir string, idx *sessionIndex) {
+	disk := s.readIndex(workingDir)
+	if disk == nil || len(disk.Entries) == 0 {
+		return
+	}
+	have := make(map[string]struct{}, len(idx.Entries))
+	for _, e := range idx.Entries {
+		have[e.ID] = struct{}{}
+	}
+	for _, e := range disk.Entries {
+		if _, ok := have[e.ID]; ok {
+			continue
+		}
+		if _, err := os.Stat(s.path(workingDir, e.ID)); err != nil {
+			continue
+		}
+		idx.Entries = append(idx.Entries, e)
+	}
 }
 
 // updateIndex adds or updates an entry in the session metadata index.
@@ -476,7 +513,7 @@ func (s *Store) mutateIndex(workingDir string, createIfMissing bool, mutate func
 // an existing entry means "keep the stored Created" (Save recovers it from
 // the session file only when the index has no usable value).
 func (s *Store) updateIndex(workingDir string, entry sessionIndexEntry) {
-	s.mutateIndex(workingDir, true, func(idx *sessionIndex) bool {
+	s.mutateIndex(workingDir, true, true, func(idx *sessionIndex) bool {
 		for i, e := range idx.Entries {
 			if e.ID != entry.ID {
 				continue
@@ -494,7 +531,7 @@ func (s *Store) updateIndex(workingDir string, entry sessionIndexEntry) {
 
 // touchIndex updates only the timestamp for a session in the index.
 func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
-	return s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+	return s.mutateIndex(workingDir, false, false, func(idx *sessionIndex) bool {
 		for i, e := range idx.Entries {
 			if e.ID == id {
 				idx.Entries[i].Updated = updated
@@ -512,7 +549,7 @@ func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
 // missing from the index are skipped — the list fallback re-scans the
 // directory on the next miss.
 func (s *Store) updateIndexCount(workingDir string, entry sessionIndexEntry) {
-	s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+	s.mutateIndex(workingDir, false, false, func(idx *sessionIndex) bool {
 		for i, e := range idx.Entries {
 			if e.ID == entry.ID {
 				idx.Entries[i].Updated = entry.Updated
@@ -526,7 +563,7 @@ func (s *Store) updateIndexCount(workingDir string, entry sessionIndexEntry) {
 
 // removeFromIndex deletes an entry from the session metadata index.
 func (s *Store) removeFromIndex(workingDir, id string) {
-	s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+	s.mutateIndex(workingDir, false, false, func(idx *sessionIndex) bool {
 		filtered := idx.Entries[:0]
 		for _, e := range idx.Entries {
 			if e.ID != id {
@@ -547,7 +584,7 @@ func (s *Store) removeFromIndexBatch(workingDir string, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
-	s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+	s.mutateIndex(workingDir, false, false, func(idx *sessionIndex) bool {
 		del := make(map[string]struct{}, len(ids))
 		for _, id := range ids {
 			del[id] = struct{}{}

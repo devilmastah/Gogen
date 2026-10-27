@@ -277,7 +277,6 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 	// if the provider has not started.
 	runCtx, runCancel := context.WithCancel(parentCtx)
 	defer runCancel()
-	errCh := rt.stream.begin(runCancel)
 
 	type turnResult struct {
 		out string
@@ -285,10 +284,17 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 	}
 	resCh := make(chan turnResult, 1)
 	go func() {
+		// Lock FIRST, then register the stream handles: holding turnMu proves
+		// the previous turn's stream has fully ended (end() precedes the turn
+		// unlock), which is the invariant that makes begin() safe from
+		// clobbering live handles — registering before the lock let a
+		// send_message to this new child start a turn that overwrote the
+		// handles the job had just installed.
 		defer rt.releaseTurn()
 		defer rt.stream.end()
-		defer func() { errCh <- nil }()
 		rt.turnMu.Lock()
+		errCh := rt.stream.begin(runCancel)
+		defer func() { errCh <- nil }()
 		// Child turn options: no owner connection, no positioned token
 		// frames, no error log/hook (the parent sees the error as the tool
 		// result), no persist warning/usage frame (the spawner flushes the

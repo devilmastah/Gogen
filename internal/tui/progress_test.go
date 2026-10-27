@@ -142,14 +142,16 @@ func TestStreamStatsProgressLine(t *testing.T) {
 	m := newStreamTestModel()
 
 	// Not streaming: stats are ignored (a superseded turn's straggler).
-	m.handleStreamStatsMsg(streamStatsMsg{toksPerSec: 42})
+	// The drop happens in handleMsg (dispatch), not in the handler, so go
+	// through Update — calling the handler directly would bypass the gate.
+	m.Update(streamStatsMsg{toksPerSec: 42})
 	if m.streamSpeedLine != "" {
 		t.Fatalf("stats applied while not streaming: %q", m.streamSpeedLine)
 	}
 
 	m.streaming = true
 	m.progressPhase = progressActive
-	m.handleStreamStatsMsg(streamStatsMsg{toksPerSec: 42})
+	m.Update(streamStatsMsg{toksPerSec: 42})
 	if m.streamSpeedLine == "" {
 		t.Fatal("streamSpeedLine not set after stats")
 	}
@@ -263,9 +265,11 @@ func TestStreamSignalProgressTransitions(t *testing.T) {
 	t.Run("idle turns drop the signals", func(t *testing.T) {
 		m := newBusy()
 		m.streaming = false
-		m.handleStreamCompactingMsg()
-		m.handleStreamStallMsg()
-		m.handleStreamRetryMsg(streamRetryMsg{reason: "stream interrupted"})
+		// Dispatched through Update: handleMsg owns the "not streaming → drop
+		// this stream-render event" gate for every stream message.
+		m.Update(streamCompactingMsg{})
+		m.Update(streamStallMsg{})
+		m.Update(streamRetryMsg{reason: "stream interrupted"})
 		if m.progressPhase != progressThinking || m.progressLabel != "" {
 			t.Fatalf("idle turn mutated the strip: phase=%v label=%q", m.progressPhase, m.progressLabel)
 		}

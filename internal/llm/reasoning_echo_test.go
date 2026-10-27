@@ -65,7 +65,7 @@ func TestReasoningEchoAcceptsOnSpellings(t *testing.T) {
 	for _, spelling := range []string{"on", "1", "true", "yes", "ON"} {
 		t.Run(spelling, func(t *testing.T) {
 			t.Setenv("GOGEN_REASONING_ECHO", spelling)
-			if !reasoningEchoEnabled() {
+			if !ReasoningEchoEnabled() {
 				t.Fatalf("%q must enable the reasoning echo", spelling)
 			}
 		})
@@ -73,14 +73,14 @@ func TestReasoningEchoAcceptsOnSpellings(t *testing.T) {
 	for _, spelling := range []string{"off", "0", "false", "no", "OFF"} {
 		t.Run(spelling, func(t *testing.T) {
 			t.Setenv("GOGEN_REASONING_ECHO", spelling)
-			if reasoningEchoEnabled() {
+			if ReasoningEchoEnabled() {
 				t.Fatalf("%q must disable the reasoning echo", spelling)
 			}
 		})
 	}
 	t.Run("unrecognized falls back to on", func(t *testing.T) {
 		t.Setenv("GOGEN_REASONING_ECHO", "sometimes")
-		if !reasoningEchoEnabled() {
+		if !ReasoningEchoEnabled() {
 			t.Fatal("an unrecognized value must not change the default")
 		}
 	})

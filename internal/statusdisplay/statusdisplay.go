@@ -110,11 +110,18 @@ type op struct {
 }
 
 var (
-	mu      sync.Mutex
-	cfg     = Config{Source: DefaultSource}
-	pending op
-	dirty   bool
-	started bool
+	mu  sync.Mutex
+	cfg = Config{Source: DefaultSource}
+	// pending is the latest row/clear op. pendingClear is the "clear the OLD
+	// target" op Configure queues when the row moves or the feature turns off:
+	// it needs its own slot because a single slot let the next Notify (which
+	// only sets pending) overwrite the clear, leaving a stale row on the old
+	// display until its TTL expired (up to 900 s). The worker runs the clear
+	// first.
+	pending      op
+	pendingClear *op
+	dirty        bool
+	started      bool
 	// lastSent dedupes identical successful rows against one target
 	// (repeated stall events must not re-POST the same bytes).
 	lastSent string
@@ -221,7 +228,10 @@ func Configure(enabled bool, host, token, source, workdir string) {
 	}
 	queuedClear := false
 	if prev.Enabled && prev.Host != "" && (!next.Enabled || prev.Host != next.Host || prev.Source != next.Source) {
-		pending = op{clear: true, cfg: prev, relay: sink}
+		// Own slot: a Notify arriving before the worker wakes must not be able
+		// to overwrite the clear (see pendingClear).
+		clear := op{clear: true, cfg: prev, relay: sink}
+		pendingClear = &clear
 		dirty = true
 		queuedClear = true
 		startWorkerLocked()
@@ -460,12 +470,20 @@ func worker() {
 	for range wake {
 		for {
 			mu.Lock()
-			if !dirty {
+			if pendingClear == nil && !dirty {
 				mu.Unlock()
 				break
 			}
-			p := pending
-			dirty = false
+			var p op
+			if pendingClear != nil {
+				// A queued clear runs first: it targets the PREVIOUS display
+				// and must not be coalesced away by the row update behind it.
+				p = *pendingClear
+				pendingClear = nil
+			} else {
+				p = pending
+				dirty = false
+			}
 			mu.Unlock()
 			process(p)
 		}

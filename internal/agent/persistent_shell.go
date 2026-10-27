@@ -56,6 +56,7 @@ type persistentShell struct {
 
 	closed    atomic.Bool
 	closeOnce sync.Once
+	reapOnce  sync.Once
 }
 
 // newPersistentShell starts the platform shell in dir.
@@ -112,15 +113,21 @@ func (s *persistentShell) readLoop() {
 //
 // Because the command runs in the shared shell, a command that reads stdin can
 // consume the next command line; that limitation is documented on the tool.
-func (s *persistentShell) Run(command string, timeout time.Duration) (string, int, string, error) {
+func (s *persistentShell) Run(ctx context.Context, command string, timeout time.Duration) (string, int, string, error) {
 	if timeout <= 0 {
 		timeout = defaultCommandIdleTimeout
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 
 	if s.Exited() {
 		return "", -1, "", errPersistentShellClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return "", -1, "", err
 	}
 
 	marker := "__GOGEN_" + randhex.ID(8, "") + "__"
@@ -134,10 +141,24 @@ func (s *persistentShell) Run(command string, timeout time.Duration) (string, in
 
 	markerBytes := []byte(marker)
 	deadline := time.Now().Add(timeout)
+	// scanFrom tracks how much of the buffer the previous poll already searched,
+	// so each 20 ms tick scans only the new bytes (the buffer can hold 4 MB, and
+	// rescanning it 50 times a second was measurable). A front trim moves the
+	// content, so the offset is rebased whenever the buffer shrank.
+	scanFrom := 0
+	prevLen := 0
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		s.outMu.Lock()
 		data := s.buf.Bytes()
-		idx := bytes.Index(data, markerBytes)
+		if len(data) < prevLen || scanFrom > len(data) {
+			scanFrom = 0 // trimmed/rewritten: rescan
+		}
+		idx := -1
+		if found := bytes.Index(data[scanFrom:], markerBytes); found >= 0 {
+			idx = scanFrom + found
+		}
 		if idx >= 0 {
 			if out, code, pwd, consumed, ok := parseShellMarker(data, idx, len(marker)); ok {
 				s.buf.Next(consumed)
@@ -145,6 +166,14 @@ func (s *persistentShell) Run(command string, timeout time.Duration) (string, in
 				return out, code, pwd, nil
 			}
 		}
+		// Keep a marker-length overlap so a marker split across two polls is
+		// still found.
+		nextScan := len(data) - (len(markerBytes) - 1)
+		if nextScan < 0 {
+			nextScan = 0
+		}
+		prevLen = len(data)
+		scanFrom = nextScan
 		readErr := s.readErr
 		s.outMu.Unlock()
 
@@ -154,14 +183,41 @@ func (s *persistentShell) Run(command string, timeout time.Duration) (string, in
 			}
 			return "", -1, "", fmt.Errorf("persistent shell exited: %w", readErr)
 		}
+		select {
+		case <-ctx.Done():
+			// The caller gave up (Esc / turn cancelled). The command may still be
+			// running in the shared shell, so it must die with the shell or the
+			// next Run's output would be corrupted by its leftovers.
+			s.killAndReap()
+			return "", -1, "", ctx.Err()
+		case <-ticker.C:
+		}
 		if time.Now().After(deadline) {
 			// Kill the shell: the timed-out command may still be running and
 			// would corrupt the next Run's output. The next call recreates it.
-			s.kill()
+			s.killAndReap()
 			return "", -1, "", errPersistentShellTimeout
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// killAndReap kills the shell and reaps it exactly once, so a cancelled or
+// timed-out Run leaves no zombie behind (kill alone leaves one until the
+// process is waited for).
+func (s *persistentShell) killAndReap() {
+	s.kill()
+	s.reap()
+}
+
+// reap waits for the shell process once, whoever gets there first (a cancelled
+// Run, Close, or the shell exiting on its own).
+func (s *persistentShell) reap() {
+	if s.proc == nil || s.proc.wait == nil {
+		return
+	}
+	s.reapOnce.Do(func() {
+		go func() { _ = s.proc.wait() }()
+	})
 }
 
 // parseShellMarker parses "<marker>:<code>:<pwd>\n" starting at idx. It reports
@@ -218,9 +274,7 @@ func (s *persistentShell) kill() {
 func (s *persistentShell) Close() error {
 	s.closeOnce.Do(func() {
 		s.kill()
-		if s.proc.wait != nil {
-			go func() { _ = s.proc.wait() }()
-		}
+		s.reap()
 	})
 	return nil
 }
@@ -289,7 +343,7 @@ func handleBashPersistent(ctx context.Context, a *Agent, args map[string]any) (s
 	if err != nil {
 		return "", err
 	}
-	out, code, pwd, err := shell.Run(command, timeout)
+	out, code, pwd, err := shell.Run(ctx, command, timeout)
 	if err != nil {
 		return "", err
 	}

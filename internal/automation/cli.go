@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"gogen/internal/onoff"
 )
 
 // RunCLI executes the `gogen automation` subcommand tree:
@@ -319,7 +321,10 @@ func cliUpdate(args []string, store *Store, stdout io.Writer) error {
 	scheduleTouched := kindSelectors > 0 || *timeStr != "" || *minute >= 0 || *timezone != ""
 	switch {
 	case kindSelectors > 0:
-		// A selector replaces the whole schedule (defaults like create).
+		// A selector replaces the whole schedule (defaults like create), but an
+		// unset --timezone must keep the STORED zone: dropping it re-based the
+		// automation on the host's local zone, so a "weekdays at 09:00 in
+		// Asia/Tokyo" row started firing at 09:00 wherever the host was.
 		timeDefault := *timeStr
 		if timeDefault == "" {
 			timeDefault = "09:00"
@@ -328,7 +333,11 @@ func cliUpdate(args []string, store *Store, stdout io.Writer) error {
 		if minuteDefault < 0 {
 			minuteDefault = 0
 		}
-		schedule, err := buildSchedule(*at, *daily, *hourly, *weekdays, *weekly, timeDefault, minuteDefault, *timezone)
+		tz := *timezone
+		if tz == "" {
+			tz = stored.Schedule.Timezone
+		}
+		schedule, err := buildSchedule(*at, *daily, *hourly, *weekdays, *weekly, timeDefault, minuteDefault, tz)
 		if err != nil {
 			return err
 		}
@@ -493,10 +502,7 @@ func requireID(args []string) (string, error) {
 }
 
 func onOff(v bool) string {
-	if v {
-		return "on"
-	}
-	return "off"
+	return onoff.Format(v)
 }
 
 func clip(s string, n int) string {

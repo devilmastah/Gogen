@@ -451,3 +451,28 @@ func TestContainsAny(t *testing.T) {
 		})
 	}
 }
+
+// TestAtomicWriterFollowsSymlink pins the symlinked-config fix: writing through
+// a symlink must update the TARGET and keep the link, not replace the link with
+// a regular file (which silently forked a dotfile-managed config).
+func TestAtomicWriterFollowsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "dotfiles-config.yaml")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "config.yaml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := WriteFileAtomic(link, []byte("new"), 0o644); err != nil {
+		t.Fatalf("WriteFileAtomic through a symlink: %v", err)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the link was replaced by a regular file (mode %v, err %v)", fi.Mode(), err)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil || string(body) != "new" {
+		t.Fatalf("target content = %q (%v), want the new bytes", body, err)
+	}
+}

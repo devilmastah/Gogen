@@ -75,7 +75,7 @@ func TestCmdCompactGuards(t *testing.T) {
 		if m.streaming {
 			t.Fatal("turn started during compaction")
 		}
-		if q := m.lives.Active().steerQueue; len(q) != 1 || q[0].text != "hello" {
+		if q := m.lives.Active().steerQ.Items(); len(q) != 1 || q[0].Text != "hello" {
 			t.Fatalf("queue = %v, want one queued item [hello]", q)
 		}
 		// The queue cannot drain while the compaction runs.

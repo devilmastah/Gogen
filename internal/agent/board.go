@@ -196,8 +196,11 @@ func (m *BoardManager) itemPath(id string) string { return filepath.Join(m.dir, 
 func (m *BoardManager) loadIndexLocked() error {
 	data, err := os.ReadFile(m.indexPath())
 	if os.IsNotExist(err) {
-		m.idx = defaultBoardIndex()
-		return nil
+		// Ticket files may still exist (the index was deleted, or an older
+		// version never wrote one). Falling back to a pristine index reset
+		// NextID to 1, so the next Add overwrote ticket 1.json and its
+		// column/order vanished from the board. Rebuild from disk instead.
+		return m.rebuildIndexLocked()
 	}
 	if err != nil {
 		return err
@@ -320,6 +323,13 @@ func (m *BoardManager) appendActivityLocked(item *BoardItem, by, text string) {
 // --- operations (web UI and agent tool share these) ---
 
 // Snapshot returns the full board state for rendering.
+//
+// Deliberately uncached: an in-memory cache needs an invalidation key, and
+// index.json is NOT one — a mutation that only touches a ticket (title, status,
+// comment, assignee) rewrites that ticket file alone. A cache keyed on the
+// index mtime therefore served stale cards, so the snapshot re-reads the index
+// and the tickets every time (the cost is bounded: at most one small JSON file
+// per ticket).
 func (m *BoardManager) Snapshot() (*BoardSnapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

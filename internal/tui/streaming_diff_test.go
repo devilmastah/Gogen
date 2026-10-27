@@ -195,7 +195,7 @@ func assertDiffParity(t *testing.T, m *Model) {
 	fresh.width = 200 // let setViewportContent run its full rebuild
 	fresh.chatLines = append([]string(nil), m.chatLines...)
 	fresh.setViewportContent()
-	if got, want := m.wrappedContentString(), fresh.wrappedContentString(); got != want {
+	if got, want := m.transcriptText(), fresh.transcriptText(); got != want {
 		t.Fatalf("incremental viewport != full rebuild\ngot:  %q\nwant: %q", got, want)
 	}
 }
@@ -232,7 +232,7 @@ func TestPatchFileProgressiveDiffParity(t *testing.T) {
 	m.handleStreamToolResult("tc0", "patch_file", "Applied 1 hunk.", true)
 	assertDiffParity(t, m)
 
-	lines := strings.Split(stripAnsi(m.wrappedContentString()), "\n")
+	lines := strings.Split(stripAnsi(m.transcriptText()), "\n")
 	// The progressive block must be framed; the tool line is rewritten in
 	// final form by handleStreamToolCallFinal, so only check its prefix.
 	wantBlock := []string{
@@ -248,7 +248,7 @@ func TestPatchFileProgressiveDiffParity(t *testing.T) {
 		"  ╰───────",
 	}
 	if len(lines) < len(wantBlock)+1 {
-		t.Fatalf("content too short (%d lines):\n%s", len(lines), m.wrappedContentString())
+		t.Fatalf("content too short (%d lines):\n%s", len(lines), m.transcriptText())
 	}
 	if !strings.HasPrefix(lines[0], "  → patch_file") {
 		t.Fatalf("tool line = %q, want prefix %q", lines[0], "  → patch_file")
@@ -282,7 +282,7 @@ func TestPatchFileDiffLastLineGrowth(t *testing.T) {
 	assertDiffParity(t, m)
 
 	want := "  → patch_file\n  ╭─ diff ─\n  --- a/f\n  +++ b/f\n  @@ -1 +1 @@\n  -oldline\n  +new"
-	if got := stripAnsi(m.wrappedContentString()); got != want {
+	if got := stripAnsi(m.transcriptText()); got != want {
 		t.Fatalf("content = %q, want %q", got, want)
 	}
 }

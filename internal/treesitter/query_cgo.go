@@ -5,17 +5,45 @@ package treesitter
 import (
 	"fmt"
 	"iter"
-	"sync"
+	"runtime"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
-// parserPool reuses tree-sitter parsers to avoid C FFI allocation overhead
-// on every parse call. Parsers are safe to reuse after SetLanguage.
-var parserPool = sync.Pool{
-	New: func() any {
+// parserPool reuses tree-sitter parsers to avoid C FFI allocation overhead on
+// every parse call. Parsers are safe to reuse after SetLanguage.
+//
+// It is a bounded free list rather than a sync.Pool because sync.Pool drops
+// idle items on every GC cycle WITHOUT running any destructor, and
+// go-tree-sitter has no finalizers (its README: "you must always call Close").
+// Every dropped parser therefore leaked its TSParser allocation for the life
+// of the process. The list holds at most one parser per P so a parallel walk
+// never allocates, and hands the overflow back to Close.
+var parserPool = make(chan *tree_sitter.Parser, runtime.GOMAXPROCS(0))
+
+// acquireParser returns a parser from the free list, or a fresh one when the
+// list is empty.
+func acquireParser() *tree_sitter.Parser {
+	select {
+	case p := <-parserPool:
+		return p
+	default:
 		return tree_sitter.NewParser()
-	},
+	}
+}
+
+// releaseParser returns a parser to the free list, closing it when the list is
+// already full (the C memory must be freed; sync.Pool's silent drop cannot be
+// allowed here).
+func releaseParser(p *tree_sitter.Parser) {
+	if p == nil {
+		return
+	}
+	select {
+	case parserPool <- p:
+	default:
+		p.Close()
+	}
 }
 
 // queryRun is one compiled query iterated over a freshly parsed file. It
@@ -38,7 +66,7 @@ type queryRun struct {
 func (r *queryRun) Close() {
 	r.cursor.Close()
 	r.tree.Close()
-	parserPool.Put(r.parser)
+	releaseParser(r.parser)
 }
 
 // Captures iterates every capture of every query match, in match order.
@@ -78,15 +106,15 @@ func runQuery(path string, content []byte, queryFor func(langName string) (*tree
 	}
 
 	lang := languageFor(langName)
-	p := parserPool.Get().(*tree_sitter.Parser)
+	p := acquireParser()
 	if err := p.SetLanguage(lang); err != nil {
-		parserPool.Put(p)
+		releaseParser(p)
 		return nil, fmt.Errorf("set language %s: %w", langName, err)
 	}
 
 	tree := p.Parse(content, nil)
 	if tree == nil {
-		parserPool.Put(p)
+		releaseParser(p)
 		return nil, fmt.Errorf("failed to parse %s", path)
 	}
 

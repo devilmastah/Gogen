@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
+	"gogen/internal/steerq"
 	"gogen/internal/streambuf"
 )
 
@@ -130,9 +132,12 @@ type sessionRuntime struct {
 	// pendingDeliver is the per-session FIFO queue shared by system
 	// deliveries (job notices, compact subagent terminal events, exact
 	// replies) and user steering messages (typed while a turn runs) — one
-	// queue, one drain path; deliverItem.Kind scopes presentation and policy.
+	// queue, one drain path. The queue itself (item kinds, caps, eviction and
+	// batching policy, slot zeroing) is internal/steerq, shared with the TUI;
+	// it is NOT internally synchronized, so every access below is made under
+	// deliverMu. A delivered item's deliverSource travels in Item.Tag.
 	deliverMu      sync.Mutex
-	pendingDeliver []deliverItem
+	pendingDeliver *steerq.Queue
 	deliverWorker  atomic.Bool
 	deliverNotify  chan struct{}
 
@@ -191,13 +196,14 @@ func approvalKindOrDelete(kind string) string {
 // initialized. The agent must be non-nil.
 func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 	rt := &sessionRuntime{
-		agent:         a,
-		stream:        &wsConnStream{},
-		approvals:     make(map[string]*pendingApproval),
-		clients:       make(map[*wsConn]struct{}),
-		passive:       make(map[*wsConn]struct{}),
-		deliverNotify: make(chan struct{}, 1),
-		turnRelease:   make(chan struct{}),
+		agent:          a,
+		stream:         &wsConnStream{},
+		approvals:      make(map[string]*pendingApproval),
+		clients:        make(map[*wsConn]struct{}),
+		passive:        make(map[*wsConn]struct{}),
+		deliverNotify:  make(chan struct{}, 1),
+		pendingDeliver: steerq.New(maxUserQueueCap, maxSystemDeliveryQueue),
+		turnRelease:    make(chan struct{}),
 	}
 	// When this session's background work drains, re-check whether it has
 	// become an evictable orphan. Both eviction paths refuse to evict a
@@ -440,9 +446,22 @@ func (rt *sessionRuntime) scheduleAutoDenyAfter(after time.Duration) {
 		rt.approvalMu.Unlock()
 		return
 	}
+	ids := make([]string, 0, len(rt.approvals))
+	for id := range rt.approvals {
+		ids = append(ids, id)
+	}
 	rt.approvalMu.Unlock()
 	time.AfterFunc(after, func() {
-		rt.autoDenyPendingApprovals()
+		// A client that re-attached before the hold expired takes over the
+		// pending prompts: denying them now would answer a prompt somebody is
+		// looking at, and blanket-denying would also kill an approval raised
+		// AFTER this timer was armed (the detach that armed it is stale).
+		if rt.clientCount() > 0 {
+			return
+		}
+		for _, id := range ids {
+			rt.completeApproval(id, false)
+		}
 	})
 }
 
@@ -524,6 +543,14 @@ func (rt *sessionRuntime) claimClose() bool {
 // the stream goroutine's enqueue is bounded by the send-queue timeout, so a
 // dead socket cannot stall the turn.
 func (rt *sessionRuntime) broadcast(msg WSMessage) {
+	// Marshal and prepare ONCE for all clients: the old per-client writeJSON
+	// re-marshaled (and re-deflated) the same payload for every socket, which
+	// for a multi-MB session history dominated the fan-out.
+	out, err := prepareOut(&msg)
+	if err != nil {
+		log.Printf("websocket marshal (%s): %v", msg.Type, err)
+		return
+	}
 	rt.clientsMu.Lock()
 	clients := make([]*wsConn, 0, len(rt.clients))
 	for c := range rt.clients {
@@ -531,7 +558,7 @@ func (rt *sessionRuntime) broadcast(msg WSMessage) {
 	}
 	rt.clientsMu.Unlock()
 	for _, c := range clients {
-		if err := c.writeJSON(msg); err != nil {
+		if err := c.writePrepared(&msg, out); err != nil {
 			rt.detach(c)
 		}
 	}
@@ -547,6 +574,11 @@ func (rt *sessionRuntime) broadcast(msg WSMessage) {
 // A skip socket that is not attached is simply absent from the client set, so
 // the caller's own echo stays its only copy.
 func (rt *sessionRuntime) broadcastExcept(skip *wsConn, msg WSMessage) {
+	out, err := prepareOut(&msg)
+	if err != nil {
+		log.Printf("websocket marshal (%s): %v", msg.Type, err)
+		return
+	}
 	rt.clientsMu.Lock()
 	clients := make([]*wsConn, 0, len(rt.clients))
 	for c := range rt.clients {
@@ -556,7 +588,7 @@ func (rt *sessionRuntime) broadcastExcept(skip *wsConn, msg WSMessage) {
 	}
 	rt.clientsMu.Unlock()
 	for _, c := range clients {
-		if err := c.writeJSON(msg); err != nil {
+		if err := c.writePrepared(&msg, out); err != nil {
 			rt.detach(c)
 		}
 	}
@@ -661,8 +693,16 @@ func (rt *sessionRuntime) autoDenyPendingApprovals() {
 
 // deleteApprover returns the session-scoped delete approver. Requests are
 // broadcast to all attached clients; the first response wins.
+//
+// With no attached client the request is DENIED fail-closed (false, nil),
+// exactly like commandApprover: a queued message that keeps running after the
+// last tab closes must not block the turn on a prompt nobody can answer (it
+// would hold turnMu, pin the runtime, and stall the rest of the queue).
 func (rt *sessionRuntime) deleteApprover() agent.DeleteApprover {
 	return func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
+		if rt.clientCount() == 0 {
+			return false, nil
+		}
 		id := newApprovalID()
 		ch := make(chan bool, 1)
 
@@ -683,6 +723,13 @@ func (rt *sessionRuntime) deleteApprover() agent.DeleteApprover {
 			Reason:     req.Reason,
 			SessionID:  rt.agent.SessionID,
 		})
+		// The last client may have detached between the guard above and the
+		// registration: detach auto-denies what is already pending, so an
+		// approval registered after that sweep would wait forever. Deny it
+		// now instead.
+		if rt.clientCount() == 0 {
+			rt.completeApproval(id, false)
+		}
 
 		select {
 		case approved := <-ch:
@@ -1269,6 +1316,12 @@ func (r *sessionRegistry) remove(id string) {
 	// release the lock themselves (releaseTurn), so this is redundant there —
 	// harmless, since notifyTurnReleased always installs a fresh channel.
 	rt.notifyTurnReleased()
+	// Drop the per-parent delivery backlog: it is keyed by session id and would
+	// otherwise keep a deleted session's undrained messages reachable for the
+	// life of the process (and re-target them if the id were ever reused).
+	r.parentDeliverMu.Lock()
+	delete(r.parentDeliveries, id)
+	r.parentDeliverMu.Unlock()
 }
 
 // setDefault makes id the default session (first in registration order), so
@@ -1307,6 +1360,83 @@ func (r *sessionRegistry) activeIDs() []string {
 	out := make([]string, 0, len(r.order))
 	out = append(out, r.order...)
 	return out
+}
+
+// runtimes returns a snapshot of the live session runtimes in registration
+// order. It replaces the "range activeIDs() then get(id)" fan-out that was
+// copy-pasted across the server: that pattern took the registry lock once for
+// the id list and again per id, allocating a []string of ids only to look each
+// one back up.
+//
+// The slice is a snapshot: a runtime can be evicted before the caller acts on
+// it. Every fan-out tolerates that — an evicted runtime has already detached its
+// clients, so broadcasting into it is a no-op — and callers must not hold the
+// slice across a blocking operation expecting it to stay current.
+func (r *sessionRegistry) runtimes() []*sessionRuntime {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*sessionRuntime, 0, len(r.order))
+	for _, id := range r.order {
+		if rt, ok := r.agents[id]; ok {
+			out = append(out, rt)
+		}
+	}
+	return out
+}
+
+// broadcastAll fans one server-wide message out to every socket attached to
+// ANY registered session, exactly ONCE per socket. Unlike broadcast it is not
+// session-scoped: board, automations and status-display payloads are
+// process-wide (every tab renders the same board/row/automations list), so
+// they go to every attached client regardless of which session its pane
+// shows.
+//
+// The dedupe is what the old "range runtimes(); rt.broadcast(msg)" loops got
+// wrong: a socket can be attached to MORE THAN ONE runtime at a time (its
+// pane plus background panes opened via session_attach), so delivering
+// per-runtime sent a socket watching K sessions K copies of the same frame —
+// K re-renders, and for a notice K toasts. Here each socket appears once; the
+// message is marshalled/prepared once for all of them (as broadcast does).
+//
+// A write failure detaches that socket from EVERY runtime that held it, not
+// just the first: detach is per-runtime, so detaching only the first would
+// leave stale client entries in the others until their own broadcasts failed.
+// detach never cancels a turn.
+//
+// Locking: the per-runtime clientsMu is taken one runtime at a time to build
+// the holder map, and the registry lock is only held inside runtimes() (a
+// snapshot) — no lock is held across a socket write, which can block up to
+// the enqueue timeout.
+func (r *sessionRegistry) broadcastAll(msg WSMessage) {
+	if r == nil {
+		return
+	}
+	holders := make(map[*wsConn][]*sessionRuntime)
+	for _, rt := range r.runtimes() {
+		if rt == nil {
+			continue
+		}
+		rt.clientsMu.Lock()
+		for c := range rt.clients {
+			holders[c] = append(holders[c], rt)
+		}
+		rt.clientsMu.Unlock()
+	}
+	if len(holders) == 0 {
+		return
+	}
+	out, err := prepareOut(&msg)
+	if err != nil {
+		log.Printf("websocket marshal (%s): %v", msg.Type, err)
+		return
+	}
+	for c, rts := range holders {
+		if err := c.writePrepared(&msg, out); err != nil {
+			for _, rt := range rts {
+				rt.detach(c)
+			}
+		}
+	}
 }
 
 // nestedDescendants returns the registered runtimes whose ParentID chain
@@ -1372,10 +1502,8 @@ func (r *sessionRegistry) detachAll(ws *wsConn) {
 	if ws == nil || r == nil {
 		return
 	}
-	for _, id := range r.activeIDs() {
-		if rt, ok := r.get(id); ok {
-			rt.detach(ws)
-		}
+	for _, rt := range r.runtimes() {
+		rt.detach(ws)
 	}
 }
 

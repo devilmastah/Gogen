@@ -32,6 +32,14 @@ func WriteFileAtomicNoSync(path string, content []byte, perm os.FileMode) error 
 	return writeFileSync(path, content, perm, true)
 }
 
+// NewAtomicWriterNoSync is the streaming counterpart of WriteFileAtomicNoSync:
+// the same temp-file-plus-rename contract and permission handling, without the
+// fsyncs (see WriteFileAtomicNoSync for when that is acceptable). Callers write
+// straight to the returned writer and then Commit (or Abort).
+func NewAtomicWriterNoSync(path string, perm os.FileMode) (*AtomicWriter, error) {
+	return newAtomicWriter(path, perm, true)
+}
+
 // writeFileSync is the shared implementation. When skipFSync is true neither
 // the temp file nor the containing directory is fsynced before/after rename
 // (trades durability for less SSD wear).
@@ -75,6 +83,13 @@ func NewAtomicWriter(path string, perm os.FileMode) (*AtomicWriter, error) {
 }
 
 func newAtomicWriter(path string, perm os.FileMode, skipFSync bool) (*AtomicWriter, error) {
+	// Resolve a symlinked target first: writing through the temp+rename would
+	// otherwise replace the LINK with a regular file, so a dotfile manager's
+	// ~/.config/gogen/config.yaml -> ~/dotfiles/... link silently became a
+	// private copy that stopped tracking the original.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err

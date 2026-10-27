@@ -227,3 +227,37 @@ func TestToolDefinitionStringStableAcrossMapOrder(t *testing.T) {
 		t.Fatalf("serialization not stable across map order:\n%q\n%q", got, want)
 	}
 }
+
+// TestReasoningTokensFollowEchoSetting pins B19c: historical reasoning only
+// counts when it will actually be sent. With GOGEN_REASONING_ECHO=off the
+// provider never sees it, so counting it inflated the estimate and fired
+// compaction early (reasoning can be a third of a reasoning-heavy session).
+func TestReasoningTokensFollowEchoSetting(t *testing.T) {
+	msg := llm.Message{
+		Role:      "assistant",
+		Content:   "the answer",
+		Reasoning: strings.Repeat("deliberation ", 40),
+	}
+
+	t.Setenv("GOGEN_REASONING_ECHO", "on")
+	withReasoning := ComputeMessageTokens(msg)
+
+	t.Setenv("GOGEN_REASONING_ECHO", "off")
+	withoutReasoning := ComputeMessageTokens(msg)
+
+	if withoutReasoning >= withReasoning {
+		t.Fatalf("echo=off counted %d tokens, echo=on %d: the reasoning is not being excluded",
+			withoutReasoning, withReasoning)
+	}
+	// The excluded amount is the reasoning text (plus framing it never had).
+	reasoningTokens := ComputeMessageTokens(llm.Message{Role: "assistant", Reasoning: msg.Reasoning})
+	if diff := withReasoning - withoutReasoning; diff < reasoningTokens-4 {
+		t.Fatalf("difference %d is smaller than the reasoning's own count %d", diff, reasoningTokens)
+	}
+	// Batched counting agrees with the per-message form.
+	t.Setenv("GOGEN_REASONING_ECHO", "off")
+	counts := CountTokens([]llm.Message{msg})
+	if counts[0] != withoutReasoning {
+		t.Fatalf("CountTokens = %d, ComputeMessageTokens = %d", counts[0], withoutReasoning)
+	}
+}

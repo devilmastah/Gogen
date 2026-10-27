@@ -113,7 +113,8 @@ func Write(location, message, hypothesisID string, data map[string]any) {
 		logPathCached = logPath
 	}
 	if logFile == nil {
-		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		// 0600: the log carries prompts, tool arguments and reasoning.
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return
 		}

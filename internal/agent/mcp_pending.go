@@ -145,6 +145,16 @@ func (p *PendingMCPRegistry) ToolNames() map[string]struct{} {
 	return reg.ToolNames()
 }
 
+// HasTool reports whether the connected registry exposes name; false before the
+// handshake completes.
+func (p *PendingMCPRegistry) HasTool(name string) bool {
+	reg := p.current()
+	if reg == nil {
+		return false
+	}
+	return reg.HasTool(name)
+}
+
 // CallTool waits for the handshake, then forwards the call.
 func (p *PendingMCPRegistry) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	if err := p.Wait(ctx); err != nil {

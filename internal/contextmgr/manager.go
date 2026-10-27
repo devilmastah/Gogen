@@ -454,7 +454,7 @@ func (m *Manager) SmartCompactStopAt() int {
 // returns the configured keep unchanged. Returns -1 when no middle exists
 // (too few messages, no user message to anchor the head, or an incomplete
 // count cache) — the caller should then not attempt a compaction at all.
-func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed int) int {
+func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed int, pinned map[int]struct{}) int {
 	m.mu.RLock()
 	keep := m.Settings.CompactKeepRecentMessages
 	m.mu.RUnlock()
@@ -471,18 +471,44 @@ func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed
 	if keep > len(messages)-2 {
 		keep = len(messages) - 2
 	}
+	// The middle must be sized EXACTLY as compactPinned will split it: the tail
+	// start is pulled back over a trailing tool group (adjustCompactTailStart)
+	// and over pinned messages (extendTailForPins). Sizing it on the naive
+	// len-keep split overestimated the tokens the summary would free, so an
+	// "emergency" keep could still overflow after compaction.
+	middle := 0
+	prevTail := -1
 	for keep > 1 {
-		tailStart := len(messages) - keep
-		middle := 0
-		for i := headIdx + 1; i < tailStart; i++ {
-			middle += counts[i] - imageTokenEstimate(messages[i])
+		tailStart := extendTailForPins(messages, headIdx, adjustCompactTailStart(messages, len(messages)-keep), pinned)
+		switch {
+		case prevTail < 0 || tailStart < prevTail:
+			// First step, or the tail moved EARLIER than last time (a pin/tool
+			// group): the running sum no longer describes this split.
+			middle = middleTokensBetween(messages, counts, headIdx+1, tailStart)
+		default:
+			// The tail only grew, so just the messages that moved into the
+			// middle need adding — this keeps the scan linear instead of
+			// re-summing the middle on every step.
+			middle += middleTokensBetween(messages, counts, prevTail, tailStart)
 		}
+		prevTail = tailStart
 		if middle >= needed {
 			break
 		}
 		keep--
 	}
 	return keep
+}
+
+// middleTokensBetween sums the summarizable token weight of messages[from:to].
+// Image estimates are subtracted because the summarization request strips
+// images (the same adjustment compactPinned applies).
+func middleTokensBetween(messages []llm.Message, counts []int, from, to int) int {
+	total := 0
+	for i := from; i < to && i < len(counts); i++ {
+		total += counts[i] - imageTokenEstimate(messages[i])
+	}
+	return total
 }
 
 // CompactKeepRecentMessages returns how many recent messages are preserved

@@ -50,12 +50,10 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	return msg
 }
 
-// onOff renders a boolean as the config-WS "on"/"off" spelling.
+// onOff renders a boolean as the config-WS "on"/"off" spelling (the shared
+// canonical form, see onoff.Format).
 func onOff(v bool) string {
-	if v {
-		return "on"
-	}
-	return "off"
+	return onoff.Format(v)
 }
 
 // reasoningEffortsUnsupported reports whether the session's current model
@@ -144,14 +142,85 @@ func agentConfigMsg(ctx context.Context, rt *sessionRuntime) WSMessage {
 // a stale picker makes clicking the mode the user believes is active a no-op
 // (see wsHandleSetMode).
 func echoConfigOffLoop(rt *sessionRuntime, ws *wsConn, ctx context.Context, a *agent.Agent, cfg *WSMessage) {
+	echoConfigReply(rt, ws, ctx, a, cfg, nil, false)
+}
+
+// echoConfigReply is the one "finish a config-changing operation" path: off
+// the read loop it applies the context stats to cfg, writes it to the acting
+// connection, broadcasts it to the session's other clients, and finally writes
+// reply (when non-nil) on the acting connection.
+//
+// cfg may be nil, which skips the config frame (a failed model selection
+// changes nothing and must not pay for a tokenization pass). reply carries the
+// command's textual answer, so it is written from the SAME goroutine after the
+// config frame — the send queue is FIFO, so the client sees state before text.
+// stampReply copies the post-stats model identity and usage counters into
+// reply, for a reply that reports them (the /models command's answer); the
+// fields only exist once the stats are applied, so it cannot happen earlier.
+//
+// Every handler that mutates per-session state and echoes config goes through
+// here: the blocks it replaces each hand-rolled "goroutine, apply stats, write,
+// maybe write response, maybe broadcast", and they disagreed about the
+// broadcast — the /mode, /think and /models command paths updated only the
+// acting connection while the picker handlers updated every attached client,
+// leaving a second tab on a stale picker (see echoConfigOffLoop for why that
+// matters for mode).
+func echoConfigReply(rt *sessionRuntime, ws *wsConn, ctx context.Context, a *agent.Agent, cfg *WSMessage, reply *WSMessage, stampReply bool) {
 	go func() {
-		accum := a.SnapshotUsageAccum()
-		applyContextStats(cfg, a.ContextStats(ctx), &accum)
-		_ = ws.writeJSON(*cfg)
-		if rt != nil {
-			rt.broadcastExcept(ws, *cfg)
+		if cfg != nil {
+			accum := a.SnapshotUsageAccum()
+			applyContextStats(cfg, a.ContextStats(ctx), &accum)
+			_ = ws.writeJSON(*cfg)
+			if rt != nil {
+				rt.broadcastExcept(ws, *cfg)
+			}
+		}
+		if reply != nil {
+			if stampReply && cfg != nil {
+				reply.Model = cfg.Model
+				reply.ContextLimit = cfg.ContextLimit
+				reply.UsedTokens = cfg.UsedTokens
+				reply.UsedSource = cfg.UsedSource
+				reply.UsedPercent = cfg.UsedPercent
+			}
+			_ = ws.writeJSON(*reply)
 		}
 	}()
+}
+
+// withTurnConfig runs the shared "take the turn, mutate, echo" choreography
+// behind the picker handlers (set model / mode / thinking level): acquire the
+// session's turn, let mutate change per-session state, build the config frame
+// from the post-mutation agent, release, then echo it off the read loop.
+//
+// mutate reports whether it changed anything: an invalid value (an
+// unrecognized mode) is a no-op, and projecting costs an off-loop
+// tokenization pass, so nothing is echoed then. A mutation error also skips
+// the echo — the model did not change, and the caller reports the error.
+//
+// acquired=false means another turn holds the lock; the caller decides how to
+// report the busy rejection (every current caller sends a settings notice).
+// The frame order the three handlers used to have inline — model filled
+// pricing before release, thinking level after, mode never — is now fixed:
+// pricing and decoration happen for all of them, before the release.
+func (s *Server) withTurnConfig(rt *sessionRuntime, ws *wsConn, ctx context.Context,
+	mutate func(a *agent.Agent) (changed bool, err error)) (acquired, changed bool, err error) {
+	if !rt.acquireTurnForHandler(ws) {
+		return false, false, nil // acquired=false is the busy signal
+	}
+	a := rt.agent
+	changed, err = mutate(a)
+	var cfg WSMessage
+	if err == nil && changed {
+		cfg = agentConfigMsgBasic(a)
+		fillModelPricing(a, &cfg)
+		s.decorateConfig(&cfg)
+	}
+	rt.releaseTurn()
+	if err == nil && changed {
+		echoConfigOffLoop(rt, ws, ctx, a, &cfg)
+	}
+	return true, changed, err
 }
 
 // fillModelPricing looks up pricing for the current model from the models.dev
@@ -342,22 +411,18 @@ func (s *Server) applyBoardManagerToAll() {
 	}
 	// The review hook rides on the (possibly just-created) manager.
 	s.installReviewAgent()
-	for _, id := range s.registry.activeIDs() {
-		if rt, ok := s.registry.get(id); ok {
-			rt.agent.SetBoardManager(bm)
-		}
+	for _, rt := range s.registry.runtimes() {
+		rt.agent.SetBoardManager(bm)
 	}
 }
 
 // broadcastConfigAll pushes a fresh config snapshot to every attached client
 // of every live session (the settings modal syncs across tabs from these).
 func (s *Server) broadcastConfigAll() {
-	for _, id := range s.registry.activeIDs() {
-		if rt, ok := s.registry.get(id); ok {
-			msg := agentConfigMsgBasic(rt.agent)
-			s.decorateConfig(&msg)
-			rt.broadcast(msg)
-		}
+	for _, rt := range s.registry.runtimes() {
+		msg := agentConfigMsgBasic(rt.agent)
+		s.decorateConfig(&msg)
+		rt.broadcast(msg)
 	}
 }
 

@@ -119,13 +119,18 @@ func loadInto(path string, into *map[string]*Automation) error {
 }
 
 // saveAutomations rewrites automations.json atomically.
+//
+// Both store files go through ioutil.WriteFileAtomic: a temp file in the target
+// directory plus fsync and a rename, so a crash or power loss mid-write can
+// never leave a truncated store behind. They stay private at 0600 (unless an
+// existing file already carries another mode).
 func (s *Store) saveAutomations() error {
 	list := make([]Automation, 0, len(s.autos))
 	for _, a := range s.autos {
 		list = append(list, *a)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
-	return writeFileAtomic(filepath.Join(s.dir, AutomationsFile), storeFileBody("automations", list))
+	return ioutil.WriteFileAtomic(filepath.Join(s.dir, AutomationsFile), storeFileBody("automations", list), 0o600)
 }
 
 // saveRuns rewrites automation_runs.json atomically, keeping the history
@@ -165,7 +170,7 @@ func (s *Store) saveRuns() error {
 		runs = runs[len(runs)-maxTotalRuns:]
 	}
 	s.runs = runs
-	return writeFileAtomic(filepath.Join(s.dir, RunsFile), storeFileBody("runs", runs))
+	return ioutil.WriteFileAtomic(filepath.Join(s.dir, RunsFile), storeFileBody("runs", runs), 0o600)
 }
 
 // initialNextRun computes the first next_run_at for a freshly stored
@@ -196,16 +201,6 @@ func storeFileBody[T any](key string, items []T) []byte {
 		data = []byte("{}")
 	}
 	return append(data, '\n')
-}
-
-// writeFileAtomic writes data via a temp file in the target directory and a
-// rename, so a crash mid-write can never leave a truncated store behind. It
-// goes through the shared atomic writer (which also fsyncs, so a power loss
-// cannot revert the store to its previous contents) and keeps the store
-// files private at 0600 unless an existing file already carries another
-// mode.
-func writeFileAtomic(path string, data []byte) error {
-	return ioutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // List returns all automations sorted by creation time (oldest first).

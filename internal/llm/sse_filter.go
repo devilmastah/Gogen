@@ -86,17 +86,34 @@ func newSSEEventFilterBody(rc io.ReadCloser) io.ReadCloser {
 		_ = rc.Close()
 		_ = pw.CloseWithError(err) // nil err = clean EOF
 	}()
-	return &sseEventFilterBody{pr: pr}
+	return &sseEventFilterBody{pr: pr, rc: rc}
 }
 
-// sseEventFilterBody is the read half handed to the SDK; Close only closes
-// the pipe — the goroutine in newSSEEventFilterBody owns the real body.
+// sseEventFilterBody is the read half handed to the SDK.
 type sseEventFilterBody struct {
 	pr *io.PipeReader
+	rc io.ReadCloser
 }
 
 func (b *sseEventFilterBody) Read(p []byte) (int, error) { return b.pr.Read(p) }
-func (b *sseEventFilterBody) Close() error               { return b.pr.Close() }
+
+// Close tears the filter down. It closes the pipe reader AND the real
+// response body: closing only the pipe leaves the filter goroutine blocked in
+// Scan() on the network read, so the connection (and the goroutine) survives
+// until the next byte or the idle read deadline — 30 minutes by default. Every
+// early close takes that path: the reasoning-stop grace timer and the
+// usage-drain timer close the stream while the provider is deliberately
+// holding the connection open, and so does the tool-call early exit.
+//
+// The filter goroutine closes rc too when it returns; a second Close on an
+// http body is a no-op error.
+func (b *sseEventFilterBody) Close() error {
+	err := b.pr.Close()
+	if cerr := b.rc.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	return err
+}
 
 // filterSSEEvents copies an SSE body from src to dst, suppressing the frames
 // the openai-go v1 decoder chokes on: comment lines and any event whose data

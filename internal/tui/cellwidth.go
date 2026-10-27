@@ -117,6 +117,23 @@ func truncateCells(s string, width int) string {
 	return b.String()
 }
 
+// truncateRunes cuts s to at most maxRunes runes and returns s unchanged when
+// it is already shorter; a non-positive budget yields "". It is the plain-text
+// sibling of truncateCells and must only be used on strings that are never
+// rendered or measured as a row: a rune is not a cell, so a wide rune (CJK,
+// emoji) costs two cells and a rune budget can still overflow a cell budget.
+// Rendered rows use cutCells/truncateCells instead.
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes])
+}
+
 // padCells returns s padded with spaces to exactly width cells (measured the
 // renderer's way) and truncated when it would overflow. It is the row-filling
 // primitive the viewport and status bar use instead of lipgloss's Width, whose

@@ -21,19 +21,42 @@ func TestDecodeJSONFieldText(t *testing.T) {
 	}
 }
 
-func TestExtraFieldAccumsSnapshot(t *testing.T) {
+// TestExtraFieldAccumsDisplayText covers what the deleted snapshot() helper
+// used to assert — accumulated reasoning is trimmed before display and
+// whitespace-only fields are skipped — on the API the production path uses.
+func TestExtraFieldAccumsDisplayText(t *testing.T) {
 	t.Parallel()
-	acc := newExtraFieldAccums()
-	var fullReasoning strings.Builder
-	acc.addFromDelta(openai.ChatCompletionChunkChoiceDelta{}, nil, &fullReasoning)
-	acc["reasoning_content"] = &strings.Builder{}
-	acc["reasoning_content"].WriteString("thinking step")
-	got := acc.snapshot()
-	if got["reasoning_content"] != "thinking step" {
-		t.Fatalf("snapshot = %#v", got)
+	if got := newExtraFieldAccums().primaryDisplayText(); got != "" {
+		t.Fatalf("empty accums = %q, want empty", got)
 	}
+	acc := newExtraFieldAccums()
+	acc.append("reasoning_content", "  thinking step  ")
+	acc.append("thinking", "   ") // whitespace-only: never displayed
 	if got := acc.primaryDisplayText(); got != "thinking step" {
-		t.Fatalf("primaryDisplayText = %q", got)
+		t.Fatalf("primaryDisplayText = %q, want trimmed %q", got, "thinking step")
+	}
+	if got, want := acc.textLen(), len("  thinking step  ")+3; got != want {
+		t.Fatalf("textLen = %d, want %d", got, want)
+	}
+}
+
+// TestCountingExtraFieldAccums keeps the memory contract of the stream path:
+// it reports the text length without retaining the text (the visible
+// reasoning is accumulated separately, so storing a second copy per key was
+// pure waste).
+func TestCountingExtraFieldAccums(t *testing.T) {
+	t.Parallel()
+	acc := newCountingExtraFieldAccums()
+	acc.append("reasoning_content", "abc")
+	acc.append("annotation", "de")
+	if got, want := acc.textLen(), 5; got != want {
+		t.Fatalf("textLen = %d, want %d", got, want)
+	}
+	if n := len(acc.builders); n != 0 {
+		t.Fatalf("counting accums retained %d per-key builders, want none", n)
+	}
+	if got := acc.primaryDisplayText(); got != "" {
+		t.Fatalf("primaryDisplayText = %q, want empty (no text retained)", got)
 	}
 }
 
@@ -89,8 +112,8 @@ func TestAddFromDeltaStandardChunkIngestsNothing(t *testing.T) {
 	acc := newExtraFieldAccums()
 	var fullReasoning strings.Builder
 	acc.addFromDelta(deltaFromJSON(t, `{"role":"assistant","content":"answer"}`), nil, &fullReasoning)
-	if len(acc) != 0 {
-		t.Fatalf("standard chunk populated accumulators: %#v", acc)
+	if len(acc.builders) != 0 {
+		t.Fatalf("standard chunk populated accumulators: %#v", acc.builders)
 	}
 	if fullReasoning.Len() != 0 {
 		t.Fatalf("standard chunk produced reasoning: %q", fullReasoning.String())
@@ -120,7 +143,7 @@ func TestAddFromDeltaNullExtraFieldIgnored(t *testing.T) {
 	t.Parallel()
 	acc := newExtraFieldAccums()
 	acc.addFromDelta(deltaFromJSON(t, `{"reasoning_content":null}`), nil, nil)
-	if len(acc) != 0 {
-		t.Fatalf("null extra field ingested: %#v", acc)
+	if len(acc.builders) != 0 {
+		t.Fatalf("null extra field ingested: %#v", acc.builders)
 	}
 }

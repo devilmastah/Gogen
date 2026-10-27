@@ -105,39 +105,30 @@ func (m *Model) wrapLine(line string) []string {
 	return parts
 }
 
-// buildFromPrefix rebuilds the viewport from wrappedPrefix + the last chat
-// line. All incremental updaters call this instead of the full re-wrap path.
+// buildFromPrefix rebuilds the viewport from prefixLines + the last chat line.
+// All incremental updaters call this instead of the full re-wrap path.
 //
 // During streaming, this is the hot path called on every token batch (~32 ms).
 // Only the last chat line changes, so we re-wrap just that line and splice it
-// onto the cached prefixLines (viewport lines for chatLines[:len-1]) instead
-// of re-splitting the entire wrapped content into lines on every flush — the
-// old SetContentMax path was O(conversation) per token batch. The max line
-// width is likewise maintained incrementally (only the new last line is
-// measured), skipping the O(N) cellWidth scan of the full conversation
-// that the stock bubbles viewport performs. The full wrappedContent string is
-// materialized lazily via wrappedContentString() for consumers that need it
-// (selection rendering); streaming itself only needs the split lines.
+// onto the cached prefixLines (viewport rows for chatLines[:len-1]) instead of
+// re-splitting the entire wrapped content on every flush — the old
+// SetContentMax path was O(conversation) per token batch. The max line width is
+// likewise maintained incrementally (only the new last line is measured),
+// skipping the O(N) cellWidth scan of the full conversation that the stock
+// bubbles viewport performs. The viewport's rows ARE the rendered transcript:
+// there is no second joined copy (see Model.chatLines for why).
 func (m *Model) buildFromPrefix() {
 	if len(m.chatLines) == 0 {
-		m.wrappedContent = ""
-		m.wrappedLines = nil
-		m.wrappedLinesDirty = false
 		m.maxWrappedWidth = 0
 		m.lastWrapped = ""
-		m.wrappedContentDirty = false
 		m.prefixLines = nil
 		m.clearSelection()
 		m.viewport.SetContentMax("", 0)
-		// styledLines is computed lazily in ensureStyledLines().
-		m.styledLinesDirty = true
 		return
 	}
 	lastParts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
 	lastWrapped := strings.Join(lastParts, "\n")
 	m.lastWrapped = lastWrapped
-	m.wrappedContentDirty = true
-	m.wrappedLinesDirty = true
 	// Incremental max width: only scan the newly wrapped last line.
 	for _, p := range lastParts {
 		if w := cellWidth(p); w > m.maxWrappedWidth {
@@ -151,23 +142,24 @@ func (m *Model) buildFromPrefix() {
 	vp = append(vp, m.prefixLines...)
 	vp = append(vp, lastLines...)
 	m.viewport.SetContentLines(vp, m.maxWrappedWidth)
-	m.clearSelection()
-	// styledLines is computed lazily in ensureStyledLines().
-	m.styledLinesDirty = true
+	// The selection is deliberately NOT cleared here: appends only add rows at
+	// the END, so an existing selection's row indices still address the same
+	// text. Clearing on every token batch made text impossible to select while
+	// a turn streamed (the drag was wiped ~30 times a second). Full rebuilds
+	// (setViewportContent) still clear — there the rows are replaced.
 }
 
-// wrappedContentString returns the full wrapped chat content, materializing
-// the lazily-maintained wrappedPrefix+lastWrapped concatenation on first
-// access. Selection rendering and tests are the only consumers; streaming
-// updates avoid building (and re-splitting) the full string on every token
-// batch. The cached value is byte-identical to what buildFromPrefix used to
-// compute eagerly.
-func (m *Model) wrappedContentString() string {
-	if m.wrappedContentDirty {
-		m.wrappedContent = m.wrappedPrefix + m.lastWrapped
-		m.wrappedContentDirty = false
+// transcriptText returns the rendered transcript: the viewport's wrapped rows
+// joined by newlines. It is the accessor for consumers that need the whole
+// rendered text (tests, and anything that used to read the deleted
+// wrappedContent copy). Cost is one O(rows) join, so callers on a hot path
+// should stay on m.viewport.Lines().
+func (m *Model) transcriptText() string {
+	lines := m.viewport.Lines()
+	if len(lines) == 0 {
+		return ""
 	}
-	return m.wrappedContent
+	return strings.Join(lines, "\n")
 }
 
 // markTranscriptRendered records the agent conversation epoch the transcript
@@ -195,7 +187,7 @@ func (m *Model) rebuildTranscriptFrom(a *agent.Agent) {
 	if a == nil {
 		return
 	}
-	m.chatLines = renderMessages(a.SnapshotMessages(), a.WorkingDir, a.CurrentModel(), a.Mode.String())
+	m.chatLines = renderMessages(a.SnapshotMessages(), a.WorkingDir, a.CurrentModel(), a.Mode.String(), m.verbose)
 	m.historyEpoch = a.HistoryEpoch()
 }
 
@@ -204,11 +196,11 @@ func (m *Model) rebuildTranscriptFrom(a *agent.Agent) {
 // moved: a mid-turn auto-compaction, a restore, a fork, or a rollback).
 //
 // The transcript is otherwise append-only, so without this a long-lived
-// session keeps every line it has ever rendered — chatLines plus its wrapped
-// (prefixLines, wrappedContent) and styled (styledLines, wrappedLines) copies
-// and the prompt-rail anchors — even though the agent's own history is
-// compacted in place. That is unbounded memory growth proportional to total
-// tokens ever produced, not to the size of the current conversation.
+// session keeps every line it has ever rendered — chatLines, the viewport's
+// wrapped rows (the single rendered copy) and the prompt-rail anchors — even
+// though the agent's own history is compacted in place. That is unbounded
+// memory growth proportional to total tokens ever produced, not to the size of
+// the current conversation.
 //
 // It must run at a turn boundary (the turn goroutine has returned); the
 // explicit /compact and session-switch paths already rebuild on their own and
@@ -262,8 +254,6 @@ func (m *Model) setViewportContent() {
 		lineNo += len(lastParts)
 	}
 	m.tocAnchors = anchors
-	m.wrappedContent = strings.Join(wrappedParts, "\n")
-	m.wrappedLinesDirty = true // lazily compute on next selection access
 	m.clearSelection()
 	// Full re-scan of all wrapped lines. Not actually rare: besides resize,
 	// session restore, and mode changes this runs at every round and turn
@@ -276,11 +266,9 @@ func (m *Model) setViewportContent() {
 			m.maxWrappedWidth = w
 		}
 	}
-	// Publish the already-split lines directly — SetContentMax would split
-	// wrappedContent right back after the join above.
+	// Publish the already-split rows directly — SetContentMax would re-split
+	// them after the join above. These rows ARE the rendered transcript.
 	m.viewport.SetContentLines(wrappedParts, m.maxWrappedWidth)
-	// styledLines is computed lazily in ensureStyledLines().
-	m.styledLinesDirty = true
 
 	// Rebuild the prefix pointing at all lines except the last. wrapLine is
 	// deterministic and the width is unchanged since the loop above, so the
@@ -291,17 +279,16 @@ func (m *Model) setViewportContent() {
 	// from prefixLines before republishing, so the shared backing is never
 	// read stale.
 	if len(m.chatLines) > 1 {
-		prefixParts := wrappedParts[:len(wrappedParts)-len(lastParts)]
-		m.wrappedPrefix = strings.Join(prefixParts, "\n") + "\n"
-		m.prefixLines = prefixParts
+		m.prefixLines = wrappedParts[:len(wrappedParts)-len(lastParts)]
 	} else {
-		m.wrappedPrefix = ""
 		m.prefixLines = nil
 	}
-	// The full content was materialized above; keep the incremental state
-	// consistent so the next buildFromPrefix splices onto the right prefix.
+	// Keep the incremental state consistent so the next buildFromPrefix
+	// splices onto the right prefix.
 	m.lastWrapped = strings.Join(lastParts, "\n")
-	m.wrappedContentDirty = false
+	// Record the width this wrap is valid for: SetSize skips the re-wrap while
+	// the width is unchanged (see Model.lastRewrapWidth).
+	m.lastRewrapWidth = m.wrapWidth()
 }
 
 func (m *Model) View() tea.View {
@@ -473,7 +460,7 @@ func (m *Model) refreshSavedSessions() {
 	if err != nil {
 		return
 	}
-	m.savedCache = result.Sessions
+	m.setSavedCache(result.Sessions)
 }
 
 // requestSavedSessions snapshots the persisted-session index off the
@@ -760,19 +747,6 @@ func (m *Model) handleStreamError(err error) {
 	}
 	m.bellIfBlurred() // web parity: turn-error notification (cancels stay quiet)
 	m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: %v", err)))
-}
-
-// sliceByRuneCount returns the prefix of s containing at most n runes.
-// Uses rune-counting so it does not split multi-byte UTF-8 characters.
-func sliceByRuneCount(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	runes := []rune(s)
-	if n >= len(runes) {
-		return s
-	}
-	return string(runes[:n])
 }
 
 func summarizeResult(result string, success bool) string {

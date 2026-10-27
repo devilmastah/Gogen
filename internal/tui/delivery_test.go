@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"gogen/internal/agent"
+	"gogen/internal/steerq"
 )
 
 // newQueueTestModel builds a minimal Model with a live-sessions registry:
@@ -50,25 +51,25 @@ func keyPress(s string) tea.KeyPressMsg {
 func TestDrainDeliveriesOnlyWhenIdle(t *testing.T) {
 	m := newQueueTestModel()
 	s := m.focusedSession()
-	s.steerQueue = []steerItem{
-		{id: "a", text: "notice-a", system: true},
-		{id: "b", text: "notice-b", system: true},
-	}
+	s.steerQ = testQueue(
+		notice("a", "notice-a"),
+		notice("b", "notice-b"),
+	)
 
 	m.streaming = true
 	if cmd := m.drainDeliveries(); cmd != nil {
 		t.Fatal("must not drain while streaming")
 	}
-	if len(s.steerQueue) != 2 {
-		t.Fatalf("queue mutated while streaming: %v", s.steerQueue)
+	if s.steerQ.Len() != 2 {
+		t.Fatalf("queue mutated while streaming: %v", s.steerQ)
 	}
 
 	m.streaming = false
 	if cmd := m.drainDeliveries(); cmd == nil {
 		t.Fatal("must drain when idle")
 	}
-	if len(s.steerQueue) != 0 {
-		t.Fatalf("queue = %v, want empty (the system run drains as one turn)", s.steerQueue)
+	if s.steerQ.Len() != 0 {
+		t.Fatalf("queue = %v, want empty (the system run drains as one turn)", s.steerQ)
 	}
 	if !m.streaming {
 		t.Fatal("drain must mark the focused session as streaming")
@@ -80,7 +81,7 @@ func TestDrainDeliveriesOnlyWhenIdle(t *testing.T) {
 	}
 	// An empty queue yields no command even when idle.
 	m.streaming = false
-	s.steerQueue = nil
+	s.steerQ = nil
 	if cmd := m.drainDeliveries(); cmd != nil {
 		t.Fatal("empty queue must not drain")
 	}
@@ -93,19 +94,19 @@ func TestDrainDeliveriesOnlyWhenIdle(t *testing.T) {
 func TestSystemDeliveriesBatchOneTurn(t *testing.T) {
 	m := newQueueTestModel()
 	s := m.focusedSession()
-	s.steerQueue = []steerItem{
-		{id: "s1", text: "notice-1", system: true},
-		{id: "s2", text: "notice-2", system: true},
-		{id: "u1", text: "user-draft"},
-		{id: "s3", text: "notice-3", system: true},
-	}
+	s.steerQ = testQueue(
+		notice("s1", "notice-1"),
+		notice("s2", "notice-2"),
+		userItem("u1", "user-draft"),
+		notice("s3", "notice-3"),
+	)
 
 	// The two leading notices drain as one turn.
 	if cmd := m.drainSessionQueue(s); cmd == nil {
 		t.Fatal("batch drain must start a turn")
 	}
-	if len(s.steerQueue) != 2 || s.steerQueue[0].id != "u1" || s.steerQueue[1].id != "s3" {
-		t.Fatalf("after batch drain queue = %v, want [u1, s3]", s.steerQueue)
+	if s.steerQ.Len() != 2 || s.steerQ.Items()[0].ID != "u1" || s.steerQ.Items()[1].ID != "s3" {
+		t.Fatalf("after batch drain queue = %v, want [u1, s3]", s.steerQ)
 	}
 
 	// Simulate the batched turn ending: drainSessionQueue only starts idle
@@ -117,8 +118,8 @@ func TestSystemDeliveriesBatchOneTurn(t *testing.T) {
 	if cmd := m.drainSessionQueue(s); cmd == nil {
 		t.Fatal("user drain must start a turn")
 	}
-	if len(s.steerQueue) != 1 || s.steerQueue[0].id != "s3" {
-		t.Fatalf("after user drain queue = %v, want [s3]", s.steerQueue)
+	if s.steerQ.Len() != 1 || s.steerQ.Items()[0].ID != "s3" {
+		t.Fatalf("after user drain queue = %v, want [s3]", s.steerQ)
 	}
 
 	s.streaming = false
@@ -127,8 +128,8 @@ func TestSystemDeliveriesBatchOneTurn(t *testing.T) {
 	if cmd := m.drainSessionQueue(s); cmd == nil {
 		t.Fatal("trailing system drain must start a turn")
 	}
-	if len(s.steerQueue) != 0 {
-		t.Fatalf("queue = %v, want empty", s.steerQueue)
+	if s.steerQ.Len() != 0 {
+		t.Fatalf("queue = %v, want empty", s.steerQ)
 	}
 }
 
@@ -142,8 +143,8 @@ func TestDeliveryRequestMsgQueues(t *testing.T) {
 	model, cmd := m.handleMsg(deliveryRequestMsg{text: "incoming notice"})
 	m2 := model.(*Model)
 	s := m2.focusedSession()
-	if len(s.steerQueue) != 1 || s.steerQueue[0].text != "incoming notice" || !s.steerQueue[0].system {
-		t.Fatalf("queue = %v, want one system item [incoming notice]", s.steerQueue)
+	if s.steerQ.Len() != 1 || s.steerQ.Items()[0].Text != "incoming notice" || s.steerQ.Items()[0].Kind == steerq.User {
+		t.Fatalf("queue = %v, want one system item [incoming notice]", s.steerQ)
 	}
 	if cmd != nil {
 		t.Fatal("must not start a turn while streaming")
@@ -172,11 +173,11 @@ func TestDeliveryRequestMsgRoutesBySid(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("must not start a turn on a streaming session")
 	}
-	if len(bg.steerQueue) != 1 || bg.steerQueue[0].text != "busy notice" || !bg.steerQueue[0].system {
-		t.Fatalf("background queue = %v, want one system item", bg.steerQueue)
+	if q := bg.steerQ.Items(); len(q) != 1 || q[0].Text != "busy notice" || q[0].Kind == steerq.User {
+		t.Fatalf("background queue = %v, want one system item", q)
 	}
-	if q := m2.focusedSession().steerQueue; len(q) != 0 {
-		t.Fatalf("notice landed on the focused session's queue: %v", q)
+	if m2.focusedSession().steerQ.Len() != 0 {
+		t.Fatalf("notice landed on the focused session's queue: %v", m2.focusedSession().steerQ.Items())
 	}
 
 	// 2. An IDLE background target drains its queue as ONE batched turn
@@ -191,10 +192,10 @@ func TestDeliveryRequestMsgRoutesBySid(t *testing.T) {
 	if !bg.streaming {
 		t.Fatal("the drained turn must mark the background session as streaming")
 	}
-	if len(bg.steerQueue) != 0 {
-		t.Fatalf("background queue = %v, want empty (the system run batches into one turn)", bg.steerQueue)
+	if bg.steerQ.Len() != 0 {
+		t.Fatalf("background queue = %v, want empty (the system run batches into one turn)", bg.steerQ)
 	}
-	if q := m3.focusedSession().steerQueue; len(q) != 0 {
+	if q := m3.focusedSession().steerQ; q.Len() != 0 {
 		t.Fatalf("focused session queue = %v, want empty", q)
 	}
 
@@ -207,9 +208,9 @@ func TestDeliveryRequestMsgRoutesBySid(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("a busy focused session must not start a turn")
 	}
-	fq := m4.focusedSession().steerQueue
-	if len(fq) != 1 || fq[0].text != "late notice" {
-		t.Fatalf("focused queue = %v, want the late notice", fq)
+	fq := m4.focusedSession().steerQ
+	if q := fq.Items(); len(q) != 1 || q[0].Text != "late notice" {
+		t.Fatalf("focused queue = %v, want the late notice", q)
 	}
 }
 
@@ -221,9 +222,9 @@ func TestDeliveryQueueOverflowDropsOldest(t *testing.T) {
 	m.streaming = true
 	s := m.focusedSession()
 	// One user item must survive the system overflow untouched.
-	s.steerQueue = append(s.steerQueue, steerItem{id: "u1", text: "user draft"})
+	s.queue().Append(userItem("u1", "user draft"))
 	for i := 1; i <= maxPendingDeliveries; i++ {
-		s.steerQueue = append(s.steerQueue, steerItem{id: fmt.Sprintf("n%d", i), text: fmt.Sprintf("notice-%d", i), system: true})
+		s.queue().Append(notice(fmt.Sprintf("n%d", i), fmt.Sprintf("notice-%d", i)))
 	}
 
 	model, cmd := m.handleMsg(deliveryRequestMsg{text: "notice-9"})
@@ -236,15 +237,15 @@ func TestDeliveryQueueOverflowDropsOldest(t *testing.T) {
 	// notice-2..9 remain.
 	sys := 0
 	hasUser, hasN1 := false, false
-	for _, it := range s2.steerQueue {
-		if it.system {
+	for _, it := range s2.steerQ.Items() {
+		if it.Kind != steerq.User {
 			sys++
-			if it.text == "notice-1" {
+			if it.Text == "notice-1" {
 				hasN1 = true
 			}
 			continue
 		}
-		if it.text == "user draft" {
+		if it.Text == "user draft" {
 			hasUser = true
 		}
 	}
@@ -287,8 +288,8 @@ func TestSubmitQueuesWhileBusy(t *testing.T) {
 	model, _, _ := m.handleSubmitKey(keyPress("enter"))
 	m2 := model.(*Model)
 	s := m2.focusedSession()
-	if len(s.steerQueue) != 1 || s.steerQueue[0].text != "fix the tests" || s.steerQueue[0].system {
-		t.Fatalf("queue = %v, want one user item [fix the tests]", s.steerQueue)
+	if q := s.steerQ.Items(); len(q) != 1 || q[0].Text != "fix the tests" || q[0].Kind != steerq.User {
+		t.Fatalf("queue = %v, want one user item [fix the tests]", s.steerQ)
 	}
 	if m2.textarea.Value() != "" {
 		t.Fatalf("composer not cleared: %q", m2.textarea.Value())
@@ -300,16 +301,76 @@ func TestSubmitQueuesWhileBusy(t *testing.T) {
 	model, _ = m2.handleMsg(deliveryRequestMsg{text: "job notice"})
 	m3 := model.(*Model)
 	s3 := m3.focusedSession()
-	if len(s3.steerQueue) != 2 || s3.steerQueue[0].system || !s3.steerQueue[1].system {
-		t.Fatalf("queue order = %v, want [user, system]", s3.steerQueue)
+	if q := s3.steerQ.Items(); len(q) != 2 || q[0].Kind != steerq.User || q[1].Kind == steerq.User {
+		t.Fatalf("queue order = %v, want [user, system]", q)
 	}
 	// Draining pops strictly in arrival order (user first, then system).
 	m3.streaming = false
 	if cmd := m3.drainSessionQueue(s3); cmd == nil {
 		t.Fatal("drain must start the queued turn")
 	}
-	if s3.steerQueue[0].text != "job notice" {
-		t.Fatalf("after first drain queue = %v, want [job notice]", s3.steerQueue)
+	if q := s3.steerQ.Items(); len(q) != 1 || q[0].Text != "job notice" {
+		t.Fatalf("after first drain queue = %v, want [job notice]", q)
+	}
+}
+
+// TestSubmitQueuesWhileCancelledTurnUnwinds pins the cancel → immediate
+// resend race: handleCancelKey clears the mirror (m.streaming) at once so the
+// UI cannot stick on a dead stream, but the cancelled turn's goroutine keeps
+// appending to the agent until its terminal message lands. A submit in that
+// window must QUEUE through the steering path — starting a turn there runs two
+// goroutines against one *agent.Agent and interleaves the persisted history.
+func TestSubmitQueuesWhileCancelledTurnUnwinds(t *testing.T) {
+	m := newQueueTestModel()
+	s := m.focusedSession()
+	s.streaming = true // cancelled turn still unwinding
+	m.streaming = false
+	seqBefore := s.turnSeq
+	m.textarea.SetValue("try again")
+
+	model, _, _ := m.handleSubmitKey(keyPress("enter"))
+	m2 := model.(*Model)
+	if s.steerQ.Len() != 1 || s.steerQ.Items()[0].Text != "try again" {
+		t.Fatalf("queue = %v, want one user item [try again]", s.steerQ)
+	}
+	if s.turnSeq != seqBefore {
+		t.Fatalf("a second turn started (turnSeq %d → %d)", seqBefore, s.turnSeq)
+	}
+	if !strings.Contains(m2.statusMsg, "Queued (1)") {
+		t.Fatalf("statusMsg = %q, want queue acknowledgment", m2.statusMsg)
+	}
+
+	// The queued item must not be stranded: the cancelled turn's terminal is
+	// the drain boundary (turnSeq still matches, since nothing started a new
+	// turn), and it starts the queued prompt.
+	seq := s.turnSeq
+	model, _ = m2.handleTurnFinishedMsg(s.id, seq, context.Canceled)
+	m3 := model.(*Model)
+	if s.steerQ.Len() != 0 {
+		t.Fatalf("queue not drained at the cancelled turn's terminal: %v", s.steerQ)
+	}
+	if s.turnSeq == seq {
+		t.Fatal("queued prompt did not start a turn at the terminal boundary")
+	}
+	_ = m3
+}
+
+// TestStartTurnRefusesStreamingSession pins the safety net behind the submit
+// gate: the shared turn entry point refuses a session that is still streaming
+// instead of bumping its turn generation and racing the unwinding turn.
+func TestStartTurnRefusesStreamingSession(t *testing.T) {
+	m := newQueueTestModel()
+	s := m.focusedSession()
+	s.streaming = true
+	seqBefore := s.turnSeq
+	if cmd := m.startTurnOnWithResult(s, "hi", nil); cmd != nil {
+		t.Fatal("must refuse to start a turn on a streaming session")
+	}
+	if s.turnSeq != seqBefore {
+		t.Fatalf("turnSeq changed (%d → %d)", seqBefore, s.turnSeq)
+	}
+	if !strings.Contains(m.statusMsg, "Busy") {
+		t.Fatalf("statusMsg = %q, want a busy notice", m.statusMsg)
 	}
 }
 
@@ -321,7 +382,7 @@ func TestUserQueueCapRefuses(t *testing.T) {
 	m.streaming = true
 	s := m.focusedSession()
 	for i := 0; i < maxSteerUserQueue; i++ {
-		s.steerQueue = append(s.steerQueue, steerItem{id: fmt.Sprintf("u%d", i), text: fmt.Sprintf("msg-%d", i)})
+		s.queue().Append(userItem(fmt.Sprintf("u%d", i), fmt.Sprintf("msg-%d", i)))
 	}
 	m.textarea.SetValue("one too many")
 	model, _, _ := m.handleSubmitKey(keyPress("enter"))
@@ -341,17 +402,17 @@ func TestCancelClearsUserSteer(t *testing.T) {
 	m := newQueueTestModel()
 	m.streaming = true
 	s := m.focusedSession()
-	s.steerQueue = []steerItem{
-		{id: "u1", text: "queued user 1"},
-		{id: "s1", text: "queued delivery", system: true},
-		{id: "u2", text: "queued user 2"},
-	}
+	s.steerQ = testQueue(
+		userItem("u1", "queued user 1"),
+		notice("s1", "queued delivery"),
+		userItem("u2", "queued user 2"),
+	)
 
 	model, _, _ := m.handleCancelKey()
 	m2 := model.(*Model)
 	s2 := m2.focusedSession()
-	if len(s2.steerQueue) != 1 || s2.steerQueue[0].text != "queued delivery" {
-		t.Fatalf("queue after cancel = %v, want [queued delivery]", s2.steerQueue)
+	if q := s2.steerQ.Items(); len(q) != 1 || q[0].Text != "queued delivery" {
+		t.Fatalf("queue after cancel = %v, want [queued delivery]", q)
 	}
 	last := m2.chatLines[len(m2.chatLines)-1]
 	if !strings.Contains(last, "Cancelled") || !strings.Contains(last, "2 queued message(s) removed") {
@@ -364,11 +425,11 @@ func TestCancelClearsUserSteer(t *testing.T) {
 func TestQueueModal(t *testing.T) {
 	m := newQueueTestModel()
 	s := m.focusedSession()
-	s.steerQueue = []steerItem{
-		{id: "u1", text: "first queued message"},
-		{id: "s1", text: "a system delivery", system: true},
-		{id: "u2", text: "third queued message"},
-	}
+	s.steerQ = testQueue(
+		userItem("u1", "first queued message"),
+		notice("s1", "a system delivery"),
+		userItem("u2", "third queued message"),
+	)
 	m.modal = ModalQueue
 
 	// Cursor defaults to the first row; render shows all three.
@@ -384,22 +445,22 @@ func TestQueueModal(t *testing.T) {
 	model, _ := m.handleQueueKey(keyPress("d"))
 	m2 := model.(*Model)
 	s2 := m2.focusedSession()
-	if len(s2.steerQueue) != 2 || s2.steerQueue[0].text != "a system delivery" {
-		t.Fatalf("queue after d = %v", s2.steerQueue)
+	if q := s2.steerQ.Items(); len(q) != 2 || q[0].Text != "a system delivery" {
+		t.Fatalf("queue after d = %v", q)
 	}
 	// `d` on the SYSTEM row is refused (machine bookkeeping).
 	m2.queueCursor = 0
 	model, _ = m2.handleQueueKey(keyPress("d"))
 	m3 := model.(*Model)
-	if len(m3.focusedSession().steerQueue) != 2 {
+	if m3.focusedSession().steerQ.Len() != 2 {
 		t.Fatal("system delivery must not be deletable")
 	}
 	// `D` clears every user item, keeps the system one.
 	model, _ = m3.handleQueueKey(keyPress("D"))
 	m4 := model.(*Model)
 	s4 := m4.focusedSession()
-	if len(s4.steerQueue) != 1 || !s4.steerQueue[0].system {
-		t.Fatalf("queue after D = %v, want [system]", s4.steerQueue)
+	if q := s4.steerQ.Items(); len(q) != 1 || q[0].Kind == steerq.User {
+		t.Fatalf("queue after D = %v, want [system]", q)
 	}
 	// esc closes the modal.
 	model, _ = m4.handleQueueKey(keyPress("esc"))
@@ -416,22 +477,22 @@ func TestQueueModal(t *testing.T) {
 func TestQueueModalCursorClampsAfterShrink(t *testing.T) {
 	m := newQueueTestModel()
 	s := m.focusedSession()
-	s.steerQueue = []steerItem{
-		{id: "u1", text: "first"},
-		{id: "u2", text: "second"},
-	}
+	s.steerQ = testQueue(
+		userItem("u1", "first"),
+		userItem("u2", "second"),
+	)
 	m.modal = ModalQueue
 	m.queueCursor = 1 // points at "second"
 
 	// The turn boundary's drain pops the head while the modal is open.
-	s.steerQueue = s.steerQueue[1:]
+	s.steerQ.Take(1)
 
 	// `d` with the stale cursor must clamp, then delete the item under the
 	// clamped cursor — not panic.
 	model, _ := m.handleQueueKey(keyPress("d"))
 	m2 := model.(*Model)
-	if got := m2.focusedSession().steerQueue; len(got) != 0 {
-		t.Fatalf("queue after stale-cursor d = %v, want empty", got)
+	if got := m2.focusedSession().steerQ; got.Len() != 0 {
+		t.Fatalf("queue after stale-cursor d = %v, want empty", got.Items())
 	}
 	if m2.queueCursor != 0 {
 		t.Fatalf("cursor after emptying = %d, want 0", m2.queueCursor)
@@ -441,14 +502,17 @@ func TestQueueModalCursorClampsAfterShrink(t *testing.T) {
 	// surviving row instead of highlighting nothing.
 	m3 := newQueueTestModel()
 	s3 := m3.focusedSession()
-	s3.steerQueue = []steerItem{
-		{id: "u1", text: "first"},
-		{id: "u2", text: "second"},
-		{id: "u3", text: "third"},
-	}
+	s3.steerQ = testQueue(
+		userItem("u1", "first"),
+		userItem("u2", "second"),
+		userItem("u3", "third"),
+	)
 	m3.modal = ModalQueue
 	m3.queueCursor = 2
-	s3.steerQueue = s3.steerQueue[:2] // "third" left the queue another way
+	s3.steerQ = testQueue( // "third" left the queue another way
+		userItem("u1", "first"),
+		userItem("u2", "second"),
+	)
 	rendered := m3.renderQueueModal()
 	if !strings.Contains(rendered, "> second") {
 		t.Fatalf("clamped highlight missing:\n%s", rendered)
@@ -463,7 +527,7 @@ func TestQueuedSuffixRenders(t *testing.T) {
 	m.progressPhase = progressActive
 	m.spinner = newProgressSpinner()
 	s := m.focusedSession()
-	s.steerQueue = []steerItem{{id: "u1", text: "one"}, {id: "u2", text: "two"}}
+	s.steerQ = testQueue(userItem("u1", "one"), userItem("u2", "two"))
 
 	got := m.renderProgressInput()
 	if !strings.Contains(got, "· 2 queued") {
@@ -483,7 +547,7 @@ func TestQueuedSuffixRenders(t *testing.T) {
 	}
 
 	// The suffix reads the focused session's queue: empty → no suffix.
-	s.steerQueue = nil
+	s.steerQ = nil
 	if got := m.renderProgressInput(); strings.Contains(got, "queued") {
 		t.Fatalf("empty queue must not render a suffix: %q", got)
 	}
@@ -518,7 +582,7 @@ func TestTurnEndRestoresIdleComposerPlaceholder(t *testing.T) {
 	m2.textarea.Focus()
 	m2.streaming = true
 	m2.applyComposerPlaceholder()
-	m2.focusedSession().steerQueue = []steerItem{{id: "u1", text: "next"}}
+	m2.focusedSession().steerQ = testQueue(userItem("u1", "next"))
 	m2.finishFocusedTurn(nil)
 	if !m2.streaming {
 		t.Fatal("the drained item must have started its turn")
@@ -526,4 +590,27 @@ func TestTurnEndRestoresIdleComposerPlaceholder(t *testing.T) {
 	if m2.textarea.Placeholder != queuedComposerPlaceholder {
 		t.Fatalf("placeholder with a drained turn = %q, want %q", m2.textarea.Placeholder, queuedComposerPlaceholder)
 	}
+}
+
+// TestClearUserSteerKeepsMachineItems pins the interrupt semantic on the TUI
+// path: /cancel drops the user's own queued text and keeps machine deliveries.
+func TestClearedSteerItemsAreZeroed(t *testing.T) {
+	m := newQueueTestModel()
+	s := m.focusedSession()
+	s.steerQ = testQueue(
+		userItem("u1", "drop me"),
+		notice("s1", "keep me"),
+		userItem("u2", "drop me too"),
+	)
+
+	if removed := s.clearUserSteer(); removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if q := s.steerQ.Items(); len(q) != 1 || q[0].ID != "s1" {
+		t.Fatalf("queue = %+v, want the system item only", q)
+	}
+	// The dropped slots themselves are zeroed by the shared queue
+	// (internal/steerq's TestTakeZeroesPoppedSlots and the DropKind path), so
+	// the item's text and images cannot stay reachable through the backing
+	// array.
 }

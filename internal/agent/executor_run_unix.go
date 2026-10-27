@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -115,6 +116,14 @@ func (e *Executor) runCommand(ctx context.Context, command string, stdin io.Read
 		return fmt.Errorf("execution error: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
+		// A backgrounded child (execute_command "server &") inherits the
+		// shell's stdout/stderr, so WaitDelay fires once the shell exits and
+		// Wait reports ErrWaitDelay even though the command itself succeeded.
+		// Treat a clean exit as success: the alternative told the model every
+		// `... &` invocation had failed.
+		if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+			return nil
+		}
 		return fmt.Errorf("execution error: %w", err)
 	}
 	return nil

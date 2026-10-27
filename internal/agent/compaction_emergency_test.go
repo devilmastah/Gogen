@@ -393,7 +393,7 @@ func TestEmergencyOnlyInsideHardWindow(t *testing.T) {
 	if !a2.emergencyCompactDue(a2.compactionTokenTotal()) {
 		t.Fatal("emergency tier should fire inside the hard window with keep+1 messages")
 	}
-	if k := ctxMgr2.ChooseCompactKeep(a2.Messages, cachedCounts(t, a2), 1000); k != 1 {
+	if k := ctxMgr2.ChooseCompactKeep(a2.Messages, cachedCounts(t, a2), 1000, nil); k != 1 {
 		t.Fatalf("ChooseCompactKeep at keep+1 messages = %d, want 1 (lowered keep)", k)
 	}
 
@@ -430,7 +430,7 @@ func TestEmergencyLowersKeepToCoverDeficit(t *testing.T) {
 
 	total := a.compactionTokenTotal()
 	needed := total - ctxMgr.HardLimit() + emergencySummaryAllowance
-	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed); k != 1 {
+	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed, nil); k != 1 {
 		t.Fatalf("ChooseCompactKeep = %d, want 1 (deficit %d exceeds the keep-2 middle)", k, needed)
 	}
 
@@ -473,7 +473,7 @@ func TestEmergencyKeepUnchangedWhenMiddleSufficient(t *testing.T) {
 
 	total := a.compactionTokenTotal()
 	needed := total - ctxMgr.HardLimit() + emergencySummaryAllowance
-	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed); k != ctxMgr.CompactKeepRecentMessages() {
+	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed, nil); k != ctxMgr.CompactKeepRecentMessages() {
 		t.Fatalf("ChooseCompactKeep = %d, want %d (middle already covers the deficit)",
 			k, ctxMgr.CompactKeepRecentMessages())
 	}

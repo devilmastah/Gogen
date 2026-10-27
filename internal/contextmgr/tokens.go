@@ -47,12 +47,14 @@ func CountTokens(messages []llm.Message) []int {
 		return nil
 	}
 	count := messageCounterFor()
+	// Resolved once per pass (an env lookup, not a per-message cost).
+	countReasoning := llm.ReasoningEchoEnabled()
 	// One memo per pass: repeated strings encode once instead of once per
 	// message.
 	memo := make(map[string]int)
 	counts := make([]int, len(messages))
 	for i := range messages {
-		counts[i] = computeMessageTokens(messages[i], count, memo) + imageTokenEstimate(messages[i])
+		counts[i] = computeMessageTokens(messages[i], count, memo, countReasoning) + imageTokenEstimate(messages[i])
 	}
 	return counts
 }
@@ -66,7 +68,7 @@ func (m *Manager) TokenCounts(messages []llm.Message) []int {
 // ComputeMessageTokens returns the estimated token count for a single message
 // using the cl100k_base tokenizer when available, falling back to a bytes/4 heuristic.
 func ComputeMessageTokens(msg llm.Message) int {
-	return computeMessageTokens(msg, messageCounterFor(), nil) + imageTokenEstimate(msg)
+	return computeMessageTokens(msg, messageCounterFor(), nil, llm.ReasoningEchoEnabled()) + imageTokenEstimate(msg)
 }
 
 func sortedToolArgKeys(args map[string]any) []string {
@@ -87,10 +89,11 @@ func (m *Manager) EstimateTokens(messages []llm.Message) int {
 		return 0
 	}
 	count := messageCounterFor()
+	countReasoning := llm.ReasoningEchoEnabled()
 	memo := make(map[string]int)
 	total := 0
 	for i := range messages {
-		total += computeMessageTokens(messages[i], count, memo) + imageTokenEstimate(messages[i])
+		total += computeMessageTokens(messages[i], count, memo, countReasoning) + imageTokenEstimate(messages[i])
 	}
 	return total
 }
@@ -247,7 +250,7 @@ func (e *LiveEstimate) Base() int {
 // between them. When memo is non-nil, repeated strings are counted once per
 // pass and the result reused — token counts are a pure function of the
 // string, so this is exact.
-func computeMessageTokens(msg llm.Message, count messageCounter, memo map[string]int) int {
+func computeMessageTokens(msg llm.Message, count messageCounter, memo map[string]int, countReasoning bool) int {
 	c := count
 	if memo != nil {
 		c = func(s string) int {
@@ -261,7 +264,13 @@ func computeMessageTokens(msg llm.Message, count messageCounter, memo map[string
 	}
 	tokens := 4 // role/message framing overhead
 	tokens += c(msg.Content)
-	tokens += c(msg.Reasoning)
+	// Reasoning only counts when it will actually be sent: with
+	// GOGEN_REASONING_ECHO=off the provider never sees historical reasoning, so
+	// counting it made the estimate (and therefore compaction) fire early —
+	// reasoning can be a third of a reasoning-heavy session.
+	if countReasoning && msg.Reasoning != "" {
+		tokens += c(msg.Reasoning)
+	}
 	tokens += c(msg.Refusal)
 	for _, tc := range msg.ToolCalls {
 		tokens += 4

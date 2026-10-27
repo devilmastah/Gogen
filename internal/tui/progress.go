@@ -192,8 +192,8 @@ func (m *Model) renderCompactingInput() string {
 // (switchToLive restores it on focus). Zero items → empty suffix.
 func (m *Model) queuedSuffix() string {
 	s := m.focusedSession()
-	if s == nil || len(s.steerQueue) == 0 {
+	if s == nil || s.queueLen() == 0 {
 		return ""
 	}
-	return DimStyle.Render(fmt.Sprintf("  · %d queued", len(s.steerQueue)))
+	return DimStyle.Render(fmt.Sprintf("  · %d queued", s.queueLen()))
 }

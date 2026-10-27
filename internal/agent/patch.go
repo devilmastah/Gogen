@@ -142,13 +142,20 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 				rollbackPatches(snapshots, created)
 				return "", err
 			}
+			// Snapshot the target's CONTENT (rollback restores it), but remove
+			// the ENTRY: plan.secure is fully resolved, so removing it would
+			// delete what a symlink points at and leave the link dangling.
 			if data, err := os.ReadFile(plan.secure); err == nil {
 				snapshots[plan.secure] = data
 			} else if !os.IsNotExist(err) {
 				rollbackPatches(snapshots, created)
 				return "", err
 			}
-			if err := os.Remove(plan.secure); err != nil && !os.IsNotExist(err) {
+			removePath := plan.secure
+			if noFollow, nfErr := e.SecurePathNoFollow(plan.target); nfErr == nil {
+				removePath = noFollow
+			}
+			if err := os.Remove(removePath); err != nil && !os.IsNotExist(err) {
 				rollbackPatches(snapshots, created)
 				return "", err
 			}
@@ -293,13 +300,17 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 
 	var original []string
 	originalTrailing := true
+	// eol is the file's dominant line ending, restored on write (see
+	// joinLinesPreserveTrailing): a patch to a CRLF checkout must not rewrite
+	// every line ending in it.
+	eol := "\n"
 	if !isCreate {
 		data, err := os.ReadFile(secure)
 		if err != nil {
 			return patchPlan{}, target, fmt.Errorf("read: %w", err)
 		}
 		originalTrailing = strings.HasSuffix(string(data), "\n")
-		original = splitLinesPreserveTrailing(string(data))
+		original, eol = splitLinesPreserveTrailing(string(data))
 	}
 
 	updated, outNoNewline, shifts, err := applyPatchHunks(original, pf.hunks, fuzzy, originalTrailing)
@@ -317,7 +328,7 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 	return patchPlan{
 		target:     target,
 		secure:     secure,
-		updated:    joinLinesPreserveTrailing(updated, !outNoNewline),
+		updated:    joinLinesPreserveTrailing(updated, !outNoNewline, eol),
 		create:     isCreate,
 		hunkShifts: shifts,
 	}, label, nil
@@ -983,6 +994,18 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool, originalT
 		n := len(h.oldLines)
 		if n == 0 {
 			if len(h.newLines) > 0 {
+				// A hunk with zero old lines is a pure INSERTION. In a
+				// unified diff the header's old line number names the line
+				// the insertion FOLLOWS ("@@ -5,0 +6,2 @@" inserts after
+				// line 5), so the 0-based index to insert at is oldStart
+				// itself — not oldStart-1, which landed every pure insertion
+				// one line early. patch(1) positions these hunks from the old
+				// side too, so a sloppily generated new-side number cannot
+				// move the insert.
+				start = h.oldStart + lineDelta
+				if start < 0 {
+					start = 0
+				}
 				if start > len(out) {
 					start = len(out)
 				}
@@ -1209,27 +1232,42 @@ func linesEqual(a, b []string) bool {
 	return true
 }
 
-func splitLinesPreserveTrailing(s string) []string {
+// splitLinesPreserveTrailing splits file content into lines for patch
+// matching and reports the line ending to restore on write.
+//
+// Only "\n" separates lines. A trailing "\r" is stripped from each line so a
+// CRLF checkout still matches the LF-normalized diff, but the ending itself is
+// returned as eol and written back by joinLinesPreserveTrailing — otherwise a
+// one-line patch to a CRLF file rewrote every line ending in it. A BARE "\r"
+// is not a separator: content that uses it (legacy Mac, and embedded \r in
+// strings) stays on one line instead of being silently split into several.
+func splitLinesPreserveTrailing(s string) (lines []string, eol string) {
 	if s == "" {
-		return nil
+		return nil, "\n"
 	}
-	// Normalize CRLF/CR on disk so patches with LF context still match Windows checkouts.
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.ReplaceAll(s, "\r", "\n")
-	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
-	return lines
+	eol = "\n"
+	if strings.Contains(s, "\r\n") {
+		eol = "\r\n"
+	}
+	lines = strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], "\r")
+	}
+	return lines, eol
 }
 
 // joinLinesPreserveTrailing joins lines, appending a trailing newline only
 // when trailing is true, so files that end without a newline keep that state
 // after patching (matching git apply rather than unconditionally adding one).
-func joinLinesPreserveTrailing(lines []string, trailing bool) string {
+// eol is the file's dominant line ending (splitLinesPreserveTrailing's second
+// result): added lines inherit it, so patching a CRLF file keeps CRLF.
+func joinLinesPreserveTrailing(lines []string, trailing bool, eol string) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	s := strings.Join(lines, "\n")
+	s := strings.Join(lines, eol)
 	if trailing {
-		s += "\n"
+		s += eol
 	}
 	return s
 }

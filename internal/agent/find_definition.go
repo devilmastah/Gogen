@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -67,20 +68,23 @@ func (e *Executor) findDefinitionText(ctx context.Context, subpath, glob, symbol
 	// const/var/let bindings.
 	pattern := definitionSearchPattern(symbol, "func", "type", "class", "const", "var")
 
-	out, err := e.SearchCode(ctx, pattern, subpath, glob, 0, false)
+	// Structured results, not SearchCode's rendered text: the context-free
+	// rendering groups hits under a bare path line, so parsing it here kept
+	// only the "line:content" lines and every fallback hit came back with no
+	// file path.
+	matches, _, err := e.SearchCodeMatches(ctx, pattern, subpath, glob, false)
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasPrefix(out, "No matches") {
-		return nil, nil
-	}
 
 	var allDefs []string
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, symbol) {
-			allDefs = append(allDefs, line)
+	for _, m := range matches {
+		// The keyword pattern can match a definition line for another
+		// identifier, so keep the symbol check the old path had.
+		if !strings.Contains(m.Text, symbol) {
+			continue
 		}
+		allDefs = append(allDefs, fmt.Sprintf("%s:%d:%s", m.Path, m.Line, m.Text))
 		if len(allDefs) >= 20 {
 			break
 		}
@@ -103,11 +107,19 @@ func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix,
 			if def.Name == symbol {
 				defs = append(defs, fmt.Sprintf("%s:%d (%s)", rel, def.Line, def.Kind))
 				if len(defs) >= 20 {
-					return nil
+					// Returning nil would only stop THIS file: walkTree keeps
+					// visiting the rest of the tree and the "at most 20" bound
+					// the output promises is exceeded.
+					return errFindFileLimit
 				}
 			}
 		}
 		return nil
 	})
+	if errors.Is(err, errFindFileLimit) {
+		// The cap was reached: stop the walk but keep the result, exactly like
+		// FindFile (the sentinel is the walk's stop signal, not a failure).
+		return defs, nil
+	}
 	return defs, err
 }

@@ -92,3 +92,30 @@ func TestCappedTailKeepsNewestBytes(t *testing.T) {
 		})
 	}
 }
+
+// TestFireChildEnvDropsOverridingVars pins the environment hygiene: projectfile
+// merge gives the environment priority over flags, so an exported
+// GOGEN_WORKING_DIR made the fired child ignore --dir (and OPENAI_BASE_URL its
+// --base-url). Everything else must survive, so exported keys/settings still
+// apply to a scheduled run.
+func TestFireChildEnvDropsOverridingVars(t *testing.T) {
+	base := []string{
+		"PATH=/usr/bin",
+		"GOGEN_WORKING_DIR=/somewhere/else",
+		"OPENAI_BASE_URL=https://other.example/v1",
+		"OPENAI_API_KEY=sk-test",
+		"GOGEN_MODEL=keep-me",
+	}
+	got := fireChildEnv(base, "EXTRA=1")
+	joined := strings.Join(got, "\n")
+	for _, banned := range []string{"GOGEN_WORKING_DIR=", "OPENAI_BASE_URL="} {
+		if strings.Contains(joined, banned) {
+			t.Fatalf("%s must be dropped from the child env:\n%s", banned, joined)
+		}
+	}
+	for _, kept := range []string{"PATH=/usr/bin", "OPENAI_API_KEY=sk-test", "GOGEN_MODEL=keep-me", "EXTRA=1"} {
+		if !strings.Contains(joined, kept) {
+			t.Fatalf("%s must be kept:\n%s", kept, joined)
+		}
+	}
+}

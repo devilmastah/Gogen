@@ -221,7 +221,7 @@ func run() error {
 	// does not block on the ~2.6 MB init overhead.
 	contextmgr.WarmTokenizer()
 
-	a, restoredModel, agentNotices := newAgent(cfg, isGlobalMode)
+	a, restoredModel, agentNotices := newAgent(cfg, isGlobalMode, opts.prompt == "")
 	startupNotices = append(startupNotices, agentNotices...)
 	// Background jobs (execute_command background=true) are owned by the
 	// session and killed when it closes; this defer covers the TUI, CLI, and

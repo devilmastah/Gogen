@@ -38,6 +38,15 @@ func (r *recordingMCPRegistry) ToolNames() map[string]struct{} {
 	return out
 }
 
+func (r *recordingMCPRegistry) HasTool(name string) bool {
+	for _, d := range r.defs {
+		if d.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *recordingMCPRegistry) CallTool(_ context.Context, name string, args map[string]any) (string, error) {
 	r.calls = append(r.calls, mcpCall{name: name, args: args})
 	if r.err != nil {

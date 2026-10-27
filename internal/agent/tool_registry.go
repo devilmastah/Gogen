@@ -15,6 +15,11 @@ import (
 type MCPToolRegistry interface {
 	Definitions() []llm.Tool
 	ToolNames() map[string]struct{}
+	// HasTool reports whether the registry exposes name. It exists so the
+	// per-call membership checks do not copy the whole name map: feature-tool
+	// assembly and the parallel-eligibility scan each tested names in a loop,
+	// and every test allocated a fresh map of every registered tool.
+	HasTool(name string) bool
 	CallTool(ctx context.Context, name string, args map[string]any) (string, error)
 }
 
@@ -51,12 +56,7 @@ func (a *Agent) mcpRegistryHas(name string) bool {
 	if a.MCPRegistry == nil {
 		return false
 	}
-	names := a.MCPRegistry.ToolNames()
-	if names == nil {
-		return false
-	}
-	_, ok := names[name]
-	return ok
+	return a.MCPRegistry.HasTool(name)
 }
 
 // featureTool is one feature-gated tool: its model-facing definition, its
@@ -347,7 +347,7 @@ func handleBackgroundJob(ctx context.Context, a *Agent, args map[string]any) (st
 		if err != nil {
 			return "", err
 		}
-		return a.BackgroundJobInput(jobID, input, appendNewline)
+		return a.BackgroundJobInput(ctx, jobID, input, appendNewline)
 	default:
 		return "", fmt.Errorf("unknown background_job action %q (want status, wait, cancel, input, or list)", action)
 	}

@@ -153,7 +153,7 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 	chatMessages := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
 	// Resolved once per conversion rather than per message; off drops the
 	// historical reasoning echo (see reasoningEchoEnabled).
-	echoReasoning := reasoningEchoEnabled()
+	echoReasoning := ReasoningEchoEnabled()
 	for _, m := range messages {
 		switch m.Role {
 		case "system":
@@ -607,6 +607,17 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		return at.result, at.err
 	}
 	streamErr := at.err
+	if permanentStreamError(streamErr) {
+		// A refusal on the request's merits (context length, auth, bad
+		// parameter, unknown model): retrying or re-uploading non-streaming
+		// cannot succeed. Return it so the caller runs its own recovery —
+		// forced compaction for an overflow — instead of paying the retry
+		// backoff and a third upload first.
+		debuglog.Write("llm/stream_recovery", "permanent stream refusal; skipping the recovery ladder", "", map[string]any{
+			"streamError": clipErrForLog(streamErr),
+		})
+		return nil, fmt.Errorf("stream error: %w", wrapContextWindowError(surfaceAPIError(streamErr)))
+	}
 	debuglog.Write("llm/stream_recovery", "stream attempt failed; recovery ladder entered", "", map[string]any{
 		"streamError": clipErrForLog(streamErr),
 		"retryable":   retryableStreamError(streamErr),
@@ -791,6 +802,29 @@ func recoveryDelay(err error, stage int) time.Duration {
 func isRateLimited(err error) bool {
 	var oerr *openai.Error
 	return errors.As(err, &oerr) && oerr.StatusCode == http.StatusTooManyRequests
+}
+
+// permanentStreamError reports whether the failure is a client-side refusal
+// that repeating the same conversation cannot fix: a 4xx the streaming retry
+// already deems non-transient (bad request, auth, unknown model/endpoint, …).
+// Those must not enter the recovery ladder — the fallback re-uploads the whole
+// conversation without streaming and fails identically, which for a
+// context-length refusal delays the agent's own compaction recovery by a full
+// round trip.
+func permanentStreamError(err error) bool {
+	if err == nil || IsContextWindowError(err) {
+		// A context-window refusal keeps its existing recovery: the streaming
+		// retry is skipped (retryableStreamError) and the non-streaming
+		// fallback still runs, because providers that refuse the stream on
+		// length occasionally serve the non-streaming copy. The agent's forced
+		// compaction is the real fix either way.
+		return false
+	}
+	var oerr *openai.Error
+	if !errors.As(err, &oerr) {
+		return false
+	}
+	return oerr.StatusCode >= 400 && oerr.StatusCode < 500 && !retryableHTTPStatus(oerr.StatusCode)
 }
 
 // retryableHTTPStatus reports whether an HTTP status from the streaming

@@ -83,3 +83,29 @@ func TestWrapContextWindowError(t *testing.T) {
 		t.Fatalf("nil was wrapped: %v", got)
 	}
 }
+
+// TestIsContextWindowErrorIgnoresThrottles pins the 429 carve-out: Bedrock-style
+// throttles say "Too many tokens, please wait…", and classifying that as an
+// overflow runs a lossy forced compaction instead of the backoff the provider
+// asked for.
+func TestIsContextWindowErrorIgnoresThrottles(t *testing.T) {
+	throttle := &openai.Error{
+		StatusCode: http.StatusTooManyRequests,
+		Message:    "Too many tokens, please wait before trying again.",
+		Request:    &http.Request{Method: "POST"},
+		Response:   &http.Response{StatusCode: http.StatusTooManyRequests},
+	}
+	if IsContextWindowError(throttle) {
+		t.Fatal("a 429 mentioning tokens must not be classified as a context overflow")
+	}
+	// The same wording on a 400 is a genuine overflow (the marker backstop).
+	badRequest := &openai.Error{
+		StatusCode: http.StatusBadRequest,
+		Message:    "Too many tokens, please wait before trying again.",
+		Request:    &http.Request{Method: "POST"},
+		Response:   &http.Response{StatusCode: http.StatusBadRequest},
+	}
+	if !IsContextWindowError(badRequest) {
+		t.Fatal("the marker backstop must still classify a 400 with the same wording")
+	}
+}

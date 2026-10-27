@@ -47,8 +47,11 @@ func parkedApprovalCount(rt *sessionRuntime) int {
 func broadcastApprovalReceived(ws *wsConn, approvalID string) bool {
 	for {
 		select {
-		case m := <-ws.sendQ:
-			if m.Type == "delete_approval" && m.ApprovalID == approvalID {
+		case out := <-ws.sendQ:
+			if out == nil || out.msg == nil {
+				continue
+			}
+			if m := *out.msg; m.Type == "delete_approval" && m.ApprovalID == approvalID {
 				return true
 			}
 		default:
@@ -358,6 +361,55 @@ func TestSubagentApprovalDeniedWhenNobodyCanAnswer(t *testing.T) {
 	}
 }
 
+// TestDeleteApproverDeniesWithNoClient pins the fail-closed no-client policy
+// delete approvals share with command approvals: a queued message that keeps
+// running after the last tab closes must get a "not approved" result, not
+// block the turn (which holds turnMu and stalls the rest of the queue) on a
+// prompt nobody can answer.
+func TestDeleteApproverDeniesWithNoClient(t *testing.T) {
+	rt := newTestRuntime(t)
+	approved, err := rt.deleteApprover()(context.Background(), agent.DeleteRequest{Paths: []string{"x"}, Reason: "test"})
+	if err != nil {
+		t.Fatalf("approver error: %v", err)
+	}
+	if approved {
+		t.Fatal("a delete approval with no attached client must be denied")
+	}
+	if n := parkedApprovalCount(rt); n != 0 {
+		t.Fatalf("%d approval(s) parked with no client attached", n)
+	}
+}
+
+// TestDeleteApproverAnswersWithClient pins the other half: with a client
+// attached the request parks on rt.approvals and the client's answer decides
+// it (completeApproval is the path the WS read loop uses).
+func TestDeleteApproverAnswersWithClient(t *testing.T) {
+	rt := newTestRuntime(t)
+	ws := newFakeWSConn()
+	rt.clientsMu.Lock()
+	rt.clients[ws] = struct{}{}
+	rt.clientsMu.Unlock()
+
+	done := make(chan bool, 1)
+	go func() {
+		approved, err := rt.deleteApprover()(context.Background(), agent.DeleteRequest{Paths: []string{"x"}, Reason: "test"})
+		if err != nil {
+			t.Errorf("approver error: %v", err)
+		}
+		done <- approved
+	}()
+	id := parkedApprovalID(t, rt)
+	rt.completeApproval(id, true)
+	select {
+	case approved := <-done:
+		if !approved {
+			t.Fatal("approval answered true must be reported as approved")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("approver did not return after completeApproval")
+	}
+}
+
 // TestEvictRuntimeDeniesParkedApproval pins the eviction tail: a runtime
 // leaving the registry can never answer an approval parked on it, so
 // evictRuntime must deny it — otherwise a background child whose approval was
@@ -371,8 +423,17 @@ func TestEvictRuntimeDeniesParkedApproval(t *testing.T) {
 	r.register("s", rt)
 
 	// Park an approval directly on the runtime (as a routed child approval
-	// would sit before the eviction). No client is attached, so the
-	// last-detach auto-deny never arms.
+	// would sit before the eviction). A client must be attached for the
+	// approval to park at all: with none, deleteApprover denies fail-closed
+	// (the same no-client policy commandApprover has). The auto-deny that
+	// rescues a parked approval arms on the last DETACH, so eviction is the
+	// only remaining rescue here. The attached socket is a working fake (not
+	// a bare &wsConn{}): a failed broadcast write detaches the client, which
+	// would fail-closed the approval before it could park.
+	ws := newFakeWSConn()
+	rt.clientsMu.Lock()
+	rt.clients[ws] = struct{}{}
+	rt.clientsMu.Unlock()
 	done := make(chan bool, 1)
 	go func() {
 		approved, err := rt.deleteApprover()(context.Background(), agent.DeleteRequest{Paths: []string{"x"}, Reason: "test"})

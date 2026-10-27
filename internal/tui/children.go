@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"gogen/internal/agent"
+	"gogen/internal/steerq"
 	"gogen/internal/subagents"
 )
 
@@ -525,22 +526,18 @@ func (m *Model) handleChildMessageMsg(msg childMessageMsg) (tea.Model, tea.Cmd) 
 	}
 	// Targeted deliveries are never silently dropped: refuse when the system
 	// queue is full, exactly like the web host's enqueueSystem.
-	sys, targeted := 0, 0
-	for _, it := range s.steerQueue {
-		if it.system {
-			sys++
-		}
-		if it.child == h {
-			targeted++
-		}
-	}
-	if sys >= maxPendingDeliveries {
+	targeted := countQueuedChildItems(s.queue(), h)
+	// A Reply is never the eviction victim (the parent is waiting on it), so
+	// the shared queue refuses only when the system cap is already full of
+	// replies.
+	if outcome, evicted := s.queue().Append(steerq.Item{
+		ID: newSteerItemID(), Text: msg.text, Kind: steerq.Reply, Tag: h,
+	}); outcome != steerq.Accepted {
 		msg.ack <- childMessageAck{ok: false, full: true}
 		return m, nil
+	} else if evicted != nil {
+		m.deliveryDrops++
 	}
-	s.steerQueue = append(s.steerQueue, steerItem{
-		id: newSteerItemID(), text: msg.text, system: true, child: h,
-	})
 	h.setQueueDepth(targeted + 1)
 	msg.ack <- childMessageAck{ok: true}
 	if m.lives.Active() == s {

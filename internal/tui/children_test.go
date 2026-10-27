@@ -17,6 +17,7 @@ import (
 	"gogen/internal/llm"
 	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
+	"gogen/internal/steerq"
 	"gogen/internal/subagents"
 )
 
@@ -197,23 +198,37 @@ func TestChildMessageQueuesAndRefusesWhenFull(t *testing.T) {
 	if res := <-ack; !res.ok || res.full {
 		t.Fatalf("first send_message = %+v, want queued", res)
 	}
-	if len(slot.steerQueue) != 1 || slot.steerQueue[0].child != handle {
+	if q := slot.steerQ.Items(); len(q) != 1 || q[0].Tag != handle {
 		t.Fatal("the targeted delivery is not queued on the child's slot")
 	}
 	if got := handle.queueDepth; got != 1 {
 		t.Fatalf("queue depth mirror = %d, want 1", got)
 	}
 
-	// Fill the system queue with ordinary notices: a targeted delivery must
-	// still be refused (not silently dropped) once the queue is at its cap.
-	slot.steerQueue = nil
+	// A targeted delivery first evicts the OLDEST NOTICE to make room (a
+	// stale notice is worth less than a message whose reply the parent is
+	// waiting on), so a queue of plain notices still accepts it.
+	slot.steerQ = testQueue()
 	for i := 0; i < maxPendingDeliveries; i++ {
-		slot.steerQueue = append(slot.steerQueue, steerItem{id: newSteerItemID(), text: "notice", system: true})
+		slot.queue().Append(notice(newSteerItemID(), "notice"))
+	}
+	ack = make(chan childMessageAck, 1)
+	_, _ = hh.m.handleChildMessageMsg(childMessageMsg{handle: handle, text: "again", ack: ack})
+	if res := <-ack; !res.ok || res.full {
+		t.Fatalf("send_message over plain notices = %+v, want queued (a notice is evicted)", res)
+	}
+
+	// With every system slot holding a REPLY, a further targeted delivery is
+	// REFUSED (never silently dropped) so the model can retry: an answer
+	// someone is waiting on must not disappear.
+	slot.steerQ = testQueue()
+	for i := 0; i < maxPendingDeliveries; i++ {
+		slot.queue().Append(steerq.Item{ID: newSteerItemID(), Text: "targeted", Kind: steerq.Reply, Tag: handle})
 	}
 	ack = make(chan childMessageAck, 1)
 	_, _ = hh.m.handleChildMessageMsg(childMessageMsg{handle: handle, text: "again", ack: ack})
 	if res := <-ack; res.ok || !res.full {
-		t.Fatalf("send_message at a full queue = %+v, want refused as full", res)
+		t.Fatalf("send_message at a full targeted queue = %+v, want refused as full", res)
 	}
 }
 
@@ -228,7 +243,7 @@ func TestChildReplyReachesParent(t *testing.T) {
 	handle.setSlot(slot)
 
 	// A notice on the child must NOT produce a parent reply.
-	slot.steerQueue = append(slot.steerQueue, steerItem{id: newSteerItemID(), text: "notice", system: true})
+	slot.queue().Append(notice(newSteerItemID(), "notice"))
 	if cmd := hh.m.drainSessionQueue(slot); cmd == nil {
 		t.Fatal("notice drain returned no turn")
 	} else if msg := cmd(); msg != nil {
@@ -249,7 +264,7 @@ func TestChildReplyReachesParent(t *testing.T) {
 		t.Fatal("the targeted delivery did not arm the reply capture")
 	}
 	if cmd == nil {
-		t.Fatalf("the targeted delivery did not start a turn (queue = %d)", len(slot.steerQueue))
+		t.Fatalf("the targeted delivery did not start a turn (queue = %d)", slot.steerQ.Len())
 	}
 	if msg := cmd(); msg != nil {
 		hh.m.handleMsg(msg)
@@ -489,31 +504,30 @@ func TestNoticeOverflowNeverEvictsATargetedDelivery(t *testing.T) {
 	for i := 0; i < maxPendingDeliveries-1; i++ {
 		_, _ = hh.m.handleMsg(deliveryRequestMsg{sid: child.SessionID, text: "notice"})
 	}
-	targetedBefore := countQueuedChildItems(slot.steerQueue, handle)
+	targetedBefore := countQueuedChildItems(slot.steerQ, handle)
 	if targetedBefore != 1 {
 		t.Fatalf("targeted queued = %d, want 1", targetedBefore)
 	}
 
 	// One more notice at a full queue: a notice is evicted, the reply survives.
 	_, _ = hh.m.handleMsg(deliveryRequestMsg{sid: child.SessionID, text: "late notice"})
-	if got := countQueuedChildItems(slot.steerQueue, handle); got != 1 {
+	if got := countQueuedChildItems(slot.steerQ, handle); got != 1 {
 		t.Fatalf("targeted queued after overflow = %d, want the reply preserved", got)
 	}
 
 	// Now make every system slot targeted: the incoming notice must be dropped.
-	for _, it := range append([]steerItem(nil), slot.steerQueue...) {
-		if it.child == nil {
-			slot.removeSteerItem(it.id)
+	for _, it := range slot.steerQ.Items() {
+		if it.Tag == nil {
+			slot.steerQ.Remove(it.ID, steerq.User)
+			slot.steerQ.Remove(it.ID, steerq.Notice)
 		}
 	}
-	for len(slot.steerQueue) < maxPendingDeliveries {
-		slot.steerQueue = append(slot.steerQueue, steerItem{
-			id: newSteerItemID(), text: "targeted", system: true, child: handle,
-		})
+	for slot.steerQ.Len() < maxPendingDeliveries {
+		slot.queue().Append(steerq.Item{ID: newSteerItemID(), Text: "targeted", Kind: steerq.Reply, Tag: handle})
 	}
 	dropsBefore := hh.m.deliveryDrops
 	_, _ = hh.m.handleMsg(deliveryRequestMsg{sid: child.SessionID, text: "notice at a full targeted queue"})
-	if got := len(slot.steerQueue); got != maxPendingDeliveries {
+	if got := slot.steerQ.Len(); got != maxPendingDeliveries {
 		t.Fatalf("queue length = %d, want %d (no targeted delivery evicted)", got, maxPendingDeliveries)
 	}
 	if hh.m.deliveryDrops != dropsBefore+1 {

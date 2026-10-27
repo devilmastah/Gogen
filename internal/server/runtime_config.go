@@ -114,11 +114,7 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 // reference from the registry builder to a function that ranges over
 // configFields would be a package-initialization cycle.
 func (s *Server) applyContextField(r *config.Config, copy func(next *contextmgr.Settings, r *config.Config)) {
-	for _, id := range s.registry.activeIDs() {
-		rt, ok := s.registry.get(id)
-		if !ok {
-			continue
-		}
+	for _, rt := range s.registry.runtimes() {
 		if rt.agent.Context == nil {
 			continue
 		}
@@ -136,11 +132,7 @@ func (s *Server) applyContextField(r *config.Config, copy func(next *contextmgr.
 // applyPreserveReasoningToAll pushes the preserve_reasoning mode to every
 // live session's OpenAI provider.
 func (s *Server) applyPreserveReasoningToAll(mode string) {
-	for _, id := range s.registry.activeIDs() {
-		rt, ok := s.registry.get(id)
-		if !ok {
-			continue
-		}
+	for _, rt := range s.registry.runtimes() {
 		if p, ok := rt.agent.Provider.(*llm.OpenAIProvider); ok {
 			p.SetPreserveReasoningMode(mode)
 		}

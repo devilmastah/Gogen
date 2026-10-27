@@ -90,6 +90,21 @@ func signalProcess(cmd *exec.Cmd, name string) error {
 	return nil
 }
 
+// controlByteFor maps a keystroke-generated signal to the control byte the
+// terminal driver turns back into that signal. An interactive shell runs each
+// job in its own process group (job control), so SIGINT/SIGTSTP must go through
+// the tty — the driver delivers them to the FOREGROUND group — or the running
+// job never sees them.
+func controlByteFor(name string) (byte, bool) {
+	switch name {
+	case "SIGINT":
+		return 0x03, true // ^C
+	case "SIGTSTP":
+		return 0x1a, true // ^Z
+	}
+	return 0, false
+}
+
 // killProcess kills the child and everything it spawned (process group).
 func killProcess(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {

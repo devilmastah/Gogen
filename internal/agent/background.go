@@ -54,6 +54,10 @@ type BackgroundJob struct {
 	// goroutine's cmd.Wait is closing it.
 	stdin   io.WriteCloser
 	stdinMu sync.Mutex
+	// stdinBusy is closed when an ABANDONED write (its caller cancelled while
+	// the pipe was blocked) finally returns. The next input call waits on it so
+	// two writers never interleave on one stdin pipe.
+	stdinBusy chan struct{}
 	// finishedAt is when the process exited; set under mu before done is
 	// closed. The finished-job cap uses it to reap the oldest finished jobs
 	// first.
@@ -96,7 +100,13 @@ func (a *Agent) StartBackgroundCommand(ctx context.Context, command string) (str
 	}
 	sink := ToolOutputFromContext(ctx)
 	end := ToolOutputEndFromContext(ctx)
-	jobCtx, cancel := context.WithCancel(context.Background())
+	// Detached from the turn (a background job outlives it) but carrying the
+	// turn's VALUES: the command approver lives in the context, and a job whose
+	// context dropped it could never ask the user about a blocked command — the
+	// guard failed closed and refused commands the foreground path would have
+	// offered for approval. WithoutCancel keeps the values and drops the
+	// cancellation/deadline; the job gets its own cancel below.
+	jobCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	job := &BackgroundJob{
 		ID:      newBackgroundJobID(),
 		Command: command,
@@ -107,6 +117,14 @@ func (a *Agent) StartBackgroundCommand(ctx context.Context, command string) (str
 		unread:  newBoundedOutputWriter(defaultBackgroundUnreadCap),
 	}
 	a.bgMu.Lock()
+	if a.bgClosed {
+		// Close already swept its snapshot of the jobs and latched the door:
+		// a job registered now would never be killed, and its reaper would keep
+		// the closed agent reachable for 30 minutes.
+		a.bgMu.Unlock()
+		cancel()
+		return "", fmt.Errorf("session is closing; cannot start a background command")
+	}
 	if a.bgJobs == nil {
 		a.bgJobs = make(map[string]*BackgroundJob)
 	}
@@ -203,7 +221,7 @@ const defaultBackgroundUnreadCap = 64 * 1024
 // loops can poll cheaply without re-reading the whole tail. The write is
 // serialized per job. Input is not a shell command: it goes to the process's
 // stdin, so the command guard deliberately does not apply.
-func (a *Agent) BackgroundJobInput(jobID, input string, appendNewline bool) (string, error) {
+func (a *Agent) BackgroundJobInput(ctx context.Context, jobID, input string, appendNewline bool) (string, error) {
 	if a.terminalJob(jobID) != nil {
 		return "", fmt.Errorf("job %s is a background terminal send; send more input with the terminal tool (action=send) or interrupt it with action=signal", jobID)
 	}
@@ -227,9 +245,50 @@ func (a *Agent) BackgroundJobInput(jobID, input string, appendNewline bool) (str
 	if appendNewline {
 		payload += "\n"
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	job.stdinMu.Lock()
 	defer job.stdinMu.Unlock()
-	n, err := job.stdin.Write([]byte(payload))
+	// A previous call may have been cancelled while its write was still
+	// blocked in the pipe (the child is not reading). Wait for that write
+	// before starting a new one so the pipe never sees two writers.
+	if job.stdinBusy != nil {
+		select {
+		case <-job.stdinBusy:
+			job.stdinBusy = nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	// The write runs in its own goroutine so a cancellation (Esc) can return
+	// instead of hanging until the child happens to read: a job that never
+	// reads stdin fills the pipe (~64 KB) and Write blocks forever.
+	type writeResult struct {
+		n   int
+		err error
+	}
+	done := make(chan writeResult, 1)
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		n, werr := job.stdin.Write([]byte(payload))
+		done <- writeResult{n: n, err: werr}
+	}()
+	var n int
+	var err error
+	select {
+	case res := <-done:
+		n, err = res.n, res.err
+	case <-job.done:
+		return "", fmt.Errorf("background job %s exited while writing to its stdin", jobID)
+	case <-ctx.Done():
+		job.stdinBusy = released
+		return "", ctx.Err()
+	}
 	if err == nil && n < len(payload) {
 		err = io.ErrShortWrite
 	}

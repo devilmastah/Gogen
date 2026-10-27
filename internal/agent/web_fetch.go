@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -34,8 +33,6 @@ const (
 	// body can yield more than 2 MB of text.
 	webFetchOutputLimit = webFetchHardMax
 )
-
-var fetchPrivateRE = regexp.MustCompile(`^127\.|^10\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^192\.168\.|^0\.0\.0\.0$|^::1$|^fe80:`)
 
 // fetchURLValidator is swappable in tests that exercise the fetch/download
 // paths against a local httptest server (the real validator blocks private
@@ -231,23 +228,34 @@ func newSharedFetchClient() *http.Client {
 		ForceAttemptHTTP2: true,
 	}
 	return &http.Client{
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= webFetchMaxRedirects {
-				return fmt.Errorf("too many redirects")
-			}
-			nextURL := req.URL.String()
-			for _, prev := range via {
-				if prev.URL.String() == nextURL {
-					return fmt.Errorf("redirect loop detected: %s", nextURL)
-				}
-			}
-			if isPrivateHost(req.URL.Hostname()) {
-				return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
-			}
-			return nil
-		},
+		Transport:     tr,
+		CheckRedirect: checkFetchRedirect,
 	}
+}
+
+// checkFetchRedirect is the redirect policy for every shared fetch client
+// (web_fetch and download_file both use newSharedFetchClient): max hops, loop
+// detection, private-host blocking, and — for EVERY hop, not just the first
+// URL — the same scheme / HTTPS-only / domain-allowlist policy. Applying the
+// policy only to the initial URL let a permitted https host redirect to plain
+// http or to a domain outside GOGEN_WEB_ALLOWED_DOMAINS.
+func checkFetchRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= webFetchMaxRedirects {
+		return fmt.Errorf("too many redirects")
+	}
+	nextURL := req.URL.String()
+	for _, prev := range via {
+		if prev.URL.String() == nextURL {
+			return fmt.Errorf("redirect loop detected: %s", nextURL)
+		}
+	}
+	if isPrivateHost(req.URL.Hostname()) {
+		return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
+	}
+	if err := validateFetchPolicy(req.URL); err != nil {
+		return fmt.Errorf("redirect to %s refused: %w", req.URL.Redacted(), err)
+	}
+	return nil
 }
 
 // fetchRequest describes a single HTTP fetch operation.
@@ -417,18 +425,25 @@ func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn,
 }
 
 // isPrivateHost reports whether host is a private/internal host that must not
-// be fetched. It is a purely syntactic check: localhost names, the private
-// literal ranges matched by fetchPrivateRE, and IP literals (v4 and v6) that
-// are loopback/private/link-local/unspecified/multicast.
+// be fetched. It is a purely syntactic check: localhost names, and IP literals
+// (v4 and v6) that are loopback/private/link-local/unspecified/multicast.
 //
-// It deliberately does NOT resolve hostnames. Name resolution happens once,
-// with the caller's context, in dialContextPublicOnly: that layer blocks a
-// host whose addresses are all internal and pins the connection to the
-// verified public addresses (defeating DNS rebinding). Resolving here as well
-// would duplicate that lookup with a blocking, context-less net.LookupIP call
-// that can outlive the tool call's own deadline — and it previously mangled
-// IPv6 literals (strings.LastIndex(host, ":") then resolving the bracket), so
-// every IPv6-literal URL was wrongly rejected as private/internal.
+// Hostnames are not classified from their text. A name that merely starts with
+// a private-IP prefix — "10.example.com", "127.example.com",
+// "192.168.example.com", "fe80.example.com" — is an ordinary public hostname.
+// Every hostname is enforced at DIAL time instead by dialContextPublicOnly,
+// which resolves the name with the caller's context, discards the internal
+// addresses, refuses the request when no public address remains, and dials only
+// the verified public IPs. Dialing the checked IPs rather than the name is what
+// closes DNS rebinding, so matching the host's text here added false-positive
+// risk with no security value.
+//
+// For the same reason this function deliberately does NOT resolve hostnames:
+// resolution happens once, with the caller's context, in dialContextPublicOnly.
+// A second lookup here would be a blocking, context-less net.LookupIP call that
+// can outlive the tool call's own deadline — and it previously mangled IPv6
+// literals (strings.LastIndex(host, ":") then resolving the bracket), so every
+// IPv6-literal URL was wrongly rejected as private/internal.
 func isPrivateHost(host string) bool {
 	host = strings.TrimSpace(strings.ToLower(host))
 	if host == "" || host == "localhost" || host == "localhost.localdomain" {
@@ -444,9 +459,6 @@ func isPrivateHost(host string) bool {
 		host = host[1 : len(host)-1]
 	}
 	if host == "" {
-		return true
-	}
-	if fetchPrivateRE.MatchString(host) {
 		return true
 	}
 	// A literal IP (v4 or v6) resolves to itself, so classify it directly
@@ -608,26 +620,36 @@ func validateFetchURL(rawURL string) (*url.URL, error) {
 	if isPrivateHost(u.Hostname()) {
 		return nil, fmt.Errorf("requests to private/internal hosts are blocked: %s", u.Hostname())
 	}
+	if err := validateFetchPolicy(u); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// validateFetchPolicy applies the scheme, HTTPS-only and domain-allowlist rules
+// to an already-parsed URL. It is the SPOT policy half of validateFetchURL,
+// split out so CheckRedirect can re-apply it to every hop — a redirect is a
+// second request the user's configuration was never checked against.
+func validateFetchPolicy(u *url.URL) error {
+	if u == nil {
+		return fmt.Errorf("redirect without a URL")
+	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("web_fetch only supports http/https URLs (got %q)", u.Scheme)
+		return fmt.Errorf("web_fetch only supports http/https URLs (got %q)", u.Scheme)
 	}
 	// Enforce HTTPS-only unless "all" is explicitly configured. Fails closed:
 	// any value other than "all" (normalizeFetchMode clamps unknown ones) blocks http.
 	if webCfg.mode() != "all" && u.Scheme != "https" {
-		return nil, fmt.Errorf("web_fetch requires https (got %s). Set GOGEN_WEB_FETCH_MODE=all for http", u.Scheme)
+		return fmt.Errorf("web_fetch requires https (got %s). Set GOGEN_WEB_FETCH_MODE=all for http", u.Scheme)
 	}
 	if allowedDomains := webCfg.allowedDomains(); len(allowedDomains) > 0 {
-		ok := false
 		host := strings.ToLower(u.Hostname())
 		for _, d := range allowedDomains {
 			if host == d || strings.HasSuffix(host, "."+d) {
-				ok = true
-				break
+				return nil
 			}
 		}
-		if !ok {
-			return nil, fmt.Errorf("domain %q is not in GOGEN_WEB_ALLOWED_DOMAINS", u.Hostname())
-		}
+		return fmt.Errorf("domain %q is not in GOGEN_WEB_ALLOWED_DOMAINS", u.Hostname())
 	}
-	return u, nil
+	return nil
 }

@@ -136,11 +136,15 @@ func TestStreamEventSidGuard(t *testing.T) {
 	m := &Model{lives: newLiveSessions(&agent.Agent{})}
 	m.lives.Add(&agent.Agent{}, "bg")
 
-	t.Run("sid extraction", func(t *testing.T) {
-		if sid, ok := streamEventSid(streamTokenMsg{token: "x", sid: "s2"}); !ok || sid != "s2" {
-			t.Fatalf("got %q %v", sid, ok)
+	t.Run("attribution extraction", func(t *testing.T) {
+		sa, ok := any(streamTokenMsg{token: "x", sid: "s2", seq: 7}).(streamAttributed)
+		if !ok {
+			t.Fatal("stream token must implement streamAttributed")
 		}
-		if _, ok := streamEventSid(tea.WindowSizeMsg{}); ok {
+		if sid, seq := sa.attribution(); sid != "s2" || seq != 7 {
+			t.Fatalf("got %q %d, want s2 7", sid, seq)
+		}
+		if _, ok := any(tea.WindowSizeMsg{}).(streamAttributed); ok {
 			t.Fatal("non-stream msg must report ok=false")
 		}
 	})
@@ -161,7 +165,7 @@ func TestStreamEventSidGuard(t *testing.T) {
 		mod, _ := m.Update(streamStartMsg{sid: "s1"})
 		got := mod.(*Model)
 		_ = got // must not panic / must be processed without drop
-		if _, ok := streamEventSid(streamStartMsg{sid: "s1"}); !ok {
+		if _, ok := any(streamStartMsg{sid: "s1"}).(streamAttributed); !ok {
 			t.Fatal("start should be tagged")
 		}
 	})
@@ -670,10 +674,10 @@ func TestSwitchDuringCompact(t *testing.T) {
 		if !ok {
 			t.Fatal("submit must be consumed while compacting (it queues)")
 		}
-		if q := m.lives.Active().steerQueue; len(q) != 1 || q[0].text != "x" {
+		if q := m.lives.Active().steerQ.Items(); len(q) != 1 || q[0].Text != "x" {
 			t.Fatalf("queue = %v, want the queued text", q)
 		}
-		m.lives.Active().steerQueue = nil
+		m.lives.Active().steerQ = nil
 		// ctrl+c cancels THIS session's compaction.
 		var cancelled bool
 		s1.compactCancel = func() { cancelled = true }
@@ -828,5 +832,45 @@ func TestSessionsModalDeleteConfirms(t *testing.T) {
 	}
 	if m.modal != ModalNone {
 		t.Fatalf("list empty after delete: modal = %v, want ModalNone", m.modal)
+	}
+}
+
+// TestStreamAttributionCoverage pins the classification the Update dispatch
+// relies on (C1): every stream-RENDER message implements streamAttributed, so
+// ownership/staleness/the not-streaming gate are applied to it by construction;
+// the two terminal messages deliberately do NOT, because handleTurnFinishedMsg
+// resolves their session and generation itself and must still finalize a turn
+// whose session lost focus.
+func TestStreamAttributionCoverage(t *testing.T) {
+	render := []tea.Msg{
+		streamStartMsg{},
+		streamRoundStartMsg{},
+		streamTokenMsg{},
+		streamThinkingMsg{},
+		streamStatsMsg{},
+		streamCompactingMsg{},
+		streamStallMsg{},
+		streamRetryMsg{},
+		streamToolCallMsg{},
+		streamToolCallArgsMsg{},
+		streamToolCallFinalMsg{},
+		streamToolExecuteMsg{},
+		streamToolResultMsg{},
+		streamRoundEndMsg{},
+		condensedNoteMsg{},
+	}
+	for _, msg := range render {
+		if _, ok := msg.(streamAttributed); !ok {
+			t.Errorf("%T does not implement streamAttributed; a new stream message must embed streamMeta", msg)
+		}
+	}
+	terminal := []tea.Msg{
+		endOfStream("s1", 1),
+		failOfStream("s1", 1, nil),
+	}
+	for _, msg := range terminal {
+		if _, ok := msg.(streamAttributed); ok {
+			t.Errorf("%T must NOT implement streamAttributed: handleTurnFinishedMsg owns its resolution", msg)
+		}
 	}
 }

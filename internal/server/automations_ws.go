@@ -218,11 +218,9 @@ func (s *Server) automationsDeleteOp(ws *wsConn, op *AutomationsOpRequest) {
 // rather than silence.
 func (s *Server) broadcastAutomationsState() {
 	snap := s.automationsSnapshot()
-	for _, id := range s.registry.activeIDs() {
-		if rt, ok := s.registry.get(id); ok {
-			rt.broadcast(WSMessage{Type: "automations_state", AutomationsState: snap})
-		}
-	}
+	// Server-wide payload: broadcastAll sends it once per socket (a socket
+	// attached to several panes would otherwise get one copy per pane).
+	s.registry.broadcastAll(WSMessage{Type: "automations_state", AutomationsState: snap})
 }
 
 // formatAutomationsTime renders an optional timestamp for notices ("" when

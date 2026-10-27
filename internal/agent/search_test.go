@@ -86,13 +86,16 @@ func TestSearchCodeMatchesIgnoreCase(t *testing.T) {
 // root search on Windows, and parseRgMatches must normalize them to the same
 // forward-slash workspace-relative paths the Go fallback emits — otherwise
 // search results (and consumers like find-definition) see OS-specific paths.
+// The leading "./" is dropped too: a root search prints it on every OS, and
+// the Go fallback never does, so keeping it made the two engines disagree
+// about the same file (and broke path comparisons in impact analysis).
 // The input is built with the platform's native separator so the test
 // exercises the real rg shape on every OS (on Unix the path passes through
-// unchanged; on Windows it must be converted).
+// otherwise unchanged; on Windows the separators must be converted).
 func TestParseRgMatchesNormalizesWindowsPaths(t *testing.T) {
 	in := filepath.FromSlash("./internal/target.go") + ":3:var TargetNeedle = 2"
 	got := parseRgMatches(in, "")
-	want := []SearchMatch{{Path: filepath.ToSlash(filepath.FromSlash("./internal/target.go")), Line: 3, Text: "var TargetNeedle = 2"}}
+	want := []SearchMatch{{Path: "internal/target.go", Line: 3, Text: "var TargetNeedle = 2"}}
 	if len(got) != 1 || got[0] != want[0] {
 		t.Fatalf("parseRgMatches = %+v, want %+v", got, want)
 	}
@@ -808,5 +811,28 @@ func TestCompileSearchPatternIgnoreCase(t *testing.T) {
 	}
 	if sens.String() == insens.String() {
 		t.Fatal("sensitive and insensitive compiles must be distinct cache entries")
+	}
+}
+
+// TestRGAvailableFollowsPath pins the memo: the ripgrep probe is cached per PATH
+// value, so a PATH change (a test, or rg installed mid-session) is still seen.
+func TestRGAvailableFollowsPath(t *testing.T) {
+	dir := t.TempDir()
+	rg := filepath.Join(dir, "rg")
+	if err := os.WriteFile(rg, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", dir)
+	if !rgAvailable() {
+		t.Fatal("rg on PATH not detected")
+	}
+	t.Setenv("PATH", t.TempDir()) // no rg here
+	if rgAvailable() {
+		t.Fatal("rg reported present after PATH changed to a dir without it")
+	}
+	t.Setenv("PATH", dir)
+	if !rgAvailable() {
+		t.Fatal("rg not re-detected after PATH was restored")
 	}
 }

@@ -156,47 +156,63 @@ func (e *Executor) callGraphWithAST(ctx context.Context, searchRoot, relPrefix, 
 func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix, glob, symbol string, skips *walkSkips) (*CallGraphResult, error) {
 	result := &CallGraphResult{Symbol: symbol, Method: "text"}
 
-	// Search for call sites of the symbol → these are the Callers.
+	// ONE walk feeds both halves of the text fallback. This used to call
+	// walkSymbolReferencesText twice — once for the call-site pattern
+	// (→ Callers) and once for the definition pattern (→ Callees) — so every
+	// file was read, split and regex-scanned twice per call_graph call. Both
+	// patterns are compiled once here (as walkSymbolReferencesText does) and
+	// applied to each file's lines in a single pass; the two lists are still
+	// filled independently, so their contents AND order are unchanged (walk
+	// order is the same, and within a file both append in line order).
 	callPattern := `\b` + regexp.QuoteMeta(symbol) + `\s*\(`
-	err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, callPattern, skips,
-		func(filePath string, lineNum int, line string) error {
-			if !isCallSite(line, symbol) {
-				return nil
-			}
-			result.Callers = append(result.Callers, FunctionRef{
-				Name: symbol,
-				File: filePath,
-				Line: lineNum,
-			})
-			return nil
-		})
+	callRe, err := compileSearchPattern(callPattern, false)
+	if err != nil {
+		return nil, err
+	}
+	// The definition pattern is a recall filter built from the shared keyword
+	// table (includes Go methods with receivers); isDefinitionLine gates the
+	// matches so this agrees with the caller-detection path.
+	defRe, err := compileSearchPattern(definitionSearchPattern(symbol, "func"), false)
 	if err != nil {
 		return nil, err
 	}
 
-	// Search for the function definition and extract callees from its body.
-	// The pattern is a recall filter built from the shared keyword table
-	// (includes Go methods with receivers); the callback gates matches with
-	// isDefinitionLine so this agrees with the caller-detection path.
-	defPattern := definitionSearchPattern(symbol, "func")
-	if err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, defPattern, skips,
-		func(filePath string, lineNum int, line string) error {
-			if !isDefinitionLine(line, symbol) {
-				return nil
-			}
-			// Found the definition at lineNum. Extract callees from the definition line
-			// and surrounding context. We use a best-effort approach here since we
-			// don't have the full file content in this callback.
-			callees := extractCalleesFromLine(line, symbol)
-			for _, c := range callees {
-				result.Callees = append(result.Callees, FunctionRef{
-					Name: c,
-					File: filePath,
-					Line: lineNum,
-				})
+	err = e.walkReadableFiles(ctx, searchRoot, relPrefix, glob, skips, false,
+		func(path, rel string, content []byte) error {
+			lines := strings.Split(string(content), "\n")
+			for i, line := range lines {
+				// Exact pre-filter: both patterns embed the symbol literally
+				// (regexp.QuoteMeta), so a line without that text can match
+				// neither. Skipping the regexes on the other ~99% of lines is
+				// what makes the single pass pay — the two regex scans, not
+				// the read/split, dominate the walk.
+				if !strings.Contains(line, symbol) {
+					continue
+				}
+				lineNum := i + 1
+				// Call sites of the symbol → these are the Callers.
+				if callRe.MatchString(line) && isCallSite(line, symbol) {
+					result.Callers = append(result.Callers, FunctionRef{
+						Name: symbol,
+						File: rel,
+						Line: lineNum,
+					})
+				}
+				// The definition line → extract callees from it. Best-effort:
+				// the callback has only the line, not the function body.
+				if defRe.MatchString(line) && isDefinitionLine(line, symbol) {
+					for _, c := range extractCalleesFromLine(line, symbol) {
+						result.Callees = append(result.Callees, FunctionRef{
+							Name: c,
+							File: rel,
+							Line: lineNum,
+						})
+					}
+				}
 			}
 			return nil
-		}); err != nil {
+		})
+	if err != nil {
 		return nil, err
 	}
 

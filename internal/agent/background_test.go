@@ -443,7 +443,7 @@ func TestBackgroundJobInputEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	out, err := a.BackgroundJobInput(id, "hello", true)
+	out, err := a.BackgroundJobInput(context.Background(), id, "hello", true)
 	if err != nil {
 		t.Fatalf("input: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestBackgroundJobInputAppendNewline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if _, err := a.BackgroundJobInput(id, "Z", false); err != nil {
+	if _, err := a.BackgroundJobInput(context.Background(), id, "Z", false); err != nil {
 		t.Fatalf("input: %v", err)
 	}
 	// Without a trailing newline the read must stay blocked: the job is
@@ -498,7 +498,7 @@ func TestBackgroundJobInputAppendNewline(t *testing.T) {
 	}
 	// The next input carries the newline: the same read completes with both
 	// payloads ("Z" + "Y\n" → "got:ZY").
-	if _, err := a.BackgroundJobInput(id, "Y", true); err != nil {
+	if _, err := a.BackgroundJobInput(context.Background(), id, "Y", true); err != nil {
 		t.Fatalf("input 2: %v", err)
 	}
 	for time.Now().Before(deadline) {
@@ -542,7 +542,7 @@ func TestBackgroundJobInputDelta(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	delta1, err := a.BackgroundJobInput(id, "x", false)
+	delta1, err := a.BackgroundJobInput(context.Background(), id, "x", false)
 	if err != nil {
 		t.Fatalf("input 1: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestBackgroundJobInputDelta(t *testing.T) {
 		t.Fatalf("first delta = %q, want the marker (output since job start)", delta1)
 	}
 
-	delta2, err := a.BackgroundJobInput(id, "y", false)
+	delta2, err := a.BackgroundJobInput(context.Background(), id, "y", false)
 	if err != nil {
 		t.Fatalf("input 2: %v", err)
 	}
@@ -581,7 +581,7 @@ func TestBackgroundJobInputFinished(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := a.BackgroundJobInput(id, "x", false); err == nil || !strings.Contains(err.Error(), "already finished") {
+	if _, err := a.BackgroundJobInput(context.Background(), id, "x", false); err == nil || !strings.Contains(err.Error(), "already finished") {
 		t.Fatalf("expected already-finished error, got %v", err)
 	}
 }
@@ -596,7 +596,7 @@ func TestBackgroundJobInputOversized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if _, err := a.BackgroundJobInput(id, strings.Repeat("x", maxBackgroundInputBytes+1), false); err == nil || !strings.Contains(err.Error(), "at most") {
+	if _, err := a.BackgroundJobInput(context.Background(), id, strings.Repeat("x", maxBackgroundInputBytes+1), false); err == nil || !strings.Contains(err.Error(), "at most") {
 		t.Fatalf("expected size-cap error, got %v", err)
 	}
 }
@@ -635,7 +635,7 @@ func TestBackgroundJobInputStdinClosed(t *testing.T) {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		_, err := a.BackgroundJobInput(id, "x", false)
+		_, err := a.BackgroundJobInput(context.Background(), id, "x", false)
 		if err != nil && strings.Contains(err.Error(), "closed its stdin") {
 			return
 		}
@@ -655,7 +655,7 @@ func TestBackgroundJobInputUnknown(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	if _, err := a.BackgroundJobInput("job-nope", "x", false); err == nil || !strings.Contains(err.Error(), "unknown background job") {
+	if _, err := a.BackgroundJobInput(context.Background(), "job-nope", "x", false); err == nil || !strings.Contains(err.Error(), "unknown background job") {
 		t.Fatalf("expected unknown-job error, got %v", err)
 	}
 }

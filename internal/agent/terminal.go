@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -160,20 +159,30 @@ func (a *Agent) closeTerminals() {
 
 // resolveTerminalDir resolves an optional terminal working directory against
 // the session working dir; an empty dir means the session working dir.
-func (a *Agent) resolveTerminalDir(dir string) string {
+//
+// A supplied dir goes through SecurePath like every other agent path: it must
+// stay inside the executor's boundary and its symlinks are resolved. Accepting
+// a bare absolute path (or one containing "..") let the tool open a shell
+// outside the workspace — an escape from the file boundary and a second route
+// around the command sandbox.
+func (a *Agent) resolveTerminalDir(dir string) (string, error) {
 	base := a.Executor.GetWorkingDir()
-	if dir == "" {
-		return base
+	if strings.TrimSpace(dir) == "" {
+		return base, nil
 	}
-	if !filepath.IsAbs(dir) {
-		return filepath.Join(base, dir)
+	secure, err := a.Executor.SecurePath(dir)
+	if err != nil {
+		return "", err
 	}
-	return dir
+	return secure, nil
 }
 
 // openTerminal starts a PTY session and registers it under a fresh id.
 func (a *Agent) openTerminal(name, dir, shell string) (*terminalSession, error) {
-	wd := a.resolveTerminalDir(dir)
+	wd, err := a.resolveTerminalDir(dir)
+	if err != nil {
+		return nil, err
+	}
 	sess, err := pty.Start(pty.Options{
 		Shell: shell,
 		Dir:   wd,
@@ -321,6 +330,14 @@ func renderTerminalDelta(res pty.SendResult) string {
 }
 
 func handleTerminalOpen(_ context.Context, a *Agent, args map[string]any) (string, error) {
+	if a.Executor == nil {
+		return "", fmt.Errorf("no executor configured")
+	}
+	// The terminal is a raw shell: with a sandbox configured it would run
+	// outside the sandbox, so refuse it exactly like bash_persistent does.
+	if mode := strings.ToLower(strings.TrimSpace(a.Executor.sandbox())); mode != "" && mode != "off" {
+		return "", fmt.Errorf("terminal is not supported with command_sandbox=%s; use execute_command", mode)
+	}
 	name, err := stringArgOptional(args, "name")
 	if err != nil {
 		return "", err
@@ -345,7 +362,7 @@ func handleTerminalOpen(_ context.Context, a *Agent, args map[string]any) (strin
 		label, ts.Dir, ts.Session.PID(), ts.Session.Title(), ts.ID), nil
 }
 
-func handleTerminalSend(_ context.Context, a *Agent, args map[string]any) (string, error) {
+func handleTerminalSend(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	id, err := stringArg(args, "session_id")
 	if err != nil {
 		return "", err
@@ -365,6 +382,19 @@ func handleTerminalSend(_ context.Context, a *Agent, args map[string]any) (strin
 	timeout, err := terminalSendTimeout(args)
 	if err != nil {
 		return "", err
+	}
+	// Submitted input is a shell command line, so it goes through the same
+	// guard bash_persistent applies — otherwise a command the guard blocks
+	// (and execute_command therefore refuses) could simply be typed into the
+	// terminal instead. Raw keystrokes (submit=false, e.g. a REPL or editor)
+	// are not command lines and are left alone.
+	if submit {
+		if a.Executor == nil {
+			return "", fmt.Errorf("no executor configured")
+		}
+		if err := a.Executor.enforceCommandGuard(ctx, text); err != nil {
+			return "", err
+		}
 	}
 	ts := a.terminalByID(id)
 	if ts == nil {

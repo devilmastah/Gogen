@@ -22,6 +22,10 @@ type fakeMCPRegistry struct {
 
 func (f *fakeMCPRegistry) Definitions() []llm.Tool        { return f.defs }
 func (f *fakeMCPRegistry) ToolNames() map[string]struct{} { return f.names }
+func (f *fakeMCPRegistry) HasTool(name string) bool {
+	_, ok := f.names[name]
+	return ok
+}
 func (f *fakeMCPRegistry) CallTool(context.Context, string, map[string]any) (string, error) {
 	return "", nil
 }

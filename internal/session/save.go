@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"slices"
@@ -67,11 +68,24 @@ func (s *Store) setCreatedCache(id string, created time.Time) {
 // the shared metadata (createdCache, saveCount, index.json) is mutated, in two
 // short critical sections that bracket the unlocked write.
 func (s *Store) Save(id string, snap SessionSnapshot) error {
+	_, err := s.SaveSized(id, snap)
+	return err
+}
+
+// SaveSized is Save plus the size of the payload written, so the agent can
+// decide when a delta has grown enough to be folded into a full snapshot (see
+// Agent.doPersist) without a second stat or a full serialization.
+//
+// The payload is STREAMED through the atomic writer instead of being marshaled
+// into one []byte first: a full snapshot of a large session was a second full
+// copy of the whole history on the heap, on top of the copy the agent already
+// took under its lock.
+func (s *Store) SaveSized(id string, snap SessionSnapshot) (int64, error) {
 	if !s.enabled || id == "" {
-		return nil
+		return 0, nil
 	}
 	if err := validateSessionID(id); err != nil {
-		return err
+		return 0, err
 	}
 
 	// First critical section: resolve the paths and the immutable Created
@@ -84,11 +98,11 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 	path := s.path(snap.WorkingDir, id)
 	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
 		s.mu.Unlock()
-		return err
+		return 0, err
 	}
 	if s.skipEmptySave(id, snap, path) {
 		s.mu.Unlock()
-		return nil
+		return 0, nil
 	}
 	created := s.recoverCreated(id, path, snap.WorkingDir)
 	s.mu.Unlock()
@@ -101,7 +115,7 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 		savePayloadHook()
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return 0, err
 	}
 	out := file{
 		Version:         version,
@@ -125,12 +139,9 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 		SubagentStatus:  snap.SubagentStatus,
 		SubagentSummary: snap.SubagentSummary,
 	}
-	data, err := json.Marshal(out)
+	n, err := s.writeSnapshot(path, out)
 	if err != nil {
-		return err
-	}
-	if err := ioutil.WriteFileAtomicNoSync(path, data, 0o600); err != nil {
-		return err
+		return 0, err
 	}
 
 	// Second critical section: publish the write to the shared metadata.
@@ -177,7 +188,39 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 	if s.autoPrune && s.saveCount%3 == 0 {
 		s.prune(snap.WorkingDir, id)
 	}
-	return nil
+	return n, nil
+}
+
+// writeSnapshot streams the encoded snapshot through the atomic writer and
+// returns the number of payload bytes written. Encoding straight to the temp
+// file avoids materializing the whole session as a second []byte on the heap;
+// the rename still makes the publish atomic for readers.
+func (s *Store) writeSnapshot(path string, out file) (int64, error) {
+	w, err := ioutil.NewAtomicWriterNoSync(path, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	cw := &countingWriter{w: w}
+	if err := json.NewEncoder(cw).Encode(out); err != nil {
+		w.Abort()
+		return 0, err
+	}
+	if err := w.Commit(); err != nil {
+		return 0, err
+	}
+	return cw.n, nil
+}
+
+// countingWriter counts the bytes written through to w.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // skipEmptySave reports whether a session with no content should not be

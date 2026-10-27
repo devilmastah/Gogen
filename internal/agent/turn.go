@@ -267,15 +267,24 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 			return toolRoundStopped, res
 		}
 		if ctx.Err() != nil {
+			// A call that returned nil error ran to completion BEFORE the
+			// cancellation: write_file/git_commit already happened, so the
+			// real result is delivered (mirroring the parallel path below).
+			// Rewriting it as "cancelled" made the model redo or undo work
+			// that had already succeeded.
 			// errors.Is, not ==: a tool that wraps the cancellation
 			// (fmt.Errorf("...: %w", ctx.Err())) must still read as
 			// cancelled, not as a real error.
-			if errTool != nil && !errors.Is(errTool, context.Canceled) {
-				res = formatToolError(res, errTool)
+			if errTool == nil {
+				a.deliverToolResult(h, tc, res, true)
 			} else {
-				res = toolCanceledMsg
+				if !errors.Is(errTool, context.Canceled) {
+					res = formatToolError(res, errTool)
+				} else {
+					res = toolCanceledMsg
+				}
+				a.deliverToolResult(h, tc, res, false)
 			}
-			a.deliverToolResult(h, tc, res, false)
 			a.appendCanceledToolResults(toolCalls[i+1:])
 			a.appendRoundImages(sinks)
 			finishStreamUI(h)
@@ -337,6 +346,38 @@ func (a *Agent) stabilizeToolArgs() {
 		a.Messages[i].ArgsStabilized = true
 	}
 }
+
+// appendAssistant appends the round's assistant message and publishes it.
+// It is the single append site for the turn loop's four exits, so they cannot
+// drift field by field: the two smart-compact exits used to drop Refusal,
+// persisting an empty assistant message and throwing away the model's
+// decline when a refusing round also tripped the compact budget.
+//
+// content overrides result.Content when non-empty (the smart-compact halt
+// path substitutes its own message); toolCalls is non-nil only for the
+// tool-call round, whose calls were stabilized by the caller — declaring
+// ArgsStabilized there keeps stabilizeToolArgs from re-validating every
+// argument buffer on each later round.
+//
+// Callers flush the session themselves: the tool-call round deliberately
+// persists after the tools have run (persistSession), not here.
+func (a *Agent) appendAssistant(h *llm.StreamHandlers, result *llm.StreamResult, content string, toolCalls []llm.ToolCall) {
+	if content == "" {
+		content = result.Content
+	}
+	a.appendMessage(llm.Message{
+		Role:           "assistant",
+		Content:        content,
+		Reasoning:      result.Reasoning,
+		Refusal:        result.Refusal,
+		ToolCalls:      toolCalls,
+		CreatedAt:      time.Now().Truncate(time.Millisecond),
+		Model:          result.Model,
+		ArgsStabilized: toolCalls != nil,
+	})
+	a.notifyMessageAppended(h, "assistant")
+}
+
 func formatToolError(result string, err error) string {
 	if result == "" {
 		return fmt.Sprintf("Error: %v", err)
@@ -464,14 +505,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			if h.OnRecoverPartialStream != nil {
 				h.OnRecoverPartialStream()
 			}
-			a.appendMessage(llm.Message{
-				Role:      "assistant",
-				Content:   result.Content,
-				Reasoning: result.Reasoning,
-				CreatedAt: time.Now().Truncate(time.Millisecond),
-				Model:     result.Model,
-			})
-			a.notifyMessageAppended(h, "assistant")
+			a.appendAssistant(h, result, "", nil)
 			a.FlushSession()
 			continue
 		case smartCompactHalt:
@@ -481,14 +515,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			if msg == "" {
 				msg = a.smartCompactHaltMessage()
 			}
-			a.appendMessage(llm.Message{
-				Role:      "assistant",
-				Content:   msg,
-				Reasoning: result.Reasoning,
-				CreatedAt: time.Now().Truncate(time.Millisecond),
-				Model:     result.Model,
-			})
-			a.notifyMessageAppended(h, "assistant")
+			a.appendAssistant(h, result, msg, nil)
 			a.FlushSession()
 			return msg, nil
 		}
@@ -527,15 +554,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 				}
 				return "", fmt.Errorf("model returned no output (finish_reason=%q; response was truncated mid-reasoning); please try again", result.FinishReason)
 			}
-			a.appendMessage(llm.Message{
-				Role:      "assistant",
-				Content:   result.Content,
-				Reasoning: result.Reasoning,
-				Refusal:   result.Refusal,
-				CreatedAt: time.Now().Truncate(time.Millisecond),
-				Model:     result.Model,
-			})
-			a.notifyMessageAppended(h, "assistant")
+			a.appendAssistant(h, result, "", nil)
 			a.FlushSession()
 			if result.Content != "" {
 				return result.Content, nil
@@ -563,16 +582,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			llm.StabilizeToolCallArgs(&result.ToolCalls[i])
 		}
 
-		a.appendMessage(llm.Message{
-			Role:      "assistant",
-			Content:   result.Content,
-			Reasoning: result.Reasoning,
-			Refusal:   result.Refusal,
-			ToolCalls: result.ToolCalls,
-			CreatedAt: time.Now().Truncate(time.Millisecond),
-			Model:     result.Model,
-		})
-		a.notifyMessageAppended(h, "assistant")
+		a.appendAssistant(h, result, "", result.ToolCalls)
 
 		switch outcome, stopMsg := a.runToolRound(ctx, h, result.ToolCalls); outcome {
 		case toolRoundStopped:
@@ -751,9 +761,9 @@ func (a *Agent) RepairOrphanToolCalls() bool {
 			// This assistant message is itself a non-tool message, so the
 			// tool-result run it just consumed does not apply to any earlier
 			// assistant tool-call message (the old forward scan broke on it).
-			seen = make(map[string]struct{})
+			clear(seen)
 		default:
-			seen = make(map[string]struct{})
+			clear(seen)
 		}
 	}
 	return modified

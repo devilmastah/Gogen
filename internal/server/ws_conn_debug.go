@@ -20,7 +20,7 @@ import (
 //
 //	GOGEN_WS_SENDQ_SIZE         override wsSendQueueSize (default 4096). A
 //	                            tiny queue under a stalling writer overflows
-//	                            quickly, so enqueueJSON's 5s timeout fires
+//	                            quickly, so wsEnqueueWait's timeout fires
 //	                            and broadcast detaches the socket — the
 //	                            "stops mid-turn" candidate (DEBUG_PLAN.md C).
 //	GOGEN_WS_STALL_MS           sleep this long before every data write once

@@ -73,6 +73,14 @@ func mergeToolCallDelta(
 			tcIndexMap[tcIdx] = len(tcAccums)
 			return appendToolCallAccum(tcAccums, tcIdx, tc)
 		}
+		// A changed NAME is the same signal even when the server sends no ID:
+		// folding it into the prior accumulator overwrote the name and threw
+		// the second call's arguments away as a "replay" of the first, so the
+		// model saw one call where it made two.
+		if tc.Function.Name != "" && tcAccums[mapIdx].Name != "" && tc.Function.Name != tcAccums[mapIdx].Name {
+			tcIndexMap[tcIdx] = len(tcAccums)
+			return appendToolCallAccum(tcAccums, tcIdx, tc)
+		}
 		return applyToolCallDelta(tcAccums, mapIdx, tc)
 	}
 

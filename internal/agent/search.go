@@ -181,7 +181,7 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 		return out + skips.footer(), nil
 	}
 
-	if _, err := exec.LookPath("rg"); err == nil {
+	if rgAvailable() {
 		out, rgErr := e.searchWithRipgrep(ctx, searchRoot, relPrefix, pattern, glob, contextLines, ignoreCase)
 		if rgErr == nil {
 			return out + skips.footer(), nil
@@ -478,8 +478,10 @@ func parseRgMatches(text, relPrefix string) []SearchMatch {
 		// Normalize to forward slashes on every platform: rg prints
 		// backslash paths on Windows for a root search (e.g.
 		// ".\internal\target.go"), while the Go fallback always emits
-		// workspace-relative slash paths.
-		path = filepath.ToSlash(path)
+		// workspace-relative slash paths. The leading "./" goes too: a root
+		// search prints every path with it, which made rg paths differ from
+		// the walker's ("app/main.go") for the same file.
+		path = strings.TrimPrefix(filepath.ToSlash(path), "./")
 		if relPrefix != "" {
 			path = filepath.ToSlash(filepath.Join(relPrefix, path))
 		}
@@ -525,12 +527,35 @@ func splitSearchMatchLine(line string) (path string, lineNum int, content string
 	return file, n, rest, true
 }
 
+// rgAvailable reports whether ripgrep is on PATH, memoized per PATH value: it
+// is consulted once per search (twice in the structured path) and a PATH
+// lookup each time is a needless pair of syscalls. Keying on the PATH string
+// keeps a test that swaps PATH — or a user installing rg mid-session — exact.
+var rgAvail struct {
+	mu    sync.Mutex
+	path  string
+	found bool
+	valid bool
+}
+
+func rgAvailable() bool {
+	path := os.Getenv("PATH")
+	rgAvail.mu.Lock()
+	defer rgAvail.mu.Unlock()
+	if rgAvail.valid && rgAvail.path == path {
+		return rgAvail.found
+	}
+	_, err := exec.LookPath("rg")
+	rgAvail.path, rgAvail.found, rgAvail.valid = path, err == nil, true
+	return rgAvail.found
+}
+
 // searchStructured runs the search through ripgrep when available, else the
 // Go fallback, and returns structured matches (context_lines=0 semantics).
 // engine is "rg" or "go" so callers can reproduce the per-engine output
 // footer SearchCode shows.
 func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool, skips *walkSkips) (matches []SearchMatch, truncated bool, engine string, err error) {
-	if _, err := exec.LookPath("rg"); err == nil {
+	if rgAvailable() {
 		ms, trunc, rgErr := e.searchWithRipgrepMatches(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase)
 		if rgErr == nil {
 			return ms, trunc, "rg", nil
@@ -896,14 +921,23 @@ func openSearchableFile(path string) (reader io.Reader, closer io.Closer, binary
 }
 
 // searchableWalkFile reports whether a walked file is worth reading: the
-// stat succeeded and the file is within the search size cap. The binary
-// probe is deferred to the read (openSearchableFile) so each file is opened
-// exactly once; walkers silently skip files that fail this check.
+// stat succeeded, the entry is a REGULAR file, and it is within the search
+// size cap. The binary probe is deferred to the read (openSearchableFile) so
+// each file is opened exactly once; walkers silently skip files that fail this
+// check.
+//
+// The regular-file requirement is the symlink containment: filepath.WalkDir
+// lstats, so a symlink entry carries its own (tiny) size and the link target
+// is never inspected. Without this check every reader followed it, so a link
+// inside the workspace made the agent read outside the boundary (os.ReadFile
+// on "x.go -> ~/.ssh/config"), block forever on a device ("x.go -> /dev/zero"
+// grows until the process dies), and replace/rename turned the link into a
+// copy of its target. Devices, FIFOs and sockets fail the same test.
 func searchableWalkFile(path string, info os.FileInfo, err error) bool {
 	if err != nil || info == nil || info.Size() > searchMaxFileBytes {
 		return false
 	}
-	return true
+	return info.Mode().IsRegular()
 }
 
 // compactSearchOutput rewrites lines of the form "filepath:line:content" or

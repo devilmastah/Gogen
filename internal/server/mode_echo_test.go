@@ -47,3 +47,36 @@ func TestSetModeBroadcastsToOtherAttachedClients(t *testing.T) {
 		return m.Type == "config" && m.SessionID == sid && m.Mode == "plan"
 	})
 }
+
+// TestChatModeCommandBroadcastsToOtherAttachedClients pins the other half of
+// the mode-convergence contract: the same mode change TYPED INTO THE CHAT
+// ("/plan", "mode plan") used to echo only to the acting connection, while the
+// picker handler above broadcast — so a second tab kept rendering the old mode
+// after an identical change made a different way. Both paths now finish
+// through echoConfigReply, which broadcasts.
+func TestChatModeCommandBroadcastsToOtherAttachedClients(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn1 := dialWS(t, srv, "/ws")
+	drainHandshake(t, conn1)
+	sid := a.SessionID
+
+	conn2 := dialWS(t, srv, "/ws")
+	drainHandshake(t, conn2)
+
+	// A chat command (not the picker): the handler holds the turn, applies
+	// the mode, releases, and echoes off the read loop.
+	if err := conn1.WriteJSON(WSMessage{Type: "message", Content: "/plan", SessionID: sid}); err != nil {
+		t.Fatalf("send /plan: %v", err)
+	}
+	readUntil(t, conn1, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "config" && m.SessionID == sid && m.Mode == "plan"
+	})
+	readUntil(t, conn2, 2*time.Second, func(m WSMessage) bool {
+		return m.Type == "config" && m.SessionID == sid && m.Mode == "plan"
+	})
+}

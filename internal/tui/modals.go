@@ -116,7 +116,7 @@ func (m *Model) renderLiveSessionsModal() string {
 		if i == m.liveCursor {
 			cursor = ">"
 		}
-		line := cursor + marker + " " + padVisible(s.label, 12) + " " + padVisible("("+s.id+")", 14) + " " + state
+		line := cursor + marker + " " + padCells(s.label, 12) + " " + padCells("("+s.id+")", 14) + " " + state
 		rows = append(rows, styleLine{text: line, highlight: i == m.liveCursor})
 	}
 	rows = append(rows, styleLine{text: "", highlight: false},
@@ -457,6 +457,34 @@ func (m *Model) dismissApproval(approved bool) {
 	m.modalBeforeApproval = ModalNone
 }
 
+// clampCursorTo clamps a list cursor into [0, total-1], and to 0 for an empty
+// list (so every consumer can test the cursor without a separate empty check).
+func clampCursorTo(cursor, total int) int {
+	return clamp(cursor, 0, max(0, total-1))
+}
+
+// visibleWindow returns the [start,end) slice of a total-entry list that keeps
+// cursor centered, so a scrolling modal moves the list by whole windows instead
+// of sliding it under the cursor. The cursor must already be inside the list
+// (see clampCursorTo); maxVisible is the caller's own row budget, since the
+// modals reserve different amounts for their headers and footers.
+func visibleWindow(cursor, total, maxVisible int) (start, end int) {
+	if total > maxVisible {
+		start = cursor - maxVisible/2
+		if start < 0 {
+			start = 0
+		}
+		if start > total-maxVisible {
+			start = total - maxVisible
+		}
+	}
+	end = start + maxVisible
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
 // --- Sessions Modal ---
 
 func (m *Model) renderSessionsModal() string {
@@ -474,29 +502,9 @@ func (m *Model) renderSessionsModal() string {
 	reserved := 13 // border(2) + title(2) + footer(4) + top/bottom margin(5)
 	maxVisible := max(3, m.height-reserved)
 
-	// Clamp cursor.
-	if m.sessionCursor >= len(m.sessionList) {
-		m.sessionCursor = len(m.sessionList) - 1
-	}
-	if m.sessionCursor < 0 {
-		m.sessionCursor = 0
-	}
-
-	// Compute scroll window so cursor stays visible.
-	start := 0
-	if len(m.sessionList) > maxVisible {
-		start = m.sessionCursor - maxVisible/2
-		if start < 0 {
-			start = 0
-		}
-		if start > len(m.sessionList)-maxVisible {
-			start = len(m.sessionList) - maxVisible
-		}
-	}
-	end := start + maxVisible
-	if end > len(m.sessionList) {
-		end = len(m.sessionList)
-	}
+	// Clamp cursor, then compute the scroll window that keeps it visible.
+	m.sessionCursor = clampCursorTo(m.sessionCursor, len(m.sessionList))
+	start, end := visibleWindow(m.sessionCursor, len(m.sessionList), maxVisible)
 
 	var rows []styleLine
 
@@ -594,17 +602,6 @@ type styleLine struct {
 	text      string
 	highlight bool // if true, apply ansiHighlightOn; if false, ansiDimOn
 	preStyled bool // if true, text already contains ANSI; don't add prefix
-}
-
-// padVisible pads s with trailing spaces to n VISIBLE cells (ANSI-aware).
-// fmt's %-Ns width counts escape runes (and miscounts wide runes), so
-// padding a styled string with it never applied and the columns it was
-// used on rendered ragged.
-func padVisible(s string, n int) string {
-	if w := cellWidth(s); w < n {
-		return s + strings.Repeat(" ", n-w)
-	}
-	return s
 }
 
 // renderBorderedModal draws a plain border box around styled text lines,
@@ -783,29 +780,9 @@ func (m *Model) modelsModalContent() ([]styleLine, map[int]int) {
 	reserved := 15 // border(2) + title(1) + thinking(2) + footer(2) + margins(5) + slack(3)
 	maxVisible := max(3, m.height-reserved)
 
-	// Clamp cursor.
-	if m.modelCursor >= len(m.modelList) {
-		m.modelCursor = len(m.modelList) - 1
-	}
-	if m.modelCursor < 0 {
-		m.modelCursor = 0
-	}
-
-	// Compute scroll window so cursor stays visible.
-	start := 0
-	if len(m.modelList) > maxVisible {
-		start = m.modelCursor - maxVisible/2
-		if start < 0 {
-			start = 0
-		}
-		if start > len(m.modelList)-maxVisible {
-			start = len(m.modelList) - maxVisible
-		}
-	}
-	end := start + maxVisible
-	if end > len(m.modelList) {
-		end = len(m.modelList)
-	}
+	// Clamp cursor, then compute the scroll window that keeps it visible.
+	m.modelCursor = clampCursorTo(m.modelCursor, len(m.modelList))
+	start, end := visibleWindow(m.modelCursor, len(m.modelList), maxVisible)
 
 	// Overflow indicator (top)
 	if start > 0 {
@@ -1315,12 +1292,13 @@ func (m *Model) renderHelpModal() string {
 		for _, bind := range sec.binds {
 			key := bind[0]
 			desc := bind[1]
-			// Pre-style: cyan key, plain desc, 24-char key column —
-			// padded by VISIBLE width (%-24s measures the escape runes,
+			// Pre-style: cyan key, plain desc, 24-CELL key column — padded
+			// and truncated by visible width (%-24s measures the escape runes,
 			// so with colors on the pad never applied and the description
-			// column started right after the key).
+			// column started right after the key; it also counts a wide rune
+			// as one cell, so a key holding one would push the description).
 			keyCol := ansiCyanOn + key + ansiReset
-			line := "  " + padVisible(keyCol, 24) + " " + desc
+			line := "  " + padCells(keyCol, 24) + " " + desc
 			rows = append(rows, styleLine{text: line, preStyled: true})
 		}
 		rows = append(rows, styleLine{text: "", highlight: false})

@@ -10,9 +10,10 @@ import (
 // full rebuild relies on: the viewport receives the per-line wrap flatten
 // directly (no join→split round-trip), the incremental prefix is a slice of
 // that flatten instead of a second wrap pass, prefixLines+lastWrapped
-// reassemble wrappedContent, and the aliased prefixLines survive the
-// streaming append funnel (appendChatLine writes the old last line's wrap
-// into the shared backing array before buildFromPrefix republishes).
+// reassemble exactly the viewport rows (the viewport is the ONLY rendered
+// copy now), and the aliased prefixLines survive the streaming append funnel
+// (appendChatLine writes the old last line's rows into the shared backing array
+// before buildFromPrefix republishes).
 func TestSetViewportContentSinglePassParity(t *testing.T) {
 	m := dragModel(t)
 	m.sidebarVisible = false
@@ -47,8 +48,8 @@ func TestSetViewportContentSinglePassParity(t *testing.T) {
 	if !slices.Equal(m.prefixLines, wantPrefix) {
 		t.Fatalf("prefixLines != chatLines[:len-1] wrap\n got: %q\nwant: %q", m.prefixLines, wantPrefix)
 	}
-	if got, want := m.wrappedPrefix+m.lastWrapped, m.wrappedContent; got != want {
-		t.Fatalf("prefix+lastWrapped != wrappedContent\ngot:  %q\nwant: %q", got, want)
+	if got, want := strings.Join(append(slices.Clone(m.prefixLines), strings.Split(m.lastWrapped, "\n")...), "\n"), strings.Join(m.viewport.Lines(), "\n"); got != want {
+		t.Fatalf("prefix+lastWrapped != viewport rows\ngot:  %q\nwant: %q", got, want)
 	}
 
 	// The aliased prefix must survive the append funnel.

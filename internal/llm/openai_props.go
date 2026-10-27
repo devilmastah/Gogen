@@ -86,9 +86,12 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 	case "off":
 		return false
 	case "on":
-		// The live default endpoint (SetProfiles may have replaced it): the
-		// kwargs must reach the endpoint the request actually goes to.
-		if strings.TrimSpace(p.defaultBaseURL()) == "" {
+		// The endpoint the CURRENT MODEL actually routes to — not the default
+		// profile: with one hosted and one local profile registered, gating on
+		// profiles[0] either drops the kwargs for the local endpoint or sends
+		// them to the hosted one. Empty is the default OpenAI API, which never
+		// takes llama.cpp kwargs.
+		if strings.TrimSpace(p.propsBaseURLForCurrentModel()) == "" {
 			return false
 		}
 		// A known "no" wins even over the forced mode: "on" is the user's

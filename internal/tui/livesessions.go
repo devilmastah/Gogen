@@ -16,6 +16,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/ioutil"
+	"gogen/internal/steerq"
 	"gogen/internal/streambuf"
 )
 
@@ -125,10 +126,12 @@ type liveSession struct {
 	// restores it when focus returns mid-round.
 	streamSpeedLine string
 
-	// pending buffers rendering events emitted while this session streamed
-	// in the background. On focus the buffer is drained and DISCARDED: a
-	// streaming target's join renders the full committed history from
-	// SnapshotMessages (every drained event is older than that snapshot),
+	// pending buffers display-only notes (condensedNoteMsg) emitted while
+	// this session streamed in the background — see enqueue for why no
+	// other event kind is kept. On focus the buffer is drained and
+	// DISCARDED: a streaming target's join renders the full committed
+	// history from SnapshotMessages (every drained event is older than
+	// that snapshot),
 	// and an idle target's rebuild is authoritative. The drain is still
 	// mandatory — an undrained buffer would replay stale events on the
 	// NEXT join (mu guards cross-thread).
@@ -150,7 +153,7 @@ type liveSession struct {
 	// goroutine appends, the Update thread snapshots on join.
 	round streambuf.RoundBuffer
 
-	// steerQueue is this session's FIFO of turns waiting for the session
+	// steerQ is this session's FIFO of turns waiting for the session
 	// to go idle (steering.go): system deliveries (job notices, scheduled
 	// reminders, subagent reports — the TUI counterpart of the web
 	// server's delivery queue) and user steering messages typed while a
@@ -161,7 +164,32 @@ type liveSession struct {
 	// it was typed into, never on whichever session happens to be focused
 	// at drain time. Update-thread-only state, like streaming/turnSeq —
 	// no lock.
-	steerQueue []steerItem
+	//
+	// The queue itself is internal/steerq, shared with the web host: item
+	// kinds, caps, the notice-batching rule and the "zero popped slots"
+	// requirement live there (they used to be implemented twice). Reads are
+	// nil-safe; writes go through queue(), which creates it.
+	steerQ *steerq.Queue
+}
+
+// queue returns this session's steering queue, creating it on first use.
+// Update-thread only (see steerQ).
+func (s *liveSession) queue() *steerq.Queue {
+	if s.steerQ == nil {
+		// maxSteerUserQueue / maxPendingDeliveries are this host's caps; the
+		// shared queue applies them (refuse user text, evict the oldest
+		// notice, never evict a targeted reply).
+		s.steerQ = steerq.New(maxSteerUserQueue, maxPendingDeliveries)
+	}
+	return s.steerQ
+}
+
+// queueLen is the nil-safe read every render path uses.
+func (s *liveSession) queueLen() int {
+	if s == nil {
+		return 0
+	}
+	return s.steerQ.Len()
 }
 
 // The session's round buffer (s.round, streambuf.RoundBuffer) accumulates
@@ -194,9 +222,18 @@ func (s *liveSession) resetProgress() {
 	s.streamSpeedLine = ""
 }
 
-// enqueue buffers one rendering event produced while this session streamed
-// in the background.
+// enqueue buffers one event produced while this session streamed in the
+// background. Only display-only notes survive a background span; every
+// other rendering event is already reflected in Messages by the time focus
+// returns (the join snapshot, or the idle rebuild), and both drains
+// (switchToLive, joinStreamingSession) keep nothing but a condensedNoteMsg
+// — so holding a tool result, a diff, a token batch or an image payload
+// here would only pin that payload in memory until the drain threw it
+// away. maxPendingStreamEvents stays as the safety net for note floods.
 func (s *liveSession) enqueue(msg tea.Msg) {
+	if _, ok := msg.(condensedNoteMsg); !ok {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.pending) >= maxPendingStreamEvents {
@@ -516,6 +553,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 		target.agent.WorkingDir,
 		target.agent.CurrentModel(),
 		target.agent.Mode.String(),
+		m.verbose,
 	)
 	m.markTranscriptRendered()
 	// Reset BEFORE the round render: renderRoundBuffer pre-seeds the
@@ -600,7 +638,6 @@ func (m *Model) renderRoundBuffer(rw *streambuf.Snapshot) {
 		label := AssistantStyle.Render(assistantLabel)
 		m.streamAssistantLine = len(m.chatLines)
 		m.chatLines = append(m.chatLines, label+" "+rw.Content)
-		m.streamAssistantBuf.WriteString(rw.Content)
 	}
 	prefix := ToolCallStyle.Render("  →")
 	for _, tc := range rw.ToolCalls {
@@ -728,102 +765,6 @@ func (m *Model) persistSidebarPrefs() {
 	})
 }
 
-// streamEventSid reports the owning-session id embedded in a streaming
-// rendering message (ok=false for every other message kind).
-func streamEventSid(msg tea.Msg) (string, bool) {
-	switch v := msg.(type) {
-	case streamStartMsg:
-		return v.sid, true
-	case streamRoundStartMsg:
-		return v.sid, true
-	case streamTokenMsg:
-		return v.sid, true
-	case streamThinkingMsg:
-		return v.sid, true
-	case streamStatsMsg:
-		return v.sid, true
-	case streamCompactingMsg:
-		return v.sid, true
-	case streamStallMsg:
-		return v.sid, true
-	case streamRetryMsg:
-		return v.sid, true
-	case streamToolCallMsg:
-		return v.sid, true
-	case streamToolCallArgsMsg:
-		return v.sid, true
-	case streamToolCallFinalMsg:
-		return v.sid, true
-	case streamToolResultMsg:
-		return v.sid, true
-	case streamToolExecuteMsg:
-		return v.sid, true
-	case streamRoundEndMsg:
-		return v.sid, true
-	case condensedNoteMsg:
-		return v.sid, true
-	}
-	return "", false
-}
-
-// endOfStream / failOfStream are the ONLY constructors for a turn's
-// terminal messages: they enforce that every terminal carries its owning
-// session id AND turn generation, so handleTurnFinishedMsg can always
-// route finalization and drop superseded turns. (A bare streamEndMsg{}
-// would finalize nothing — ByID("") misses — and brick the focused
-// session's input forever.)
-func endOfStream(sid string, seq uint64) tea.Msg {
-	return streamEndMsg{sid: sid, seq: seq}
-}
-
-func failOfStream(sid string, seq uint64, err error) tea.Msg {
-	return streamErrorMsg{err: err, sid: sid, seq: seq}
-}
-
-// streamEventAttribution reports the (sid, seq) turn attribution embedded
-// in a streaming message (ok=false for every other message kind). Unlike
-// streamEventSid it INCLUDES the terminal messages: a superseded turn's
-// terminal must be dropped too, not just its render events.
-func streamEventAttribution(msg tea.Msg) (sid string, seq uint64, ok bool) {
-	switch v := msg.(type) {
-	case streamStartMsg:
-		return v.sid, v.seq, true
-	case streamRoundStartMsg:
-		return v.sid, v.seq, true
-	case streamTokenMsg:
-		return v.sid, v.seq, true
-	case streamThinkingMsg:
-		return v.sid, v.seq, true
-	case streamStatsMsg:
-		return v.sid, v.seq, true
-	case streamCompactingMsg:
-		return v.sid, v.seq, true
-	case streamStallMsg:
-		return v.sid, v.seq, true
-	case streamRetryMsg:
-		return v.sid, v.seq, true
-	case streamToolCallMsg:
-		return v.sid, v.seq, true
-	case streamToolCallArgsMsg:
-		return v.sid, v.seq, true
-	case streamToolCallFinalMsg:
-		return v.sid, v.seq, true
-	case streamToolResultMsg:
-		return v.sid, v.seq, true
-	case streamToolExecuteMsg:
-		return v.sid, v.seq, true
-	case streamRoundEndMsg:
-		return v.sid, v.seq, true
-	case condensedNoteMsg:
-		return v.sid, v.seq, true
-	case streamEndMsg:
-		return v.sid, v.seq, true
-	case streamErrorMsg:
-		return v.sid, v.seq, true
-	}
-	return "", 0, false
-}
-
 // staleTurn reports whether an attributed event belongs to a SUPERSEDED
 // turn of a known session (its seq no longer matches the session's
 // current turnSeq). seq 0 means UNATTRIBUTED — produced outside any turn,
@@ -844,6 +785,20 @@ func (m *Model) staleTurn(sid string, seq uint64) bool {
 // ownsStream reports whether sid belongs to the focused session.
 func (m *Model) ownsStream(sid string) bool {
 	return m.lives == nil || m.lives.Active().id == sid
+}
+
+// endOfStream / failOfStream are the ONLY constructors for a turn's
+// terminal messages: they enforce that every terminal carries its owning
+// session id AND turn generation, so handleTurnFinishedMsg can always
+// route finalization and drop superseded turns. (A bare streamEndMsg{}
+// would finalize nothing — ByID("") misses — and brick the focused
+// session's input forever.)
+func endOfStream(sid string, seq uint64) tea.Msg {
+	return streamEndMsg{sid: sid, seq: seq}
+}
+
+func failOfStream(sid string, seq uint64, err error) tea.Msg {
+	return streamErrorMsg{err: err, sid: sid, seq: seq}
 }
 
 // turnSession returns the session that owns a newly-started turn,

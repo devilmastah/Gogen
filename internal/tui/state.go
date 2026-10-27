@@ -130,6 +130,12 @@ type Model struct {
 	// changes, and the 30 s tick). Written only on the Update thread
 	// (savedSessionsMsg).
 	savedCache []agent.SessionInfo
+	// savedTimes memoizes each saved session's parsed UpdatedAt, keyed by
+	// session id (value: the raw string that was parsed, so a refresh that
+	// moves the timestamp re-parses). buildSidebarRows runs once per View
+	// and again per mouse/key event, so without this every frame reparsed
+	// every row's RFC3339Nano timestamp. Same-thread as savedCache.
+	savedTimes map[string]savedStamp
 	// savedReqSeq guards against a stale savedSessionsMsg (an older
 	// request resolving after a newer one) clobbering the fresh snapshot.
 	savedReqSeq uint64
@@ -224,21 +230,27 @@ type Model struct {
 	// user-cancelled flag live on the owning session, not here.
 	compacting bool
 
-	// Chat content buffer (lines to render)
-	chatLines        []string
-	wrappedPrefix    string   // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
-	wrappedContent   string   // pre-computed wrapped content for viewport
-	maxWrappedWidth  int      // cached max line width (incremental, avoids O(N) scan)
-	styledLines      []string // wrappedContent split by "\n" (cached for selection render)
-	styledLinesDirty bool     // true when styledLines needs recomputation
+	// Chat content buffer (lines to render). This is the RAW source; the
+	// WRAPPED form lives only in the viewport (viewport.Lines(), spliced from
+	// prefixLines + the last line's wrap), which is the single rendered copy.
+	// The old design also kept a joined wrappedContent string, a second join in
+	// wrappedPrefix and an ANSI-stripped split (wrappedLines) + a styled split
+	// (styledLines) of the same rows, all for text selection — four more
+	// transcript copies, with an O(transcript) copy on every appended line.
+	// Selection now reads the viewport rows and strips ANSI per visible row.
+	chatLines       []string
+	maxWrappedWidth int // cached max line width (incremental, avoids O(N) scan)
 	// Incremental wrapping state: prefixLines holds the viewport lines for
 	// chatLines[:len-1] so streaming updates splice only the last line's wrap
-	// instead of re-splitting the whole conversation. wrappedContentDirty
-	// defers the wrappedPrefix+lastWrapped concatenation until a consumer
-	// (selection rendering) actually needs the full string.
-	prefixLines         []string
-	lastWrapped         string
-	wrappedContentDirty bool
+	// instead of re-splitting the whole conversation.
+	prefixLines []string
+	lastWrapped string
+	// lastRewrapWidth is wrapWidth() at the last FULL re-wrap
+	// (setViewportContent). SetSize runs at every round and turn boundary via
+	// relayout, where the terminal size has not changed: re-wrapping the whole
+	// transcript there is pure cost, so SetSize skips the re-wrap when the wrap
+	// width still matches. A real resize (or any width change) clears it.
+	lastRewrapWidth int
 	// historyEpoch is the agent conversation epoch (agent.HistoryEpoch) the
 	// current transcript was rendered from. The transcript is append-only
 	// between full rebuilds, so a wholesale history reshape — a mid-turn
@@ -250,9 +262,11 @@ type Model struct {
 	// rebuildTranscriptIfReshaped.
 	historyEpoch uint64
 
-	// Streaming accumulation
-	streamAssistantBuf  strings.Builder
-	streamAssistantLine int // chatLines index for the live assistant line (-1 if none)
+	// Streaming accumulation. streamAssistantLine is the chatLines index of the
+	// live assistant line (-1 when none) and doubles as the "the line exists"
+	// marker; streamWrap is that line's incremental wrap (see streamWrapCache).
+	streamAssistantLine int
+	streamWrap          streamWrapCache
 	streamThinkingBuf   strings.Builder
 	streamThinkingOpen  bool
 	streamThinkingLine  int                     // chatLines index for the open thinking line (-1 if none)
@@ -340,11 +354,11 @@ type Model struct {
 	// Screen dimensions tracking
 	ready bool
 
-	// Text selection (mouse drag-to-select in viewport)
-	selectionYOff     int // viewport YOffset at selection start (for stable coordinates)
-	selection         *SelectionState
-	wrappedLines      []string // ANSI-stripped wrapped content lines (coordinate mapping)
-	wrappedLinesDirty bool
+	// Text selection (mouse drag-to-select in viewport). Coordinates are rows
+	// of the viewport's wrapped content; the plain text of a row is derived on
+	// demand (see Model.plainLine) instead of being cached per row.
+	selectionYOff int // viewport YOffset at selection start (for stable coordinates)
+	selection     *SelectionState
 	// Render caches — recomputed only when inputs change.
 	dividerCache       string
 	dividerCacheWidth  int
@@ -429,7 +443,6 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 		sessionID:            "",
 		selectionYOff:        -1,
 		selection:            nil,
-		wrappedLines:         nil,
 		statusMsg:            "",
 	}
 
@@ -451,7 +464,7 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 		// OUTPUT time), not the process start.
 		m.seedRootLastActive()
 		// Build initial history
-		m.chatLines = renderMessages(a.Messages, a.WorkingDir, modelLine, a.Mode.String())
+		m.chatLines = renderMessages(a.Messages, a.WorkingDir, modelLine, a.Mode.String(), m.verbose)
 		m.setViewportContent()
 		m.pinFollow()
 		m.markTranscriptRendered()
@@ -586,7 +599,15 @@ func (m *Model) SetSize(width, height int) {
 	m.textarea.SetWidth(main - 2)
 	m.textarea.SetHeight(textareaHeight)
 
-	m.setViewportContent()
+	// Re-wrap only when the wrap width actually changed. SetSize runs at every
+	// round and turn boundary (relayout) and on every modal/queue change, where
+	// the terminal size is the same — re-wrapping the whole transcript there is
+	// pure cost (the transcript is already wrapped for this width; every
+	// chatLines mutation goes through buildFromPrefix or a full re-wrap).
+	// Content-only paths keep calling setViewportContent directly.
+	if m.wrapWidth() != m.lastRewrapWidth {
+		m.setViewportContent()
+	}
 	if m.viewDetached {
 		// Re-wrapping redefines the "below the fold" baseline: without
 		// this, a width change alone would read as new messages.

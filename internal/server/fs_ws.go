@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 )
 
 // respondOp runs one FS/Git request-response op and writes the standardized
@@ -34,9 +35,16 @@ type fsOp struct {
 	// send queue, drained by a single writer) and the client correlates
 	// by RequestID, so out-of-order delivery is fine. Only meaningful on
 	// read ops: write ops run under the workspace filesystem lock and
-	// must stay on the caller's goroutine.
+	// must stay on the caller's goroutine — unless noFSLock is set.
 	async bool
-	run   func(s *Server, ctx context.Context, msg WSMessage, resp *WSMessage) error
+	// noFSLock marks a WRITE op that does not touch the working tree: it is
+	// network-only (git_push). Such an op skips the workspace filesystem lock
+	// AND runs off the read loop, because fsMu is global — a slow push held it
+	// for the whole transfer, stalling every session's file edits and the
+	// connection's other messages. The op must not read or write working-tree
+	// files, or it would race the locked tool handlers.
+	noFSLock bool
+	run      func(s *Server, ctx context.Context, msg WSMessage, resp *WSMessage) error
 }
 
 // fsReadOps dispatches read-only FS/Git requests. Unknown types are ignored.
@@ -181,10 +189,18 @@ var fsWriteOps = map[string]fsOp{
 	"git_push": {
 		// Push to origin with a fixed argv; the only user-controlled input
 		// is the branch ref, validated inside GitPush (validateGitRef).
+		//
+		// noFSLock: the transfer is network I/O and mutates no working-tree
+		// file. Holding the workspace lock (and the read loop) for it stalled
+		// every session's edits during a slow push; a bounded timeout keeps a
+		// hung remote from pinning the goroutine until the tab closes.
 		resultType: "git_push_result",
+		noFSLock:   true,
 		run: func(s *Server, ctx context.Context, msg WSMessage, resp *WSMessage) error {
+			pushCtx, cancel := context.WithTimeout(ctx, gitPushTimeout)
+			defer cancel()
 			var err error
-			resp.Result, err = s.ws.Exec.GitPush(ctx, msg.Branch)
+			resp.Result, err = s.ws.Exec.GitPush(pushCtx, msg.Branch)
 			return err
 		},
 	},
@@ -195,10 +211,21 @@ var fsWriteOps = map[string]fsOp{
 // the actual mutation window of a running tool, never for the whole
 // streaming turn. Unknown types are ignored.
 func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMessage) {
+	op, ok := fsWriteOps[msg.Type]
+	if !ok {
+		return
+	}
+	if op.noFSLock {
+		// Network-only op: no lock (fsMu is global, so holding it for a push
+		// blocked every session's file edits) and no read-loop stall.
+		go s.runFSOp(ws, ctx, msg, op)
+		return
+	}
 	s.ws.fsMu.Lock()
 	defer s.ws.fsMu.Unlock()
-
-	if op, ok := fsWriteOps[msg.Type]; ok {
-		s.runFSOp(ws, ctx, msg, op)
-	}
+	s.runFSOp(ws, ctx, msg, op)
 }
+
+// gitPushTimeout bounds one git_push. Long enough for a big push over a slow
+// link, short enough that a hung remote cannot pin the goroutine.
+const gitPushTimeout = 2 * time.Minute

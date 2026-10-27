@@ -108,7 +108,9 @@ func WriteLLMResponse(rec LLMResponseRecord) {
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return
 		}
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		// 0600: the response log carries full prompts, reasoning and tool
+		// arguments.
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return
 		}

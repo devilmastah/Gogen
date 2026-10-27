@@ -17,7 +17,9 @@ var (
 // deliberately out of scope — delete the contents first, or use
 // execute_command's guarded shell for a bulk removal.
 func (e *Executor) DeleteFile(ctx context.Context, path string) (string, error) {
-	secure, err := e.SecurePath(path)
+	// No-follow: removing "config.yml" when it is a symlink unlinks the LINK.
+	// Resolving first deleted the target and left the link dangling.
+	secure, err := e.SecurePathNoFollow(path)
 	if err != nil {
 		return "", err
 	}

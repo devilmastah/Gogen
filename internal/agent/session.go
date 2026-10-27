@@ -512,16 +512,29 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	}
 
 	// Decide: full snapshot or incremental delta?
-	// Full snapshot on first save, when more than 5 new messages have
-	// arrived, or when it's been >30s since the last full snapshot.
-	// Also when non-message metadata (label, mode, model, thinking level,
-	// oneshot, project profile, todos) changed since the last full snapshot:
-	// incremental deltas do not carry those fields, so a quit before the
-	// next full save would silently drop the change.
+	//
+	// A full snapshot is written when there is none yet, when non-message
+	// metadata (label, mode, model, thinking level, oneshot, project profile,
+	// todos) changed — deltas do not carry those fields, so a quit before the
+	// next full save would silently drop the change — and otherwise at most
+	// every fullSaveInterval.
+	//
+	// The size trigger replaces the old "more than 5 new messages" rule: a
+	// delta REWRITES every message since the last full save, so a fixed
+	// message count made the total write volume quadratic in session length
+	// (a 10 MB session was rewritten in full ~400 times). Folding the delta in
+	// when it reaches a fraction of the snapshot keeps each save proportional
+	// to what changed, and every save still persists the new messages.
 	needsFullSave := a.lastSavedMsgCount == 0 ||
-		count-a.lastSavedMsgCount > 5 ||
-		time.Since(a.lastFullSaveTime) > 30*time.Second ||
+		time.Since(a.lastFullSaveTime) > fullSaveInterval ||
 		!reflect.DeepEqual(st.meta, a.lastMeta)
+	if !needsFullSave {
+		threshold := int64(fullSaveDeltaFloor)
+		if scaled := a.lastSnapshotBytes / fullSaveDeltaRatio; scaled > threshold {
+			threshold = scaled
+		}
+		needsFullSave = pendingDeltaBytes(st.msgs, a.lastSavedMsgCount) > threshold
+	}
 
 	var ok bool
 	if needsFullSave {
@@ -634,15 +647,75 @@ func (a *Agent) persistFullSnapshot(st persistState, count int, skipTokenCounts 
 		}
 		a.statsMu.Unlock()
 	}
-	if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
+	// SaveSized is an optional capability (the real store implements it, and
+	// the size is what drives the delta-folding decision); a SessionPersister
+	// that only has Save still works, at the cost of the size trigger falling
+	// back to its floor.
+	n, err := saveSnapshotSized(a.SessionStore, a.SessionID, snap)
+	if err != nil {
 		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
 		a.lastPersistErr = err
 		return false
 	}
 	a.lastSavedMsgCount = count
 	a.lastFullSaveTime = time.Now()
+	a.lastSnapshotBytes = n
 	a.lastMeta = st.meta
 	return true
+}
+
+// sizedSnapshotSaver is the optional SessionPersister capability that reports
+// how many bytes a snapshot write produced (see fullSaveDeltaFloor).
+type sizedSnapshotSaver interface {
+	SaveSized(id string, snap SessionSnapshot) (int64, error)
+}
+
+// saveSnapshotSized writes snap and reports its payload size, using SaveSized
+// when the store supports it.
+func saveSnapshotSized(store SessionPersister, id string, snap SessionSnapshot) (int64, error) {
+	if s, ok := store.(sizedSnapshotSaver); ok {
+		return s.SaveSized(id, snap)
+	}
+	return 0, store.Save(id, snap)
+}
+
+// fullSaveInterval bounds how long a session may go without a full snapshot.
+// Durability does not depend on it (every save writes the delta), so it only
+// bounds how long the delta keeps growing; the size and metadata triggers are
+// the primary ones.
+const fullSaveInterval = 5 * time.Minute
+
+// fullSaveDeltaFloor is the smallest delta worth folding into a full snapshot:
+// below it the delta is cheap to rewrite, so small sessions keep taking the
+// incremental path. Above it the threshold is a fraction of the snapshot
+// (fullSaveDeltaRatio), which keeps every save proportional to the data that
+// changed instead of rewriting the whole history on a message count.
+const fullSaveDeltaFloor = 256 << 10
+
+// fullSaveDeltaRatio is the fraction of the last snapshot's payload a delta may
+// reach before it is folded in.
+const fullSaveDeltaRatio = 4
+
+// pendingDeltaBytes estimates the payload of the delta a save would rewrite:
+// every message since the last full snapshot plus a per-message envelope. It is
+// an estimate on purpose — the decision only needs the order of magnitude, and
+// summing content lengths is far cheaper than serializing.
+func pendingDeltaBytes(msgs []llm.Message, from int) int64 {
+	if from < 0 || from >= len(msgs) {
+		return 0
+	}
+	const perMessageOverhead = 160 // role, timestamps, JSON keys
+	var total int64
+	for _, m := range msgs[from:] {
+		total += int64(len(m.Content) + len(m.Reasoning) + len(m.Refusal) + perMessageOverhead)
+		for _, tc := range m.ToolCalls {
+			total += int64(len(tc.Name) + len(tc.ArgsStr) + len(tc.ID) + 16)
+		}
+		for _, img := range m.Images {
+			total += int64(len(img.DataURL))
+		}
+	}
+	return total
 }
 
 // persistDeltaSnapshot appends only the messages since the last full save.
@@ -947,6 +1020,10 @@ type sessionPersist struct {
 	// incremental delta saves, avoiding full JSON serialization every 5s.
 	lastSavedMsgCount int
 	lastFullSaveTime  time.Time // when the last full snapshot was written
+	// lastSnapshotBytes is the payload size of the last full snapshot (0 when
+	// unknown, e.g. a disabled store). doPersist folds a delta into a full
+	// snapshot once the delta reaches a fraction of it: see fullSaveDeltaRatio.
+	lastSnapshotBytes int64
 
 	// persistMu serializes doPersist executions. The turn goroutine (holding
 	// turnMu) and the shutdown/delete/eviction flush paths (no turnMu) can

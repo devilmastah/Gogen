@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // Regression tests for the openai-go "unexpected end of JSON input" stream
@@ -178,6 +180,47 @@ func TestSSEFilterTransportNonSSEPassthrough(t *testing.T) {
 	got, _ := io.ReadAll(res.Body)
 	if string(got) != body {
 		t.Fatalf("non-SSE body = %q, want unchanged %q", got, body)
+	}
+}
+
+// blockingBody is a response body whose Read blocks until Close is called, so
+// a test can tell whether closing the filtered body reached the real one.
+type blockingBody struct {
+	release chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingBody) Read([]byte) (int, error) {
+	<-b.release
+	return 0, io.EOF
+}
+
+func (b *blockingBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+// TestSSEEventFilterBodyCloseClosesUnderlyingBody pins the early-close leak
+// fix: closing the filtered body must close the real response body. Closing
+// only the pipe reader leaves the filter goroutine blocked in Scanner.Scan()
+// on the network read, so the TCP connection and the goroutine survive until
+// the next byte or the idle read deadline (30 minutes by default) — exactly
+// what every deliberate early close produces while the provider holds the
+// connection open (reasoning-stop grace timer, usage-drain timer, tool-call
+// early exit).
+func TestSSEEventFilterBodyCloseClosesUnderlyingBody(t *testing.T) {
+	t.Parallel()
+	body := &blockingBody{release: make(chan struct{}), closed: make(chan struct{})}
+	defer close(body.release)
+	filtered := newSSEEventFilterBody(body)
+	if err := filtered.Close(); err != nil {
+		t.Fatalf("filtered Close: %v", err)
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the filtered body did not close the underlying response body")
 	}
 }
 

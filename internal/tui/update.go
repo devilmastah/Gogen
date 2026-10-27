@@ -35,19 +35,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
-	// Drop streaming render events whose owner lost focus between send and
-	// delivery (switch-boundary stragglers). Terminal msgs carry sid too
-	// and are routed by handleTurnFinishedMsg instead.
-	if sid, ok := streamEventSid(msg); ok && !m.ownsStream(sid) {
-		return m, nil
-	}
-	// Drop events from a SUPERSEDED turn (cancel + resubmit): the old
-	// turn's goroutine may still be unwinding, and its stragglers — tokens
-	// AND the terminal — carry the previous turnSeq. Letting them through
-	// would clobber the new turn's state (cancel func, streaming flags,
-	// transcript) and surface a stale "context canceled" error.
-	if sid, seq, ok := streamEventAttribution(msg); ok && m.staleTurn(sid, seq) {
-		return m, nil
+	// One gate for everything that belongs to a streaming turn: the ownership
+	// and staleness checks, and the "not streaming → drop" filter the fourteen
+	// render handlers each opened with.
+	//
+	// The classification is the streamAttributed interface (embedded
+	// streamMeta), so a new stream message is covered by construction. The two
+	// deliberate exceptions are expressed HERE instead of by omitting a line
+	// from a handler body:
+	//   - terminal messages (streamEndMsg / streamErrorMsg) do not implement
+	//     streamAttributed: handleTurnFinishedMsg resolves their session and
+	//     generation itself, and a terminal for a session that lost focus must
+	//     still finalize;
+	//   - condensedNoteMsg renders regardless of the focused session's
+	//     streaming state — it is a note from a background session, and
+	//     dropping it while a *different* session streams lost the notice.
+	if sa, ok := msg.(streamAttributed); ok {
+		sid, seq := sa.attribution()
+		// Ownership: drop render events whose owner lost focus between send
+		// and delivery (switch-boundary stragglers).
+		if !m.ownsStream(sid) {
+			return m, nil
+		}
+		// Staleness: events from a SUPERSEDED turn (cancel + resubmit). The
+		// old turn's goroutine may still be unwinding, and letting its
+		// stragglers through would clobber the new turn's state (cancel func,
+		// streaming flags, transcript) and surface a stale "context canceled".
+		if m.staleTurn(sid, seq) {
+			return m, nil
+		}
+		if _, isNote := msg.(condensedNoteMsg); !isNote && !m.streaming {
+			return m, nil
+		}
 	}
 
 	switch msg := msg.(type) {
@@ -143,7 +162,7 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A stale response (an older request resolving after a newer
 		// one) must not clobber the fresh snapshot.
 		if msg.seq == m.savedReqSeq && msg.ok {
-			m.savedCache = msg.sessions
+			m.setSavedCache(msg.sessions)
 		}
 		return m, nil
 
@@ -171,51 +190,7 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// System message delivery (queue + drain when idle)
 	case deliveryRequestMsg:
-		// Deliveries are per-session steering-queue items (steering.go) and
-		// the notice names its session, so it is queued THERE: a job notice
-		// fired from a background goroutine must not be re-attributed to
-		// whichever session happens to be focused when the message reaches
-		// the Update thread. Overflow drops the OLDEST SYSTEM delivery
-		// (freshness wins — a stale job notice is worse than none), reported
-		// at the next drain; user steering items are never dropped here.
-		s := m.noticeTarget(msg.sid)
-		if s == nil {
-			return m, nil
-		}
-		sys := 0
-		for _, it := range s.steerQueue {
-			if it.system {
-				sys++
-			}
-		}
-		if sys >= maxPendingDeliveries {
-			// Freshness wins for NOTICES: evict the oldest one. A targeted
-			// send_message delivery is a message whose reply the parent is
-			// waiting on, so it must never be evicted by a notice — when every
-			// system slot holds one, drop THIS notice instead (the web host's
-			// enqueueSystem policy).
-			victim := -1
-			for i, it := range s.steerQueue {
-				if it.system && it.child == nil {
-					victim = i
-					break
-				}
-			}
-			if victim < 0 {
-				m.deliveryDrops++
-				return m, nil
-			}
-			s.steerQueue = append(s.steerQueue[:victim], s.steerQueue[victim+1:]...)
-			m.deliveryDrops++
-		}
-		s.steerQueue = append(s.steerQueue, steerItem{id: newSteerItemID(), text: msg.text, system: true})
-		if m.lives != nil && m.lives.Active() == s {
-			return m, m.drainDeliveries()
-		}
-		// A background session's notice drains on ITS idle boundary — now,
-		// if it is idle (startTurnOn buffers the events for replay), or at
-		// its next turn end (handleTurnFinishedMsg).
-		return m, m.drainSessionQueue(s)
+		return m.handleDeliveryRequestMsg(msg)
 
 	// Pass mouse events to the viewport for wheel scrolling
 	case tea.MouseMsg:
@@ -341,7 +316,7 @@ func (m *Model) handleCompactResultMsg(msg compactResultMsg) (tea.Model, tea.Cmd
 	// Compaction rewrote Messages: rebuild the transcript around the
 	// summary (the old inline path left the pre-compact history on
 	// screen, which no longer matched the agent's state).
-	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String(), m.verbose)
 	m.chatLines = append(m.chatLines, SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
 	m.setViewportContent()
 	m.pinFollow() // the transcript was replaced wholesale
@@ -379,6 +354,22 @@ func (m *Model) handleModelListMsg(msg modelListMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleModelSwitchMsg(msg modelSwitchMsg) (tea.Model, tea.Cmd) {
+	// A turn is still streaming: rebuilding the transcript here would read
+	// Messages from under the stream goroutine AND replace chatLines, so the
+	// live assistant/thinking line indices would point at the wrong lines.
+	// Mark the transcript stale instead — the turn-end convergence rebuild
+	// re-renders it from Messages (the same guard handleCompactResultMsg uses).
+	if m.streaming {
+		if msg.err != nil {
+			m.statusMsg = "✗ Models: " + msg.err.Error()
+		} else {
+			m.statusMsg = msg.out
+		}
+		if s := m.turnSession(); s != nil {
+			s.transcriptStale = true
+		}
+		return m, nil
+	}
 	if m.agent != msg.agent {
 		// The switch applied to a session that is no longer focused; its
 		// transcript (with the new model line) is rebuilt whenever it is
@@ -399,7 +390,7 @@ func (m *Model) handleModelSwitchMsg(msg modelSwitchMsg) (tea.Model, tea.Cmd) {
 	// Re-render chat lines with the updated model line, THEN append the
 	// switch notice — the old order appended first and the rebuild wiped
 	// the line, so modal selections silently showed nothing.
-	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String(), m.verbose)
 	m.chatLines = append(m.chatLines, SystemStyle.Render(msg.out))
 	// Staged thinking level (models modal): apply AFTER the switch so
 	// HandleThinkingCommand's validation runs against the new model's
@@ -464,33 +455,21 @@ func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleStreamStartMsg() (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamStart()
 	return m, m.setProgress(progressThinking, "thinking")
 }
 
 func (m *Model) handleStreamRoundStartMsg() (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamRoundStart()
 	return m, m.setProgress(progressThinking, "thinking")
 }
 
 func (m *Model) handleStreamTokenMsg(msg streamTokenMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamToken(msg.token)
 	return m, m.setProgress(progressActive, "")
 }
 
 func (m *Model) handleStreamThinkingMsg(msg streamThinkingMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamThinking(msg.token)
 	return m, m.setProgress(progressActive, "")
 }
@@ -502,9 +481,6 @@ func (m *Model) handleStreamThinkingMsg(msg streamThinkingMsg) (tea.Model, tea.C
 // them — so mirroring onto the focused liveSession keeps a focus switch
 // from showing a stale rate.
 func (m *Model) handleStreamStatsMsg(msg streamStatsMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.streamSpeedLine = DimStyle.Render(fmt.Sprintf("%.0f tok/s", msg.toksPerSec))
 	if s := m.focusedSession(); s != nil {
 		s.streamSpeedLine = m.streamSpeedLine
@@ -517,9 +493,6 @@ func (m *Model) handleStreamStatsMsg(msg streamStatsMsg) (tea.Model, tea.Cmd) {
 // stream callbacks). The next progress event — token, stats, round
 // boundary, or turn end — replaces the label.
 func (m *Model) handleStreamCompactingMsg() (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	return m, m.setProgress(progressCompacting, "compacting history")
 }
 
@@ -529,8 +502,12 @@ func (m *Model) handleStreamCompactingMsg() (tea.Model, tea.Cmd) {
 // args stream, the phase is active and the stall signal is moot — and while
 // a recovery is running (progressRetry) the retry reason already explains the
 // silence, so the generic wait must not replace it.
+//
+// The "is this session streaming at all" half of the old guard is gone:
+// handleMsg drops stream-render events for a non-streaming Model before
+// dispatch, so only the progress line's own state matters here.
 func (m *Model) handleStreamStallMsg() (tea.Model, tea.Cmd) {
-	if !m.streaming || m.progressPhase != progressThinking || m.progressRetry {
+	if m.progressPhase != progressThinking || m.progressRetry {
 		return m, nil
 	}
 	return m, m.setProgress(progressThinking, "still waiting on model")
@@ -541,9 +518,6 @@ func (m *Model) handleStreamStallMsg() (tea.Model, tea.Cmd) {
 // follows is the retry's whole generation, not a hang. Any later progress
 // event restores the normal label (setProgress clears the retry mark).
 func (m *Model) handleStreamRetryMsg(msg streamRetryMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	cmd := m.setProgress(progressThinking, "retrying stream ("+msg.reason+")")
 	// setProgress cleared the mark for the normal updates; this label IS the
 	// retry state, so re-mark it (mirrored for a focus switch).
@@ -555,33 +529,21 @@ func (m *Model) handleStreamRetryMsg(msg streamRetryMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleStreamToolCallMsg(msg streamToolCallMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamToolCall(msg.index, msg.id, msg.name)
 	return m, m.setProgress(progressActive, "")
 }
 
 func (m *Model) handleStreamToolCallArgsMsg(msg streamToolCallArgsMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamToolArgs(msg.index, msg.id, msg.delta)
 	return m, m.setProgress(progressActive, "")
 }
 
 func (m *Model) handleStreamToolCallFinalMsg(msg streamToolCallFinalMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamToolCallFinal(msg.index, msg.tc)
 	return m, nil
 }
 
 func (m *Model) handleStreamToolExecuteMsg(msg streamToolExecuteMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	label := "running tool"
 	if msg.name != "" {
 		label = "running " + msg.name
@@ -590,17 +552,11 @@ func (m *Model) handleStreamToolExecuteMsg(msg streamToolExecuteMsg) (tea.Model,
 }
 
 func (m *Model) handleStreamToolResultMsg(msg streamToolResultMsg) (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamToolResult(msg.id, msg.name, msg.result, msg.success)
 	return m, m.setProgress(progressThinking, "thinking")
 }
 
 func (m *Model) handleStreamRoundEndMsg() (tea.Model, tea.Cmd) {
-	if !m.streaming {
-		return m, nil
-	}
 	m.handleStreamRoundEnd()
 	return m, m.setProgress(progressThinking, "thinking")
 }

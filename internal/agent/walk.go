@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -129,6 +131,34 @@ func walkTree(ctx context.Context, searchRoot, relPrefix string, opts walkOpts, 
 		}
 		return visit(walkPath, rel, d)
 	})
+}
+
+// readFileBounded reads a walked file's content, capped at
+// searchMaxFileBytes. The stat-based gate in searchableWalkFile can go stale
+// (a file can grow between the stat and the read, and a device reports size 0
+// forever), so the read itself is bounded: one extra byte is read to detect
+// growth and the file is skipped rather than loaded.
+func readFileBounded(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, searchMaxFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	// Binary probe: these walkers feed regex and tree-sitter scans, where a NUL
+	// byte means the "file" is an object/binary blob. Skipping it here stops
+	// wasted work and keeps NUL-laden noise out of tool output (the search
+	// fallback probes for the same thing in openSearchableFile).
+	if bytes.IndexByte(data, 0) >= 0 {
+		return nil, fmt.Errorf("%s looks binary", path)
+	}
+	if len(data) > searchMaxFileBytes {
+		return nil, fmt.Errorf("%s exceeds the %d-byte search cap", path, searchMaxFileBytes)
+	}
+	return data, nil
 }
 
 // walkSkips accumulates the non-fatal errors walkTree reports through

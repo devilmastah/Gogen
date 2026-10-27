@@ -179,6 +179,9 @@ function terminalSetExpanded(expanded) {
     terminalSaveState();
     terminalRefreshStripVar();
     if (expanded) {
+        // The shell is spawned on demand server-side, so opening the panel is
+        // what asks for it (a no-op once it is up).
+        terminalUserEnsure();
         terminalFitSoon();
     } else if (terminalIsMobile()) {
         terminalCloseMobile();
@@ -394,6 +397,14 @@ export function terminalUserExited(code) {
 
 function terminalRestartUser() {
     if (userTermState !== 'dead') return;
+    terminalUserRequest();
+}
+
+// Asks the server for this connection's user shell. The server spawns the
+// shell lazily, on the first user_term_request, instead of at connect: a
+// connection that never shows the terminal panel then costs no pty and no
+// shell process. Resets the tab to its "spawning" state first.
+function terminalUserRequest() {
     userTermState = 'spawning';
     const t = terminals.get(USER_TERM_ID);
     if (t) {
@@ -407,6 +418,26 @@ function terminalRestartUser() {
     if (s && s.readyState === WebSocket.OPEN) {
         s.send(JSON.stringify({ type: 'user_term_request' }));
     }
+}
+
+// Asks for the shell whenever the panel is visible: on socket (re)connect and
+// when the panel expands. freshSocket revives a shell that died with the
+// previous socket; without it a 'dead' shell keeps its ↻ restart affordance
+// (the user exited that one on purpose).
+export function terminalUserEnsure(freshSocket) {
+    if (!terminalPanel || !deps || terminalLoadFailed) return;
+    if (!terminalPanel.classList.contains('expanded')) return;
+    if (!freshSocket) {
+        // A shell that is already up needs no second request, and one the user
+        // exited on purpose keeps its ↻ affordance (a panel expand must not
+        // silently restart it).
+        if (userTermState === 'ready' || userTermState === 'dead') return;
+    }
+    // On a fresh socket ask unconditionally: the server closes a connection's
+    // shell on teardown, so a client that still reports 'ready' is holding a
+    // terminal the new connection does not have. The request is harmless when
+    // the server already has one (it answers with user_term_opened again).
+    terminalUserRequest();
 }
 
 // Sends the fitted terminal size to the server for the user shell.

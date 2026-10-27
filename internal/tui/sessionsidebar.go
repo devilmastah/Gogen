@@ -206,6 +206,58 @@ func (m *Model) sidebarSeqOf(id string) int {
 	return m.sidebarSeqNext
 }
 
+// savedStamp memoizes one saved session's parsed UpdatedAt. raw is the
+// timestamp string the parse came from, so a refresh that rewrites a row's
+// timestamp invalidates the entry.
+type savedStamp struct {
+	raw string
+	ts  time.Time
+}
+
+// savedTime returns si's parsed UpdatedAt, parsing at most once per
+// (id, raw) pair. buildSidebarRows runs on every View and again on every
+// mouse/key event that clamps or re-resolves the list, so without this memo
+// each frame re-parsed every saved row's RFC3339Nano timestamp.
+func (m *Model) savedTime(si agent.SessionInfo) time.Time {
+	if si.ID == "" { // no id → nothing to key on; parse without caching
+		ts, err := time.Parse(time.RFC3339Nano, si.UpdatedAt)
+		if err != nil {
+			return time.Time{}
+		}
+		return ts
+	}
+	if st, ok := m.savedTimes[si.ID]; ok && st.raw == si.UpdatedAt {
+		return st.ts
+	}
+	var ts time.Time
+	if parsed, err := time.Parse(time.RFC3339Nano, si.UpdatedAt); err == nil {
+		ts = parsed
+	}
+	if m.savedTimes == nil {
+		m.savedTimes = make(map[string]savedStamp, len(m.savedCache))
+	}
+	m.savedTimes[si.ID] = savedStamp{raw: si.UpdatedAt, ts: ts}
+	return ts
+}
+
+// setSavedCache replaces the persisted-session snapshot and drops memoized
+// timestamps for sessions that are no longer listed (see savedTimes).
+func (m *Model) setSavedCache(list []agent.SessionInfo) {
+	m.savedCache = list
+	if len(m.savedTimes) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(list))
+	for _, si := range list {
+		live[si.ID] = true
+	}
+	for id := range m.savedTimes {
+		if !live[id] {
+			delete(m.savedTimes, id)
+		}
+	}
+}
+
 // buildSidebarRows merges the persisted-session index (m.savedCache) with
 // the live registry into the unified list. Saved entries come first (store
 // order, recency-sorted); live sessions overlay onto their saved row by
@@ -239,9 +291,7 @@ func (m *Model) buildSidebarRows() []sidebarRow {
 			seen[si.ID] = true
 		}
 		r := sidebarRow{id: si.ID, label: si.Label, msgCount: si.MessageCount, liveIdx: -1}
-		if ts, err := time.Parse(time.RFC3339Nano, si.UpdatedAt); err == nil {
-			r.updatedAt = ts
-		}
+		r.updatedAt = m.savedTime(si)
 		// Match EVERY live slot hosting this session (marking all of them
 		// covered, so none of them falls through to the fallback loop
 		// below), but render the row from ONE of them: the focused slot
@@ -679,9 +729,15 @@ func (m *Model) renderSidebar(mainLines int) string {
 	// dim pads a (possibly pre-styled) content string to the panel width.
 	// Measurement is ANSI-aware so styled meta lines truncate and pad by
 	// their VISIBLE width (raw-rune counting would break on escape codes).
+	// The pad is measured on the CUT result, not the input: a wide rune
+	// straddling the boundary makes ansi.Cut return one cell less than
+	// requested (it never splits a double-width rune), and padding by the
+	// input's width then left that row a cell short — the right border
+	// stepped left on exactly those lines.
 	dim := func(s string) string {
-		return ansiDimOn + "│ " + cutCells(s, 0, inner) +
-			strings.Repeat(" ", max(0, inner-cellWidth(s))) + ansiReset
+		t := cutCells(s, 0, inner)
+		return ansiDimOn + "│ " + t +
+			strings.Repeat(" ", max(0, inner-cellWidth(t))) + ansiReset
 	}
 	out := make([]string, 0, mainLines)
 	add := func(s string) {
@@ -764,7 +820,7 @@ const sidebarFooterButtonsLen = len(sidebarFooterNewLabel) + 2 + len(sidebarFoot
 func (m *Model) renderSidebarFooter(inner int) string {
 	if inner < sidebarFooterButtonsLen {
 		// Reserve one cell before the right border like the button form.
-		return ansiDimOn + "│ " + sliceByRuneCount(sidebarFooterPlain, max(0, inner-1)) +
+		return ansiDimOn + "│ " + truncateRunes(sidebarFooterPlain, max(0, inner-1)) +
 			" " + ansiReset
 	}
 	btn := func(b int) string {
@@ -775,7 +831,7 @@ func (m *Model) renderSidebarFooter(inner int) string {
 	}
 	tail := "  " + sidebarFooterRest
 	if inner < len(sidebarFooterPlain)+1 {
-		tail = sliceByRuneCount(tail, inner-sidebarFooterButtonsLen-1)
+		tail = truncateRunes(tail, inner-sidebarFooterButtonsLen-1)
 	}
 	line := btn(sidebarFooterNew) + sidebarFooterNewLabel + ansiReset + "  " +
 		btn(sidebarFooterClose) + sidebarFooterCloseLabel + ansiReset + "  " +
@@ -812,6 +868,17 @@ func (m *Model) sidebarFooterAt(x, y int) (button int, ok bool) {
 	return sidebarFooterNone, false
 }
 
+// depthIndent is the tree indent for a nested (subagent) row at depth: two
+// cells per level behind a "└ " glyph, capped at three levels so a long chain
+// cannot widen the panel past its column budget. Empty for a top-level row.
+// Shared by the title and meta lines so a row's two lines line up.
+func depthIndent(depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	return strings.Repeat("  ", min(depth-1, 3)) + "└ "
+}
+
 // renderSidebarTitle renders one row's title line the way the web row's
 // title does: a plain full-fg label (the cursor row gets the highlight
 // style — the web "current" row's emphasis) with the right-aligned ✕
@@ -836,10 +903,7 @@ func (m *Model) renderSidebarTitle(r sidebarRow, cursor bool, inner int) string 
 	// The indent eats into the label budget in VISIBLE cells (like the pad
 	// below), so a deep chain cannot widen the panel past its column budget;
 	// the glyph is capped at 3 steps to keep the label readable.
-	indent := ""
-	if r.depth > 0 {
-		indent = strings.Repeat("  ", min(r.depth-1, 3)) + "└ "
-	}
+	indent := depthIndent(r.depth)
 	labelMax := inner - 5 - cellWidth(indent)
 	if labelMax < 2 {
 		labelMax = 2
@@ -908,9 +972,7 @@ func (m *Model) sidebarMeta(r sidebarRow) string {
 	}
 	var b strings.Builder
 	b.WriteString("  ")
-	if r.depth > 0 {
-		b.WriteString(strings.Repeat("  ", min(r.depth-1, 3)) + "└ ")
-	}
+	b.WriteString(depthIndent(r.depth))
 	if state != "" {
 		if dot {
 			b.WriteString(dotStyle)

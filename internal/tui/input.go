@@ -183,14 +183,15 @@ func (m *Model) handleSubmitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) 
 			return m, nil, true
 		}
 
-		// Busy (a turn running or a compaction in flight): the composer is
-		// NOT locked — steering. Plain text is QUEUED (FIFO, delivered as
-		// the next user turn when the in-flight one ends); /queue opens the
-		// management modal; other commands are refused with a hint (they
-		// would rebind the session or rewrite history mid-turn). A running
-		// /compact also queues: the drain waits for it (drainDeliveries
-		// gates on both m.streaming and m.compacting).
-		if m.streaming || m.compacting {
+		// Busy (a turn running, a compaction in flight, or a cancelled turn
+		// still unwinding — see submitBusy): the composer is NOT locked —
+		// steering. Plain text is QUEUED (FIFO, delivered as the next user
+		// turn when the in-flight one ends); /queue opens the management
+		// modal; other commands are refused with a hint (they would rebind
+		// the session or rewrite history mid-turn). A running /compact also
+		// queues: the drain waits for it (drainDeliveries gates on both
+		// m.streaming and m.compacting).
+		if m.submitBusy() {
 			trimmed := strings.TrimSpace(input)
 			// History bookkeeping: queued text is typed input.
 			m.appendInputHistory(input)

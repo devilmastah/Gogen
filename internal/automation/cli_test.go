@@ -426,3 +426,55 @@ func TestCLICreateJSONOutput(t *testing.T) {
 		t.Fatalf("create --json record incomplete: %+v", decoded.Automation)
 	}
 }
+
+// TestCLIUpdateWeekdaysKeepsTimezone pins the patch path: replacing the
+// schedule with a selector and no --timezone must keep the STORED zone.
+// Dropping it re-based the automation on the host's local zone, so a
+// "weekdays 09:00 Asia/Tokyo" row started firing at 09:00 wherever the host
+// happened to be.
+func TestCLIUpdateWeekdaysKeepsTimezone(t *testing.T) {
+	st, _ := newTestStore(t)
+	runCLICapture(t, st, "create", "My job", "--prompt", "do it", "--dir", "/tmp/proj",
+		"--weekdays", "--time", "09:00", "--timezone", "Asia/Tokyo")
+	autos := st.List()
+	if len(autos) != 1 {
+		t.Fatalf("create stored %d automations, want 1", len(autos))
+	}
+	id := autos[0].ID
+
+	runCLICapture(t, st, "update", id, "--weekdays")
+
+	updated, ok := st.Get(id)
+	if !ok {
+		t.Fatal("automation vanished after update")
+	}
+	if updated.Schedule.Timezone != "Asia/Tokyo" {
+		t.Fatalf("timezone = %q after --weekdays update, want the stored Asia/Tokyo", updated.Schedule.Timezone)
+	}
+	if updated.Schedule.Kind != KindWeekdays {
+		t.Fatalf("kind = %s, want weekdays", updated.Schedule.Kind)
+	}
+}
+
+// TestParseClockRejectsTrailingGarbage pins the strict HH:MM parse: the old
+// fmt.Sscanf("%d:%d") stopped after the second number and IGNORED the rest, so
+// "9:30pm" silently became 09:30.
+func TestParseClockRejectsTrailingGarbage(t *testing.T) {
+	if h, m, err := ParseClock("09:30"); err != nil || h != 9 || m != 30 {
+		t.Fatalf("ParseClock(09:30) = (%d,%d,%v)", h, m, err)
+	}
+	if h, m, err := ParseClock("9:30"); err != nil || h != 9 || m != 30 {
+		t.Fatalf("ParseClock(9:30) = (%d,%d,%v)", h, m, err)
+	}
+	for _, bad := range []string{"9:30pm", "09:30:00", "9h30", "0930", ":", "09:", ":30", ""} {
+		if bad == "" {
+			continue // empty means the default, handled above
+		}
+		if _, _, err := ParseClock(bad); err == nil {
+			t.Fatalf("ParseClock(%q) accepted, want an error", bad)
+		}
+	}
+	if h, m, err := ParseClock(""); err != nil || h != 9 || m != 0 {
+		t.Fatalf("ParseClock(empty) = (%d,%d,%v), want the 09:00 default", h, m, err)
+	}
+}

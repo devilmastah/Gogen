@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/debuglog"
+	"gogen/internal/steerq"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -25,26 +27,6 @@ import (
 // no turn lock), so it lives on the liveSession next to streaming/turnSeq —
 // the same home as the web server's per-runtime delivery queue it unifies
 // with — not in an agent domain group.
-
-// steerItem is one queued turn waiting for the session to go idle.
-type steerItem struct {
-	// id identifies the item (cancel targeting / debugging); generated.
-	id string
-	// text is the prompt the drained turn will run.
-	text string
-	// system marks a machine-generated delivery (job notice, scheduled
-	// reminder, subagent report): rendered as a system notice line, not
-	// individually cancellable, and never dropped by the user-interrupt
-	// clear.
-	system bool
-	// child marks a TARGETED delivery into a subagent child (send_message):
-	// it is never batched with notices (its reply capture is armed per turn
-	// and must stay 1:1 with the tool call), never dropped by overflow, and
-	// its exact turn output is injected into the parent as the reply. Only
-	// this source arms the capture — a child's reaction to any other machine
-	// message must not be mistaken for a reply the parent asked for.
-	child *childHandle
-}
 
 var (
 	steerIDMu  sync.Mutex
@@ -69,13 +51,7 @@ const maxSteerUserQueue = 20
 
 // countUserSteer counts queued user items. Update thread only.
 func (s *liveSession) countUserSteer() int {
-	n := 0
-	for _, it := range s.steerQueue {
-		if !it.system {
-			n++
-		}
-	}
-	return n
+	return s.steerQ.Count(steerq.User)
 }
 
 // clearUserSteer drops every USER queue item (the interrupt semantic:
@@ -85,29 +61,17 @@ func (s *liveSession) countUserSteer() int {
 // bookkeeping whose loss strands the delivery machinery. Update thread
 // only.
 func (s *liveSession) clearUserSteer() int {
-	kept := s.steerQueue[:0]
-	removed := 0
-	for _, it := range s.steerQueue {
-		if it.system {
-			kept = append(kept, it)
-			continue
-		}
-		removed++
+	if s.steerQ == nil {
+		return 0
 	}
-	s.steerQueue = kept
-	return removed
+	return len(s.steerQ.DropKind(steerq.User))
 }
 
 // removeSteerItem drops one USER queue item by id; system deliveries are
 // not individually cancellable. Reports whether anything was removed.
 func (s *liveSession) removeSteerItem(id string) bool {
-	for i, it := range s.steerQueue {
-		if !it.system && it.id == id {
-			s.steerQueue = append(s.steerQueue[:i], s.steerQueue[i+1:]...)
-			return true
-		}
-	}
-	return false
+	_, ok := s.steerQ.Remove(id, steerq.User)
+	return ok
 }
 
 // enqueueSteer queues the user's text against the FOCUSED session while it
@@ -116,32 +80,82 @@ func (s *liveSession) removeSteerItem(id string) bool {
 // boundary. Overflow refuses (never silently drops typed text).
 func (m *Model) enqueueSteer(text string) tea.Cmd {
 	s := m.turnSession()
-	if n := s.countUserSteer(); n >= maxSteerUserQueue {
+	if outcome, _ := s.queue().Append(steerq.Item{ID: newSteerItemID(), Text: text, Kind: steerq.User}); outcome != steerq.Accepted {
 		m.statusMsg = fmt.Sprintf("Too many queued messages (limit %d) — stop the turn or wait for it.", maxSteerUserQueue)
 		return nil
 	}
-	s.steerQueue = append(s.steerQueue, steerItem{id: newSteerItemID(), text: text})
 	m.statusMsg = fmt.Sprintf("Queued (%d) — runs after the current turn", s.countUserSteer())
 	return nil
 }
 
-// startTurnOn runs a turn on sess (focused or background) with the
-// per-session wiring shared by every turn entry point (seq, cancel ctx,
-// adapter, delete approver). Callers must ensure sess is idle (no
-// streaming turn). The FOCUSED-session mirrors (m.streaming, progress
-// strip, chat line, composer relayout) are the caller's business — see
-// startTurn.
+// handleDeliveryRequestMsg queues a system delivery (a job notice, a scheduled
+// reminder, a subagent report) on the session it names.
+//
+// Deliveries are per-session steering-queue items, and the notice names its
+// session, so it is queued THERE: a job notice fired from a background
+// goroutine must not be re-attributed to whichever session happens to be
+// focused when the message reaches the Update thread. Overflow drops the
+// OLDEST SYSTEM delivery (freshness wins — a stale job notice is worse than
+// none), reported at the next drain; user steering items are never dropped
+// here.
+//
+// It lives here rather than inline in the Update dispatch because it is
+// steering-queue policy, not message routing (C1): the whole queue contract is
+// in this file.
+func (m *Model) handleDeliveryRequestMsg(msg deliveryRequestMsg) (tea.Model, tea.Cmd) {
+	s := m.noticeTarget(msg.sid)
+	if s == nil {
+		return m, nil
+	}
+	// The cap/eviction policy is the shared queue's (internal/steerq): at the
+	// system cap the OLDEST NOTICE is evicted, and when every system slot
+	// holds a targeted send_message delivery — whose reply the parent is
+	// waiting on — this notice is dropped instead, exactly like the web host's
+	// enqueueSystem.
+	outcome, evicted := s.queue().Append(steerq.Item{ID: newSteerItemID(), Text: msg.text, Kind: steerq.Notice})
+	switch {
+	case outcome == steerq.Dropped:
+		// Every system slot holds a targeted reply: this notice is dropped
+		// rather than evicting one.
+		m.deliveryDrops++
+		return m, nil
+	case evicted != nil:
+		m.deliveryDrops++
+	}
+	if m.lives != nil && m.lives.Active() == s {
+		return m, m.drainDeliveries()
+	}
+	// A background session's notice drains on ITS idle boundary — now, if it
+	// is idle (startTurnOn buffers the events for replay), or at its next turn
+	// end (handleTurnFinishedMsg).
+	return m, m.drainSessionQueue(s)
+}
+
 // startTurnOnWithResult runs a turn on sess (focused or background) with the
 // per-session wiring shared by every turn entry point (seq, cancel ctx,
 // adapter, delete approver). Callers must ensure sess is idle (no streaming
 // turn). The FOCUSED-session mirrors (m.streaming, progress strip, chat line,
 // composer relayout) are the caller's business — see startTurnWithResult.
 //
+// A still-streaming sess is REFUSED: a turn's goroutine keeps appending to the
+// session's *agent.Agent until its terminal arrives, so starting a second turn
+// in that window interleaves the two turns in the persisted history. The
+// submit gate queues instead (see Model.submitBusy), so this is a safety net
+// for a caller that ever forgets to check.
+//
 // onResult is optional and runs on the turn's own goroutine when
 // StreamProcessInput returns, so a caller that needs the authoritative output
 // (a subagent's main run, or the exact reply to a send_message) never has to
 // infer it from the transcript. onResult must not touch Update-thread state.
 func (m *Model) startTurnOnWithResult(sess *liveSession, text string, onResult func(string, error)) tea.Cmd {
+	if sess == nil {
+		return nil
+	}
+	if sess.streaming {
+		m.statusMsg = "Busy — the previous turn is still stopping; press Enter again"
+		debuglog.Write("tui/turn", "startTurnOnWithResult refused: session still streaming", "turn-double-start", nil)
+		return nil
+	}
 	sess.streaming = true
 	// Bump the turn generation BEFORE the goroutine starts: every message
 	// this turn emits (and its terminal) carries the new seq, so a later
@@ -203,6 +217,24 @@ func (m *Model) startTurnOnWithResult(sess *liveSession, text string, onResult f
 	}
 }
 
+// submitBusy reports whether a submitted prompt must be QUEUED instead of
+// started as a new turn. m.streaming/m.compacting are mirrors of the focused
+// session, and handleCancelKey clears m.streaming immediately (the UI must not
+// stick on a stream that was just cancelled). The cancelled turn's goroutine,
+// however, keeps appending to the session's *agent.Agent until its terminal
+// message arrives, so the session's own flag is checked as well: submitting
+// into that window used to start a SECOND turn on the same agent and
+// interleave the persisted history.
+func (m *Model) submitBusy() bool {
+	if m.streaming || m.compacting {
+		return true
+	}
+	if s := m.turnSession(); s != nil && (s.streaming || s.compacting) {
+		return true
+	}
+	return false
+}
+
 // drainSessionQueue pops the queue head from s — or, when the head is a
 // system delivery, the contiguous run of system deliveries behind it — and
 // starts its turn. The queue drains at every terminal boundary
@@ -216,47 +248,42 @@ func (m *Model) startTurnOnWithResult(sess *liveSession, text string, onResult f
 // buffer in the session's replay queue and their terminal routes back here
 // through handleTurnFinishedMsg.
 func (m *Model) drainSessionQueue(s *liveSession) tea.Cmd {
-	if s == nil || s.streaming || s.compacting || len(s.steerQueue) == 0 {
+	if s == nil || s.streaming || s.compacting || s.steerQ.Len() == 0 {
 		return nil
 	}
 	// A notice run shares ONE turn (one provider request); a TARGETED
 	// send_message delivery always gets its own turn, because its reply
 	// capture is armed per delivery and must stay 1:1 with the tool call.
-	n := 1
-	if s.steerQueue[0].system && s.steerQueue[0].child == nil {
-		for n < len(s.steerQueue) && s.steerQueue[n].system && s.steerQueue[n].child == nil {
-			n++
-		}
-	}
-	batch := s.steerQueue[:n]
-	s.steerQueue = s.steerQueue[n:]
+	// The head-run rule itself is the shared queue's (steerq.Batch): only a
+	// contiguous run of Notice items is ever batched.
+	batch := s.steerQ.Take(len(s.steerQ.Batch()))
+	n := len(batch)
 	item := batch[0]
 	// text is the turn prompt (blank-line separated); display is the
 	// focused transcript's system line (one notice per visual line).
-	text, display := item.text, item.text
+	text, display := item.Text, item.Text
 	if n > 1 {
 		texts := make([]string, n)
 		for i, it := range batch {
-			texts[i] = it.text
+			texts[i] = it.Text
 		}
 		text = strings.Join(texts, "\n\n")
 		display = strings.Join(texts, "\n")
 	}
 	var onResult func(string, error)
-	if item.child != nil {
+	if h := queuedChild(item); h != nil {
 		// Targeted delivery: arm the exact-reply capture for THIS turn and
 		// resolve it into the parent conversation when the turn ends. The
 		// queue depth is re-mirrored so Busy sees the remaining backlog.
-		h := item.child
 		if child := h.childOf(); child != nil {
 			child.BeginReply()
 		}
-		h.setQueueDepth(countQueuedChildItems(s.steerQueue, h))
+		h.setQueueDepth(s.steerQ.CountTag(h))
 		onResult = childTurnResultSink(m.spawner, h, false)
 	}
 	focused := m.lives != nil && m.lives.Active() == s
 	if focused {
-		if item.system {
+		if item.Kind != steerq.User {
 			return m.startTurnWithResult(text, SystemStyle.Render(noticeLabel+" "+display), onResult)
 		}
 		return m.startTurnWithResult(text, UserStyle.Render(userLabel)+" "+text, onResult)
@@ -264,16 +291,17 @@ func (m *Model) drainSessionQueue(s *liveSession) tea.Cmd {
 	return m.startTurnOnWithResult(s, text, onResult)
 }
 
+// queuedChild returns the child handle of a TARGETED delivery item (nil for
+// notices and user items).
+func queuedChild(it steerq.Item) *childHandle {
+	h, _ := it.Tag.(*childHandle)
+	return h
+}
+
 // countQueuedChildItems counts the queued targeted deliveries still waiting for
 // handle h (its own backlog), so the handle's busy mirror stays honest.
-func countQueuedChildItems(queue []steerItem, h *childHandle) int {
-	n := 0
-	for _, it := range queue {
-		if it.child == h {
-			n++
-		}
-	}
-	return n
+func countQueuedChildItems(q *steerq.Queue, h *childHandle) int {
+	return q.CountTag(h)
 }
 
 // noticeTarget resolves the session a system delivery was raised for: the
@@ -297,29 +325,17 @@ func (m *Model) noticeTarget(sid string) *liveSession {
 	return m.turnSession()
 }
 
-// isBusyCommand reports whether input is a slash command or one of the
-// bare command words the TUI command table dispatches. Pure: while a turn
-// runs, such input is REFUSED with a hint (commands like /new or /resume
-// would rebind the session mid-turn) instead of being queued as chat —
-// /queue itself is intercepted earlier.
+// isBusyCommand reports whether input is command-shaped (a slash command or a
+// bare command word) and must therefore be REFUSED with a hint while a turn
+// runs — commands like /new or /resume would rebind the session mid-turn —
+// instead of being queued as chat. /queue is intercepted earlier.
+//
+// The classification itself lives in agent.IsCommandInput, shared with the
+// web's busy gate: the two surfaces used to keep separate word lists and
+// disagreed about bare "think"/"models" (commands on the web) versus
+// "verbose"/"compact"/"queue" (commands in the TUI).
 func isBusyCommand(trimmed string) bool {
-	if strings.HasPrefix(trimmed, "/") {
-		return true
-	}
-	if trimmed == "plan" || trimmed == "act" || trimmed == "mode" ||
-		trimmed == "context" || trimmed == "help" || trimmed == "verbose" ||
-		trimmed == "subagents" || trimmed == "save-config" || trimmed == "compact" ||
-		trimmed == "new" || trimmed == "sessions" || trimmed == "resume" || trimmed == "fork" ||
-		trimmed == "switch" || trimmed == "open" || trimmed == "queue" {
-		return true
-	}
-	for _, p := range []string{"think ", "context ", "models ", "dir ", "switch ", "open ",
-		"save-config ", "sessions ", "resume ", "fork ", "switch"} {
-		if strings.HasPrefix(trimmed, p) {
-			return true
-		}
-	}
-	return false
+	return agent.IsCommandInput(trimmed)
 }
 
 // relayout re-runs the size math so the busy band's progress strip (the
@@ -345,9 +361,9 @@ func (m *Model) relayout() {
 func (m *Model) renderQueueModal() string {
 	rows := []styleLine{{text: "Queued messages", highlight: true}}
 	s := m.focusedSession()
-	var items []steerItem
+	var items []steerq.Item
 	if s != nil {
-		items = s.steerQueue
+		items = s.steerQ.Items()
 	}
 	if len(items) == 0 {
 		rows = append(rows, styleLine{text: "Nothing queued."})
@@ -364,11 +380,11 @@ func (m *Model) renderQueueModal() string {
 			cursor = 0
 		}
 		for i, it := range items {
-			label := it.text
-			if it.system {
+			label := it.Text
+			if it.Kind != steerq.User {
 				label = "[delivery] " + label
 			}
-			label = sliceByRuneCount(label, 58)
+			label = truncateRunes(label, 58)
 			prefix := "  "
 			if i == cursor {
 				prefix = "> "
@@ -401,7 +417,7 @@ func (m *Model) handleQueueKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	s := m.focusedSession()
 	n := 0
 	if s != nil {
-		n = len(s.steerQueue)
+		n = s.steerQ.Len()
 	}
 	m.clampQueueCursor(n)
 	switch msg.String() {
@@ -417,12 +433,12 @@ func (m *Model) handleQueueKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "d":
 		if s != nil && n > 0 {
-			if it := s.steerQueue[m.queueCursor]; it.system {
+			if it := s.steerQ.Items()[m.queueCursor]; it.Kind != steerq.User {
 				// Deliveries are not individually cancellable.
 				m.statusMsg = "System deliveries wait for the idle state and cannot be cancelled individually."
-			} else if s.removeSteerItem(it.id) {
-				if m.queueCursor >= len(s.steerQueue) {
-					m.queueCursor = len(s.steerQueue) - 1
+			} else if s.removeSteerItem(it.ID) {
+				if m.queueCursor >= s.steerQ.Len() {
+					m.queueCursor = s.steerQ.Len() - 1
 				}
 				if m.queueCursor < 0 {
 					m.queueCursor = 0

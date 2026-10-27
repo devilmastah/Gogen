@@ -87,6 +87,21 @@ func (a *Agent) armSmartCompactStream(h *llm.StreamHandlers) (*llm.StreamHandler
 		}
 	}
 	prevStop := h.StopStream
+	// base is the conversation total at the START of the current round. Round
+	// boundaries are the only places messages are appended, so it cannot change
+	// DURING a round — and StopStream is consulted on every streamed chunk,
+	// where compactionTokenTotal's walk over every message count (plus, without
+	// a fresh provider baseline, a system-suffix rebuild and hash) was pure
+	// repetition. -1 means "not applicable" (feature off, or no stop point).
+	var base atomic.Int64
+	base.Store(-1)
+	recomputeBase := func() {
+		if !a.smartCompactEnabled() || a.Context == nil || a.Context.SmartCompactStopAt() <= 0 {
+			base.Store(-1)
+			return
+		}
+		base.Store(int64(a.compactionTokenTotal()))
+	}
 	local.StopStream = func() bool {
 		if prevStop != nil && prevStop() {
 			return true
@@ -98,13 +113,18 @@ func (a *Agent) armSmartCompactStream(h *llm.StreamHandlers) (*llm.StreamHandler
 		if stopAt <= 0 {
 			return false
 		}
-		total := a.compactionTokenTotal()
+		total := int(base.Load())
 		if total < 0 {
 			return false
 		}
 		return total+int(gen.Load()/4) >= stopAt
 	}
-	return &local, func() { gen.Store(0) }
+	// The reset runs at every round start, which is exactly when the cached
+	// base can legitimately change.
+	return &local, func() {
+		gen.Store(0)
+		recomputeBase()
+	}
 }
 
 // replyExceedsBudget reports whether appending this assistant round would
@@ -273,7 +293,7 @@ func (a *Agent) compactIfDue(ctx context.Context, h *llm.StreamHandlers) bool {
 		// compactable middle) keeps the configured keep, which makes the
 		// attempt a documented no-op.
 		needed := total - a.Context.HardLimit() + emergencySummaryAllowance
-		if k := a.Context.ChooseCompactKeep(a.Messages, counts, needed); k > 0 {
+		if k := a.Context.ChooseCompactKeep(a.Messages, counts, needed, pinned); k > 0 {
 			keep = k
 		}
 	}

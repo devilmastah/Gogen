@@ -136,7 +136,7 @@ type streamAccumulator struct {
 func newStreamAccumulator() *streamAccumulator {
 	return &streamAccumulator{
 		tcIndexMap: make(map[int]int),
-		extras:     newExtraFieldAccums(),
+		extras:     newCountingExtraFieldAccums(),
 	}
 }
 

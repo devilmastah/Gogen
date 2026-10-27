@@ -182,6 +182,12 @@ const writeBufferSize = 64 << 10
 // sticky error (open or write failure) disables the target: subsequent
 // Writes return the same error and the caller falls back to plain
 // truncation. Target is safe for concurrent use.
+// MaxTargetBytes caps one spill file. A command that streams forever (`yes`)
+// would otherwise fill the disk: the output is spilled precisely because it is
+// too big for memory, so nothing else bounds it. Hitting the cap is reported to
+// the writer as an error, which surfaces as the tool result.
+const MaxTargetBytes int64 = 64 << 20
+
 type Target struct {
 	store     *Store
 	sessionID string
@@ -232,6 +238,10 @@ func (t *Target) Write(p []byte) (int, error) {
 		t.f = f
 		t.path = path
 		t.bw = bufio.NewWriterSize(f, writeBufferSize)
+	}
+	if t.written >= MaxTargetBytes {
+		t.err = fmt.Errorf("spill: output exceeded %d bytes; the rest is not being captured", MaxTargetBytes)
+		return 0, t.err
 	}
 	// Writes land in the buffer, not the file: the file is only read back
 	// after Finish (which flushes), never concurrently with an open
@@ -589,10 +599,14 @@ func RepointFile(workingDir, oldPath, toSessionID string) (string, error) {
 	}
 	_, werr := f.Write(data)
 	cerr := f.Close()
-	if werr != nil {
-		return "", werr
-	}
-	if cerr != nil {
+	if werr != nil || cerr != nil {
+		// Remove the partial copy: a truncated file at newPath would satisfy
+		// the Lstat check above on the NEXT repoint and be handed to the model
+		// as if it were complete.
+		_ = os.Remove(newPath)
+		if werr != nil {
+			return "", werr
+		}
 		return "", cerr
 	}
 	return newPath, nil

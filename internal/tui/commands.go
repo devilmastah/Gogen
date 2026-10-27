@@ -273,7 +273,7 @@ func cmdVerbose(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 func cmdMode(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	out, _ := m.agent.HandleModeCommand(input)
 	if trimmed == "/plan" || trimmed == "plan" || trimmed == "/act" || trimmed == "act" {
-		m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+		m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String(), m.verbose)
 		m.chatLines = append(m.chatLines, SystemStyle.Render(out))
 		m.setViewportContent()
 		m.pinFollow() // the transcript was replaced wholesale
@@ -342,7 +342,7 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	} else {
 		m.appendChatLine(SystemStyle.Render(result.Output))
 		if len(result.History) > 0 {
-			m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+			m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String(), m.verbose)
 			m.setViewportContent()
 			m.pinFollow() // restored history starts at the live edge
 			m.markTranscriptRendered()
@@ -370,7 +370,7 @@ func (m *Model) applySessionSwitch(result agent.SessionCommandResult) tea.Cmd {
 	m.chatLines = nil
 	m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
 	if len(result.History) > 0 {
-		m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
+		m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String(), m.verbose)...)
 	}
 	m.setViewportContent()
 	m.pinFollow() // fresh transcript (the focused session changed)

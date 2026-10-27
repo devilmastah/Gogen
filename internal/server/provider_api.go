@@ -205,11 +205,7 @@ func (s *Server) applyProviderList(ws *wsConn, providers []config.OpenAIProvider
 // internally synchronized.
 func (s *Server) applyProviderProfilesToAll() {
 	profiles := s.ws.providerProfiles()
-	for _, id := range s.registry.activeIDs() {
-		rt, ok := s.registry.get(id)
-		if !ok {
-			continue
-		}
+	for _, rt := range s.registry.runtimes() {
 		if p, ok := rt.agent.Provider.(*llm.OpenAIProvider); ok {
 			_ = p.SetProfiles(profiles)
 		}
@@ -225,11 +221,7 @@ func (s *Server) applyProviderProfilesToAll() {
 func (s *Server) revalidateSessionModels() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	for _, id := range s.registry.activeIDs() {
-		rt, ok := s.registry.get(id)
-		if !ok {
-			continue
-		}
+	for _, rt := range s.registry.runtimes() {
 		model := rt.agent.CurrentModel()
 		if model == "" {
 			continue

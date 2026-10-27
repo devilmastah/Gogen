@@ -39,7 +39,7 @@ func streamThinkingChunked(t *testing.T, m *Model, text string) {
 		}
 		m.handleStreamThinking(text[offset:end])
 		offset = end
-		if got, want := m.wrappedContentString(), wantThinkingLine(m); got != want {
+		if got, want := m.transcriptText(), wantThinkingLine(m); got != want {
 			t.Fatalf("after %d bytes:\n got %q\nwant %q", offset, got, want)
 		}
 	}
@@ -69,11 +69,11 @@ func TestThinkingIncrementalTrailingNewline(t *testing.T) {
 
 	streamThinkingChunked(t, m, "alpha\nbeta\ngamma\n")
 	m.handleStreamThinking("delta")
-	if got, want := m.wrappedContentString(), wantThinkingLine(m); got != want {
+	if got, want := m.transcriptText(), wantThinkingLine(m); got != want {
 		t.Fatalf("got %q\nwant %q", got, want)
 	}
-	if !strings.Contains(m.wrappedContentString(), "delta") {
-		t.Fatalf("delta missing from display:\n%s", m.wrappedContentString())
+	if !strings.Contains(m.transcriptText(), "delta") {
+		t.Fatalf("delta missing from display:\n%s", m.transcriptText())
 	}
 	m.closeThinkingBlock()
 }
@@ -92,7 +92,7 @@ func TestThinkingIncrementalResizeRebuildsCache(t *testing.T) {
 	m.width = 80
 	m.viewport.Width = 30
 	m.setViewportContent()
-	if got, want := m.wrappedContentString(), wantThinkingLine(m); got != want {
+	if got, want := m.transcriptText(), wantThinkingLine(m); got != want {
 		t.Fatalf("after resize:\n got %q\nwant %q", got, want)
 	}
 	streamThinkingChunked(t, m, " more after resize\nfinal")
@@ -116,7 +116,7 @@ func TestThinkingIncrementalRoundBufferSeed(t *testing.T) {
 		t.Fatalf("seeded line = %q, want %q", m.chatLines[m.streamThinkingLine], want)
 	}
 	m.setViewportContent()
-	if got, want := m.wrappedContentString(), wantThinkingLine(m); got != want {
+	if got, want := m.transcriptText(), wantThinkingLine(m); got != want {
 		t.Fatalf("after seed:\n got %q\nwant %q", got, want)
 	}
 	streamThinkingChunked(t, m, " continued\nand wrapped tightly here.")

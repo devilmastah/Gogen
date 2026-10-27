@@ -67,7 +67,10 @@ func (e *Executor) walkReadableFiles(ctx context.Context, searchRoot, relPrefix,
 		if parsedOnly && !treesitter.ReferenceSearchSupported(path) {
 			return nil
 		}
-		content, err := os.ReadFile(path)
+		// Bounded read: the walker only hands over regular files, and the
+		// read itself re-checks the size cap so a file that grew after the
+		// stat cannot be loaded whole.
+		content, err := readFileBounded(path)
 		if err != nil {
 			return nil
 		}

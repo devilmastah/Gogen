@@ -187,8 +187,7 @@ func TestSliceByCellsUTF8(t *testing.T) {
 
 func TestGetSelectedTextUTF8(t *testing.T) {
 	m := &Model{}
-	m.wrappedContent = "café au lait"
-	m.wrappedLinesDirty = true
+	seedViewportRows(m, "café au lait")
 	m.selection = &SelectionState{
 		Active: true,
 		StartX: 0,
@@ -207,8 +206,7 @@ func TestGetSelectedTextUTF8(t *testing.T) {
 
 func TestCopySelectionKeepsUntilCopy(t *testing.T) {
 	m := &Model{}
-	m.wrappedContent = "hello world\nsecond line"
-	m.wrappedLinesDirty = true
+	seedViewportRows(m, "hello world\nsecond line")
 	m.selection = &SelectionState{
 		Active:   true,
 		Dragging: false,
@@ -230,8 +228,7 @@ func TestMouseReleaseDoesNotClearSelection(t *testing.T) {
 	m.viewport.Height = 20
 	m.viewport.Width = 40
 	m.viewport.Style = ViewportStyle
-	m.wrappedContent = "hello world"
-	m.wrappedLinesDirty = true
+	seedViewportRows(m, "hello world")
 	m.selectionYOff = 0
 	m.selection = &SelectionState{
 		Active:   true,
@@ -265,8 +262,7 @@ func TestButtonNoneMotionDoesNotClearDrag(t *testing.T) {
 	m.viewport.Height = 20
 	m.viewport.Width = 40
 	m.viewport.Style = ViewportStyle
-	m.wrappedContent = "hello world"
-	m.wrappedLinesDirty = true
+	seedViewportRows(m, "hello world")
 	m.selectionYOff = 0
 	m.selection = &SelectionState{
 		Active:   true,
@@ -298,8 +294,7 @@ func TestMousePressRestartsSelection(t *testing.T) {
 	m.viewport.Height = 20
 	m.viewport.Width = 40
 	m.viewport.Style = ViewportStyle
-	m.wrappedContent = "hello world"
-	m.wrappedLinesDirty = true
+	seedViewportRows(m, "hello world")
 	m.selection = &SelectionState{
 		Active:   true,
 		Dragging: false,
@@ -430,4 +425,180 @@ func TestSelectionRenderMatchesHorizontalScroll(t *testing.T) {
 			t.Fatalf("contentX = %d, want 8 (the xOffset)", contentX)
 		}
 	})
+}
+
+// seedViewportRows installs the given transcript text as the viewport's wrapped
+// rows — the single rendered copy selection reads (the old wrappedContent/
+// wrappedLines caches are gone).
+func seedViewportRows(m *Model, text string) {
+	rows := strings.Split(text, "\n")
+	width := 0
+	for _, r := range rows {
+		if w := cellWidth(r); w > width {
+			width = w
+		}
+	}
+	m.viewport.SetContentLines(rows, width)
+}
+
+// TestSelectionRendersFromViewportRows pins the M1 rewrite: selection reads the
+// viewport's wrapped rows (the only rendered copy) and derives plain text per
+// visible row, instead of keeping a joined string plus its stripped and styled
+// splits of the whole transcript.
+func TestSelectionRendersFromViewportRows(t *testing.T) {
+	m := dragModel(t)
+	m.sidebarVisible = false
+	m.viewport = NewViewport(m.mainWidth(), 10)
+	m.viewport.Style = ViewportStyle
+	// A styled row: highlighting must map plain cells back onto the styled
+	// bytes, exactly as before the rewrite.
+	m.chatLines = []string{AssistantStyle.Render("hello styled world"), "second line"}
+	m.setViewportContent()
+
+	plain := m.plainLine(0)
+	if plain != "hello styled world" {
+		t.Fatalf("plainLine(0) = %q, want the ANSI-stripped row", plain)
+	}
+	if got := m.plainLineCount(); got != len(m.viewport.Lines()) {
+		t.Fatalf("plainLineCount = %d, want %d", got, len(m.viewport.Lines()))
+	}
+
+	m.selection = &SelectionState{Active: true, StartX: 0, StartY: 0, EndX: 5, EndY: 0}
+	if got := m.getSelectedText(); got != "hello" {
+		t.Fatalf("getSelectedText = %q, want %q", got, "hello")
+	}
+	rendered := m.renderViewportWithSelection()
+	if !strings.Contains(rendered, "\x1b[7m") {
+		t.Fatal("selection highlight missing from the rendered viewport")
+	}
+	if !strings.Contains(stripANSI(rendered), "hello styled world") {
+		t.Fatalf("rendered viewport lost the row text: %q", stripANSI(rendered))
+	}
+}
+
+// TestGetSelectedTextMultiRow uses viewport rows spanning a wrap boundary.
+func TestGetSelectedTextMultiRow(t *testing.T) {
+	m := &Model{}
+	seedViewportRows(m, "first row\nsecond row\nthird")
+	m.selection = &SelectionState{Active: true, StartX: 6, StartY: 0, EndX: 6, EndY: 1}
+	if got, want := m.getSelectedText(), "row\nsecond"; got != want {
+		t.Fatalf("getSelectedText = %q, want %q", got, want)
+	}
+}
+
+// BenchmarkRenderViewportWithSelection covers the per-frame selection render on
+// a long transcript. Before M1 this stripped and split the WHOLE transcript on
+// every frame (two full copies); now it reads the viewport rows and strips only
+// the visible selected rows.
+func BenchmarkRenderViewportWithSelection(b *testing.B) {
+	m := &Model{}
+	m.sidebarVisible = false
+	m.viewport = NewViewport(m.mainWidth(), 40)
+	m.viewport.Style = ViewportStyle
+	rows := make([]string, 2000)
+	for i := range rows {
+		rows[i] = AssistantStyle.Render("row " + strings.Repeat("x", 40))
+	}
+	m.viewport.SetContentLines(rows, 60)
+	m.selection = &SelectionState{Active: true, StartX: 0, StartY: 100, EndX: 10, EndY: 130}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if out := m.renderViewportWithSelection(); out == "" {
+			b.Fatal("empty render")
+		}
+	}
+}
+
+// BenchmarkRenderViewportPlain is the unselected counterpart: the per-frame
+// cost of Viewport.View on the same long transcript. The selection path pads
+// its rows with fitRows too, so its cost should track this one rather than a
+// whole lipgloss Render pass.
+func BenchmarkRenderViewportPlain(b *testing.B) {
+	m := &Model{}
+	m.sidebarVisible = false
+	m.viewport = NewViewport(m.mainWidth(), 40)
+	m.viewport.Style = ViewportStyle
+	rows := make([]string, 2000)
+	for i := range rows {
+		rows[i] = AssistantStyle.Render("row " + strings.Repeat("x", 40))
+	}
+	m.viewport.SetContentLines(rows, 60)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if out := m.viewport.View(); out == "" {
+			b.Fatal("empty render")
+		}
+	}
+}
+
+// TestSelectionSurvivesStreaming pins the B25 fix: appending rows (a token
+// batch) must not wipe the user's selection. It used to be cleared on every
+// batch, so text could not be selected while a turn streamed.
+func TestSelectionSurvivesStreaming(t *testing.T) {
+	m := newQueueTestModel()
+	m.chatLines = []string{"first row"}
+	m.SetSize(80, 40)
+	m.streamAssistantLine = -1 // the real constructor's initial value
+	m.selection = &SelectionState{Active: true, StartX: 0, StartY: 0, EndX: 5, EndY: 0}
+
+	// A streaming append (appendChatLine) goes through buildFromPrefix.
+	m.appendChatLine("second row")
+	if m.selection == nil {
+		t.Fatal("selection cleared by a streaming append")
+	}
+	// And the streamed-line path (publishStreamWrap) must not clear it either.
+	m.handleStreamToken("streaming token")
+	if m.selection == nil {
+		t.Fatal("selection cleared by a token batch")
+	}
+	if got := m.getSelectedText(); got != "first" {
+		t.Fatalf("selected text = %q, want the original selection", got)
+	}
+
+	// A full rebuild still clears: the rows are replaced, so row coordinates no
+	// longer address the same text.
+	m.setViewportContent()
+	if m.selection != nil {
+		t.Fatal("selection survived a full transcript rebuild")
+	}
+}
+
+// TestZeroWidthRunesInSelection pins the cell math for combining marks and
+// variation selectors: they occupy no cell of their own, so a selection must not
+// shift by one per combining mark (and must still carry the mark when its base
+// character is selected).
+func TestZeroWidthRunesInSelection(t *testing.T) {
+	const combining = "e\u0301" // e + COMBINING ACUTE
+
+	m := &Model{}
+	seedViewportRows(m, combining+"x")
+	// Cell 0 is "é" (e + combining mark); cell 1 is "x".
+	m.selection = &SelectionState{Active: true, StartX: 0, StartY: 0, EndX: 1, EndY: 0}
+	if got, want := m.getSelectedText(), combining; got != want {
+		t.Fatalf("selecting the composed cell = %q, want %q", got, want)
+	}
+	m.selection = &SelectionState{Active: true, StartX: 1, StartY: 0, EndX: 2, EndY: 0}
+	if got, want := m.getSelectedText(), "x"; got != want {
+		t.Fatalf("selecting the following cell = %q, want %q", got, want)
+	}
+	// The highlight's cell→rune mapping must cover the mark with its base.
+	startRi, endRi := cellsToRuneRange(combining+"x", 0, 1)
+	if startRi != 0 || endRi != 2 {
+		t.Fatalf("cellsToRuneRange(0,1) = (%d,%d), want (0,2) to cover e+combining", startRi, endRi)
+	}
+}
+
+// TestMapPlainToStyledSkipsOSC pins the OSC gap: a hyperlink/OSC sequence must be
+// skipped like a CSI, or every mapping after it is off by the sequence length.
+func TestMapPlainToStyledSkipsOSC(t *testing.T) {
+	styled := "\x1b]8;;https://example.com\x07link\x1b[0m text"
+	plain := stripANSI(styled)
+	if plain != "link text" {
+		t.Fatalf("plain = %q", plain)
+	}
+	// Plain index 5 ('t' of "text") maps to the byte offset of that 't'.
+	got := mapPlainToStyled(5, styled)
+	if got >= len(styled) || styled[got] != 't' {
+		t.Fatalf("mapPlainToStyled(5) = %d (%q), want the 't' of \"text\"", got, styled[got:])
+	}
 }

@@ -122,27 +122,34 @@ func (e *Executor) dependencyAnalysisWithText(ctx context.Context, searchRoot, r
 }
 
 func (e *Executor) findIndirectDependents(ctx context.Context, directDependents []string) []string {
-	indirect := make(map[string]bool)
-
+	// One alternation over every direct dependent, searched once through the
+	// structured API. The previous per-dependent loop parsed SearchCode's
+	// context-free output as "path:line:content", but that mode returns the
+	// grouped layout (a bare path line followed by "line:content" lines), so
+	// every line failed to parse and indirect dependents were never found.
+	quoted := make([]string, 0, len(directDependents))
 	for _, dep := range directDependents {
-		// Search for references to the relative path (e.g. "internal/agent/utils").
-		// This is more precise than searching for just the filename stem.
-		pattern := regexp.QuoteMeta(dep)
-		results, err := e.SearchCode(ctx, pattern, "", "", 0, false)
-		if err != nil {
+		if dep == "" {
 			continue
 		}
-		if strings.HasPrefix(results, "No matches") {
-			continue
-		}
+		quoted = append(quoted, regexp.QuoteMeta(dep))
+	}
+	if len(quoted) == 0 {
+		return nil
+	}
+	matches, _, err := e.SearchCodeMatches(ctx, "(?:"+strings.Join(quoted, "|")+")", "", "", false)
+	if err != nil {
+		return nil
+	}
 
-		// Parse results
-		lines := strings.Split(results, "\n")
-		for _, line := range lines {
-			file, _, ok := splitSearchLine(line)
-			if ok && file != dep {
-				indirect[file] = true
-			}
+	direct := make(map[string]bool, len(directDependents))
+	for _, dep := range directDependents {
+		direct[dep] = true
+	}
+	indirect := make(map[string]bool)
+	for _, m := range matches {
+		if !direct[m.Path] {
+			indirect[m.Path] = true
 		}
 	}
 

@@ -22,7 +22,7 @@ package server
 //	go test -tags debug ./internal/server -run TestLiveHarnessServer -v &
 //	sleep 3 && node tmp/live_stall_detach.js
 //
-// The stall must exceed enqueueJSON's 5s queue-full timeout: with the tiny
+// The stall must exceed wsEnqueueWait's queue-full timeout: with the tiny
 // queue plus a 6s-per-write stall, the first blocked send times out, the
 // socket is detached, and the turn keeps running headless (see the script's
 // header for the full walkthrough).

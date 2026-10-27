@@ -19,32 +19,55 @@ import (
 
 // --- Bubble Tea messages for streaming ---
 
-// Every streaming message carries its owning session id (sid) and the
-// turn generation (seq) it was produced by; see streamEventAttribution
-// and liveSession.turnSeq for the drop rules.
+// streamMeta is the ownership/staleness stamp every streaming message carries:
+// the session that owns the turn (sid) and the turn generation (seq). handleMsg
+// drops events whose session no longer owns the focus and events from a
+// superseded turn (see ownsStream / staleTurn and liveSession.turnSeq).
+//
+// It is EMBEDDED rather than repeated as two fields so ONE type assertion
+// answers "which session, which turn?" for every message: the two
+// hand-written 15-case switches that used to do it (streamEventSid,
+// streamEventAttribution) had to be extended in lockstep with each other and
+// with the dispatch switch, and nothing enforced that. Field promotion keeps
+// msg.sid / msg.seq working everywhere.
+//
+// The turn's TERMINAL messages (streamEndMsg, streamErrorMsg) deliberately do
+// not embed it: they are routed by handleTurnFinishedMsg, which does its own
+// session/generation resolution, so they must reach the dispatcher even when
+// the focused session is not the one that finished.
+type streamMeta struct {
+	sid string
+	seq uint64
+}
+
+// attribution implements streamAttributed (the one classifier handleMsg uses).
+func (s streamMeta) attribution() (sid string, seq uint64) { return s.sid, s.seq }
+
+// streamAttributed is implemented by every message that belongs to a streaming
+// turn — by embedding streamMeta. See streamMeta for why this replaced two
+// duplicate type switches.
+type streamAttributed interface {
+	attribution() (sid string, seq uint64)
+}
 
 // streamStartMsg is sent when the agent first begins processing.
 type streamStartMsg struct {
-	sid string
-	seq uint64
+	streamMeta
 }
 
 // streamRoundStartMsg is sent at the start of each LLM round after the first.
 type streamRoundStartMsg struct {
-	sid string
-	seq uint64
+	streamMeta
 }
 
 type streamTokenMsg struct {
 	token string
-	sid   string
-	seq   uint64
+	streamMeta
 }
 
 type streamThinkingMsg struct {
 	token string
-	sid   string
-	seq   uint64
+	streamMeta
 }
 
 // streamStatsMsg carries the shared streamutil.SpeedMeter's smoothed
@@ -53,8 +76,7 @@ type streamThinkingMsg struct {
 // not per-token, and always precedes the round's terminal messages.
 type streamStatsMsg struct {
 	toksPerSec float64
-	sid        string
-	seq        uint64
+	streamMeta
 }
 
 // streamCompactingMsg is sent when the agent compacts history mid-turn
@@ -62,8 +84,7 @@ type streamStatsMsg struct {
 // full non-streaming LLM call, so without this the strip shows a bare
 // "thinking" spinner for the whole silent summarization.
 type streamCompactingMsg struct {
-	sid string
-	seq uint64
+	streamMeta
 }
 
 // streamStallMsg is sent when no SSE chunk has arrived for several seconds
@@ -71,8 +92,7 @@ type streamCompactingMsg struct {
 // "thinking" spinner for a "still waiting" label. Cleared by the next
 // progress event (any token/stats/round boundary).
 type streamStallMsg struct {
-	sid string
-	seq uint64
+	streamMeta
 }
 
 // streamRetryMsg is sent when a failed stream attempt is retried with live
@@ -80,24 +100,21 @@ type streamStallMsg struct {
 // silent stretch that follows is a whole regeneration, not a hang.
 type streamRetryMsg struct {
 	reason string
-	sid    string
-	seq    uint64
+	streamMeta
 }
 
 type streamToolCallMsg struct {
 	index int
 	id    string
 	name  string
-	sid   string
-	seq   uint64
+	streamMeta
 }
 
 type streamToolCallArgsMsg struct {
 	index int
 	id    string
 	delta string
-	sid   string
-	seq   uint64
+	streamMeta
 }
 
 type streamToolResultMsg struct {
@@ -105,31 +122,27 @@ type streamToolResultMsg struct {
 	name    string
 	result  string
 	success bool
-	sid     string
-	seq     uint64
+	streamMeta
 }
 
 // streamToolCallFinalMsg is sent when tool call args are fully parsed.
 type streamToolCallFinalMsg struct {
 	index int
 	tc    llm.ToolCall
-	sid   string
-	seq   uint64
+	streamMeta
 }
 
 // streamToolExecuteMsg is sent immediately before a tool runs.
 type streamToolExecuteMsg struct {
 	name string
-	sid  string
-	seq  uint64
+	streamMeta
 }
 
 // streamRoundEndMsg is sent at the end of each streaming round
 // (including intermediate tool-call rounds). It resets buffers
 // but does NOT set streaming=false.
 type streamRoundEndMsg struct {
-	sid string
-	seq uint64
+	streamMeta
 }
 
 // streamEndMsg is sent when all streaming is complete (final message from
@@ -153,8 +166,7 @@ type streamErrorMsg struct {
 // (Phase 0e) for rendering as a system line.
 type condensedNoteMsg struct {
 	note string
-	sid  string
-	seq  uint64
+	streamMeta
 }
 
 type contextStatsMsg struct {
@@ -418,16 +430,18 @@ func (s *StreamAdapter) OnToolResult(id, name, result string, success bool) {
 
 // appendChatLine adds a line to the chat buffer and updates the viewport.
 func (m *Model) appendChatLine(line string) {
-	// Move the current last line's wrapping into the prefix so that only
-	// the *new* last line needs re-wrapping on subsequent updates.
+	// Move the current last line's rows into the prefix so that only the NEW
+	// last line needs re-wrapping.
+	//
+	// The wrap is computed HERE rather than reusing m.lastWrapped: the raw last
+	// line can change without lastWrapped being refreshed — the round-end trim
+	// rewrites chatLines[last] (TrimRight of trailing newlines) and does not
+	// re-wrap before the next append. Reusing the stale wrap smuggled the
+	// trimmed-away blank row back in as an extra separator (the blank-line
+	// regression this funnel already fixed once). Wrapping one line is O(line),
+	// not O(transcript); the joined-copy that WAS quadratic is gone.
 	if len(m.chatLines) > 0 {
-		parts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
-		wrapped := strings.Join(parts, "\n")
-		// wrappedPrefix already ends with "\n" (or is empty on the first
-		// line); appending the wrapped line keeps a single separator.
-		m.wrappedPrefix += wrapped + "\n"
-		// Keep the incremental viewport prefix in sync (see buildFromPrefix).
-		m.prefixLines = append(m.prefixLines, strings.Split(wrapped, "\n")...)
+		m.prefixLines = append(m.prefixLines, m.wrapLine(m.chatLines[len(m.chatLines)-1])...)
 	}
 	m.chatLines = append(m.chatLines, line)
 	if isUserPromptLine(line) {
@@ -465,12 +479,11 @@ func (m *Model) replaceLastLine(text string) {
 
 func (m *Model) handleStreamToken(token string) {
 	m.closeThinkingBlock()
-	if m.streamAssistantBuf.Len() == 0 {
+	if m.streamAssistantLine < 0 {
 		label := AssistantStyle.Render(assistantLabel)
 		m.streamAssistantLine = len(m.chatLines)
 		m.appendChatLine(label + " ")
 	}
-	m.streamAssistantBuf.WriteString(token)
 	m.appendToStreamLine(m.streamAssistantLine, token)
 	m.bumpContextEstimate(token)
 }
@@ -640,14 +653,14 @@ func (m *Model) closeThinkingBlock() {
 	m.streamThinkingLine = -1
 	// Reset assistant state so content tokens arriving after this thinking
 	// block create a new line below it, preserving temporal order.
-	m.streamAssistantBuf.Reset()
 	m.streamAssistantLine = -1
+	m.invalidateStreamWrap()
 }
 
 // commitChatLineWrite applies one write to chat line idx — appending text
 // when append is true, replacing the line otherwise — and settles the
 // viewport. This is the streaming prefix-cache invalidation rule in one
-// place: wrappedPrefix caches the wrap of everything before the last line,
+// place: prefixLines caches the rows of everything before the last line,
 // so only a write to the LAST chat line keeps it valid (cheap suffix
 // rebuild via buildFromPrefix); a write to any earlier line stales the
 // prefix and needs the full re-wrap (setViewportContent). The viewport is
@@ -658,6 +671,12 @@ func (m *Model) commitChatLineWrite(idx int, append bool, text string) {
 		m.chatLines[idx] += text
 	} else {
 		m.chatLines[idx] = text
+	}
+	// A write that did not come from the incremental streaming path makes the
+	// cache's record of this line stale (a replacement at the same index would
+	// otherwise be overwritten by the next token's cached render).
+	if m.streamWrap.valid && m.streamWrap.lineIdx == idx {
+		m.invalidateStreamWrap()
 	}
 	if idx == len(m.chatLines)-1 {
 		m.buildFromPrefix()
@@ -682,7 +701,117 @@ func (m *Model) appendToStreamLine(lineIdx int, text string) {
 		m.appendToLastLine(text)
 		return
 	}
+	// Incremental path for the live reply (the common case): chatLines keeps
+	// the RAW text and the cache owns the wrap, so a batch re-wraps only the
+	// in-progress line. Only the LAST chat line can take it — that is the line
+	// the viewport splice replaces — and a width change or any other write to
+	// the line invalidates the cache, which then re-seeds once from raw text.
+	if lineIdx == len(m.chatLines)-1 {
+		c := &m.streamWrap
+		m.chatLines[lineIdx] += text
+		if !c.valid || c.lineIdx != lineIdx || c.width != m.wrapWidth() {
+			m.seedStreamWrap(lineIdx)
+		} else {
+			m.advanceStreamWrap(text)
+		}
+		m.publishStreamWrap()
+		return
+	}
 	m.commitChatLineWrite(lineIdx, true, text)
+}
+
+// streamWrapCache is the incremental wrap state of the live assistant line.
+// finalized holds the rows of every FINALIZED raw line — each wrapped once,
+// at width — and current is the raw in-progress tail, re-wrapped per batch.
+//
+// Per-line wrapping is byte-identical to wrapping the whole reply: wrapCells
+// resets its state at every newline, and the CR/tab normalization wrapLine
+// applies is line-local (CRs are dropped, tabs expanded, never turned into line
+// breaks). So a 32 ms token batch costs O(in-progress line) instead of
+// O(whole reply) — the old path re-wrapped the entire accumulated answer on
+// every flush, which is O(n²) over a long answer.
+//
+// chatLines keeps the RAW line and only the viewport receives the wrapped parts
+// (publishStreamWrap), so the round-end trim and the transcript rebuild keep
+// operating on raw text. The cache is valid only while lineIdx names the LAST
+// chat line at width; buildFromPrefix, setViewportContent and
+// commitChatLineWrite invalidate it.
+type streamWrapCache struct {
+	valid     bool
+	lineIdx   int
+	width     int
+	finalized []string // wrapped rows of the finalized lines
+	current   string
+}
+
+// invalidateStreamWrap drops the incremental wrap; the next batch re-seeds it
+// from the raw chat line.
+func (m *Model) invalidateStreamWrap() {
+	m.streamWrap.valid = false
+}
+
+// seedStreamWrap rebuilds the cache from the line's current RAW text — one
+// O(lines) wrap, on the first batch of a line (or after an invalidation).
+func (m *Model) seedStreamWrap(lineIdx int) {
+	c := &m.streamWrap
+	*c = streamWrapCache{valid: true, lineIdx: lineIdx, width: m.wrapWidth()}
+	raw := m.chatLines[lineIdx]
+	if i := strings.LastIndexByte(raw, '\n'); i >= 0 {
+		c.finalized = m.wrapLine(raw[:i])
+		c.current = raw[i+1:]
+		return
+	}
+	c.current = raw
+}
+
+// advanceStreamWrap folds a token batch into the cache: every newline finalizes
+// the in-progress line (wrapped once, never re-wrapped), leaving only the tail.
+func (m *Model) advanceStreamWrap(token string) {
+	c := &m.streamWrap
+	for {
+		i := strings.IndexByte(token, '\n')
+		if i < 0 {
+			c.current += token
+			return
+		}
+		c.current += token[:i]
+		c.finalized = append(c.finalized, m.wrapLine(c.current)...)
+		c.current = ""
+		token = token[i+1:]
+	}
+}
+
+// streamWrappedParts returns the wrapped rows of the live assistant line.
+func (m *Model) streamWrappedParts() []string {
+	c := &m.streamWrap
+	parts := make([]string, 0, len(c.finalized)+1)
+	parts = append(parts, c.finalized...)
+	return append(parts, m.wrapLine(c.current)...)
+}
+
+// publishStreamWrap splices the cached rows into the viewport without
+// re-wrapping the reply: buildFromPrefix minus the wrapLine call, keeping the
+// same incremental state (lastWrapped, prefixLines, max width) so the next
+// buildFromPrefix stays consistent.
+func (m *Model) publishStreamWrap() {
+	if m.streamWrap.lineIdx != len(m.chatLines)-1 {
+		m.buildFromPrefix()
+		return
+	}
+	parts := m.streamWrappedParts()
+	vp := m.viewport.Lines()
+	vp = vp[:0]
+	vp = append(vp, m.prefixLines...)
+	vp = append(vp, parts...)
+	m.lastWrapped = strings.Join(parts, "\n")
+	for _, p := range parts {
+		if w := cellWidth(p); w > m.maxWrappedWidth {
+			m.maxWrappedWidth = w
+		}
+	}
+	m.viewport.SetContentLines(vp, m.maxWrappedWidth)
+	// No clearSelection here: this is an append-only splice (see buildFromPrefix).
+	m.followBottom()
 }
 
 // replaceStreamLine replaces text in a tracked streaming line (refresh rule
@@ -704,9 +833,10 @@ func (m *Model) replaceStreamLine(lineIdx int, text string) {
 func (m *Model) handleStreamToolCall(index int, id string, name string) {
 	// Close thinking if open — finalize the block in chat
 	m.closeThinkingBlock()
-	// Close assistant buffer (text tokens before tool call are shown as-is in chat)
-	m.streamAssistantBuf.Reset()
+	// The reply typed before this tool call stays in the transcript as-is; the
+	// next content token starts a new line below the tool rows.
 	m.streamAssistantLine = -1
+	m.invalidateStreamWrap()
 	m.streamToolCallNames[index] = name
 	m.setActiveTool(name)
 	m.streamToolCallArgs[index] = &streamToolArgs{}
@@ -1137,53 +1267,24 @@ func parseInlineJSONArgs(raw []byte) (map[string]any, error) {
 }
 
 func (m *Model) handleStreamToolResult(id string, name string, result string, success bool) {
-	// Collect all new lines first, then append in a batch so the viewport
-	// rebuilds once instead of on every appendChatLine call.
-	var newLines []string
 	// The tool finished; the next indicator phase is "thinking" for the next
 	// model round (which re-announces any new tool via handleStreamToolCall).
 	m.setActiveTool("")
 
-	newLines = append(newLines, toolResultStatusLine(name, success))
-
-	// For patch_file: render the original diff with colors
-	showDiffResult := name == "show_diff" && isDiffContent(result)
-	if name == "patch_file" {
-		// If diff was already shown progressively during arg streaming,
-		// skip the full block render.
-		if m.toolDiffShown[id] {
-			// Summary only — border was already closed in handleStreamToolCallFinal
-			if m.verbose {
-				for _, line := range strings.Split(result, "\n") {
-					newLines = append(newLines, ToolResultBodyStyle.Render("  │ "+line))
-				}
-			} else {
-				summary := summarizeResult(result, success)
-				newLines = append(newLines, DimStyle.Render(fmt.Sprintf("  %s", summary)))
-			}
-		} else if diff, ok := m.toolCallDiffs[id]; ok && diff != "" {
-			newLines = append(newLines, diffBlock(diff)...)
-		}
-	} else if showDiffResult {
-		newLines = append(newLines, diffBlock(result)...)
-	} else if m.verbose {
-		for _, line := range strings.Split(result, "\n") {
-			newLines = append(newLines, ToolResultBodyStyle.Render("  │ "+line))
-		}
-	} else {
-		summary := summarizeResult(result, success)
-		newLines = append(newLines, DimStyle.Render(fmt.Sprintf("  %s", summary)))
+	// A patch_file diff already rendered while its arguments streamed must not
+	// be drawn again: pass "" so the shared renderer falls through to the
+	// body/summary choice (the same one a restored transcript makes).
+	diff := ""
+	if name == "patch_file" && !m.toolDiffShown[id] {
+		diff = m.toolCallDiffs[id]
 	}
-
-	// If this already came from a diff path, stop — don't double-append.
-	if showDiffResult {
-		m.appendChatLines(newLines)
-		// Account for tool result tokens in the live context estimate even
-		// when the visual block was already rendered during arg streaming.
-		m.bumpContextEstimate(result)
-		return
-	}
-
+	newLines := toolResultLines(toolResultParams{
+		name:    name,
+		result:  result,
+		success: success,
+		diff:    diff,
+		verbose: m.verbose,
+	})
 	m.bumpContextEstimate(result)
 	m.appendChatLines(newLines)
 }
@@ -1195,10 +1296,9 @@ func (m *Model) appendChatLines(lines []string) {
 	}
 	for _, line := range lines {
 		if len(m.chatLines) > 0 {
-			parts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
-			wrapped := strings.Join(parts, "\n")
-			m.wrappedPrefix += wrapped + "\n"
-			m.prefixLines = append(m.prefixLines, strings.Split(wrapped, "\n")...)
+			// Wrapped per iteration: chatLines grows inside the loop, so a
+			// cached wrap would describe a different line after the first pass.
+			m.prefixLines = append(m.prefixLines, m.wrapLine(m.chatLines[len(m.chatLines)-1])...)
 		}
 		m.chatLines = append(m.chatLines, line)
 		if isUserPromptLine(line) {
@@ -1214,8 +1314,8 @@ func (m *Model) appendChatLines(lines []string) {
 // diff rendered in an earlier round is not re-shown in the next round. Pass
 // false on new-turn / cancel / error paths to wipe everything.
 func (m *Model) resetStreamState(keepToolDiffShown bool) {
-	m.streamAssistantBuf.Reset()
 	m.streamAssistantLine = -1
+	m.invalidateStreamWrap()
 	m.streamThinkingBuf.Reset()
 	m.streamThinkingCache = streamThinkingCache{}
 	m.streamThinkingOpen = false
@@ -1280,8 +1380,8 @@ func (m *Model) handleStreamRoundEnd() {
 		m.chatLines[m.streamAssistantLine] = strings.TrimRight(m.chatLines[m.streamAssistantLine], "\n")
 	}
 	m.closeThinkingBlock()
-	m.streamAssistantBuf.Reset()
 	m.streamAssistantLine = -1
+	m.invalidateStreamWrap()
 	// Keep streamToolCallNames / toolCallDiffs until OnRoundStart or turn end so
 	// OnToolCall finals and patch diffs still resolve after OnStreamEnd.
 

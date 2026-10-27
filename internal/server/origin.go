@@ -52,6 +52,43 @@ func parseAllowedOrigins(raw string) map[string]struct{} {
 	return out
 }
 
+// loopbackHosts are the Host-header names that address a loopback listener.
+// Bracket stripping is done by checkWSHost, so "::1" is enough.
+var loopbackHosts = map[string]struct{}{
+	"localhost": {},
+	"127.0.0.1": {},
+	"::1":       {},
+}
+
+// hostOnly strips the port (and IPv6 brackets) from a Host-header value.
+func hostOnly(host string) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	// A bare "[::1]" (no port) leaves the brackets: strip them.
+	return strings.Trim(host, "[]")
+}
+
+// checkWSHost rejects a WebSocket request whose Host header does not address
+// the loopback listener the server is bound to (see Server.loopbackBind).
+//
+// This is the DNS-rebinding defence the Origin check cannot provide: under
+// rebinding the attacker controls BOTH the Origin and the Host header, so
+// checkWSOrigin's "Origin host == Host" fallback passes while the request
+// actually reaches 127.0.0.1 with Host: evil.example. The Host still names
+// the attacker's domain, which is what this rejects. allowed
+// (web_allowed_origins) is honoured as an escape hatch for a loopback bind
+// fronted by a proxy.
+func checkWSHost(r *http.Request, allowed map[string]struct{}) bool {
+	host := hostOnly(r.Host)
+	if _, ok := loopbackHosts[host]; ok {
+		return true
+	}
+	_, ok := allowed[host]
+	return ok
+}
+
 func checkWSOrigin(r *http.Request, allowed map[string]struct{}) bool {
 	if len(allowed) == 0 {
 		allowed = defaultAllowedHosts
@@ -61,11 +98,7 @@ func checkWSOrigin(r *http.Request, allowed map[string]struct{}) bool {
 	// ("[::1]:8081"). Splitting on ":" alone turns "[::1]:8081" into "[" and
 	// broke the loopback / same-host checks for IPv6 clients. SplitHostPort
 	// handles both; trim brackets for the comparison.
-	reqHost := r.Host
-	if h, _, err := net.SplitHostPort(r.Host); err == nil {
-		reqHost = h
-	}
-	reqHost = strings.ToLower(strings.Trim(reqHost, "[]"))
+	reqHost := hostOnly(r.Host)
 	loopback := reqHost == "localhost" || reqHost == "127.0.0.1" || reqHost == "::1"
 	if origin == "" {
 		// Non-browser clients (curl, etc.) omit Origin. Only allow that on loopback.

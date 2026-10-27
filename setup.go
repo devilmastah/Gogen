@@ -28,7 +28,13 @@ import (
 // agent's lifecycle defers (a.Close, a.FlushPending, MCP shutdown) so the
 // existing shutdown order is preserved. The session store stays internal to
 // setup: main never reads it after construction.
-func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []string) {
+//
+// restoreSession=false skips the auto-restore entirely. One-shot (-p) runs
+// need it: runSinglePrompt resets straight to a fresh session, so decoding
+// the previous conversation only to throw it away cost a full session-file
+// read (and started the model-validation path against a session nobody
+// continues) before the first prompt.
+func newAgent(cfg *config.Config, isGlobalMode bool, restoreSession bool) (*agent.Agent, string, []string) {
 	var notices []string
 	// The provider carries ALL registered OpenAI-compatible profiles (the
 	// legacy fields form the implicit default profile), so the TUI's /models
@@ -125,7 +131,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 	a.SetSessionID(session.NewID())
 	// Local-only restore: avoid blocking startup on provider ListModels.
 	var restoredModel string
-	if sessionEnabled {
+	if sessionEnabled && restoreSession {
 		if latest, err := store.LatestID(cfg.WorkingDir); err == nil && latest != "" {
 			if snap, err := store.LoadInWorkingDir(cfg.WorkingDir, latest); err == nil {
 				a.RestoreSession(snap, latest)

@@ -47,7 +47,7 @@ func measureWireBytes(messages []Message, tools []Tool) wireBytes {
 	// Reasoning is only on the wire when the echo is enabled; counting it
 	// otherwise would make the parts exceed the exact total (negative
 	// Framing) and misattribute the saving.
-	echoReasoning := reasoningEchoEnabled()
+	echoReasoning := ReasoningEchoEnabled()
 	for i := range messages {
 		m := &messages[i]
 		if m.Role == "system" {

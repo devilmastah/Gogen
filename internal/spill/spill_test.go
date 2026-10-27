@@ -645,3 +645,31 @@ func TestContextTargetRoundTrip(t *testing.T) {
 		t.Fatalf("TargetFromContext = %v, want the attached target", got)
 	}
 }
+
+// TestTargetCapBoundsSpillGrowth pins the size cap: a command that streams
+// forever must not fill the disk, since the spill exists precisely because the
+// output does not fit in memory.
+func TestTargetCapBoundsSpillGrowth(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+	tgt := st.NewTarget("sess", "cap")
+	chunk := make([]byte, 1<<20)
+	// Write past the cap in 1 MiB chunks; the write that crosses it must fail
+	// instead of silently growing.
+	var err error
+	for i := 0; i < int(MaxTargetBytes/(1<<20))+2; i++ {
+		if _, werr := tgt.Write(chunk); werr != nil {
+			err = werr
+			break
+		}
+	}
+	if err == nil {
+		t.Fatal("writes past MaxTargetBytes were accepted")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("error = %v, want a size-cap message", err)
+	}
+	if _, total, ok := tgt.Finish(); ok && total > MaxTargetBytes {
+		t.Fatalf("spilled %d bytes, cap is %d", total, MaxTargetBytes)
+	}
+}

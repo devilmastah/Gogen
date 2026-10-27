@@ -106,6 +106,11 @@ func signalProcess(cmd *exec.Cmd, name string) error {
 	}
 }
 
+// controlByteFor: there is no terminal driver raising signals from control
+// bytes on Windows, so every signal takes the direct process path (see
+// signalProcess).
+func controlByteFor(string) (byte, bool) { return 0, false }
+
 // killProcess terminates the child.
 func killProcess(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {

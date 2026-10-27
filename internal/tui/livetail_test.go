@@ -12,25 +12,49 @@ import (
 	"gogen/internal/llm"
 )
 
+// The background replay buffer holds ONLY display-only notes: every other
+// rendering event is already reflected in Messages by the time focus
+// returns and both drains discard it, so buffering it would just pin the
+// payload (a tool result, a diff, an image data-URL) in memory until the
+// drain threw it away.
 func TestLiveSessionPendingBuffer(t *testing.T) {
 	s := &liveSession{id: "s9"}
 
-	t.Run("fifo order", func(t *testing.T) {
-		s.enqueue(streamTokenMsg{token: "a"})
-		s.enqueue(streamTokenMsg{token: "b"})
+	t.Run("rendering events are dropped", func(t *testing.T) {
+		s.enqueue(streamToolResultMsg{
+			sid:    s.id,
+			seq:    1,
+			name:   "execute_command",
+			result: strings.Repeat("x", 1<<20),
+		})
+		s.enqueue(streamTokenMsg{token: "batch", sid: s.id})
+		if got := len(s.pending); got != 0 {
+			t.Fatalf("pending = %d, want 0 (payload must not be buffered)", got)
+		}
+		if out := s.popAll(); len(out) != 0 {
+			t.Fatalf("popAll = %v, want empty", out)
+		}
+	})
+
+	t.Run("notes buffered in fifo order", func(t *testing.T) {
+		s.enqueue(condensedNoteMsg{note: "note a", sid: s.id})
+		s.enqueue(condensedNoteMsg{note: "note b", sid: s.id})
 		out := s.popAll()
-		if len(out) != 2 || out[0].(streamTokenMsg).token != "a" {
-			t.Fatalf("popAll = %v, want [a b]", out)
+		if len(out) != 2 {
+			t.Fatalf("popAll = %v, want [note a note b]", out)
+		}
+		if note, ok := out[0].(condensedNoteMsg); !ok || note.note != "note a" {
+			t.Fatalf("out[0] = %#v, want note a", out[0])
 		}
 		if left := s.popAll(); len(left) != 0 {
 			t.Fatalf("second popAll = %v, want empty", left)
 		}
 	})
 
-	t.Run("cap drops oldest", func(t *testing.T) {
+	t.Run("note flood respects cap", func(t *testing.T) {
 		s2 := &liveSession{id: "s10"}
 		for i := 0; i < maxPendingStreamEvents+8; i++ {
-			s2.enqueue(streamTokenMsg{token: "x"})
+			s2.enqueue(condensedNoteMsg{note: "x", sid: s2.id})
 		}
 		if got := len(s2.pending); got != maxPendingStreamEvents {
 			t.Fatalf("len = %d, want cap %d", got, maxPendingStreamEvents)
@@ -128,8 +152,15 @@ func TestAdapterBuffersWhenBackground(t *testing.T) {
 
 	ad := NewStreamAdapter(sess.id, 0, prog, sess)
 	ad.send(streamTokenMsg{token: "z"})
-	if len(sent) != 0 || len(sess.pending) != 1 {
-		t.Fatal("background event must buffer, not send")
+	if len(sent) != 0 {
+		t.Fatal("background event must not be sent to the program")
+	}
+	if n := len(sess.pending); n != 0 {
+		t.Fatalf("pending = %d, want 0 (only display-only notes are buffered)", n)
+	}
+	ad.send(condensedNoteMsg{note: "note", sid: sess.id})
+	if n := len(sess.pending); n != 1 {
+		t.Fatalf("pending = %d, want the buffered note", n)
 	}
 
 	sess.focused.Store(true)
@@ -168,7 +199,7 @@ func TestJoinTranscriptConvergesAtTurnEnd(t *testing.T) {
 	}
 	// The transcript equals a fresh renderMessages(Messages): the transient
 	// join notice is gone and the completed reply is present.
-	want := renderMessages(a2.SnapshotMessages(), a2.WorkingDir, a2.CurrentModel(), a2.Mode.String())
+	want := renderMessages(a2.SnapshotMessages(), a2.WorkingDir, a2.CurrentModel(), a2.Mode.String(), m.verbose)
 	if strings.Join(m.chatLines, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("converged transcript != fresh renderMessages(Messages):\ngot:\n%s\nwant:\n%s",
 			strings.Join(m.chatLines, "\n"), strings.Join(want, "\n"))
@@ -367,8 +398,8 @@ func TestJoinRendersInFlightRound(t *testing.T) {
 	if m.streamAssistantLine < 0 || m.streamAssistantLine >= len(m.chatLines) {
 		t.Fatalf("assistant line not pre-seeded: %d", m.streamAssistantLine)
 	}
-	if got := m.streamAssistantBuf.String(); got != "partial re" {
-		t.Fatalf("streamAssistantBuf = %q, want %q", got, "partial re")
+	if got := m.chatLines[m.streamAssistantLine]; !strings.HasSuffix(got, "partial re") {
+		t.Fatalf("assistant line = %q, want suffix %q", got, "partial re")
 	}
 	// Live continuation appends seamlessly (no new assistant line).
 	before := len(m.chatLines)
@@ -378,9 +409,6 @@ func TestJoinRendersInFlightRound(t *testing.T) {
 	}
 	if got := m.chatLines[m.streamAssistantLine]; !strings.HasSuffix(got, "partial reply") {
 		t.Fatalf("assistant line = %q, want suffix %q", got, "partial reply")
-	}
-	if got := m.streamAssistantBuf.String(); got != "partial reply" {
-		t.Fatalf("streamAssistantBuf = %q, want %q", got, "partial reply")
 	}
 }
 

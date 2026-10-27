@@ -26,7 +26,9 @@ import (
 // user_term_opened once the shell is up, user_term_exit when it exits. Output
 // is streamed as user_term_output chunks from the PTY read goroutine. The
 // shell runs in the workspace's current working directory at spawn time (the
-// executor has its own mutex, so no turn lock is needed).
+// executor has its own mutex, so no turn lock is needed). It is called from the
+// user_term_request handler only — never at connect — so a connection that
+// never uses the terminal panel costs no pty and no shell process.
 func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
 	if holder.get() != nil {
 		return
@@ -51,6 +53,11 @@ func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
 	go func() {
 		<-ut.Done()
 		code := ut.ExitCode()
+		// Deliver whatever the batcher still holds BEFORE the exit report:
+		// user_term_exit must stay the last frame of this shell, and the last
+		// partial batch of output would otherwise be lost (the terminal is
+		// done, so nothing else will flush it).
+		ut.FlushOutput()
 		// Only report the exit if this terminal is still the connection's
 		// current one (a respawn may already have replaced it).
 		if holder.clear(ut) {
@@ -67,10 +74,17 @@ type Server struct {
 	config         *config.Config
 	allowedOrigins map[string]struct{}
 	authToken      string
-	tlsCertFile    string
-	tlsKeyFile     string
-	wsConnsMu      sync.Mutex
-	wsConns        []*websocket.Conn
+	// loopbackBind records that Start is listening on a loopback address
+	// (the default). It gates checkWSHost: a DNS-rebinding attack reaches a
+	// loopback listener from 127.0.0.1 with an attacker-chosen Host, so the
+	// Host header must name loopback. A non-loopback bind keeps accepting any
+	// Host — a same-machine browser legitimately uses the machine's LAN name
+	// there, and token auth is mandatory on that path.
+	loopbackBind bool
+	tlsCertFile  string
+	tlsKeyFile   string
+	wsConnsMu    sync.Mutex
+	wsConns      []*websocket.Conn
 	// wsLive counts the live /ws and /ws/editor handler goroutines.
 	// net/http stops tracking a connection once the WebSocket upgrade
 	// hijacks it, so neither httptest.Server.Close nor the http server's
@@ -538,7 +552,8 @@ func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, pane **s
 // is not blocked by hijacked connections, then returns so the caller can
 // FlushSession (Ctrl+C / SIGTERM in --web mode).
 func (s *Server) Start(ctx context.Context, addr string) error {
-	if !IsLoopbackBind(addr) {
+	s.loopbackBind = IsLoopbackBind(addr)
+	if !s.loopbackBind {
 		if s.authToken == "" {
 			return fmt.Errorf("non-loopback bind %q requires an auth token; set GOGEN_WEB_TOKEN or web_auth_token", addr)
 		}

@@ -69,6 +69,29 @@ func TestParseUnifiedDiffKeepsBlankContextLines(t *testing.T) {
 	}
 }
 
+// TestPureInsertionHunkLandsAfterTheNamedLine pins git's zero-old-count
+// convention end to end: "@@ -2,0 +3,1 @@" inserts AFTER line 2, so the new
+// line becomes the third. Parsing plus applying must agree with patch(1);
+// the old start = oldStart-1 arithmetic inserted one line early.
+func TestPureInsertionHunkLandsAfterTheNamedLine(t *testing.T) {
+	diff := "--- a/file.txt\n+++ b/file.txt\n@@ -2,0 +3,1 @@\n+inserted\n"
+	files, err := parseUnifiedDiff(diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || len(files[0].hunks) != 1 {
+		t.Fatalf("files=%d hunks=%v", len(files), files)
+	}
+	got, _, _, err := applyPatchHunks([]string{"a", "b", "c"}, files[0].hunks, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a", "b", "inserted", "c"}
+	if !linesEqual(got, want) {
+		t.Fatalf("lines = %#v, want %#v", got, want)
+	}
+}
+
 func TestParseUnifiedDiffAcceptsCompactHunkHeader(t *testing.T) {
 	diff := "--- a/main.go\n+++ b/main.go\n@@-1,2 +1,3@@\n package main\n+// x\n func main() {\n"
 	files, err := parseUnifiedDiff(diff)
@@ -1905,6 +1928,9 @@ func TestApplyPatchHunksTrailingNewline(t *testing.T) {
 			wantNoNewline: false,
 		},
 		{
+			// "@@ -1,0 +2,1 @@" inserts AFTER line 1, as patch(1) does: a
+			// zero-old-count hunk header names the line the insertion
+			// follows.
 			name:             "insertion before EOF keeps original trailing state",
 			original:         []string{"a", "b"},
 			originalTrailing: false,
@@ -1913,8 +1939,21 @@ func TestApplyPatchHunksTrailingNewline(t *testing.T) {
 				oldLines: nil,
 				newLines: []string{"x"},
 			}},
-			wantOut:       []string{"x", "a", "b"},
+			wantOut:       []string{"a", "x", "b"},
 			wantNoNewline: true,
+		},
+		{
+			// "@@ -0,0 +1,1 @@" is the one case that inserts at index 0.
+			name:             "insertion at the start of the file",
+			original:         []string{"a", "b"},
+			originalTrailing: true,
+			hunks: []patchHunk{{
+				oldStart: 0,
+				oldLines: nil,
+				newLines: []string{"x"},
+			}},
+			wantOut:       []string{"x", "a", "b"},
+			wantNoNewline: false,
 		},
 		{
 			name:             "deleting the file tail newline-terminates the previous line",

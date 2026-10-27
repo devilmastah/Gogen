@@ -48,7 +48,11 @@ func TestCommandApproverRoundTrip(t *testing.T) {
 	waitFor(t, time.Second, func() bool {
 		for {
 			select {
-			case m := <-ws.sendQ:
+			case out := <-ws.sendQ:
+				if out == nil || out.msg == nil {
+					continue
+				}
+				m := *out.msg
 				if m.Type == "command_approval" && m.ApprovalID == id {
 					if m.Command != "python -c 'print(1)'" || m.Reason != "pat" {
 						t.Errorf("command_approval payload = %+v", m)

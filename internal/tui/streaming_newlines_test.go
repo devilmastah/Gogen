@@ -26,7 +26,7 @@ func newStreamTestModel() *Model {
 // the incremental streaming path) contains a fully blank visual line that
 // is not part of the intended layout.
 func hasBlankRenderedLine(m *Model) bool {
-	for _, l := range strings.Split(m.wrappedContentString(), "\n") {
+	for _, l := range strings.Split(m.transcriptText(), "\n") {
 		if stripAnsi(l) == "" {
 			return true
 		}
@@ -64,7 +64,7 @@ func TestNoExtraNewlineBeforeToolCall(t *testing.T) {
 	m.handleStreamToolCall(0, "tc0", "read_file")
 
 	if hasBlankRenderedLine(m) {
-		t.Fatalf("blank line present between assistant text and tool call\n%s", m.wrappedContentString())
+		t.Fatalf("blank line present between assistant text and tool call\n%s", m.transcriptText())
 	}
 }
 
@@ -89,12 +89,12 @@ func TestNoExtraNewlineBetweenRounds(t *testing.T) {
 	m.handleStreamToken("Done.")
 
 	if hasBlankRenderedLine(m) {
-		t.Fatalf("blank line present between rounds\n%s", m.wrappedContentString())
+		t.Fatalf("blank line present between rounds\n%s", m.transcriptText())
 	}
 }
 
 // TestNoExtraNewlineAcrossManyAppends covers the general case that produced
-// double separators once wrappedPrefix became non-empty: every appendChatLine
+// double separators once the incremental prefix became non-empty: every appendChatLine
 // after the first must add exactly one separator newline, not two.
 func TestNoExtraNewlineAcrossManyAppends(t *testing.T) {
 	m := newStreamTestModel()
@@ -103,12 +103,12 @@ func TestNoExtraNewlineAcrossManyAppends(t *testing.T) {
 	m.appendChatLine("line three")
 
 	if hasBlankRenderedLine(m) {
-		t.Fatalf("blank line present across appends\n%s", m.wrappedContentString())
+		t.Fatalf("blank line present across appends\n%s", m.transcriptText())
 	}
 
 	want := "line one\nline two\nline three"
-	if stripAnsi(m.wrappedContentString()) != want {
-		t.Fatalf("wrappedContent = %q, want %q", m.wrappedContentString(), want)
+	if stripAnsi(m.transcriptText()) != want {
+		t.Fatalf("wrappedContent = %q, want %q", m.transcriptText(), want)
 	}
 }
 
@@ -131,11 +131,11 @@ func TestNoBlankLinesFromWrappedThinking(t *testing.T) {
 	} {
 		m.handleStreamThinking(tok)
 		if hasBlankRenderedLine(m) {
-			t.Fatalf("blank line while streaming %q\n%s", tok, m.wrappedContentString())
+			t.Fatalf("blank line while streaming %q\n%s", tok, m.transcriptText())
 		}
 	}
 	m.closeThinkingBlock()
 	if hasBlankRenderedLine(m) {
-		t.Fatalf("blank line after closing thinking block\n%s", m.wrappedContentString())
+		t.Fatalf("blank line after closing thinking block\n%s", m.transcriptText())
 	}
 }

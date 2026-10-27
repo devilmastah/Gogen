@@ -101,6 +101,7 @@
             terminalOpen,
             terminalToggleMobile,
             terminalTogglePanel,
+            terminalUserEnsure,
             terminalUserExited,
             terminalUserOpened,
             terminalWrite,
@@ -4306,6 +4307,11 @@
                 // model catalog is a remote /v1/models call that can dominate
                 // startup latency, so fetch it after first paint (idle).
                 ws.send(JSON.stringify({ type: 'list_sessions' }));
+                // The server spawns the interactive user shell lazily (first
+                // user_term_request), not at connect. Ask for it now when the
+                // terminal panel is already visible; a fresh socket also
+                // revives a shell that died with the previous connection.
+                terminalUserEnsure(true);
                 const scheduleModels = window.requestIdleCallback
                     || ((fn) => setTimeout(fn, 200));
                 scheduleModels(() => ensureModelsLoaded());

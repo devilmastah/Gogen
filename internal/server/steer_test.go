@@ -8,6 +8,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/llm"
 	"gogen/internal/session"
+	"gogen/internal/steerq"
 )
 
 // userMsgIndex returns the index of the first user message containing
@@ -228,24 +229,24 @@ func TestSystemOverflowSparesUserItems(t *testing.T) {
 		t.Fatalf("countUser = %d after system overflow, want %d (user items must not be dropped)", got, maxUserQueueCap)
 	}
 	// System items are bounded at the cap.
-	rt.deliverMu.Lock()
 	sys := 0
-	for _, it := range rt.pendingDeliver {
-		if it.Kind == deliverSystem {
+	for _, it := range queuedItems(rt) {
+		if it.Kind != steerq.User {
 			sys++
 		}
 	}
-	rt.deliverMu.Unlock()
 	if sys != maxSystemDeliveryQueue {
 		t.Fatalf("queued system items = %d, want %d", sys, maxSystemDeliveryQueue)
 	}
 }
 
 // TestSteerableInputWords pins the command-word classification the steering
-// branch runs BEFORE taking the turn lock: every bare word the dispatchers
-// match (including help, which the first cut of this list missed) keeps the
-// dispatch/busy path, while a word that merely STARTS with one stays chat and
-// queues. An image-only message is steerable (the attachments are content).
+// branch runs BEFORE taking the turn lock (agent.IsCommandInput, shared with
+// the TUI's mid-turn gate): command-shaped input keeps the dispatch/busy
+// path, chat text queues, and a word that merely STARTS with a command word
+// stays chat. An EXACT-only command word followed by arguments is chat too —
+// HandleHelpCommand and friends match the whole trimmed input, so
+// "help me debug" reaches the model rather than a usage message.
 func TestSteerableInputWords(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -254,7 +255,9 @@ func TestSteerableInputWords(t *testing.T) {
 	}{
 		{"plain chat", "fix the parser bug", true},
 		{"bare help is a command", "help", false},
-		{"help with args", "help me debug", false},
+		{"exact-only command with args is chat", "help me debug", true},
+		{"tui-only command word counts everywhere", "compact", false},
+		{"word starting with switch", "switchboard is down", true},
 		{"slash help", "/help", false},
 		{"slash anything", "/new", false},
 		{"bare plan", "plan", false},
@@ -308,9 +311,7 @@ func TestQueueIDValidationAndDedupe(t *testing.T) {
 			t.Fatalf("enqueue %q refused", id)
 		}
 	}
-	rt.deliverMu.Lock()
-	items := append([]deliverItem(nil), rt.pendingDeliver...)
-	rt.deliverMu.Unlock()
+	items := queuedItems(rt)
 	if len(items) != 6 {
 		t.Fatalf("queued items = %d, want 6", len(items))
 	}

@@ -2,7 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"gogen/internal/llm"
 )
@@ -10,7 +12,7 @@ import (
 // renderMessages converts a slice of LLM messages into styled display lines
 // suitable for the chat viewport. All messages are rendered (no truncation;
 // the viewport handles scrolling).
-func renderMessages(messages []llm.Message, workingDir string, modelName string, mode string) []string {
+func renderMessages(messages []llm.Message, workingDir string, modelName string, mode string, verbose bool) []string {
 	var lines []string
 	var tcMap map[string]llm.ToolCall
 	tcMapNeeded := false
@@ -75,7 +77,7 @@ func renderMessages(messages []llm.Message, workingDir string, modelName string,
 			}
 		case "tool":
 			if msg.Content != "" {
-				lines = append(lines, renderToolResult(msg, tcMap)...)
+				lines = append(lines, renderToolResult(msg, tcMap, verbose)...)
 			}
 		}
 	}
@@ -83,48 +85,77 @@ func renderMessages(messages []llm.Message, workingDir string, modelName string,
 	return lines
 }
 
-// renderToolResult renders a single tool result in a style that matches the
-// live-streaming rendering (handleStreamToolResult), including the tool name,
-// success/failure status, diff blocks, and result summaries.
-func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall) []string {
-	var lines []string
+// toolResultParams is the input of the ONE tool-result renderer. The live
+// stream (handleStreamToolResult) and a restored transcript
+// (renderToolResult) both go through toolResultLines, so a result cannot look
+// different depending on whether the user watched it stream or scrolled back
+// to it — they had drifted on verbose mode (ignored when restoring), on
+// patch_file without a diff, and on how success is detected.
+type toolResultParams struct {
+	name    string
+	result  string
+	success bool
+	// diff is a patch_file diff to render as a block. The live path passes ""
+	// once the diff was already rendered while the arguments streamed (its
+	// border was closed there, so re-rendering would duplicate it); a restored
+	// transcript passes the diff it found in the tool call's arguments.
+	diff    string
+	verbose bool
+}
 
-	// Resolve the tool name from the matching tool call.
-	toolName := ""
-	var tc llm.ToolCall
-	hasTC := false
-	if tcMap != nil {
-		tc, hasTC = tcMap[msg.ToolCallID]
-		if hasTC {
-			toolName = tc.Name
-		}
+// toolResultLines renders a finished tool call: the status line, then either
+// a diff block, the verbose body, or the one-line summary.
+func toolResultLines(p toolResultParams) []string {
+	lines := []string{toolResultStatusLine(p.name, p.success)}
+	if p.name == "show_diff" && isDiffContent(p.result) {
+		return append(lines, diffBlock(p.result)...)
 	}
-
-	// Detect success/failure heuristically from the stored message content.
-	success := !strings.HasPrefix(strings.TrimSpace(msg.Content), "Error:")
-
-	lines = append(lines, toolResultStatusLine(toolName, success))
-
-	// show_diff: when the result looks like a unified diff, render it coloured
-	// and skip the summary (matches the live path).
-	if toolName == "show_diff" && isDiffContent(msg.Content) {
-		lines = append(lines, diffBlock(msg.Content)...)
+	if p.name == "patch_file" && p.diff != "" {
+		return append(lines, diffBlock(p.diff)...)
+	}
+	// patch_file with no diff to show (already streamed, or never captured)
+	// falls through to the same body/summary choice every other tool gets, so
+	// such a result is never just a bare status line.
+	if p.verbose {
+		for _, line := range strings.Split(p.result, "\n") {
+			lines = append(lines, ToolResultBodyStyle.Render("  │ "+line))
+		}
 		return lines
 	}
+	return append(lines, DimStyle.Render("  "+summarizeResult(p.result, p.success)))
+}
 
-	// patch_file: render the diff that was passed as a tool argument (when
-	// available). Like the live path, skip the summary when a diff is shown.
-	if toolName == "patch_file" && hasTC {
-		if diff, ok := tc.Args["diff"].(string); ok && diff != "" {
-			lines = append(lines, diffBlock(diff)...)
-			return lines
+// toolResultSuccess reports whether a PERSISTED tool result was a success.
+// A restored transcript has no success flag (the message is plain text), so
+// this is the only signal available: the agent prefixes failures with
+// "Error:" (formatToolError). The live path knows better and passes its
+// explicit bool; the heuristic is deliberately confined here, where a future
+// persisted flag would replace it in one place.
+func toolResultSuccess(content string) bool {
+	return !strings.HasPrefix(strings.TrimSpace(content), "Error:")
+}
+
+// renderToolResult renders one tool result from the conversation history by
+// resolving its tool call (name, and the patch_file diff) and delegating to
+// the shared renderer.
+func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall, verbose bool) []string {
+	toolName := ""
+	diff := ""
+	if tc, ok := tcMap[msg.ToolCallID]; ok {
+		toolName = tc.Name
+		if toolName == "patch_file" {
+			if d, ok := tc.Args["diff"].(string); ok {
+				diff = d
+			}
 		}
 	}
-
-	// Summary for everything else (matches the non-verbose live path).
-	summary := summarizeResult(msg.Content, success)
-	lines = append(lines, DimStyle.Render("  "+summary))
-	return lines
+	return toolResultLines(toolResultParams{
+		name:    toolName,
+		result:  msg.Content,
+		success: toolResultSuccess(msg.Content),
+		diff:    diff,
+		verbose: verbose,
+	})
 }
 
 // formatArgsMap renders tool-call arguments as "key=value" pairs joined by
@@ -135,13 +166,24 @@ func formatArgsMap(args map[string]any, maxLen int, skip func(string) bool) stri
 	if len(args) == 0 {
 		return ""
 	}
-	var parts []string
-	for k, v := range args {
+	// Sorted keys: map iteration order is random, so the same tool call
+	// rendered a different string on every rebuild. That reshuffled the
+	// arguments in the transcript (breaking prompt-cache stability) and made
+	// the final line differ from the streamed one.
+	keys := make([]string, 0, len(args))
+	for k := range args {
 		if skip != nil && skip(k) {
 			continue
 		}
-		val := fmt.Sprintf("%v", v)
-		if len(val) > maxLen {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	var parts []string
+	for _, k := range keys {
+		val := fmt.Sprintf("%v", args[k])
+		// maxLen counts RUNES (truncateRunes); comparing bytes made a CJK value
+		// get an ellipsis without actually being shortened.
+		if utf8.RuneCountInString(val) > maxLen {
 			val = truncateRunes(val, maxLen-3) + "..."
 		}
 		parts = append(parts, fmt.Sprintf("%s=%q", k, val))

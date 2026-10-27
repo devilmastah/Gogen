@@ -38,6 +38,20 @@ func Enabled() bool {
 	return true
 }
 
+// allowedLangsCache memoizes the parsed allowlist keyed by the raw value it was
+// built from (the configured field or the environment variable). langNameForPath
+// and friends call this per FILE, and rebuilding the map per file was pure
+// garbage; keying on the raw string keeps a later SetConfig/env change — and
+// tests that set the variable per case — exact.
+var (
+	allowedLangsMu    sync.Mutex
+	allowedLangsRaw   string
+	allowedLangsSet   map[string]struct{}
+	allowedLangsValid bool
+)
+
+// allowedLangs returns the parsed language allowlist (nil = all allowed). The
+// returned map is SHARED and read-only: callers must not mutate it.
 func allowedLangs() map[string]struct{} {
 	cfgMu.RLock()
 	var raw string
@@ -48,6 +62,18 @@ func allowedLangs() map[string]struct{} {
 		cfgMu.RUnlock()
 		raw = strings.TrimSpace(os.Getenv("GOGEN_TREESITTER_LANGS"))
 	}
+	allowedLangsMu.Lock()
+	defer allowedLangsMu.Unlock()
+	if allowedLangsValid && raw == allowedLangsRaw {
+		return allowedLangsSet
+	}
+	parsed := parseAllowedLangs(raw)
+	allowedLangsRaw, allowedLangsSet, allowedLangsValid = raw, parsed, true
+	return parsed
+}
+
+// parseAllowedLangs splits a comma-separated allowlist.
+func parseAllowedLangs(raw string) map[string]struct{} {
 	if raw == "" {
 		return nil
 	}

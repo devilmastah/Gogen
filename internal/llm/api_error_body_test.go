@@ -317,7 +317,7 @@ func TestGenerateResponseSurfacesStringErrorPayload(t *testing.T) {
 // consequence: with the payload normalized, a definitive 400 is no longer
 // mistaken for a transient stream drop, so the streaming retry is skipped
 // (previously the decode error made it retryable and the ladder ran in full).
-// The non-streaming fallback still runs, exactly as for any other 4xx.
+// The ladder stops: a permanent refusal skips both the retry and the fallback.
 func TestStreamStringErrorPayloadSkipsDecodeLadder(t *testing.T) {
 	// Recovery backoff disabled so the ladder runs instantly; t.Setenv
 	// precludes t.Parallel.
@@ -351,8 +351,11 @@ func TestStreamStringErrorPayloadSkipsDecodeLadder(t *testing.T) {
 	if got := streamRequests.Load(); got != 1 {
 		t.Fatalf("stream requests = %d, want 1 (a definitive 400 must not get the streaming retry)", got)
 	}
-	if got := nonStreamRequests.Load(); got != 1 {
-		t.Fatalf("non-stream requests = %d, want 1 (the fallback still runs)", got)
+	// A definitive 400 is not a transport failure: re-uploading the whole
+	// conversation without streaming cannot succeed, and it used to pay the
+	// fallback backoff before surfacing the same error.
+	if got := nonStreamRequests.Load(); got != 0 {
+		t.Fatalf("non-stream requests = %d, want 0 (a permanent refusal skips the fallback)", got)
 	}
 }
 

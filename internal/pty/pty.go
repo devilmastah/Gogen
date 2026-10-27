@@ -270,9 +270,17 @@ func (s *Session) Scrollback() (string, bool) {
 	return s.scroll.String(), s.dropped
 }
 
-// Signal delivers name to the child's process group. The name must be one of
+// Signal delivers name to the running session. The name must be one of
 // Signals; unsupported names (and SIGKILL/SIGTSTP on platforms without process
 // groups) return an error.
+//
+// SIGINT and SIGTSTP go THROUGH the pty (a control byte) rather than to the
+// shell's process group: an interactive shell runs each job in its own group
+// (job control), so signalling the shell's group misses the job that is
+// actually running — bash ignores the SIGINT and `npm test` keeps going. The
+// terminal driver delivers the byte to the FOREGROUND group, which is exactly
+// what a ^C keystroke does. SIGTERM, SIGHUP and SIGKILL stay process-group
+// signals (they are not keystroke-generated).
 func (s *Session) Signal(name string) error {
 	if s.Exited() {
 		return ErrExited
@@ -280,20 +288,56 @@ func (s *Session) Signal(name string) error {
 	if !validSignal(name) {
 		return fmt.Errorf("unknown signal %q (want one of %v)", name, Signals)
 	}
+	if b, ok := controlByteFor(name); ok {
+		return s.writeControl(b)
+	}
 	return signalProcess(s.cmd, name)
 }
 
-// Close kills the child's process group and releases the pty. It is
+// writeControl writes one control byte to the pty master, which raises the
+// corresponding signal in the terminal's foreground process group.
+func (s *Session) writeControl(b byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.Exited() {
+		return ErrExited
+	}
+	_, err := s.handle.Write([]byte{b})
+	return err
+}
+
+// Close terminates the child's process group and releases the pty. It is
 // idempotent and safe to call concurrently with Send/Read; subsequent
 // operations fail with ErrExited.
+//
+// SIGHUP goes first: an interactive bash forwards it to its jobs on exit, so
+// `&` jobs die with the shell. SIGKILL alone gave bash no chance to do that,
+// which left every background job running as an orphan. The group is SIGKILLed
+// after a short grace period (or immediately when the child is already gone).
 func (s *Session) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		_ = signalProcess(s.cmd, "SIGHUP")
+		select {
+		case <-s.done:
+		case <-time.After(closeHangupGrace):
+		}
 		killProcess(s.cmd)
 		err = s.closeHandle()
 	})
 	return err
 }
+
+// closeHangupGrace bounds how long Close waits for the child to honour SIGHUP
+// before the process group is killed.
+//
+// It costs nothing in the common case — Close waits on the child's own exit
+// signal and returns as soon as the shell is reaped — so the window only elapses
+// for a shell that IGNORES the hangup, and lengthening it is nearly free. It is
+// a variable rather than a constant so tests can widen it: 250 ms proved too
+// tight under load, where an interactive bash may be descheduled before it can
+// forward SIGHUP to its jobs, which is exactly how `&` jobs were orphaned.
+var closeHangupGrace = time.Second
 
 // validSignal reports whether name is in the accepted set.
 func validSignal(name string) bool {

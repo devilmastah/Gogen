@@ -9,7 +9,7 @@ func listDefinitions(path string, content []byte) ([]Definition, error) {
 	return nil, ErrUnsupported
 }
 
-func findSymbolReferences(path string, content []byte, symbol string) ([]Reference, error) {
+func findSymbolReferences(path string, content []byte, symbol string, limit int) ([]Reference, error) {
 	if !Enabled() {
 		return nil, ErrDisabled
 	}

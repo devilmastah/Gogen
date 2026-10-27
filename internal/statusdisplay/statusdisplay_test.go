@@ -993,3 +993,57 @@ func TestFormatElapsed(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestQueuedClearSurvivesANotify pins the separate clear slot: moving the row
+// to another host queues a "clear the old display" op, and a Notify arriving
+// before the worker wakes must not overwrite it (the old single slot left the
+// stale row on the previous display until its TTL — up to 900 s).
+func TestQueuedClearSurvivesANotify(t *testing.T) {
+	resetForTest(t)
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var enterOnce, releaseOnce sync.Once
+	var mu sync.Mutex
+	var got []relayed
+	SetSink(func(row []byte, clear bool, source string) {
+		// Hold the worker inside its first delivery so the following Configure
+		// and Notify are both queued before anything else is processed.
+		enterOnce.Do(func() {
+			close(entered)
+			<-release
+		})
+		mu.Lock()
+		got = append(got, relayed{row: string(row), clear: clear, source: source})
+		mu.Unlock()
+	})
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		SetSink(nil)
+	})
+
+	Configure(true, "host-a.invalid", "", "gogen-a", t.TempDir())
+	Notify(agent.TurnEvent{Phase: agent.TurnPhaseStarted})
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker never reached the sink")
+	}
+
+	// Row moves to another host (queues the clear), then a Notify lands before
+	// the worker wakes.
+	Configure(true, "host-b.invalid", "", "gogen-b", t.TempDir())
+	Notify(agent.TurnEvent{Phase: agent.TurnPhaseEnded})
+	releaseOnce.Do(func() { close(release) })
+
+	relayedOps := waitForRelayed(t, &mu, &got, 3)
+	if relayedOps[0].clear || relayedOps[0].source != "gogen-a" {
+		t.Fatalf("first relay = %+v, want a row for gogen-a", relayedOps[0])
+	}
+	if !relayedOps[1].clear || relayedOps[1].source != "gogen-a" {
+		t.Fatalf("second relay = %+v, want the queued clear for gogen-a (overwritten by the Notify?)", relayedOps[1])
+	}
+	if relayedOps[2].clear || relayedOps[2].source != "gogen-b" {
+		t.Fatalf("third relay = %+v, want a row for gogen-b", relayedOps[2])
+	}
+}

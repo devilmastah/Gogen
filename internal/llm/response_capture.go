@@ -9,10 +9,45 @@ import (
 	"github.com/openai/openai-go/v3"
 )
 
-type extraFieldAccums map[string]*strings.Builder
+// extraFieldAccums accumulates a response's non-standard (provider-specific)
+// fields, keyed by field name.
+//
+// Two shapes are needed, and only one of them needs the text:
+//   - the non-stream path feeds it a finished message's extras map and then
+//     asks primaryDisplayText() which field to show, so it keeps a builder
+//     per key;
+//   - the stream path ingests every delta and only ever asks textLen() > 0.
+//     It keeps no per-key text at all (builders == nil): the streamed
+//     reasoning the user sees is accumulated separately in
+//     streamAcc.fullReasoning, so a builder per key stored a second full copy
+//     of every reasoning chunk for the sole purpose of a length check.
+type extraFieldAccums struct {
+	builders map[string]*strings.Builder
+	total    int
+}
 
+// newExtraFieldAccums returns an accumulator that keeps each field's text
+// (for primaryDisplayText).
 func newExtraFieldAccums() extraFieldAccums {
-	return make(extraFieldAccums)
+	return extraFieldAccums{builders: make(map[string]*strings.Builder)}
+}
+
+// newCountingExtraFieldAccums returns an accumulator that only tracks how
+// much text it saw (for textLen), storing none of it.
+func newCountingExtraFieldAccums() extraFieldAccums {
+	return extraFieldAccums{}
+}
+
+// append adds text under key, keeping the text only in the full shape.
+func (a *extraFieldAccums) append(key, text string) {
+	a.total += len(text)
+	if a.builders == nil {
+		return
+	}
+	if a.builders[key] == nil {
+		a.builders[key] = &strings.Builder{}
+	}
+	a.builders[key].WriteString(text)
 }
 
 var streamDisplayExtraFields = map[string]bool{
@@ -33,7 +68,7 @@ func extraFieldShouldDisplay(key string) bool {
 		strings.Contains(lower, "thought")
 }
 
-func (a extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDelta, onThinking func(string), fullReasoning *strings.Builder) {
+func (a *extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDelta, onThinking func(string), fullReasoning *strings.Builder) {
 	emit := a.thinkingEmitter(onThinking, fullReasoning)
 	// Every non-standard field a provider emits is surfaced in
 	// delta.JSON.ExtraFields — including null and type-mismatched values
@@ -75,7 +110,7 @@ func (a extraFieldAccums) thinkingEmitter(onThinking func(string), fullReasoning
 	}
 }
 
-func (a extraFieldAccums) ingestPiece(key, raw string, emit func(key, piece string)) {
+func (a *extraFieldAccums) ingestPiece(key, raw string, emit func(key, piece string)) {
 	if raw == "" || raw == "null" {
 		return
 	}
@@ -83,10 +118,7 @@ func (a extraFieldAccums) ingestPiece(key, raw string, emit func(key, piece stri
 	if piece == "" {
 		return
 	}
-	if a[key] == nil {
-		a[key] = &strings.Builder{}
-	}
-	a[key].WriteString(piece)
+	a.append(key, piece)
 	if emit != nil {
 		emit(key, piece)
 	}
@@ -126,13 +158,13 @@ func decodeJSONFieldText(raw string) string {
 
 func (a extraFieldAccums) primaryDisplayText() string {
 	for _, key := range []string{"reasoning_content", "reasoning", "thinking", "thought", "analysis"} {
-		if b := a[key]; b != nil {
+		if b := a.builders[key]; b != nil {
 			if s := strings.TrimSpace(b.String()); s != "" {
 				return s
 			}
 		}
 	}
-	for key, b := range a {
+	for key, b := range a.builders {
 		if extraFieldShouldDisplay(key) && b != nil {
 			if s := strings.TrimSpace(b.String()); s != "" {
 				return s
@@ -143,27 +175,7 @@ func (a extraFieldAccums) primaryDisplayText() string {
 }
 
 func (a extraFieldAccums) textLen() int {
-	total := 0
-	for _, b := range a {
-		total += b.Len()
-	}
-	return total
-}
-
-func (a extraFieldAccums) snapshot() map[string]string {
-	if len(a) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(a))
-	for k, b := range a {
-		if s := strings.TrimSpace(b.String()); s != "" {
-			out[k] = s
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return a.total
 }
 
 func primaryDisplayFromExtrasMap(extras map[string]string) string {
@@ -172,10 +184,7 @@ func primaryDisplayFromExtrasMap(extras map[string]string) string {
 	}
 	acc := newExtraFieldAccums()
 	for k, v := range extras {
-		if acc[k] == nil {
-			acc[k] = &strings.Builder{}
-		}
-		acc[k].WriteString(v)
+		acc.append(k, v)
 	}
 	return acc.primaryDisplayText()
 }

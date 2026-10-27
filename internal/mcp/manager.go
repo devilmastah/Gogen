@@ -143,41 +143,70 @@ func ValidServers(servers []config.MCPServerConfig) []config.MCPServerConfig {
 }
 
 // NewManager starts configured MCP servers and builds a tool registry.
+//
+// Servers start IN PARALLEL: each one may spend up to its own init_timeout_secs
+// on a cold launcher (`npx -y <package>`), and starting them one after another
+// made the total startup time the sum of those budgets — while the callers that
+// wait for the handshake (the gateway, the settings test) only allow the
+// SLOWEST single budget (MaxInitTimeout), so a third slow server was never
+// waited for at all. Registration still happens in the configured order, so the
+// tool set and its names stay deterministic.
 func NewManager(servers []config.MCPServerConfig) (*Manager, error) {
 	reg := &Registry{tools: make(map[string]toolEntry)}
 	m := &Manager{reg: reg}
-	for _, s := range ValidServers(servers) {
-		c, err := startClient(s)
-		if err != nil {
-			// Keep starting the remaining servers, but surface the failure:
-			// a server that fails to spawn otherwise vanishes silently from
-			// the model's toolset with no trace.
-			log.Printf("mcp: server %q failed to start: %v", s.Name, err)
+	valid := ValidServers(servers)
+	type serverResult struct {
+		name   string
+		client *Client
+		tools  []llm.Tool
+	}
+	results := make([]serverResult, len(valid))
+	var wg sync.WaitGroup
+	for i, s := range valid {
+		wg.Add(1)
+		go func(i int, s config.MCPServerConfig) {
+			defer wg.Done()
+			c, err := startClient(s)
+			if err != nil {
+				// Keep starting the remaining servers, but surface the failure:
+				// a server that fails to spawn otherwise vanishes silently from
+				// the model's toolset with no trace.
+				log.Printf("mcp: server %q failed to start: %v", s.Name, err)
+				return
+			}
+			initTimeout := initTimeoutFor(s)
+			initCtx, cancel := context.WithTimeout(context.Background(), initTimeout)
+			defer cancel()
+			if err := c.initialize(initCtx); err != nil {
+				_ = c.Close()
+				// A slow launcher (cold `npx -y <package>`) is the common cause
+				// of a handshake timeout, so name the bound that was hit: without
+				// it the server just vanishes from the toolset with no trace.
+				log.Printf("mcp: server %q failed to initialize within %s: %v (raise mcp_servers[].init_timeout_secs if the launcher is slow)", s.Name, initTimeout, err)
+				return
+			}
+			tools, err := c.listTools(initCtx)
+			if err != nil {
+				_ = c.Close()
+				log.Printf("mcp: server %q failed to list tools: %v", s.Name, err)
+				return
+			}
+			results[i] = serverResult{name: s.Name, client: c, tools: tools}
+		}(i, s)
+	}
+	wg.Wait()
+
+	// Register in the configured order, never in completion order: the tool set
+	// (and the duplicate-name suffixing reg.add applies) must not depend on
+	// which server answered first.
+	for _, r := range results {
+		if r.client == nil {
 			continue
 		}
-		initTimeout := initTimeoutFor(s)
-		initCtx, cancel := context.WithTimeout(context.Background(), initTimeout)
-		err = c.initialize(initCtx)
-		if err != nil {
-			cancel()
-			_ = c.Close()
-			// A slow launcher (cold `npx -y <package>`) is the common cause
-			// of a handshake timeout, so name the bound that was hit: without
-			// it the server just vanishes from the toolset with no trace.
-			log.Printf("mcp: server %q failed to initialize within %s: %v (raise mcp_servers[].init_timeout_secs if the launcher is slow)", s.Name, initTimeout, err)
-			continue
+		for _, tool := range r.tools {
+			reg.add(r.name, tool.Name, tool, r.client)
 		}
-		tools, err := c.listTools(initCtx)
-		cancel()
-		if err != nil {
-			_ = c.Close()
-			log.Printf("mcp: server %q failed to list tools: %v", s.Name, err)
-			continue
-		}
-		for _, tool := range tools {
-			reg.add(s.Name, tool.Name, tool, c)
-		}
-		m.clients = append(m.clients, c)
+		m.clients = append(m.clients, r.client)
 	}
 	return m, nil
 }
@@ -718,6 +747,15 @@ func (r *Registry) ToolNames() map[string]struct{} {
 		out[name] = struct{}{}
 	}
 	return out
+}
+
+// HasTool reports whether name is a registered MCP tool (agent.MCPToolRegistry).
+func (r *Registry) HasTool(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.tools[name]
+	return ok
 }
 
 // CallTool implements agent.MCPToolRegistry.

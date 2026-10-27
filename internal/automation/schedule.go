@@ -2,6 +2,7 @@ package automation
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,8 +33,19 @@ func ParseClock(v string) (int, int, error) {
 	if v == "" {
 		return 9, 0, nil
 	}
-	var h, m int
-	if _, err := fmt.Sscanf(v, "%d:%d", &h, &m); err != nil {
+	// Split and Atoi rather than fmt.Sscanf("%d:%d"): Sscanf stops after the
+	// second number and IGNORES the rest, so "9:30pm" parsed as 09:30 — a
+	// silently mis-scheduled automation. Atoi rejects the trailing text.
+	hPart, mPart, ok := strings.Cut(v, ":")
+	if !ok {
+		return 0, 0, fmt.Errorf("want HH:MM, got %q", v)
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(hPart))
+	if err != nil {
+		return 0, 0, fmt.Errorf("want HH:MM, got %q", v)
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(mPart))
+	if err != nil {
 		return 0, 0, fmt.Errorf("want HH:MM, got %q", v)
 	}
 	if h < 0 || h > 23 || m < 0 || m > 59 {

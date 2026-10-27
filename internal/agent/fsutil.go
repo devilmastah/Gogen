@@ -86,6 +86,51 @@ func (e *Executor) SecurePath(path string) (string, error) {
 	return resolvedPath, nil
 }
 
+// SecurePathNoFollow applies the same boundary rules as SecurePath but leaves
+// the FINAL component unresolved, so the caller acts on the entry itself rather
+// than on its target. Removal needs this: deleting "config.yml" when it is a
+// symlink must unlink the link, not delete the file it points at (which also
+// left the link dangling over a hole).
+func (e *Executor) SecurePathNoFollow(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	root := e.PathBoundary
+	if root == "" {
+		root = e.GetWorkingDir()
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	resolvedRoot, err := evalPath(rootAbs)
+	if err != nil {
+		return "", fmt.Errorf("path boundary: %w", err)
+	}
+	wdAbs, err := filepath.Abs(e.GetWorkingDir())
+	if err != nil {
+		return "", err
+	}
+	absPath, err := resolveExecutorPath(wdAbs, path)
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(absPath)
+	if base == "." || base == ".." || base == string(filepath.Separator) {
+		return "", fmt.Errorf("path %s must name a file or entry, not a directory", path)
+	}
+	resolvedDir, err := evalPath(filepath.Dir(absPath))
+	if err != nil {
+		return "", err
+	}
+	candidate := filepath.Join(resolvedDir, base)
+	if !isWithinRoot(candidate, resolvedRoot) {
+		return "", fmt.Errorf("path %s is outside of allowed boundary %s", path, rootAbs)
+	}
+	return candidate, nil
+}
+
 // resolveExecutorPath maps a user/model path to an absolute path under the working directory.
 func resolveExecutorPath(workingDir, path string) (string, error) {
 	if filepath.IsAbs(path) {

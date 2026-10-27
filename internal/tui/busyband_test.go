@@ -77,7 +77,7 @@ func TestBusyFrameStaysInsideTerminal(t *testing.T) {
 	m.streamSpeedLine = DimStyle.Render("42 tok/s")
 	s := m.focusedSession()
 	if s != nil {
-		s.steerQueue = []steerItem{{id: "u1", text: "one"}, {id: "u2", text: "two"}}
+		s.steerQ = testQueue(userItem("u1", "one"), userItem("u2", "two"))
 	}
 
 	frame := m.renderMainColumn()

@@ -70,13 +70,14 @@ func TestPatchFixtures(t *testing.T) {
 				}
 				var orig []string
 				origTrailing := true
+				origEOL := "\n"
 				if oldPath != "/dev/null" {
 					origB, err := os.ReadFile(filepath.Join(dir, "orig", filepath.FromSlash(oldPath)))
 					if err != nil {
 						t.Fatalf("orig/%s: %v", oldPath, err)
 					}
 					origTrailing = strings.HasSuffix(string(origB), "\n")
-					orig = splitLinesPreserveTrailing(string(origB))
+					orig, origEOL = splitLinesPreserveTrailing(string(origB))
 				}
 				got, outNoNewline, _, err := applyPatchHunks(orig, pf.hunks, true, origTrailing)
 				if err != nil {
@@ -95,7 +96,7 @@ func TestPatchFixtures(t *testing.T) {
 				// Compare the joined output byte-for-byte (after EOL
 				// normalization) so the trailing-newline state — which a
 				// line-slice comparison cannot see — is asserted too.
-				gotStr := joinLinesPreserveTrailing(got, !outNoNewline)
+				gotStr := normalizeEOL(joinLinesPreserveTrailing(got, !outNoNewline, origEOL))
 				wantStr := normalizeEOL(string(wantB))
 				if gotStr != wantStr {
 					t.Fatalf("%s: got %q, want %q", newPath, gotStr, wantStr)

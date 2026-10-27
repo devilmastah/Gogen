@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gogen/internal/ioutil"
@@ -65,7 +66,10 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 	var changes []FileChange
 
 	err := e.walkReadableFiles(ctx, searchRoot, relPrefix, glob, skips, true, func(path, rel string, content []byte) error {
-		refs, err := treesitter.FindSymbolReferences(path, content, oldName)
+		// Uncapped on purpose: this list drives an in-place rewrite, so a
+		// truncated search would rename only the first 200 occurrences in a
+		// file and still report success.
+		refs, err := treesitter.FindSymbolReferencesAll(path, content, oldName)
 		if err != nil || len(refs) == 0 {
 			return nil
 		}
@@ -99,10 +103,13 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 			}
 		}
 
-		var linesChanged []int
+		// Sorted, not map order: the tool result is part of the prompt tail,
+		// so an unstable order breaks prompt caching across identical runs.
+		linesChanged := make([]int, 0, len(linesChangedSet))
 		for line := range linesChangedSet {
 			linesChanged = append(linesChanged, line)
 		}
+		slices.Sort(linesChanged)
 		changes = append(changes, FileChange{
 			Path:         rel,
 			LinesChanged: linesChanged,

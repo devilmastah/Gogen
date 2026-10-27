@@ -20,6 +20,44 @@ func newTestBoard(t *testing.T) *BoardManager {
 	return NewBoardManager(t.TempDir(), false)
 }
 
+// TestBoardMissingIndexDoesNotOverwriteTickets pins the recovery path: with
+// index.json gone but ticket files present, the next Add must allocate a fresh
+// ID instead of restarting at 1 and clobbering the existing ticket's file (the
+// board then lost a card and its column order).
+func TestBoardMissingIndexDoesNotOverwriteTickets(t *testing.T) {
+	dir := t.TempDir() + "/" + "board"
+	m := NewBoardManager(dir, false)
+	if _, err := m.Add("first", "", "low", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Add("second", "", "low", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(m.indexPath()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh manager (the next process) sees no index and must rebuild it.
+	m2 := NewBoardManager(dir, false)
+	out, err := m2.Add("third", "", "low", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "#3") {
+		t.Fatalf("add output = %q, want #3", out)
+	}
+	// The two earlier tickets still exist with unchanged titles.
+	list, err := m2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"first", "second", "third"} {
+		if !strings.Contains(list, want) {
+			t.Fatalf("board list lost %q:\n%s", want, list)
+		}
+	}
+}
+
 // TestBoardLifecycle covers add → list → show → claim → move → comment →
 // block → done and the persisted file layout (index.json + one file per
 // ticket).

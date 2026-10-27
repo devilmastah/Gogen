@@ -182,7 +182,13 @@ func compileQuery(langName, kind, src string) (*tree_sitter.Query, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compile %s query for %s: %w", kind, langName, *err)
 	}
-	queryCache.Store(key, q)
+	if existing, loaded := queryCache.LoadOrStore(key, q); loaded {
+		// A concurrent caller compiled the same query first. Keep the cached
+		// one and release ours: go-tree-sitter has no finalizers, so a losing
+		// query left unclosed is leaked C memory for the process lifetime.
+		q.Close()
+		return existing.(*tree_sitter.Query), nil
+	}
 	return q, nil
 }
 
@@ -232,8 +238,8 @@ func parseIssues(lang *tree_sitter.Language, content []byte) []Issue {
 		return nil
 	}
 
-	p := parserPool.Get().(*tree_sitter.Parser)
-	defer parserPool.Put(p)
+	p := acquireParser()
+	defer releaseParser(p)
 	parser := p
 	if err := parser.SetLanguage(lang); err != nil {
 		return []Issue{{Line: 1, Message: fmt.Sprintf("set language: %v", err)}}
@@ -258,6 +264,13 @@ func parseIssues(lang *tree_sitter.Language, content []byte) []Issue {
 
 func collectIssues(n *tree_sitter.Node, issues *[]Issue, seen map[int]struct{}) {
 	if n == nil {
+		return
+	}
+	// Prune subtrees that cannot contain a problem: HasError() is true when the
+	// node OR any descendant is an error, and a missing node has no children.
+	// The walk used to descend into every node through cgo even though only a
+	// handful of subtrees can produce an issue.
+	if !n.HasError() && !n.IsMissing() {
 		return
 	}
 	if n.IsError() || n.IsMissing() {

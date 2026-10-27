@@ -6,7 +6,6 @@ import (
 	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -18,45 +17,25 @@ func stripANSI(s string) string {
 	return ansi.Strip(s)
 }
 
-// truncateRunes truncates s to at most maxRunes runes, returning the original
-// string if it is already shorter. This avoids slicing multi-byte UTF-8
-// characters mid-rune.
-func truncateRunes(s string, maxRunes int) string {
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
-		return s
+// Selection coordinates are rows of the viewport's wrapped content. The rows
+// themselves live in exactly one place (the viewport); the PLAIN text of a row
+// — ANSI stripped — is derived on demand, for the few rows a mouse event or a
+// visible frame actually needs. The previous design kept three extra copies of
+// the whole transcript (a joined string, its ANSI-stripped split and its styled
+// split) and rebuilt them after every streaming batch.
+
+// plainLine returns row i of the wrapped transcript with ANSI stripped, or ""
+// when i is out of range.
+func (m *Model) plainLine(i int) string {
+	lines := m.viewport.Lines()
+	if i < 0 || i >= len(lines) {
+		return ""
 	}
-	return string(runes[:maxRunes])
+	return stripANSI(lines[i])
 }
 
-// ensureWrappedLines lazily computes m.wrappedLines (ANSI‑stripped) when it is
-// dirty.  This avoids expensive stripANSI + Split on every streaming token.
-func (m *Model) ensureWrappedLines() {
-	if !m.wrappedLinesDirty {
-		return
-	}
-	if content := m.wrappedContentString(); content == "" {
-		m.wrappedLines = nil
-	} else {
-		m.wrappedLines = strings.Split(stripANSI(content), "\n")
-	}
-	m.wrappedLinesDirty = false
-}
-
-// ensureStyledLines lazily computes m.styledLines (ANSI‑preserved split)
-// when it is dirty. This avoids the expensive Split on every streaming token
-// when no text selection is active.
-func (m *Model) ensureStyledLines() {
-	if !m.styledLinesDirty {
-		return
-	}
-	if content := m.wrappedContentString(); content == "" {
-		m.styledLines = nil
-	} else {
-		m.styledLines = strings.Split(content, "\n")
-	}
-	m.styledLinesDirty = false
-}
+// plainLineCount is the number of wrapped transcript rows.
+func (m *Model) plainLineCount() int { return len(m.viewport.Lines()) }
 
 // SelectionState tracks the in-progress or finalized text selection.
 // StartX/EndX are terminal cell columns (not byte offsets) into the plain line.
@@ -221,13 +200,17 @@ func (m *Model) copySelection() (bool, tea.Cmd) {
 	return true, tea.SetClipboard(text)
 }
 
-// runeWidth returns the terminal cell width of r (at least 1 for printable).
+// runeWidth returns the terminal cell width of r: 2 for wide (CJK/emoji), 1 for
+// ordinary, and 0 for zero-width runes — combining marks, ZWJ, variation
+// selectors. They must NOT count as their own cell: a selection coordinate is a
+// CELL column, and treating "e" + U+0301 as two cells made every cell after it
+// one column off (the highlight landed on the wrong characters and the copied
+// text was cut short).
 func runeWidth(r rune) int {
-	w := cellWidth(string(r))
-	if w < 1 {
-		return 1
+	if w := cellWidth(string(r)); w > 0 {
+		return w
 	}
-	return w
+	return 0
 }
 
 // sliceByCells returns the substring of s covering terminal cells [start, end).
@@ -242,12 +225,21 @@ func sliceByCells(s string, start, end int) string {
 	col := 0
 	for _, r := range s {
 		rw := runeWidth(r)
+		if rw == 0 {
+			// Zero-width: it belongs to the cell of the character before it.
+			if col-1 >= start && col-1 < end {
+				b.WriteRune(r)
+			}
+			continue
+		}
 		next := col + rw
 		if next > start && col < end {
 			b.WriteRune(r)
 		}
 		col = next
-		if col >= end {
+		// Stop only PAST the range: a zero-width rune at col == end belongs to
+		// the last included cell, so it must still be visited.
+		if col > end {
 			break
 		}
 	}
@@ -264,6 +256,16 @@ func cellsToRuneRange(s string, startCell, endCell int) (startRi, endRi int) {
 	startRi = -1
 	for _, r := range s {
 		rw := runeWidth(r)
+		if rw == 0 {
+			if col-1 >= startCell && col-1 < endCell {
+				if startRi < 0 {
+					startRi = ri
+				}
+				endRi = ri + 1
+			}
+			ri++
+			continue
+		}
 		next := col + rw
 		if next > startCell && col < endCell {
 			if startRi < 0 {
@@ -273,7 +275,9 @@ func cellsToRuneRange(s string, startCell, endCell int) (startRi, endRi int) {
 		}
 		col = next
 		ri++
-		if col >= endCell {
+		if col > endCell {
+			// Past the range; a zero-width rune at the boundary was handled
+			// above (it belongs to the last included cell).
 			break
 		}
 	}
@@ -286,7 +290,6 @@ func cellsToRuneRange(s string, startCell, endCell int) (startRi, endRi int) {
 // mouseToContent converts terminal-relative mouse coordinates to
 // content coordinates (line and cell column in the plain wrapped content).
 func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
-	m.ensureWrappedLines()
 	// Chat column starts right of the sessions panel; presses on the panel
 	// itself never select chat text.
 	mouseX -= m.sidebarOffsetX()
@@ -299,7 +302,7 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 	if m.selection != nil && m.selection.Dragging && m.selectionYOff >= 0 {
 		contentY = mouseY + m.selectionYOff
 	}
-	if contentY < 0 || contentY >= len(m.wrappedLines) {
+	if contentY < 0 || contentY >= m.plainLineCount() {
 		return -1, -1
 	}
 
@@ -313,7 +316,7 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 		contentX = 0
 	}
 
-	line := m.wrappedLines[contentY]
+	line := m.plainLine(contentY)
 	if max := cellWidth(line); contentX > max {
 		contentX = max
 	}
@@ -324,8 +327,7 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 // getSelectedText returns the plain text currently selected, or "" if
 // nothing is selected. StartX/EndX are cell columns.
 func (m *Model) getSelectedText() string {
-	m.ensureWrappedLines()
-	if m.selection == nil || len(m.wrappedLines) == 0 {
+	if m.selection == nil || m.plainLineCount() == 0 {
 		return ""
 	}
 
@@ -340,10 +342,10 @@ func (m *Model) getSelectedText() string {
 
 	var b strings.Builder
 	for y := startY; y <= endY; y++ {
-		if y >= len(m.wrappedLines) {
+		if y >= m.plainLineCount() {
 			break
 		}
-		line := m.wrappedLines[y]
+		line := m.plainLine(y)
 		ls := 0
 		le := cellWidth(line)
 		if y == startY {
@@ -374,7 +376,6 @@ func (m *Model) clearSelection() {
 // ANSI codes on selected text to preserve all original styling while adding
 // the selection highlight.
 func (m *Model) renderViewportWithSelection() string {
-	m.ensureWrappedLines()
 	w := m.viewport.Width
 	h := m.viewport.Height
 	if sw := m.viewport.Style.GetWidth(); sw != 0 {
@@ -395,8 +396,9 @@ func (m *Model) renderViewportWithSelection() string {
 	if m.selection != nil && m.selection.Dragging && m.selectionYOff >= 0 {
 		yOff = m.selectionYOff
 	}
-	m.ensureStyledLines()
-	styledLines := m.styledLines
+	// The viewport already holds the styled wrapped rows: the selection render
+	// reads them directly instead of keeping its own joined+split copy.
+	styledLines := m.viewport.Lines()
 
 	// Normalize selection range
 	selSY, selEY := m.selection.StartY, m.selection.EndY
@@ -420,10 +422,11 @@ func (m *Model) renderViewportWithSelection() string {
 	var lines []string
 	for i := 0; i < contentHeight; i++ {
 		ci := yOff + i
-		if ci < len(styledLines) && ci < len(m.wrappedLines) {
+		if ci < len(styledLines) {
 			line := styledLines[ci]
 			if ci >= selSY && ci <= selEY {
-				lineWidth := cellWidth(m.wrappedLines[ci])
+				plain := stripANSI(line)
+				lineWidth := cellWidth(plain)
 				hs := 0
 				he := lineWidth
 				if ci == selSY {
@@ -439,7 +442,7 @@ func (m *Model) renderViewportWithSelection() string {
 					he = lineWidth
 				}
 				if hs < he {
-					line = highlightPlainRange(line, m.wrappedLines[ci], hs, he)
+					line = highlightPlainRange(line, plain, hs, he)
 				}
 			}
 			if cutAll && contentWidth > 0 {
@@ -451,15 +454,15 @@ func (m *Model) renderViewportWithSelection() string {
 		}
 	}
 
-	contents := lipgloss.NewStyle().
-		Width(contentWidth).
-		Height(contentHeight).
-		MaxHeight(contentHeight).
-		MaxWidth(contentWidth).
-		Render(strings.Join(lines, "\n"))
+	// Pad with fitRows, exactly as Viewport.View does — not with a lipgloss
+	// style. It is the same "exactly height rows of width cells, truncate
+	// don't re-wrap" contract the normal render uses, measured in wcwidth (so
+	// the selection frame cannot disagree with the unselected one about row
+	// widths), and it skips a full lipgloss Render pass over the whole screen
+	// on every frame of a drag.
 	return m.viewport.Style.
 		UnsetWidth().UnsetHeight().
-		Render(contents)
+		Render(fitRows(lines, contentWidth, contentHeight))
 }
 
 // highlightPlainRange inserts reverse-video ANSI codes (\x1b[7m ... \x1b[27m)
@@ -487,19 +490,39 @@ func highlightPlainRange(styled, plain string, start, end int) string {
 func mapPlainToStyled(plainIdx int, styled string) int {
 	plainPos := 0
 	for i := 0; i < len(styled); {
-		// Skip ANSI escape sequences (\x1b[...m etc.)
-		if styled[i] == '\x1b' && i+1 < len(styled) && styled[i+1] == '[' {
-			end := i + 2
-			for end < len(styled) {
-				c := styled[end]
-				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+		// Skip ANSI escape sequences. CSI (ESC [) ends at its final byte; OSC
+		// (ESC ]) ends at BEL or ST (ESC \). Skipping only CSI counted an OSC
+		// payload as plain text, shifting every mapping after a hyperlink.
+		if styled[i] == '\x1b' && i+1 < len(styled) {
+			switch styled[i+1] {
+			case '[':
+				end := i + 2
+				for end < len(styled) {
+					c := styled[end]
+					if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+						end++
+						break
+					}
 					end++
-					break
 				}
-				end++
+				i = end
+				continue
+			case ']':
+				end := i + 2
+				for end < len(styled) {
+					if styled[end] == '\x07' {
+						end++
+						break
+					}
+					if styled[end] == '\x1b' && end+1 < len(styled) && styled[end+1] == '\\' {
+						end += 2
+						break
+					}
+					end++
+				}
+				i = end
+				continue
 			}
-			i = end
-			continue
 		}
 		if plainPos >= plainIdx {
 			return i

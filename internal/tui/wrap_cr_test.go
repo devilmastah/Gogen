@@ -177,7 +177,7 @@ func TestHistoryRenderCRIsStripped(t *testing.T) {
 	m := newSidebarTestModel(100)
 	m.SetSize(100, 24)
 
-	m.chatLines = renderMessages(historyCRMessages(), "/tmp", "model", "act")
+	m.chatLines = renderMessages(historyCRMessages(), "/tmp", "model", "act", false)
 	m.setViewportContent()
 
 	frame := m.renderMainColumn()

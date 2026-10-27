@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"gogen/internal/randhex"
 )
 
 var (
@@ -161,7 +163,11 @@ func extractToolCallsFromTextMode(text string, allowBareJSON bool) []ToolCall {
 func renumberExtractedToolCalls(toolCalls []ToolCall) {
 	for i := range toolCalls {
 		toolCalls[i].Index = i
-		toolCalls[i].ID = "tc_extracted_" + strconv.Itoa(i)
+		// Unique per batch, not per index: a fixed "tc_extracted_<i>" collided
+		// across rounds, so history carried duplicate tool-call IDs — the
+		// tool-result roster then matched the wrong results ("first result
+		// wins") and strict providers reject the request outright.
+		toolCalls[i].ID = randhex.ID(8, "tc_")
 	}
 }
 

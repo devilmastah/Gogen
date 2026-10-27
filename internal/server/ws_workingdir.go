@@ -75,9 +75,16 @@ func (s *Server) handleWSWorkingDir(ws *wsConn, ctx context.Context, pane **sess
 		paneRT.notifyTurnReleased()
 		accum := a.SnapshotUsageAccum()
 		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
-		echo := WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ModelProvider: cfg.ModelProvider, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode, GlobalMode: cfg.GlobalMode, Board: cfg.Board, Subagent: cfg.Subagent, SubagentMaxDepth: cfg.SubagentMaxDepth}
-		s.decorateConfig(&echo)
-		_ = ws.writeJSON(echo)
+		fillModelPricing(a, &cfg) // pure cache lookup, like the other echoes
+		// The echo IS the standard config frame (agentConfigMsgBasic + stats)
+		// with the new directory stamped on it: the hand-copied literal that
+		// used to sit here listed 18 of the frame's fields, so every field
+		// added since (pricing, reasoning efforts, session identity, the
+		// runtime config registry's projection) silently missed this echo and
+		// left the client half-stale after a workspace change.
+		cfg.WorkingDir = absDir
+		s.decorateConfig(&cfg)
+		_ = ws.writeJSON(cfg)
 		if len(skipped) > 0 {
 			writeNoticeError(ws, "workspace", workingDirSkipMessage(absDir, skipped))
 		}

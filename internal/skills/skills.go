@@ -136,16 +136,50 @@ func (m *Manager) List() []Skill {
 }
 
 // Read returns one skill by name, or an error when it does not exist.
+//
+// The candidate paths for name are resolved directly instead of scanning the
+// roots with List (which reads and parses the body of every skill to return
+// one), applying exactly the precedence List/scanRoot implement: the project
+// root before the user root, and within one root a bundle
+// (<root>/<name>/SKILL.md) before a flat <root>/<name>.md file. Read is not
+// subject to the MaxSkills cap — that cap bounds a List result, not a
+// single-skill lookup.
 func (m *Manager) Read(name string) (Skill, error) {
 	if !kebabCase.MatchString(name) {
 		return Skill{}, fmt.Errorf("invalid skill name %q (want kebab-case)", name)
 	}
-	for _, s := range m.List() {
-		if s.Name == name {
-			return s, nil
+	if m != nil {
+		for _, root := range []struct {
+			dir    string
+			source string
+		}{{m.projectSkillsDir(), "project"}, {m.userRoot(), "user"}} {
+			if root.dir == "" {
+				continue
+			}
+			if s, ok := readSkillAt(root.dir, name); ok {
+				s.Source = root.source
+				return s, nil
+			}
 		}
 	}
 	return Skill{}, fmt.Errorf("skill %q not found", name)
+}
+
+// readSkillAt reads the single skill name from one root, applying scanRoot's
+// within-root precedence: a bundle (<root>/<name>/SKILL.md) wins over a flat
+// file (<root>/<name>.md) of the same name, and the flat file is only
+// consulted when the bundle is absent or unusable (unreadable, oversized, or
+// without a body) — the same fall-through scanRoot's name dedupe produces.
+// The returned Skill carries exactly the fields scanRoot builds (Source is
+// the caller's to set).
+func readSkillAt(root, name string) (Skill, bool) {
+	if body, description, ok := readSkillFile(filepath.Join(root, name, "SKILL.md")); ok {
+		return Skill{Name: name, Description: description, Body: body}, true
+	}
+	if body, description, ok := readSkillFile(filepath.Join(root, name+".md")); ok {
+		return Skill{Name: name, Description: description, Body: body}, true
+	}
+	return Skill{}, false
 }
 
 // scanRoot scans one skill root: bundle dirs first (a bundle wins a flat

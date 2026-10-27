@@ -2,6 +2,7 @@ package llm
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/openai/openai-go/v3"
@@ -456,5 +457,66 @@ func TestToolAccumFinalizesWithUnicodeWhitespace(t *testing.T) {
 	merged := mergeToolArgsDelta(acc.ArgsStr, `{"a": 1}`, acc.argsFinalized)
 	if merged != acc.ArgsStr {
 		t.Fatalf("replay after finalize = %q, want unchanged %q", merged, acc.ArgsStr)
+	}
+}
+
+// TestMergeToolCallDeltaNameChangeStartsNewCall pins the no-ID case: a server
+// that reuses index 0 and omits the ID made two calls, and the second one's
+// name used to overwrite the first while its arguments were discarded as a
+// "replay" — the model saw one call where it made two.
+func TestMergeToolCallDeltaNameChangeStartsNewCall(t *testing.T) {
+	m := map[int]int{}
+	var accums []tcAccum
+	accums, _ = mergeToolCallDelta(deltaTool(0, "id-1", "read_file", `{"path":"a"}`), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(0, "", "write_file", `{"path":"b"}`), accums, m)
+
+	if len(accums) != 2 {
+		t.Fatalf("accumulators = %d, want 2 (a changed name is a new call)", len(accums))
+	}
+	if accums[0].Name != "read_file" || accums[1].Name != "write_file" {
+		t.Fatalf("names = %q, %q; want read_file, write_file", accums[0].Name, accums[1].Name)
+	}
+	if !strings.Contains(accums[0].ArgsStr, `"a"`) || !strings.Contains(accums[1].ArgsStr, `"b"`) {
+		t.Fatalf("args = %q, %q; the second call's arguments were dropped", accums[0].ArgsStr, accums[1].ArgsStr)
+	}
+}
+
+// TestMergeToolCallDeltaSameNameContinuation: the name change rule must not
+// split a normal continuation (same name, no ID).
+func TestMergeToolCallDeltaSameNameContinuation(t *testing.T) {
+	m := map[int]int{}
+	var accums []tcAccum
+	accums, _ = mergeToolCallDelta(deltaTool(0, "id-1", "read_file", ""), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(0, "", "read_file", `{"path":"a"}`), accums, m)
+	if len(accums) != 1 {
+		t.Fatalf("accumulators = %d, want 1 (same name): %+v", len(accums), accums)
+	}
+	if accums[0].ArgsStr != `{"path":"a"}` {
+		t.Fatalf("args = %q", accums[0].ArgsStr)
+	}
+}
+
+// TestRenumberExtractedToolCallsUniqueAcrossBatches pins the cross-round
+// collision: a fixed "tc_extracted_<i>" gave every round the same IDs, so the
+// history held duplicates and result lookups matched the wrong call.
+func TestRenumberExtractedToolCallsUniqueAcrossBatches(t *testing.T) {
+	first := []ToolCall{{Name: "read_file"}, {Name: "write_file"}}
+	second := []ToolCall{{Name: "read_file"}, {Name: "write_file"}}
+	renumberExtractedToolCalls(first)
+	renumberExtractedToolCalls(second)
+
+	seen := map[string]bool{}
+	for _, tc := range append(append([]ToolCall{}, first...), second...) {
+		if tc.ID == "" {
+			t.Fatal("extracted tool call has no ID")
+		}
+		if seen[tc.ID] {
+			t.Fatalf("duplicate tool-call ID %q across rounds", tc.ID)
+		}
+		seen[tc.ID] = true
+	}
+	// Indices stay dense per batch (they drive the model-order rendering).
+	if first[0].Index != 0 || first[1].Index != 1 {
+		t.Fatalf("indices = %d,%d; want 0,1", first[0].Index, first[1].Index)
 	}
 }

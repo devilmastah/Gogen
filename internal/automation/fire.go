@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -82,22 +83,13 @@ type ProcessFire struct {
 	idDir string
 }
 
-type atomicBool struct {
-	mu sync.Mutex
-	v  bool
-}
+// atomicBool is the kill flag the timeout timer sets and the wait goroutine
+// reads. sync/atomic.Bool, not a mutex: it is touched from a timer callback
+// and from the run goroutine, and there is nothing to protect but the flag.
+type atomicBool struct{ v atomic.Bool }
 
-func (b *atomicBool) set(v bool) {
-	b.mu.Lock()
-	b.v = v
-	b.mu.Unlock()
-}
-
-func (b *atomicBool) get() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.v
-}
+func (b *atomicBool) set(v bool) { b.v.Store(v) }
+func (b *atomicBool) get() bool  { return b.v.Load() }
 
 // NewProcessFire builds a ProcessFire spawning the current executable.
 // idDir is where per-run session-id link files are created ("" = the OS
@@ -144,9 +136,9 @@ func (f *ProcessFire) Fire(a *Automation) (*FireHandle, error) {
 	}
 	cmd := exec.Command(f.Binary, build(a)...)
 	cmd.Dir = a.WorkingDir
-	env := append(os.Environ(), SessionIDFileEnv+"="+idName)
-	env = append(env, f.ExtraEnv...)
-	cmd.Env = env
+	cmd.Env = fireChildEnv(os.Environ(), append([]string{SessionIDFileEnv + "=" + idName}, f.ExtraEnv...)...)
+	// Own process group so a timeout can take down the tree the run spawned.
+	setFireProcessGroup(cmd)
 
 	// Cap the stderr tail kept as failure detail (the child's stdout — the
 	// model's reply — is discarded: the session transcript is the record).
@@ -165,7 +157,9 @@ func (f *ProcessFire) Fire(a *Automation) (*FireHandle, error) {
 	killFlag := &atomicBool{}
 	timer := time.AfterFunc(timeout, func() {
 		killFlag.set(true)
-		_ = cmd.Process.Kill()
+		// SIGTERM the group, then SIGKILL: a hard kill of the direct child left
+		// the shell jobs and tool subprocesses it had started running.
+		killFireProcess(cmd)
 	})
 
 	ch := make(chan FireResult, 1)
@@ -243,4 +237,26 @@ func (t *cappedTail) String() string {
 		return fmt.Sprintf("… (%d more bytes) ", t.dropped) + string(t.tail)
 	}
 	return string(t.tail)
+}
+
+// fireChildEnv builds the fired child's environment: the host environment minus
+// the variables that would silently override the arguments the runner passes.
+// projectfile.Merge gives the environment priority over flags, so an exported
+// GOGEN_WORKING_DIR makes the child ignore `--dir <automation working dir>` and
+// run in whatever directory the host was started from; OPENAI_BASE_URL has the
+// same relationship to `--base-url`.
+//
+// Everything else is kept on purpose: a user's exported settings (API keys,
+// model, feature switches) should still apply to a scheduled run.
+func fireChildEnv(base []string, extra ...string) []string {
+	out := make([]string, 0, len(base)+len(extra))
+	for _, kv := range base {
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "GOGEN_WORKING_DIR", "OPENAI_BASE_URL":
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, extra...)
 }

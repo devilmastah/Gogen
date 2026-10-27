@@ -45,11 +45,49 @@ func TestIsPrivateHostLiterals(t *testing.T) {
 		{"ipv6 public bracketed with port", "[2606:4700:4700::1111]:443", false},
 
 		{"hostname not resolved here", "example.com", false},
+		{"hostname starting with 10.", "10.example.com", false},
+		{"hostname starting with 127.", "127.example.com", false},
+		{"hostname starting with 172.16.", "172.16.example.com", false},
+		{"hostname starting with 192.168.", "192.168.example.com", false},
+		{"hostname starting with fe80", "fe80.example.com", false},
+		{"hostname starting with 192.168. with port", "192.168.example.com:443", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isPrivateHost(tc.host); got != tc.want {
 				t.Errorf("isPrivateHost(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsPrivateHostHostnameFalsePositives pins the boundary between a private
+// IP LITERAL and a public HOSTNAME that merely shares its prefix. The predicate
+// used to be a regexp over the host text, so every one of the hostnames below
+// (ordinary public names) was rejected as private while the corresponding
+// literal was — and still is — the thing that must be blocked. Hostnames are
+// now left to dialContextPublicOnly, which enforces the rule at dial time
+// (resolve, discard internal addresses, dial the verified public IPs); that is
+// the DNS-rebinding guard, so the text match only ever added false positives.
+func TestIsPrivateHostHostnameFalsePositives(t *testing.T) {
+	pairs := []struct {
+		name     string
+		hostname string // public hostname: must NOT be classified as private
+		literal  string // matching private literal: MUST stay blocked
+	}{
+		{"10/8", "10.example.com", "10.1.2.3"},
+		{"127/8", "127.example.com", "127.0.0.1"},
+		{"172.16/12", "172.16.example.com", "172.16.0.1"},
+		{"192.168/16", "192.168.example.com", "192.168.1.1"},
+		{"fe80::/10", "fe80.example.com", "fe80::1"},
+	}
+	for _, tc := range pairs {
+		t.Run(tc.name, func(t *testing.T) {
+			if isPrivateHost(tc.hostname) {
+				t.Errorf("isPrivateHost(%q) = true, want false: a hostname must not be classified from its text", tc.hostname)
+			}
+			if !isPrivateHost(tc.literal) {
+				t.Errorf("isPrivateHost(%q) = false, want true: the private literal must stay blocked", tc.literal)
 			}
 		})
 	}

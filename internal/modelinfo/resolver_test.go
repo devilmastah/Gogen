@@ -1,6 +1,7 @@
 package modelinfo
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -457,4 +458,205 @@ func (r *Resolver) ProviderID(baseURL string) (string, bool) {
 		return "", false
 	}
 	return provider.ID, true
+}
+
+// waitSettled waits until the resolver holds data, has no refresh in flight,
+// and the test server has served exactly want requests.
+func waitSettled(t *testing.T, r *Resolver, hits *atomic.Int32, want int32, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		r.mu.RLock()
+		loaded, refreshing := r.data != nil, r.refreshing
+		r.mu.RUnlock()
+		if loaded && !refreshing && hits.Load() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	r.mu.RLock()
+	loaded, refreshing := r.data != nil, r.refreshing
+	r.mu.RUnlock()
+	t.Fatalf("timed out waiting for %d fetch(es): loaded=%v refreshing=%v hits=%d",
+		want, loaded, refreshing, hits.Load())
+}
+
+// readFileEventually polls path until its content equals want (or the timeout
+// expires) and returns the last content read.
+func readFileEventually(t *testing.T, path string, want []byte, timeout time.Duration) []byte {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		b, err := os.ReadFile(path)
+		if err == nil && bytes.Equal(b, want) {
+			return b
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("cache file %s: %v", path, err)
+			}
+			return b
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestWarmUsesFreshDiskCacheWithoutNetwork is the P7.1 regression guard: a
+// fresh process whose .gogen/models.json is younger than cacheTTL must not
+// re-download the registry. Warm used to call refreshAsync directly, which on
+// empty memory downloaded unconditionally and never looked at the disk cache,
+// so every restart re-fetched api.json even when the cache was seconds old.
+func TestWarmUsesFreshDiskCacheWithoutNetwork(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(sampleRegistry())
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cache := filepath.Join(dir, "models.json")
+	writeRegistry(t, cache, sampleRegistry()) // mtime = now → fresh
+
+	r := NewResolver(cache)
+	r.url = srv.URL
+	r.client = &http.Client{Timeout: 2 * time.Second}
+
+	r.Warm()
+	waitSettled(t, r, &hits, 0, 5*time.Second)
+
+	lim, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8")
+	if err != nil {
+		t.Fatalf("resolve from fresh disk cache: %v", err)
+	}
+	if lim.Context != 1000000 {
+		t.Fatalf("Context=%d, want 1000000", lim.Context)
+	}
+
+	// Give a (wrongly) started background fetch time to reach the server.
+	time.Sleep(200 * time.Millisecond)
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("Warm with a fresh disk cache issued %d registry request(s), want 0", n)
+	}
+}
+
+// servedRegistryJSON carries fields the Go structs do not model — an unknown
+// provider field, an unknown model field, a top-level "_meta" pseudo-provider
+// and a provider without an "api" field. Persisting it verbatim is the P7.1
+// requirement; a json.Marshal of the parsed registry would drop all of them.
+const servedRegistryJSON = `{
+  "_meta": {"version": 7},
+  "opencode": {
+    "id": "opencode",
+    "api": "https://opencode.ai/zen/v1",
+    "unknown_provider_field": {"keep": "me"},
+    "models": {
+      "claude-opus-4-8": {
+        "id": "claude-opus-4-8",
+        "limit": {"context": 1000000, "output": 128000},
+        "unknown_model_field": ["keep", "me"]
+      }
+    }
+  },
+  "future-provider": {
+    "id": "future-provider",
+    "name": "no api field yet",
+    "models": {}
+  }
+}`
+
+// TestStaleDiskCacheFetchesOnceAndStoresRawBytes covers the other half of
+// P7.1: a cache older than cacheTTL is refreshed exactly once, and the new
+// bytes are written verbatim (no lossy re-marshal).
+func TestStaleDiskCacheFetchesOnceAndStoresRawBytes(t *testing.T) {
+	served := []byte(servedRegistryJSON)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write(served)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cache := filepath.Join(dir, "models.json")
+	writeRegistry(t, cache, sampleRegistry())
+	stale := time.Now().Add(-cacheTTL - time.Hour)
+	if err := os.Chtimes(cache, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewResolver(cache)
+	r.url = srv.URL
+	r.client = &http.Client{Timeout: 2 * time.Second}
+
+	r.Warm()
+	waitSettled(t, r, &hits, 1, 5*time.Second)
+
+	// Exactly one fetch: the freshly written cache must not be re-downloaded.
+	time.Sleep(200 * time.Millisecond)
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("registry requests = %d, want exactly 1", n)
+	}
+
+	got := readFileEventually(t, cache, served, 2*time.Second)
+	if !bytes.Equal(got, served) {
+		t.Fatalf("cache content is not the raw response:\n got: %s\nwant: %s", got, served)
+	}
+	for _, field := range []string{`"_meta"`, `"unknown_provider_field"`, `"unknown_model_field"`, `"future-provider"`} {
+		if !bytes.Contains(got, []byte(field)) {
+			t.Fatalf("cache dropped unmodelled field %s: %s", field, got)
+		}
+	}
+
+	lim, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8")
+	if err != nil {
+		t.Fatalf("resolve after refresh: %v", err)
+	}
+	if lim.Context != 1000000 || lim.Output != 128000 {
+		t.Fatalf("got %+v, want context=1000000 output=128000", lim)
+	}
+
+	// Providers without an "api" field are skipped when building the byAPI
+	// index (they must never resolve for an empty base URL).
+	if _, ok := r.ProviderID(""); ok {
+		t.Fatal("api-less provider was indexed under an empty base URL")
+	}
+}
+
+// TestDiskLoadAgesRegistryFromFileMTime pins the mtime-derived fetchedAt: data
+// read from disk must carry the cache file's age, not "just fetched", or a
+// restart would treat any cache as fresh-but-about-to-expire.
+func TestDiskLoadAgesRegistryFromFileMTime(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(sampleRegistry())
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cache := filepath.Join(dir, "models.json")
+	writeRegistry(t, cache, sampleRegistry())
+	want := time.Now().Add(-3 * time.Minute) // well inside cacheTTL
+	if err := os.Chtimes(cache, want, want); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewResolver(cache)
+	r.url = srv.URL
+	r.client = &http.Client{Timeout: 2 * time.Second}
+
+	r.Warm()
+	waitSettled(t, r, &hits, 0, 5*time.Second)
+
+	r.mu.RLock()
+	got := r.fetchedAt
+	r.mu.RUnlock()
+
+	if d := got.Sub(want); d > time.Second || d < -time.Second {
+		t.Fatalf("fetchedAt = %v, want ~%v (cache mtime), delta %v", got, want, d)
+	}
+	if age := time.Since(got); age < time.Minute {
+		t.Fatalf("fetchedAt is only %v old; disk data was stamped as freshly fetched", age)
+	}
 }

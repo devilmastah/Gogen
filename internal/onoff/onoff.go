@@ -27,3 +27,14 @@ func Enabled(v string) bool {
 	on, ok := Parse(v)
 	return ok && on
 }
+
+// Format renders a boolean as the canonical "on"/"off" spelling accepted by
+// Parse. The config, the CLI and the config-WS all emit this form; keeping it
+// here is what stops the two copies that had drifted (CLI vs web) from
+// disagreeing again.
+func Format(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
+}

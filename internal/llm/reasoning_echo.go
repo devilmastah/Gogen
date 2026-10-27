@@ -6,7 +6,7 @@ import (
 	"gogen/internal/onoff"
 )
 
-// reasoningEchoEnabled reports whether historical assistant reasoning is re-sent
+// ReasoningEchoEnabled reports whether historical assistant reasoning is re-sent
 // as reasoning_content on every request.
 //
 // Echoing is byte-stable — the prefix never changes as the conversation grows,
@@ -25,7 +25,7 @@ import (
 // dropping older reasoning as the conversation grows changes the bytes of
 // EARLIER messages, which invalidates the provider's cached prefix on every
 // subsequent round — the opposite of the intended saving.
-func reasoningEchoEnabled() bool {
+func ReasoningEchoEnabled() bool {
 	if on, ok := onoff.Parse(os.Getenv("GOGEN_REASONING_ECHO")); ok {
 		return on
 	}

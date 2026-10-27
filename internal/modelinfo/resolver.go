@@ -2,14 +2,15 @@
 // models.dev registry, given only a provider base URL — no provider-specific
 // code required. Designed to slot into gogen's internal/llm package.
 //
-// The full registry JSON is downloaded at most once (then refreshed on a TTL
-// in the background). Lookups are pure in-memory / disk-cache matches and
-// never block on the network.
+// The full registry JSON is downloaded at most once per cacheTTL; a restart
+// reuses the on-disk cache while it is younger than that. Lookups are pure
+// in-memory / disk-cache matches and never block on the network.
 package modelinfo
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,7 +23,18 @@ import (
 
 const (
 	registryURL = "https://models.dev/api.json"
-	cacheTTL    = 5 * time.Minute
+	// cacheTTL is how long a loaded registry — in memory, or on disk via the
+	// cache file's mtime — counts as fresh. models.dev only changes when a
+	// provider adds a model or a price, so 6h picks up new entries within a
+	// working day while turning "one download per process start" into a
+	// handful of downloads per day.
+	//
+	// This TTL and the mtime-based fetchedAt belong together: with the former
+	// 5 minutes, stamping disk-loaded data with the file's mtime would make
+	// restarts MORE eager to re-download (any cache older than 5 minutes would
+	// look stale), not less. The longer TTL is what makes mtime-stamping pay
+	// off — a cache written seconds ago is reused instead of re-fetched.
+	cacheTTL = 6 * time.Hour
 	// fetchTimeout bounds background network I/O only — Resolve never waits on it.
 	fetchTimeout = 3 * time.Second
 	// failBackoff avoids hammering models.dev (or re-entering refresh) after a miss.
@@ -141,20 +153,35 @@ func (r *Resolver) SetCachePath(path string) {
 	r.lastFail = time.Time{}
 }
 
-// Warm starts a background registry fetch. Safe to call multiple times;
-// concurrent calls coalesce. Call at startup so lookups hit memory soon.
+// Warm populates the registry, preferring the on-disk cache: a cache younger
+// than cacheTTL is loaded and NO network request is made, so a restarting
+// process reuses the cache it wrote moments ago. Only a missing, unreadable or
+// stale cache starts a background fetch. Safe to call multiple times;
+// concurrent refreshes coalesce. Call at startup so lookups hit memory soon.
 func (r *Resolver) Warm() {
 	if r == nil {
 		return
 	}
-	r.refreshAsync()
+	// load() never performs network I/O inline and never waits on it: the
+	// "not loaded yet" error only means a background refresh is in flight, so
+	// it is expected (and irrelevant) here.
+	_ = r.load()
 }
 
-// setDataLocked installs a registry and rebuilds the API-URL index.
-// Caller must hold r.mu for writing.
+// setDataLocked installs a registry that was just fetched from the network and
+// rebuilds the API-URL index. Caller must hold r.mu for writing.
 func (r *Resolver) setDataLocked(data registry) {
+	r.setDataAtLocked(data, time.Now())
+}
+
+// setDataAtLocked is setDataLocked with an explicit fetch time, used for
+// data read from the disk cache: fetchedAt comes from the cache file's mtime,
+// so a restart inherits the age of the cache instead of pretending it was just
+// downloaded.
+// Caller must hold r.mu for writing.
+func (r *Resolver) setDataAtLocked(data registry, fetchedAt time.Time) {
 	r.data = data
-	r.fetchedAt = time.Now()
+	r.fetchedAt = fetchedAt
 	r.lastFail = time.Time{}
 	r.byAPI = make(map[string]providerEntry, len(data))
 	for id, p := range data {
@@ -194,8 +221,10 @@ func (r *Resolver) load() error {
 		return nil
 	}
 
-	if diskData, diskErr := r.readDiskCache(); diskErr == nil {
-		r.setDataLocked(diskData)
+	if diskData, diskMTime, diskErr := r.readDiskCache(); diskErr == nil {
+		// fetchedAt follows the file's mtime: refreshAsync below then only
+		// fetches when the cache is actually older than cacheTTL.
+		r.setDataAtLocked(diskData, diskMTime)
 		r.mu.Unlock()
 		r.refreshAsync()
 		return nil
@@ -229,7 +258,7 @@ func (r *Resolver) refreshAsync() {
 	r.mu.Unlock()
 
 	go func() {
-		data, err := r.fetchRemote()
+		data, raw, err := r.fetchRemote()
 
 		r.mu.Lock()
 		if err != nil {
@@ -245,7 +274,7 @@ func (r *Resolver) refreshAsync() {
 		// refreshing is the completion signal callers (and tests) poll, so it
 		// must not report the refresh done while its disk write is still in
 		// flight.
-		r.writeDiskCache(cachePath, data)
+		r.writeDiskCache(cachePath, raw)
 		r.mu.Lock()
 		r.refreshing = false
 		r.mu.Unlock()
@@ -259,53 +288,76 @@ func (r *Resolver) endpoint() string {
 	return registryURL
 }
 
-func (r *Resolver) fetchRemote() (registry, error) {
+// fetchRemote downloads the registry, returning both the parsed registry and
+// the raw response body so the disk cache can store the registry verbatim.
+func (r *Resolver) fetchRemote() (registry, []byte, error) {
 	req, err := http.NewRequest(http.MethodGet, r.endpoint(), nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models.dev returned status %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("models.dev returned status %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
 	}
 	var reg registry
-	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
-		return nil, err
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		return nil, nil, err
 	}
-	return reg, nil
+	return reg, raw, nil
 }
 
-func (r *Resolver) readDiskCache() (registry, error) {
+// readDiskCache reads the cache returned by writeDiskCache, also returning the
+// file's mtime so the caller can age the loaded registry (see setDataAtLocked).
+func (r *Resolver) readDiskCache() (registry, time.Time, error) {
 	if r.cachePath == "" {
-		return nil, fmt.Errorf("no cache path configured")
+		return nil, time.Time{}, fmt.Errorf("no cache path configured")
 	}
-	b, err := os.ReadFile(r.cachePath)
+	f, err := os.Open(r.cachePath)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
+	}
+	defer f.Close()
+	// Stat the open file, not the path: atomic writes rename a fresh file into
+	// place, so the handle guarantees bytes and mtime belong to one version.
+	st, err := f.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, time.Time{}, err
 	}
 	var reg registry
 	if err := json.Unmarshal(b, &reg); err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	return reg, nil
+	return reg, st.ModTime(), nil
 }
 
-// writeDiskCache persists data to cachePath. The path is passed explicitly
-// rather than read from r.cachePath so callers outside the lock cannot race
-// with SetCachePath.
-func (r *Resolver) writeDiskCache(cachePath string, data registry) {
-	if cachePath == "" {
+// writeDiskCache persists the raw registry response at cachePath. The path is
+// passed explicitly rather than read from r.cachePath so callers outside the
+// lock cannot race with SetCachePath.
+//
+// raw is written verbatim rather than a re-marshal of the parsed registry:
+// that skips a full marshal on every fetch and, more importantly, is lossless —
+// any field this package does not model (unknown provider/model keys, new API
+// fields) survives in the cache. Keeping the cache raw is also why providers
+// without an "api" field are NOT filtered out here: setDataAtLocked already
+// skips them when building the byAPI lookup index, which is the only place
+// their absence matters, and filtering would force the marshal back.
+func (r *Resolver) writeDiskCache(cachePath string, raw []byte) {
+	if cachePath == "" || len(raw) == 0 {
 		return
 	}
-	b, err := json.Marshal(data)
-	if err != nil {
-		return
-	}
-	_ = ioutil.WriteFileAtomicNoSync(cachePath, b, 0o644)
+	_ = ioutil.WriteFileAtomicNoSync(cachePath, raw, 0o644)
 }
 
 // normalizeURL strips a trailing slash so "https://x/v1" and "https://x/v1/"

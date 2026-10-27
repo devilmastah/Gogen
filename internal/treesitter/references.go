@@ -1,6 +1,7 @@
 package treesitter
 
 import (
+	"bytes"
 	"cmp"
 	"fmt"
 	"slices"
@@ -19,8 +20,26 @@ type Reference struct {
 	Text  string
 }
 
-// FindSymbolReferences locates identifier occurrences matching symbol in a source file.
+// maxReferencesPerFile bounds the reference list returned to display-only
+// callers (find_symbol, call_graph, dependencies). rename uses the uncapped
+// FindSymbolReferencesAll so a rewrite never covers only part of a file.
+const maxReferencesPerFile = 200
+
+// FindSymbolReferences locates identifier occurrences matching symbol in a
+// source file, capped at maxReferencesPerFile. Use it for display and search
+// callers, where a bounded answer is the point.
 func FindSymbolReferences(path string, content []byte, symbol string) ([]Reference, error) {
+	return findReferences(path, content, symbol, maxReferencesPerFile)
+}
+
+// FindSymbolReferencesAll is the uncapped variant. Callers that REWRITE the
+// file (rename) must use it: a truncated reference list would silently rename
+// only part of the occurrences while reporting success.
+func FindSymbolReferencesAll(path string, content []byte, symbol string) ([]Reference, error) {
+	return findReferences(path, content, symbol, 0)
+}
+
+func findReferences(path string, content []byte, symbol string, limit int) ([]Reference, error) {
 	if err := guardEnabled(); err != nil {
 		return nil, err
 	}
@@ -28,7 +47,7 @@ func FindSymbolReferences(path string, content []byte, symbol string) ([]Referen
 	if symbol == "" {
 		return nil, fmt.Errorf("symbol is required")
 	}
-	return findSymbolReferences(path, content, symbol)
+	return findSymbolReferences(path, content, symbol, limit)
 }
 
 // FormatReferenceMatches renders references in search_code-style lines.
@@ -60,13 +79,21 @@ func dedupeReferences(refs []Reference) []Reference {
 	return out
 }
 
-func lineTextAt(content []byte, line int) string {
-	if line < 1 {
-		return ""
+// lineTextAtOffset returns the trimmed text of the line containing byte offset
+// off. It scans out from the offset, which is O(line): the previous version
+// split the WHOLE file for every reference, so a 1 MB file with 200 hits
+// allocated ~200 MB of garbage per search.
+func lineTextAtOffset(content []byte, off int) string {
+	if off < 0 {
+		off = 0
 	}
-	lines := strings.Split(strings.TrimSuffix(string(content), "\n"), "\n")
-	if line > len(lines) {
-		return ""
+	if off > len(content) {
+		off = len(content)
 	}
-	return strings.TrimSpace(lines[line-1])
+	start := bytes.LastIndexByte(content[:off], '\n') + 1
+	end := len(content)
+	if i := bytes.IndexByte(content[off:], '\n'); i >= 0 {
+		end = off + i
+	}
+	return strings.TrimSpace(string(content[start:end]))
 }

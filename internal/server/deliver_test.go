@@ -14,6 +14,7 @@ import (
 	"gogen/internal/llm"
 	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
+	"gogen/internal/steerq"
 )
 
 // deliveredCount reports how many times needle appears across the agent's
@@ -231,9 +232,11 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 		agent:         &agent.Agent{},
 		deliverNotify: make(chan struct{}, 1),
 	}
+	stale := make([]deliverItem, 0, maxSystemDeliveryQueue)
 	for i := 0; i < maxSystemDeliveryQueue; i++ {
-		rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: "stale", Kind: deliverSystem})
+		stale = append(stale, deliverItem{ID: newQueueItemID(), Text: "stale", Kind: deliverSystem})
 	}
+	seedDeliveries(rt, stale...)
 	// No worker goroutine for this unit test: the queue stays at cap so the
 	// overflow branch fires deterministically.
 	rt.deliverWorker.Store(true)
@@ -256,12 +259,14 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 	}
 
 	// The drop-oldest + append invariant still holds after the fix.
-	rt.deliverMu.Lock()
-	n := len(rt.pendingDeliver)
-	last := rt.pendingDeliver[n-1]
-	rt.deliverMu.Unlock()
-	if n != maxSystemDeliveryQueue || last.Text != "overflow notice" {
-		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last.Text, maxSystemDeliveryQueue)
+	q := queuedItems(rt)
+	n := len(q)
+	var last string
+	if n > 0 {
+		last = q[n-1].Text
+	}
+	if n != maxSystemDeliveryQueue || last != "overflow notice" {
+		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last, maxSystemDeliveryQueue)
 	}
 }
 
@@ -493,18 +498,16 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 	if ok, full := rt.deliverChildMessage("targeted-1"); !ok || full {
 		t.Fatalf("targeted enqueue refused with notice slots free (ok=%v full=%v)", ok, full)
 	}
-	rt.deliverMu.Lock()
 	nSys, nNotice := 0, 0
-	for _, it := range rt.pendingDeliver {
-		if it.Kind != deliverSystem {
+	for _, it := range queuedItems(rt) {
+		if it.Kind == steerq.User {
 			continue
 		}
 		nSys++
-		if it.Source == deliverFromSystem {
+		if it.Tag == deliverSource(deliverFromSystem) {
 			nNotice++
 		}
 	}
-	rt.deliverMu.Unlock()
 	if nSys != maxSystemDeliveryQueue || nNotice != maxSystemDeliveryQueue-1 {
 		t.Fatalf("after targeted enqueue: system=%d notices=%d, want %d/%d (oldest notice evicted)",
 			nSys, nNotice, maxSystemDeliveryQueue, maxSystemDeliveryQueue-1)
@@ -525,18 +528,16 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 	if !rt2.deliverToSession("notice-at-full") {
 		t.Fatal("a notice must be consumed (dropped) rather than refused")
 	}
-	rt2.deliverMu.Lock()
 	n, nTargeted := 0, 0
-	for _, it := range rt2.pendingDeliver {
-		if it.Kind != deliverSystem {
+	for _, it := range queuedItems(rt2) {
+		if it.Kind == steerq.User {
 			continue
 		}
 		n++
-		if it.Source == deliverFromChildMessage {
+		if it.Kind == steerq.Reply {
 			nTargeted++
 		}
 	}
-	rt2.deliverMu.Unlock()
 	if n != maxSystemDeliveryQueue || nTargeted != maxSystemDeliveryQueue {
 		t.Fatalf("queue = %d items (%d targeted), want all %d targeted preserved", n, nTargeted, maxSystemDeliveryQueue)
 	}

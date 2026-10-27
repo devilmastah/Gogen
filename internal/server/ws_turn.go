@@ -148,31 +148,21 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	a := rt.agent
 	modeOut, modeHandled := a.HandleModeCommand(msg.Content)
 	if modeHandled {
-		modeCfg := agentConfigMsgBasic(a)
-		s.decorateConfig(&modeCfg)
+		cfg := agentConfigMsgBasic(a)
+		fillModelPricing(a, &cfg)
+		s.decorateConfig(&cfg)
 		rt.releaseTurn()
-		// Tokenization + echo off the read loop (large uncached sessions
-		// take seconds; the read loop serializes every message).
-		go func(cfg WSMessage, out string) {
-			accum := a.SnapshotUsageAccum()
-			applyContextStats(&cfg, a.ContextStats(r.Context()), &accum)
-			_ = ws.writeJSON(cfg)
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
-		}(modeCfg, modeOut)
+		echoConfigReply(rt, ws, r.Context(), a, &cfg, &WSMessage{Type: "response", Content: modeOut}, false)
 		return
 	}
 
 	thinkOut, thinkHandled := a.HandleThinkingCommand(msg.Content)
 	if thinkHandled {
+		cfg := agentConfigMsgBasic(a)
+		fillModelPricing(a, &cfg)
+		s.decorateConfig(&cfg)
 		rt.releaseTurn()
-		go func(out string) {
-			cfg := agentConfigMsg(r.Context(), rt)
-			_, thinking := a.ModeAndThinkingLevel()
-			cfg.ThinkingLevel = string(thinking)
-			s.decorateConfig(&cfg)
-			_ = ws.writeJSON(cfg)
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
-		}(thinkOut)
+		echoConfigReply(rt, ws, r.Context(), a, &cfg, &WSMessage{Type: "response", Content: thinkOut}, false)
 		return
 	}
 
@@ -180,8 +170,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	if ctxHandled {
 		rt.releaseTurn()
 		go func(out string) {
-			ctxMsg := contextMsg(r.Context(), a)
-			_ = ws.writeJSON(ctxMsg)
+			_ = ws.writeJSON(contextMsg(r.Context(), a))
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
 		}(ctxOut)
 		return
@@ -199,29 +188,28 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
 		out, _, modelErr := a.HandleModelsCommand(r.Context(), msg.Content)
 		cfg := agentConfigMsgBasic(a)
+		fillModelPricing(a, &cfg)
 		s.decorateConfig(&cfg)
 		rt.releaseTurn()
-		// Echo off the read loop (tokenization can take seconds on a large
-		// uncached session; the read loop serializes every message). Both
-		// cfg (success only) and resp are written from the goroutine so
-		// their relative order is preserved via the send-queue FIFO.
-		go func(out string, modelErr error, cfg WSMessage) {
-			fillModelPricing(a, &cfg)
-			accum := a.SnapshotUsageAccum()
-			applyContextStats(&cfg, a.ContextStats(r.Context()), &accum)
-			resp := WSMessage{Type: "response", Content: out}
-			if modelErr != nil {
-				resp.Content = fmt.Sprintf("Error: %v", modelErr)
-			} else {
-				resp.Model = cfg.Model
-				resp.ContextLimit = cfg.ContextLimit
-				resp.UsedTokens = cfg.UsedTokens
-				resp.UsedSource = cfg.UsedSource
-				resp.UsedPercent = cfg.UsedPercent
-				_ = ws.writeJSON(cfg)
-			}
-			_ = ws.writeJSON(resp)
-		}(out, modelErr, cfg)
+		resp := WSMessage{Type: "response", Content: out}
+		if modelErr != nil {
+			// A failed selection changes nothing: report the error and skip
+			// the config frame (it would pay for a tokenization pass to
+			// describe state the client already has).
+			echoConfigReply(rt, ws, r.Context(), a, nil, &WSMessage{
+				Type: "response", Content: fmt.Sprintf("Error: %v", modelErr),
+			}, false)
+			return
+		}
+		// The reply carries the new model's identity and usage so the client's
+		// toolbar updates from the same frame, in the same order (the send
+		// queue is FIFO): config first, then the answer.
+		resp.Model = cfg.Model
+		resp.ContextLimit = cfg.ContextLimit
+		resp.UsedTokens = cfg.UsedTokens
+		resp.UsedSource = cfg.UsedSource
+		resp.UsedPercent = cfg.UsedPercent
+		echoConfigReply(rt, ws, r.Context(), a, &cfg, &resp, true)
 		return
 	}
 
@@ -393,16 +381,10 @@ func isPlainChatInput(content string) bool {
 	if trimmed == "" {
 		return false
 	}
-	if strings.HasPrefix(trimmed, "/") {
-		return false
-	}
-	word, _, _ := strings.Cut(trimmed, " ")
-	switch word {
-	case "help", "plan", "act", "mode", "context", "think", "models",
-		"new", "sessions", "resume", "fork":
-		return false
-	}
-	return true
+	// Shared with the TUI's mid-turn submit gate (agent.IsCommandInput), so
+	// the two surfaces answer "queue as chat or refuse as a command?"
+	// identically.
+	return !agent.IsCommandInput(trimmed)
 }
 
 // errTurnEvicted is returned by runTurnBody when the runtime was evicted

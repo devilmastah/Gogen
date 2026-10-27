@@ -2,6 +2,7 @@ package llm
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -54,8 +55,17 @@ func IsContextWindowError(err error) bool {
 		return true
 	}
 	var oerr *openai.Error
-	if errors.As(err, &oerr) && oerr.Code == "context_length_exceeded" {
-		return true
+	if errors.As(err, &oerr) {
+		if oerr.Code == "context_length_exceeded" {
+			return true
+		}
+		// A throttle is not an overflow, whatever its wording: Bedrock-style
+		// 429s say "Too many tokens, please wait…", and classifying that as a
+		// context refusal triggers a lossy forced compaction instead of the
+		// backoff the provider asked for.
+		if oerr.StatusCode == http.StatusTooManyRequests {
+			return false
+		}
 	}
 	msg := strings.ToLower(apiErrorText(err))
 	for _, marker := range contextWindowMarkers {

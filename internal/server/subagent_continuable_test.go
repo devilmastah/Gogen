@@ -359,9 +359,7 @@ func TestSessionRuntimeQuiescentCoversDeliveryHandoff(t *testing.T) {
 	}
 
 	// A queued delivery alone is enough to hold the answer at "no".
-	rt.deliverMu.Lock()
-	rt.pendingDeliver = []deliverItem{{ID: newQueueItemID(), Text: "notice", Kind: deliverSystem, Source: deliverFromSystem}}
-	rt.deliverMu.Unlock()
+	seedDeliveries(rt, deliverItem{ID: newQueueItemID(), Text: "notice", Kind: deliverSystem, Source: deliverFromSystem})
 	if sessionRuntimeQuiescent(rt) {
 		t.Fatal("a runtime with a queued delivery must not read quiescent")
 	}
@@ -369,9 +367,7 @@ func TestSessionRuntimeQuiescentCoversDeliveryHandoff(t *testing.T) {
 	// The handoff window: the worker popped the item (queue empty) and
 	// cleared deliverWorker, but still holds turnMu while the turn
 	// goroutine it just spawned has not started yet.
-	rt.deliverMu.Lock()
-	rt.pendingDeliver = nil
-	rt.deliverMu.Unlock()
+	seedDeliveries(rt)
 	rt.deliverWorker.Store(true)
 	rt.turnMu.Lock()
 	rt.deliverWorker.Store(false)
@@ -526,9 +522,7 @@ func TestBackgroundChildBusy(t *testing.T) {
 	// session writes race the temp-dir cleanup (flake: "directory not
 	// empty"). Emptying the queue makes the worker's post-acquire re-check
 	// drop the item and exit without a turn.
-	child.Handle.deliverMu.Lock()
-	child.Handle.pendingDeliver = nil
-	child.Handle.deliverMu.Unlock()
+	seedDeliveries(child.Handle)
 }
 
 // TestRetentionReleasesAfterQueuedDelivery pins the retention/queue

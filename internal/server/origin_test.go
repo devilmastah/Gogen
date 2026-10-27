@@ -37,6 +37,40 @@ func TestCheckWSOrigin(t *testing.T) {
 	}
 }
 
+// TestCheckWSHost pins the DNS-rebinding defence: the Host header of a
+// request to a loopback-bound listener must name loopback (or a configured
+// allowed origin), because an attacker-controlled page rebinding its own
+// domain to 127.0.0.1 sends its own name as Host.
+func TestCheckWSHost(t *testing.T) {
+	allowed := parseAllowedOrigins("")
+	cases := []struct {
+		name string
+		host string
+		want bool
+	}{
+		{"localhost with port", "localhost:8080", true},
+		{"ipv4 loopback with port", "127.0.0.1:8080", true},
+		{"ipv6 loopback with port", "[::1]:8080", true},
+		{"ipv6 loopback bare", "[::1]", true},
+		{"rebound domain", "evil.example:8080", false},
+		{"lan address", "192.168.1.5:8080", false},
+		{"empty host", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://127.0.0.1:8080/ws", nil)
+			req.Host = tc.host
+			if got := checkWSHost(req, allowed); got != tc.want {
+				t.Fatalf("checkWSHost(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+	// A configured allowed origin stays honoured as the proxy escape hatch.
+	if got := checkWSHost(&http.Request{Host: "gogen.internal:9000"}, parseAllowedOrigins("gogen.internal")); !got {
+		t.Fatal("configured allowed origin should pass the Host check")
+	}
+}
+
 func TestIsLoopbackBind(t *testing.T) {
 	if !IsLoopbackBind("127.0.0.1:8080") {
 		t.Fatal("expected loopback")

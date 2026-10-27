@@ -234,18 +234,15 @@ func wsHandleSetModel(req *wsRequest) {
 	// lock then only touches the in-memory cache. If the pre-fetch fails,
 	// SelectModel surfaces the same error under the lock — no regression.
 	_, _ = rt.agent.ListModels(ctx)
-	if !rt.acquireTurnForHandler(ws) {
+	acquired, _, err := s.withTurnConfig(rt, ws, ctx, func(a *agent.Agent) (bool, error) {
+		return true, a.SelectModel(ctx, msg.Model)
+	})
+	if !acquired {
 		// UI-channel handler (model picker): the busy rejection must NOT
 		// render into the chat transcript — it toasts as a model notice.
 		writeNoticeError(ws, "model", errAgentBusy)
 		return
 	}
-	a := rt.agent
-	err := a.SelectModel(ctx, msg.Model)
-	cfg := agentConfigMsgBasic(a)
-	fillModelPricing(a, &cfg)
-	s.decorateConfig(&cfg)
-	rt.releaseTurn()
 	if err != nil {
 		writeNoticeError(ws, "model", fmt.Sprintf("Error: %v", err))
 		return
@@ -255,17 +252,13 @@ func wsHandleSetModel(req *wsRequest) {
 	// settings modal's default-profile save (provider_save), never here, and
 	// no other session's provider is touched, so two panes can run different
 	// models concurrently. The config echo carries this session's own
-	// Mode/ThinkingLevel/Model to every client attached to IT (echoConfigOffLoop),
+	// Mode/ThinkingLevel/Model to every client attached to IT (echoConfigReply),
 	// never to another session's clients.
-	// Tokenization + echo off the read loop: ContextStats on a large
-	// uncached session takes seconds, and the read loop serializes every
-	// message (including pane switches).
-	echoConfigOffLoop(rt, ws, ctx, a, &cfg)
 	// llama.cpp endpoints: derive the new model's true reasoning-effort
 	// options from /props (+ /apply-template) and push a config update when
 	// they differ from the fallback the echo above carried (the provider
 	// caches per model, so repeat switches are no-ops).
-	s.maybeProbeReasoningEfforts(ctx, a)
+	s.maybeProbeReasoningEfforts(ctx, rt.agent)
 }
 
 func wsHandleSetMode(req *wsRequest) {
@@ -275,33 +268,24 @@ func wsHandleSetMode(req *wsRequest) {
 	}
 	rt := target
 	ctx := r.Context()
-	if !rt.acquireTurnForHandler(ws) {
+	// Mode is per-SESSION state that every attached client renders in its
+	// picker, and the model's tool list follows the SERVER's mode: a second
+	// tab/window (or a second pane on the same session) left on the previous
+	// value would show "act" for a session whose tools are the read-only plan
+	// set — and its picker's "already active" short-circuit makes clicking Act
+	// a silent no-op, so the user could not recover from that tab. The echo
+	// therefore fans out to every attached client (echoConfigReply).
+	acquired, _, _ := s.withTurnConfig(rt, ws, ctx, func(a *agent.Agent) (bool, error) {
+		m, ok := agent.ParseMode(msg.Mode)
+		if !ok {
+			return false, nil // unrecognized value: nothing to echo
+		}
+		a.SetMode(m)
+		return true, nil
+	})
+	if !acquired {
 		// UI-channel handler (mode picker): busy rejection as a notice.
 		writeNoticeError(ws, "mode", errAgentBusy)
-		return
-	}
-	a := rt.agent
-	modeSet := false
-	var cfg WSMessage
-	if m, ok := agent.ParseMode(msg.Mode); ok {
-		a.SetMode(m)
-		modeSet = true
-		cfg = agentConfigMsgBasic(a)
-		s.decorateConfig(&cfg)
-	}
-	rt.releaseTurn()
-	if modeSet {
-		// Echo off the read loop (tokenization can take seconds on a large
-		// uncached session; the read loop serializes every message).
-		//
-		// Mode is per-SESSION state that every attached client renders in its
-		// picker, and the model's tool list follows the SERVER's mode: a
-		// second tab/window (or a second pane on the same session) left on
-		// the previous value would show "act" for a session whose tools are
-		// the read-only plan set — and its picker's "already active"
-		// short-circuit makes clicking Act a silent no-op, so the user cannot
-		// recover from that tab. Fan the echo out to every attached client.
-		echoConfigOffLoop(rt, ws, ctx, a, &cfg)
 	}
 }
 
@@ -312,23 +296,20 @@ func wsHandleSetThinkingLevel(req *wsRequest) {
 	}
 	rt := target
 	ctx := r.Context()
-	if !rt.acquireTurnForHandler(ws) {
+	acquired, _, _ := s.withTurnConfig(rt, ws, ctx, func(a *agent.Agent) (bool, error) {
+		// An out-of-range level for the current model is ignored, not
+		// rejected — but the echo still runs, so the client's picker
+		// re-syncs to the level the session actually has.
+		if s.isValidThinkingLevel(a, msg.ThinkingLevel) {
+			a.SetThinkingLevel(agent.ThinkingLevel(msg.ThinkingLevel))
+		}
+		return true, nil
+	})
+	if !acquired {
 		// UI-channel handler (thinking-level picker): busy rejection as a
 		// notice.
 		writeNoticeError(ws, "thinking", errAgentBusy)
-		return
 	}
-	a := rt.agent
-	if s.isValidThinkingLevel(a, msg.ThinkingLevel) {
-		a.SetThinkingLevel(agent.ThinkingLevel(msg.ThinkingLevel))
-	}
-	cfg := agentConfigMsgBasic(a)
-	rt.releaseTurn()
-	fillModelPricing(a, &cfg)
-	s.decorateConfig(&cfg)
-	// Echo off the read loop (tokenization can take seconds on a large
-	// uncached session; the read loop serializes every message).
-	echoConfigOffLoop(rt, ws, ctx, a, &cfg)
 }
 
 // wsHandleConfig routes config scoped by the pane's sessionId. After a

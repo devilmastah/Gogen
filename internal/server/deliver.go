@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gogen/internal/llm"
+	"gogen/internal/steerq"
 )
 
 // deliverKind distinguishes the two producers sharing one FIFO queue per
@@ -59,6 +60,60 @@ type deliverItem struct {
 	Source deliverSource
 	// Images carries user-attached images (nil for system items).
 	Images []llm.ImageInput
+}
+
+// deliveriesLocked returns the runtime's delivery queue, creating it on first
+// use (a hand-built runtime — tests, a nested child without the full
+// constructor — may have none). Caller holds deliverMu: the shared queue is not
+// internally synchronized, and this assigns the field.
+func (rt *sessionRuntime) deliveriesLocked() *steerq.Queue {
+	if rt.pendingDeliver == nil {
+		rt.pendingDeliver = steerq.New(maxUserQueueCap, maxSystemDeliveryQueue)
+	}
+	return rt.pendingDeliver
+}
+
+// steerqKind maps this host's (kind, source) pair onto the shared queue's
+// kind, which is what the caps, eviction preference and batching rule key on:
+// a user message is its own kind, a targeted send_message delivery is a Reply
+// (never evicted, never batched), and every other machine message is a
+// Notice (batchable, evictable oldest-first).
+func steerqKind(k deliverKind, src deliverSource) steerq.Kind {
+	if k == deliverUser {
+		return steerq.User
+	}
+	if src == deliverFromChildMessage {
+		return steerq.Reply
+	}
+	return steerq.Notice
+}
+
+// deliverItemFrom builds the queue item for a delivery; the deliverSource
+// travels in Tag because only a targeted delivery arms the delivery-start
+// hook (see deliverLoop).
+func deliverItemFrom(id, text string, k deliverKind, src deliverSource, images []llm.ImageInput) steerq.Item {
+	return steerq.Item{ID: id, Text: text, Kind: steerqKind(k, src), Images: images, Tag: src}
+}
+
+// itemSource reads back the deliverSource stored by deliverItemFrom.
+func itemSource(it steerq.Item) deliverSource {
+	src, _ := it.Tag.(deliverSource)
+	return src
+}
+
+// itemFromSteerq is the read-side view of a queued item, so the drain code
+// keeps speaking this host's vocabulary.
+func itemFromSteerq(it steerq.Item) deliverItem {
+	return deliverItem{ID: it.ID, Text: it.Text, Kind: mapDeliverKind(it.Kind), Source: itemSource(it), Images: it.Images}
+}
+
+// mapDeliverKind is the inverse of steerqKind for the fields the drain reads
+// (a targeted delivery is a system item with deliverFromChildMessage).
+func mapDeliverKind(k steerq.Kind) deliverKind {
+	if k == steerq.User {
+		return deliverUser
+	}
+	return deliverSystem
 }
 
 // maxSystemDeliveryQueue bounds pending SYSTEM message deliveries per
@@ -128,12 +183,7 @@ func validQueueID(id string) bool {
 // queueIDInUseLocked reports whether id is already queued for this runtime.
 // Caller holds deliverMu.
 func (rt *sessionRuntime) queueIDInUseLocked(id string) bool {
-	for _, it := range rt.pendingDeliver {
-		if it.ID == id {
-			return true
-		}
-	}
-	return false
+	return rt.pendingDeliver.Has(id, steerq.User) || rt.pendingDeliver.Has(id, steerq.Notice) || rt.pendingDeliver.Has(id, steerq.Reply)
 }
 
 // enqueueUserTurn queues a user steering message typed while a turn is
@@ -163,7 +213,9 @@ func (rt *sessionRuntime) enqueueUserTurn(id, content string, images []llm.Image
 	if !validQueueID(id) || rt.queueIDInUseLocked(id) {
 		id = newQueueItemID()
 	}
-	rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: id, Text: content, Kind: deliverUser, Images: images})
+	// The user cap was checked above under the same lock, so Accepted is the
+	// only outcome here.
+	rt.deliveriesLocked().Append(deliverItemFrom(id, content, deliverUser, deliverFromSystem, images))
 	if !rt.deliverWorker.Swap(true) {
 		go rt.deliverLoop()
 	}
@@ -178,13 +230,7 @@ func (rt *sessionRuntime) enqueueUserTurn(id, content string, images []llm.Image
 
 // countUser counts queued user items. Caller holds deliverMu.
 func (rt *sessionRuntime) countUser() int {
-	n := 0
-	for _, it := range rt.pendingDeliver {
-		if it.Kind == deliverUser {
-			n++
-		}
-	}
-	return n
+	return rt.pendingDeliver.Count(steerq.User)
 }
 
 // broadcastQueueState sends a queue_update frame describing the runtime's
@@ -208,9 +254,9 @@ func (rt *sessionRuntime) broadcastQueueState(left ...string) {
 func (rt *sessionRuntime) queueItems() []QueueItem {
 	rt.deliverMu.Lock()
 	defer rt.deliverMu.Unlock()
-	out := make([]QueueItem, 0, len(rt.pendingDeliver))
-	for _, it := range rt.pendingDeliver {
-		if it.Kind == deliverUser {
+	out := make([]QueueItem, 0, rt.pendingDeliver.Len())
+	for _, it := range rt.pendingDeliver.Items() {
+		if it.Kind == steerq.User {
 			out = append(out, QueueItem{ID: it.ID, Text: it.Text})
 		}
 	}
@@ -225,14 +271,7 @@ func (rt *sessionRuntime) removeQueuedItem(id string) bool {
 		return false
 	}
 	rt.deliverMu.Lock()
-	removed := false
-	for i, it := range rt.pendingDeliver {
-		if it.Kind == deliverUser && it.ID == id {
-			rt.pendingDeliver = append(rt.pendingDeliver[:i], rt.pendingDeliver[i+1:]...)
-			removed = true
-			break
-		}
-	}
+	_, removed := rt.pendingDeliver.Remove(id, steerq.User)
 	rt.deliverMu.Unlock()
 	return removed
 }
@@ -249,18 +288,21 @@ func (rt *sessionRuntime) clearUserQueue() int {
 		return 0
 	}
 	rt.deliverMu.Lock()
-	kept := rt.pendingDeliver[:0]
-	removed := 0
-	for _, it := range rt.pendingDeliver {
-		if it.Kind == deliverUser {
-			removed++
-			continue
-		}
-		kept = append(kept, it)
-	}
-	rt.pendingDeliver = kept
+	// DropKind zeroes the dropped slots: a removed item can carry multi-MB
+	// data-URL images, and leaving them in the backing array kept them
+	// reachable for the lifetime of the queue.
+	removed := len(rt.pendingDeliver.DropKind(steerq.User))
 	rt.deliverMu.Unlock()
 	return removed
+}
+
+// dropDeliveredLocked removes the first n queued items (caller holds
+// deliverMu) and CLEARS their slots: reslicing alone left the item, which can
+// carry a multi-MB data-URL image, reachable through the backing array.
+func (rt *sessionRuntime) dropDeliveredLocked(n int) {
+	// Take zeroes the popped slots, so a removed item's text and images are
+	// not kept reachable through the backing array.
+	rt.pendingDeliver.Take(n)
 }
 
 // deliverToSession injects a system-generated message into the session as a
@@ -326,43 +368,26 @@ func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) (ok, ful
 		return false, false
 	}
 	rt.deliverMu.Lock()
-	nSys := 0
-	for _, it := range rt.pendingDeliver {
-		if it.Kind == deliverSystem {
-			nSys++
-		}
+	// The cap/eviction preference is the shared queue's policy (steerq): at
+	// the system cap the OLDEST NOTICE is evicted for either kind; when every
+	// slot holds a targeted reply, a new reply is REFUSED (so the caller
+	// reports an actionable error instead of dropping a message whose answer
+	// is pending) and a new notice is DROPPED (a full reply queue must not
+	// lose its replies).
+	outcome, evicted := rt.deliveriesLocked().Append(deliverItemFrom(newQueueItemID(), text, deliverSystem, src, nil))
+	var dropped bool
+	switch {
+	case outcome == steerq.Refused:
+		rt.deliverMu.Unlock()
+		return false, true
+	case outcome == steerq.Dropped:
+		rt.deliverMu.Unlock()
+		rt.broadcast(WSMessage{Type: "notice", Kind: "delivery", Success: false,
+			Content: "A background message was dropped (delivery queue full)."})
+		return true, false
+	case evicted != nil:
+		dropped = true
 	}
-	dropped := false
-	if nSys >= maxSystemDeliveryQueue {
-		// Evict the OLDEST notice first: freshness wins for notices, and a
-		// targeted delivery is a message whose reply the parent waits for.
-		victim := -1
-		for i, it := range rt.pendingDeliver {
-			if it.Kind == deliverSystem && it.Source == deliverFromSystem {
-				victim = i
-				break
-			}
-		}
-		switch {
-		case victim >= 0:
-			rt.pendingDeliver = append(rt.pendingDeliver[:victim], rt.pendingDeliver[victim+1:]...)
-			dropped = true
-		case src == deliverFromChildMessage:
-			// Every slot holds a targeted delivery: refuse the new one so
-			// the caller reports an actionable error instead of dropping a
-			// queued message whose reply is pending.
-			rt.deliverMu.Unlock()
-			return false, true
-		default:
-			// All targeted and this producer is a notice: drop the notice
-			// itself (a full targeted queue must not lose its replies).
-			rt.deliverMu.Unlock()
-			rt.broadcast(WSMessage{Type: "notice", Kind: "delivery", Success: false,
-				Content: "A background message was dropped (delivery queue full)."})
-			return true, false
-		}
-	}
-	rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: text, Kind: deliverSystem, Source: src})
 	if !rt.deliverWorker.Swap(true) {
 		go rt.deliverLoop()
 	}
@@ -471,7 +496,7 @@ func (r *sessionRegistry) clearParentDeliveries(id string) {
 func (rt *sessionRuntime) deliverLoop() {
 	for {
 		rt.deliverMu.Lock()
-		if len(rt.pendingDeliver) == 0 {
+		if rt.pendingDeliver.Len() == 0 {
 			rt.deliverWorker.Store(false)
 			rt.deliverMu.Unlock()
 			return
@@ -481,12 +506,14 @@ func (rt *sessionRuntime) deliverLoop() {
 		// actually starting. Popping first opened a handoff window (queue
 		// empty, turnMu still free) where the just-ended turn's orphan
 		// re-check could evict the runtime and drop the item.
-		item := rt.pendingDeliver[0]
+		// Peek, do NOT pop: see the handoff-window note below.
+		head, _ := rt.pendingDeliver.Peek()
+		item := itemFromSteerq(head)
 		rt.deliverMu.Unlock()
 
 		if rt.evicted.Load() {
 			rt.deliverMu.Lock()
-			rt.pendingDeliver = rt.pendingDeliver[1:]
+			rt.dropDeliveredLocked(1)
 			rt.deliverMu.Unlock()
 			continue // dropped: the runtime left the registry mid-queue
 		}
@@ -512,7 +539,7 @@ func (rt *sessionRuntime) deliverLoop() {
 		// persist a message nobody sees — drop it (at-most-once).
 		if rt.evicted.Load() {
 			rt.deliverMu.Lock()
-			rt.pendingDeliver = rt.pendingDeliver[1:]
+			rt.dropDeliveredLocked(1)
 			rt.deliverMu.Unlock()
 			rt.releaseTurn()
 			continue
@@ -532,7 +559,7 @@ func (rt *sessionRuntime) deliverLoop() {
 		// do NOT pop the (different) item now at the head and deliver the
 		// stale one; release the turn lock and re-peek instead.
 		rt.deliverMu.Lock()
-		if len(rt.pendingDeliver) == 0 || rt.pendingDeliver[0].ID != item.ID {
+		if head, ok := rt.pendingDeliver.Peek(); !ok || head.ID != item.ID {
 			rt.deliverMu.Unlock()
 			rt.releaseTurn()
 			continue
@@ -545,20 +572,22 @@ func (rt *sessionRuntime) deliverLoop() {
 		// capture is armed per turn and must stay 1:1 with the tool call);
 		// strict FIFO across kinds is preserved because only a contiguous
 		// head run is taken.
-		batch := rt.pendingDeliver[:1]
-		if batch[0].Kind == deliverSystem && batch[0].Source == deliverFromSystem {
-			n := 1
-			for n < len(rt.pendingDeliver) {
-				it := rt.pendingDeliver[n]
-				if it.Kind != deliverSystem || it.Source != deliverFromSystem {
-					break
-				}
-				n++
-			}
-			batch = rt.pendingDeliver[:n]
+		//
+		// Batch computes that head run (steerq.Batch is the one definition of
+		// the rule; it keys on the shared kind, where a targeted delivery is a
+		// Reply and never batches).
+		batch := rt.pendingDeliver.Batch()
+		// Capture everything the delivery needs BEFORE dropping the run:
+		// dropDeliveredLocked zeroes the popped slots (so their text/images
+		// are no longer retained by the backing array). batch is a COPY, and
+		// joinDeliveryTexts builds a new string, so both stay valid after the
+		// clear.
+		item = itemFromSteerq(batch[0])
+		text := item.Text
+		if len(batch) > 1 {
+			text = joinDeliveryTexts(batch)
 		}
-		rt.pendingDeliver = rt.pendingDeliver[len(batch):]
-		item = batch[0]
+		rt.dropDeliveredLocked(len(batch))
 		rt.deliverMu.Unlock()
 		// A USER item left the queue to run: every attached client must see
 		// the queue state converge (the sending tab's optimistic queued
@@ -588,11 +617,8 @@ func (rt *sessionRuntime) deliverLoop() {
 		// The turn-end signal wakes the worker for the next pop, so queued
 		// items drain in FIFO order across consecutive turns. A batched
 		// notice run is ONE turn (one provider request); user and targeted
-		// items keep one turn each.
-		text := item.Text
-		if len(batch) > 1 {
-			text = joinDeliveryTexts(batch)
-		}
+		// items keep one turn each. `text` was captured before the pop cleared
+		// the batch slots.
 		rt.startTurnWithResult(nil, text, item.Images, onResult)
 	}
 }
@@ -618,14 +644,14 @@ func (rt *sessionRuntime) hasPendingDeliveries() bool {
 	}
 	rt.deliverMu.Lock()
 	defer rt.deliverMu.Unlock()
-	return len(rt.pendingDeliver) > 0
+	return rt.pendingDeliver.Len() > 0
 }
 
 // joinDeliveryTexts merges a batch of one-way system notices into a single
 // turn input: one block per notice, blank-line separated so the model reads
 // them as distinct deliveries (each already carries its own "[job …]" /
 // "[subagent …]" prefix).
-func joinDeliveryTexts(batch []deliverItem) string {
+func joinDeliveryTexts(batch []steerq.Item) string {
 	var b strings.Builder
 	for i, it := range batch {
 		if i > 0 {

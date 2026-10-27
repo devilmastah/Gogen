@@ -35,10 +35,27 @@ func newTestRuntime(t *testing.T) *sessionRuntime {
 // queue full").
 func newFakeWSConn() *wsConn {
 	return &wsConn{
-		conn:  &websocket.Conn{},
-		sendQ: make(chan *WSMessage, 64),
-		quit:  make(chan struct{}),
-		done:  make(chan struct{}),
+		conn: &websocket.Conn{},
+		// Prepared frames; captureMsg keeps the WSMessage attached so helpers
+		// can assert on it (there is no writer goroutine here).
+		sendQ:      make(chan *wsOut, 64),
+		quit:       make(chan struct{}),
+		done:       make(chan struct{}),
+		captureMsg: true,
+	}
+}
+
+// nextQueued pops the oldest queued frame's captured message. Tests use it in
+// select/default form via queued() below.
+func (w *wsConn) nextQueued() (WSMessage, bool) {
+	select {
+	case out := <-w.sendQ:
+		if out == nil || out.msg == nil {
+			return WSMessage{}, false
+		}
+		return *out.msg, true
+	default:
+		return WSMessage{}, false
 	}
 }
 
@@ -333,13 +350,8 @@ func TestRegistryEvictRuntimeUnregistersBeforeNotify(t *testing.T) {
 	}
 	// The attached client still received session_detached (notification
 	// happens after removal but writes to the clients set).
-	select {
-	case m := <-ws.sendQ:
-		if m.Type != "session_detached" {
-			t.Fatalf("broadcast type = %q, want session_detached", m.Type)
-		}
-	default:
-		t.Fatal("attached client did not receive session_detached after eviction")
+	if m, ok := ws.nextQueued(); !ok || m.Type != "session_detached" {
+		t.Fatalf("broadcast frame = %+v, %v; want session_detached", m, ok)
 	}
 	// Attachments are swept: the removed runtime holds no sockets.
 	if rt.clientCount() != 0 {
@@ -376,13 +388,8 @@ func TestEvictedRuntimeDetachesClients(t *testing.T) {
 
 	r.evictRuntime(rtA)
 
-	select {
-	case m := <-ws.sendQ:
-		if m.Type != "session_detached" {
-			t.Fatalf("broadcast type = %q, want session_detached", m.Type)
-		}
-	default:
-		t.Fatal("attached client did not receive session_detached")
+	if m, ok := ws.nextQueued(); !ok || m.Type != "session_detached" {
+		t.Fatalf("broadcast frame = %+v, %v; want session_detached", m, ok)
 	}
 	if rtA.clientCount() != 0 {
 		t.Fatal("evicted victim still has attached clients")
