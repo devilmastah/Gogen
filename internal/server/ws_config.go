@@ -531,6 +531,11 @@ func (s *Server) configFilePath() string {
 // without it). Keys that only ever came from the environment stay out of
 // the file, exactly as before.
 func (s *Server) persistConfig(cfg *config.Config) {
+	// One writer at a time: each write is temp-file + rename, so two
+	// concurrent persists race on the target (a benign "no such file" on
+	// POSIX, ACCESS_DENIED on Windows).
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	var err error
 	if s.ws.GlobalMode {
 		err = projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{
@@ -566,6 +571,9 @@ func (s *Server) persistConfigForced(cfg *config.Config) {
 	if s == nil || s.ws == nil || cfg == nil {
 		return
 	}
+	// Serialized with persistConfig (see the persistMu comment).
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	var err error
 	if s.ws.GlobalMode {
 		err = projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{IncludeSecrets: true})

@@ -83,8 +83,17 @@ type Server struct {
 	loopbackBind bool
 	tlsCertFile  string
 	tlsKeyFile   string
-	wsConnsMu    sync.Mutex
-	wsConns      []*websocket.Conn
+	// persistMu serializes config-file writes. Two handlers can persist at
+	// once (a feature toggle and a provider save, a runtime-config change and
+	// an MCP edit): each write is temp-file + rename, so concurrent runs race
+	// on the same target — harmless "no such file" on POSIX but a real
+	// ACCESS_DENIED on Windows when two renames target one open file. Leaf
+	// lock: only guards the file write, never held across another lock
+	// acquisition on the same object (the workspace lock it takes inside is
+	// always acquired in this order, and nothing takes them the other way).
+	persistMu sync.Mutex
+	wsConnsMu sync.Mutex
+	wsConns   []*websocket.Conn
 	// wsLive counts the live /ws and /ws/editor handler goroutines.
 	// net/http stops tracking a connection once the WebSocket upgrade
 	// hijacks it, so neither httptest.Server.Close nor the http server's
