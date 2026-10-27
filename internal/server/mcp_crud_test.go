@@ -2,6 +2,7 @@ package server
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -74,8 +75,17 @@ func TestMCPCRUDViaWS(t *testing.T) {
 	if !strings.Contains(string(data), "name: fetch") || !strings.Contains(string(data), "TOKEN: s3cret") {
 		t.Fatalf("persisted config missing the MCP server:\n%s", data)
 	}
-	if info, err := os.Stat(projectfile.DefaultSavePath(dir)); err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("config perms = %v (err=%v), want 0600", info.Mode().Perm(), err)
+	// 0600 is POSIX-only: Windows does not honor POSIX mode bits (Stat
+	// reports 0666/0777 for any writable file), so the forced-secret write is
+	// pinned on the content above and the mode only where it is meaningful.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(projectfile.DefaultSavePath(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("config perms = %o, want 600", perm)
+		}
 	}
 
 	// ── Re-save without the command/env keeps the stored values ──

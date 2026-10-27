@@ -174,7 +174,7 @@ func TestWindowsBackgroundJobInterp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if _, err := a.BackgroundJobInput(id, "hello", true); err != nil {
+	if _, err := a.BackgroundJobInput(context.Background(), id, "hello", true); err != nil {
 		t.Fatalf("input: %v", err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
