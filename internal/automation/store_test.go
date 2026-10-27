@@ -33,7 +33,28 @@ func (c *timeCursor) Advance(d time.Duration) { c.t = c.t.Add(d) }
 
 func ptrTime(t time.Time) *time.Time { return &t }
 
-// daily automation due exactly now.
+// setStoredNextRun plants a next_run_at on a stored row and PERSISTS it.
+//
+// The direct in-memory poke these tests used to do would now be discarded:
+// every store mutation re-reads the file first (the compare-and-set the
+// cross-process lock exists for), so test setup has to reach the file exactly
+// like a hand-edited store does.
+func setStoredNextRun(t *testing.T, st *Store, id string, when time.Time) {
+	t.Helper()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	a, ok := st.autos[id]
+	if !ok {
+		t.Fatalf("setStoredNextRun: no automation with id %s", id)
+	}
+	a.NextRunAt = ptrTime(when)
+	if err := st.saveAutomations(); err != nil {
+		t.Fatalf("setStoredNextRun: save: %v", err)
+	}
+}
+
+// dueDaily creates a daily automation due exactly now, so a claim is due (the
+// stored next run is persisted, see setStoredNextRun).
 func dueDaily(st *Store, now time.Time) Automation {
 	a := Automation{
 		Title:      "Nightly triage",
@@ -45,8 +66,12 @@ func dueDaily(st *Store, now time.Time) Automation {
 	if err := st.Create(&a); err != nil {
 		panic(err)
 	}
-	// Force the stored next run to exactly `now` so the claim is due.
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.autos[a.ID].NextRunAt = ptrTime(now)
+	if err := st.saveAutomations(); err != nil {
+		panic(err)
+	}
 	return a
 }
 
@@ -250,7 +275,7 @@ func TestClaimDueCatchupMissed(t *testing.T) {
 
 	// The row went stale: it was due 2 days ago (GoGen was closed).
 	stale := cursor.t.Add(-48 * time.Hour)
-	st.autos[a.ID].NextRunAt = ptrTime(stale)
+	setStoredNextRun(t, st, a.ID, stale)
 
 	claims := st.ClaimDue(cursor.t, DefaultCatchupWindow)
 	if len(claims) != 0 {
@@ -279,7 +304,7 @@ func TestClaimDueCatchupMissed(t *testing.T) {
 func TestClaimDueWithinCatchupWindow(t *testing.T) {
 	st, cursor := newTestStore(t)
 	a := dueDaily(st, cursor.t)
-	st.autos[a.ID].NextRunAt = ptrTime(cursor.t.Add(-40 * time.Minute))
+	setStoredNextRun(t, st, a.ID, cursor.t.Add(-40*time.Minute))
 
 	claims := st.ClaimDue(cursor.t, DefaultCatchupWindow)
 	if len(claims) != 1 {
@@ -323,10 +348,17 @@ func TestClaimOnceDisarms(t *testing.T) {
 func TestClaimUnfixableDisables(t *testing.T) {
 	st, cursor := newTestStore(t)
 	// Bypass validation by writing the record like a hand-edited store file
-	// would: an unknown schedule kind.
+	// would: an unknown schedule kind (Create would reject it, so the row goes
+	// straight to disk — the store re-reads it, exactly like the sweep did).
 	a := Automation{ID: NewID(), Title: "broken", Prompt: "p", WorkingDir: "/x",
 		Schedule: Schedule{Kind: "fortnightly", Time: "09:00"}, Enabled: true, NextRunAt: ptrTime(cursor.t)}
+	st.mu.Lock()
 	st.autos[a.ID] = &a
+	if err := st.saveAutomations(); err != nil {
+		st.mu.Unlock()
+		t.Fatalf("save the hand-edited row: %v", err)
+	}
+	st.mu.Unlock()
 
 	claims := st.ClaimDue(cursor.t, DefaultCatchupWindow)
 	if len(claims) != 1 {
@@ -369,7 +401,7 @@ func TestSetEnabledPersistsAndRecomputes(t *testing.T) {
 	if !ok || got.Enabled {
 		t.Fatalf("disable did not persist: %+v", got)
 	}
-	st2.autos[a.ID].NextRunAt = ptrTime(time.Now().Add(-time.Hour))
+	setStoredNextRun(t, st2, a.ID, time.Now().Add(-time.Hour))
 	if claims := st2.ClaimDue(time.Now(), DefaultCatchupWindow); len(claims) != 0 {
 		t.Fatalf("disabled row was claimed")
 	}
@@ -753,5 +785,84 @@ func TestStoreFileShapes(t *testing.T) {
 	}
 	if runs.Version != 1 || len(runs.Runs) != 1 {
 		t.Fatalf("unexpected runs file: %s", data)
+	}
+}
+
+// TestReadersSeeAnotherInstancesWrites pins read-path freshness: a row created
+// or edited through a second Store instance must show up in this instance's
+// List/Get/Runs without this one performing a mutation of its own.
+//
+// A second instance in the same process is the faithful simulation of another
+// PROCESS here: the two share nothing but the files on disk (each has its own
+// memory and its own mutex), which is exactly the relation between the CLI and
+// a running host. Before the stamp check, List/Get served the copy loaded at
+// OpenStore, so a job created from the terminal stayed invisible in the web
+// tab until some unrelated mutation refreshed it — and after the cross-process
+// lock work the write survived, so the stale read became the visible half of
+// that bug.
+func TestReadersSeeAnotherInstancesWrites(t *testing.T) {
+	dir := t.TempDir()
+	host, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("OpenStore(host): %v", err)
+	}
+	cli, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("OpenStore(cli): %v", err)
+	}
+	if got := host.List(); len(got) != 0 {
+		t.Fatalf("fresh store lists %d automations", len(got))
+	}
+
+	// 1. A row created by the other instance becomes visible.
+	a := Automation{
+		Title:      "created from the CLI",
+		Prompt:     "check the thing",
+		WorkingDir: dir,
+		Schedule:   Schedule{Kind: KindHourly, Minute: 5, Timezone: "UTC"},
+		Enabled:    true,
+	}
+	if err := cli.Create(&a); err != nil {
+		t.Fatalf("cli Create: %v", err)
+	}
+	if got := host.List(); len(got) != 1 || got[0].ID != a.ID {
+		t.Fatalf("host List after cli Create = %+v, want the created row", got)
+	}
+	if got, ok := host.Get(a.ID); !ok || got.Title != a.Title {
+		t.Fatalf("host Get after cli Create = %+v ok=%v", got, ok)
+	}
+
+	// 2. An edit by the other instance becomes visible, including a same-length
+	// one (the stamp compares mtime as well as size).
+	stored, ok := cli.Get(a.ID)
+	if !ok {
+		t.Fatal("cli Get: row vanished")
+	}
+	stored.Title = "edited from CLI" // same length as "created from the CLI"? no — but keep it simple
+	stored.Prompt = "check the other thing"
+	if err := cli.Update(&stored); err != nil {
+		t.Fatalf("cli Update: %v", err)
+	}
+	if got, _ := host.Get(a.ID); got.Prompt != "check the other thing" {
+		t.Fatalf("host Get after cli Update = %q, want the edited prompt", got.Prompt)
+	}
+
+	// 3. A run recorded by the other instance becomes visible.
+	if _, err := cli.RecordFire(a.ID, time.Now()); err != nil {
+		t.Fatalf("cli RecordFire: %v", err)
+	}
+	if runs := host.Runs(a.ID); len(runs) != 1 || runs[0].AutomationID != a.ID {
+		t.Fatalf("host Runs after cli RecordFire = %+v, want one run", runs)
+	}
+
+	// 4. A delete by the other instance becomes visible.
+	if err := cli.Delete(a.ID); err != nil {
+		t.Fatalf("cli Delete: %v", err)
+	}
+	if got, ok := host.Get(a.ID); ok {
+		t.Fatalf("host Get after cli Delete = %+v, want gone", got)
+	}
+	if got := host.List(); len(got) != 0 {
+		t.Fatalf("host List after cli Delete = %+v, want empty", got)
 	}
 }

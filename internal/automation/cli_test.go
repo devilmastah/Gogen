@@ -3,6 +3,7 @@ package automation
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -476,5 +477,97 @@ func TestParseClockRejectsTrailingGarbage(t *testing.T) {
 	}
 	if h, m, err := ParseClock(""); err != nil || h != 9 || m != 0 {
 		t.Fatalf("ParseClock(empty) = (%d,%d,%v), want the 09:00 default", h, m, err)
+	}
+}
+
+// TestCLIUpdatePatchKeepsUnsetScheduleFields pins the set-vs-default rule the
+// shared scheduleFlags struct encodes: a flag the user did not pass keeps the
+// STORED value, in the selector branch (where unset --time/--minute fall back
+// to create's defaults, but the timezone stays stored) and in the bare-modifier
+// branch (where only the passed field moves).
+func TestCLIUpdatePatchKeepsUnsetScheduleFields(t *testing.T) {
+	cases := []struct {
+		name  string
+		args  []string
+		check func(t *testing.T, got Schedule)
+	}{
+		{
+			name: "selector keeps the stored timezone, not the stored time",
+			args: []string{"--daily"},
+			check: func(t *testing.T, got Schedule) {
+				if got.Kind != KindDaily || got.Time != "09:00" {
+					t.Fatalf("selector did not take create's time default: %+v", got)
+				}
+				if got.Timezone != "Asia/Tokyo" {
+					t.Fatalf("timezone = %q, want the stored Asia/Tokyo", got.Timezone)
+				}
+			},
+		},
+		{
+			name: "bare time modifier leaves the timezone",
+			args: []string{"--time", "23:45"},
+			check: func(t *testing.T, got Schedule) {
+				if got.Kind != KindWeekly || got.Time != "23:45" || got.Timezone != "Asia/Tokyo" {
+					t.Fatalf("bare --time patch drifted: %+v", got)
+				}
+				if len(got.Weekdays) != 3 {
+					t.Fatalf("weekdays lost: %+v", got.Weekdays)
+				}
+			},
+		},
+		{
+			name: "selector plus timezone overrides the stored zone",
+			args: []string{"--weekdays", "--timezone", "Europe/Berlin"},
+			check: func(t *testing.T, got Schedule) {
+				if got.Kind != KindWeekdays || got.Timezone != "Europe/Berlin" {
+					t.Fatalf("explicit --timezone not applied: %+v", got)
+				}
+			},
+		},
+		{
+			name: "hourly with minute",
+			args: []string{"--hourly", "--minute", "5"},
+			check: func(t *testing.T, got Schedule) {
+				if got.Kind != KindHourly || got.Minute != 5 || got.Timezone != "Asia/Tokyo" {
+					t.Fatalf("hourly patch drifted: %+v", got)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			st, _ := newTestStore(t)
+			runCLICapture(t, st, "create", "Weekly job", "--prompt", "p", "--dir", "/tmp",
+				"--weekly", "1,3,5", "--time", "22:00", "--timezone", "Asia/Tokyo")
+			autos := st.List()
+			if len(autos) != 1 {
+				t.Fatalf("create stored %d automations", len(autos))
+			}
+			id := autos[0].ID
+			args := append([]string{"update", id}, tc.args...)
+			runCLICapture(t, st, args...)
+			got, ok := st.Get(id)
+			if !ok {
+				t.Fatal("update lost the record")
+			}
+			tc.check(t, got.Schedule)
+		})
+	}
+}
+
+// TestCLIUpdateNothingToPass pins the usage error for an update that sets no
+// field at all (message unchanged by the scheduleFlags refactor).
+func TestCLIUpdateNothingToPass(t *testing.T) {
+	st, _ := newTestStore(t)
+	a := updateBase(t, st)
+	var out bytes.Buffer
+	err := runCLI([]string{"update", a.ID}, st, &out)
+	if err == nil {
+		t.Fatal("update without fields must fail")
+	}
+	var usage usageError
+	if !errors.As(err, &usage) || !strings.Contains(usage.msg, "nothing to update") {
+		t.Fatalf("error = %v, want the 'nothing to update' usage error", err)
 	}
 }

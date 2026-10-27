@@ -90,7 +90,7 @@ func TestUpdateFields(t *testing.T) {
 			// Move next_run_at to a known value so the keep-vs-recompute
 			// policy is observable.
 			known := time.Date(2026, 1, 6, 9, 0, 0, 0, time.UTC)
-			st.autos[a.ID].NextRunAt = &known
+			setStoredNextRun(t, st, a.ID, known)
 
 			updated := a
 			tc.mutate(&updated)
@@ -234,7 +234,7 @@ func TestUpdateUnknownIDAndValidation(t *testing.T) {
 func TestUpdateKeepsNextRunThroughSweep(t *testing.T) {
 	st, cursor := newTestStore(t)
 	a := updateBase(t, st)
-	st.autos[a.ID].NextRunAt = ptrTime(cursor.t.Add(2 * time.Minute))
+	setStoredNextRun(t, st, a.ID, cursor.t.Add(2*time.Minute))
 
 	updated := a
 	updated.Prompt = "urgent fix: also check the changelog"

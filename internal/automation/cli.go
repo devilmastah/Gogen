@@ -170,25 +170,19 @@ func cliCreate(args []string, store *Store, stdout io.Writer) error {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	prompt := fs.String("prompt", "", "prompt to run (required)")
 	dir := fs.String("dir", "", "working directory for the run (default: current dir)")
-	at := fs.String("at", "", "run once at this instant (RFC 3339, e.g. 2026-08-10T09:00:00Z)")
-	daily := fs.Bool("daily", false, "every day at --time")
-	hourly := fs.Bool("hourly", false, "every hour at :--minute")
-	weekdays := fs.Bool("weekdays", false, "Monday–Friday at --time")
-	weekly := fs.String("weekly", "", "weekly on these weekdays, 0=Sun…6=Sat (e.g. 1,3,5)")
-	timeStr := fs.String("time", "09:00", "fire time HH:MM (daily/weekdays/weekly)")
-	minute := fs.Int("minute", 0, "minute of hour (hourly)")
-	timezone := fs.String("timezone", "", "IANA timezone for wall-clock times (default: local)")
+	sched := registerScheduleFlags(fs)
 	disabled := fs.Bool("disabled", false, "create paused (enabled=false)")
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
 	if err := fs.Parse(reorderArgs(args, createValueFlags)); err != nil {
 		return err
 	}
+	sched.detect(fs)
 	title := strings.Join(fs.Args(), " ")
 	if title == "" {
 		return usageError{msg: "usage: gogen automation create <title> [flags]"}
 	}
 
-	schedule, err := buildSchedule(*at, *daily, *hourly, *weekdays, *weekly, *timeStr, *minute, *timezone)
+	schedule, err := sched.build(*sched.timezone)
 	if err != nil {
 		return err
 	}
@@ -225,30 +219,91 @@ func cliUsage() string {
 	return "usage: gogen automation ls | get <id> | create <title> [schedule] | update <id> [fields] | enable <id> | disable <id> | runs <id> | delete <id>"
 }
 
-// buildSchedule assembles the Schedule from the CLI's exactly-one-selector
-// flags (the reference design's rule: --at/--daily/--hourly/--weekdays/
-// --weekly are mutually exclusive).
-func buildSchedule(at string, daily, hourly, weekdays bool, weekly, timeStr string, minute int, timezone string) (Schedule, error) {
-	specified := 0
-	for _, on := range []bool{at != "", daily, hourly, weekdays, weekly != ""} {
-		if on {
-			specified++
+// scheduleFlags is the schedule half of `create` and `update`: the same flag
+// names, defaults and help text in both, plus ONE answer to "which of them did
+// the user actually set?".
+//
+// That single answer is the point. Create and update used to keep two separate
+// counters and two sets of sentinels (an empty --time, a -1 --minute meaning
+// "keep the stored value"), and their disagreement about what "unset" meant is
+// what silently dropped a stored timezone on `update --weekdays` (B30).
+// fs.Visit reports only the flags present on the command line, so set-vs-default
+// is decided once, by the flag package, and both commands read the same map.
+type scheduleFlags struct {
+	at       *string
+	weekly   *string
+	time     *string
+	minute   *int
+	timezone *string
+	// The boolean selectors are only meaningful through set: a false default
+	// and "not passed" are otherwise indistinguishable. The pointers exist
+	// because that is how the flag package registers them.
+	daily    *bool
+	hourly   *bool
+	weekdays *bool
+	// set holds the names of the flags the user really passed (see detect).
+	set map[string]bool
+}
+
+// scheduleSelectors are the mutually exclusive schedule kinds.
+var scheduleSelectors = [...]string{"at", "daily", "hourly", "weekdays", "weekly"}
+
+// registerScheduleFlags adds the schedule flags to fs and returns their
+// accessors. Call detect after fs.Parse.
+func registerScheduleFlags(fs *flag.FlagSet) *scheduleFlags {
+	return &scheduleFlags{
+		at:       fs.String("at", "", "run once at this instant (RFC 3339, e.g. 2026-08-10T09:00:00Z)"),
+		daily:    fs.Bool("daily", false, "every day at --time"),
+		hourly:   fs.Bool("hourly", false, "every hour at :--minute"),
+		weekdays: fs.Bool("weekdays", false, "Monday–Friday at --time"),
+		weekly:   fs.String("weekly", "", "weekly on these weekdays, 0=Sun…6=Sat (e.g. 1,3,5)"),
+		time:     fs.String("time", "09:00", "fire time HH:MM (daily/weekdays/weekly)"),
+		minute:   fs.Int("minute", 0, "minute of hour (hourly)"),
+		timezone: fs.String("timezone", "", "IANA timezone for wall-clock times (default: local)"),
+	}
+}
+
+// detect records which schedule flags the user passed. It must run after
+// fs.Parse: the set map is the ONLY source of truth for "did the user set
+// this?", so no caller has to re-infer it from a value it cannot tell apart
+// from the default.
+func (f *scheduleFlags) detect(fs *flag.FlagSet) {
+	f.set = map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) { f.set[fl.Name] = true })
+}
+
+// selectors counts the schedule kinds the user selected.
+func (f *scheduleFlags) selectors() int {
+	n := 0
+	for _, name := range scheduleSelectors {
+		if f.set[name] {
+			n++
 		}
 	}
-	if specified != 1 {
+	return n
+}
+
+// build assembles the Schedule for the selected kind, with the flag defaults
+// for the fields the user did not pass (create's rule: --time defaults to
+// 09:00, --minute to 0). timezone is passed in because `create` uses the flag
+// and `update` keeps the stored zone when the flag is absent.
+func (f *scheduleFlags) build(timezone string) (Schedule, error) {
+	if f.selectors() != 1 {
 		return Schedule{}, usageError{msg: "pass exactly one schedule: --at | --daily | --hourly | --weekdays | --weekly <days>"}
 	}
+	timeStr := *f.time
+	minute := *f.minute
 	switch {
-	case at != "":
-		return Schedule{Kind: KindOnce, At: at, Timezone: timezone}, nil
-	case daily:
+	case f.set["at"]:
+		return Schedule{Kind: KindOnce, At: *f.at, Timezone: timezone}, nil
+	case f.set["daily"]:
 		return Schedule{Kind: KindDaily, Time: timeStr, Timezone: timezone}, nil
-	case hourly:
+	case f.set["hourly"]:
 		return Schedule{Kind: KindHourly, Minute: minute, Timezone: timezone}, nil
-	case weekdays:
+	case f.set["weekdays"]:
 		return Schedule{Kind: KindWeekdays, Time: timeStr, Timezone: timezone}, nil
 	default:
-		days, err := ParseWeekdays(weekly)
+		days, err := ParseWeekdays(*f.weekly)
 		if err != nil {
 			return Schedule{}, err
 		}
@@ -256,31 +311,68 @@ func buildSchedule(at string, daily, hourly, weekdays bool, weekly, timeStr stri
 	}
 }
 
+// applyPatch applies the schedule flags the user actually set to a stored
+// record and reports whether anything schedule-related was touched (which is
+// what re-times the next run — see Store.Update, which only re-times when the
+// schedule really changed).
+//
+// A selector replaces the whole schedule with create's defaults; the bare
+// modifiers (--time/--minute/--timezone) patch the stored schedule in place.
+// Either way every field the user did NOT pass keeps its stored value — the
+// timezone in the selector branch above all: dropping it re-based the
+// automation on the host's local zone, so a "weekdays 09:00 in Asia/Tokyo" row
+// started firing at 09:00 wherever the host happened to be (B30).
+func (f *scheduleFlags) applyPatch(a *Automation) (bool, error) {
+	switch n := f.selectors(); {
+	case n > 1:
+		return false, usageError{msg: "pass only one schedule selector: --at | --daily | --hourly | --weekdays | --weekly <days>"}
+	case n == 1:
+		timezone := *f.timezone
+		if !f.set["timezone"] {
+			timezone = a.Schedule.Timezone
+		}
+		schedule, err := f.build(timezone)
+		if err != nil {
+			return false, err
+		}
+		a.Schedule = schedule
+		return true, nil
+	}
+	touched := false
+	if f.set["time"] {
+		a.Schedule.Time = *f.time
+		touched = true
+	}
+	if f.set["timezone"] {
+		a.Schedule.Timezone = *f.timezone
+		touched = true
+	}
+	if f.set["minute"] {
+		a.Schedule.Minute = *f.minute
+		touched = true
+	}
+	return touched, nil
+}
+
 // cliUpdate is the PATCH-style edit: pass at least one field; omitted
 // fields keep their stored values. A schedule selector (--at/--daily/
 // --hourly/--weekdays/--weekly) replaces the whole schedule; the bare
-// modifiers (--time/--minute/--timezone/--weekly days without a kind) patch
-// the stored schedule's fields in place. Either way a schedule change
-// re-times next_run_at (prompt-only edits never do — see Store.Update).
+// modifiers (--time/--minute/--timezone) patch the stored schedule's fields in
+// place (see scheduleFlags.applyPatch). Either way a schedule change re-times
+// next_run_at (prompt-only edits never do — see Store.Update).
 func cliUpdate(args []string, store *Store, stdout io.Writer) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	title := fs.String("title", "", "new title")
 	prompt := fs.String("prompt", "", "new prompt")
 	dir := fs.String("dir", "", "new working directory")
-	at := fs.String("at", "", "run once at this instant (RFC 3339, e.g. 2026-08-10T09:00:00Z)")
-	daily := fs.Bool("daily", false, "every day at --time")
-	hourly := fs.Bool("hourly", false, "every hour at :--minute")
-	weekdays := fs.Bool("weekdays", false, "Monday–Friday at --time")
-	weekly := fs.String("weekly", "", "weekly on these weekdays, 0=Sun…6=Sat (e.g. 1,3,5)")
-	timeStr := fs.String("time", "", "fire time HH:MM (daily/weekdays/weekly; empty keeps the stored time)")
-	minute := fs.Int("minute", -1, "minute of hour (hourly; -1 keeps the stored minute)")
-	timezone := fs.String("timezone", "", "IANA timezone for wall-clock times (default: local)")
+	sched := registerScheduleFlags(fs)
 	enable := fs.Bool("enable", false, "enable the automation")
 	disable := fs.Bool("disable", false, "pause the automation")
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
 	if err := fs.Parse(reorderArgs(args, updateValueFlags)); err != nil {
 		return err
 	}
+	sched.detect(fs)
 	id, err := requireID(fs.Args())
 	if err != nil {
 		return err
@@ -298,65 +390,36 @@ func cliUpdate(args []string, store *Store, stdout io.Writer) error {
 		return fmt.Errorf("no automation with id %s", id)
 	}
 
-	kindSelectors := 0
-	for _, on := range []bool{*at != "", *daily, *hourly, *weekdays, *weekly != ""} {
-		if on {
-			kindSelectors++
-		}
-	}
-	if kindSelectors > 1 {
-		return usageError{msg: "pass only one schedule selector: --at | --daily | --hourly | --weekdays | --weekly <days>"}
-	}
-
 	updated := stored
+	scheduleTouched, err := sched.applyPatch(&updated)
+	if err != nil {
+		return err
+	}
+	// changed tracks "the user passed something": it is accumulated while the
+	// fields are applied rather than re-derived from the flag values at the
+	// end (re-deriving is where update and create drifted apart before).
+	changed := scheduleTouched
 	if *title != "" {
 		updated.Title = *title
+		changed = true
 	}
 	if *prompt != "" {
 		updated.Prompt = *prompt
+		changed = true
 	}
 	if *dir != "" {
 		updated.WorkingDir = *dir
-	}
-	scheduleTouched := kindSelectors > 0 || *timeStr != "" || *minute >= 0 || *timezone != ""
-	switch {
-	case kindSelectors > 0:
-		// A selector replaces the whole schedule (defaults like create), but an
-		// unset --timezone must keep the STORED zone: dropping it re-based the
-		// automation on the host's local zone, so a "weekdays at 09:00 in
-		// Asia/Tokyo" row started firing at 09:00 wherever the host was.
-		timeDefault := *timeStr
-		if timeDefault == "" {
-			timeDefault = "09:00"
-		}
-		minuteDefault := *minute
-		if minuteDefault < 0 {
-			minuteDefault = 0
-		}
-		tz := *timezone
-		if tz == "" {
-			tz = stored.Schedule.Timezone
-		}
-		schedule, err := buildSchedule(*at, *daily, *hourly, *weekdays, *weekly, timeDefault, minuteDefault, tz)
-		if err != nil {
-			return err
-		}
-		updated.Schedule = schedule
-	case scheduleTouched:
-		// Bare modifiers patch the stored schedule in place.
-		updated.Schedule.Time = pickString(*timeStr, stored.Schedule.Time)
-		updated.Schedule.Timezone = pickString(*timezone, stored.Schedule.Timezone)
-		if *minute >= 0 {
-			updated.Schedule.Minute = *minute
-		}
+		changed = true
 	}
 	if *enable {
 		updated.Enabled = true
+		changed = true
 	}
 	if *disable {
 		updated.Enabled = false
+		changed = true
 	}
-	if !scheduleTouched && *title == "" && *prompt == "" && *dir == "" && !*enable && !*disable {
+	if !changed {
 		return usageError{msg: "nothing to update — pass at least one field (--title/--prompt/--dir/--time/--minute/--timezone, a schedule selector, or --enable/--disable)"}
 	}
 	if err := st.Update(&updated); err != nil {
@@ -374,15 +437,6 @@ func cliUpdate(args []string, store *Store, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "Updated %s %q\n", updated.ID, updated.Title)
 	writeAutomation(stdout, updated)
 	return nil
-}
-
-// pickString returns the new value when set, else the stored one (the
-// update PATCH rule for string schedule fields).
-func pickString(next, stored string) string {
-	if next != "" {
-		return next
-	}
-	return stored
 }
 
 func cliSetEnabled(on bool, args []string, store *Store, stdout io.Writer) error {

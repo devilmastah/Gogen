@@ -91,7 +91,7 @@ func dueAutomation(t *testing.T, st *Store, cursor *timeCursor) Automation {
 	if err := st.Create(&a); err != nil {
 		t.Fatal(err)
 	}
-	st.autos[a.ID].NextRunAt = ptrTime(cursor.t)
+	setStoredNextRun(t, st, a.ID, cursor.t)
 	return a
 }
 
@@ -203,7 +203,7 @@ func TestSchedulerMissedRunsAreNotFired(t *testing.T) {
 	fire := &recordingFire{}
 	s, st, cursor := newSchedulerTest(t, fire.Fire)
 	a := dueAutomation(t, st, cursor)
-	st.autos[a.ID].NextRunAt = ptrTime(cursor.t.Add(-48 * time.Hour))
+	setStoredNextRun(t, st, a.ID, cursor.t.Add(-48*time.Hour))
 
 	s.Start(context.Background())
 	defer s.Stop()
@@ -234,7 +234,7 @@ func TestSchedulerInterruptedRunsMarked(t *testing.T) {
 	// for in-flight fires — so its RecordFire/RecordFinish writes landed in
 	// t.TempDir's RemoveAll window ("directory not empty" on macOS) and its
 	// completion log hit t.Logf after the test ended.
-	st.autos[a.ID].NextRunAt = ptrTime(cursor.t.Add(time.Hour))
+	setStoredNextRun(t, st, a.ID, cursor.t.Add(time.Hour))
 
 	s.Start(context.Background())
 	defer s.Stop()

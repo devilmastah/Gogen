@@ -845,8 +845,11 @@ How it works:
 - **Storage**: records live in the global config dir as JSON —
   `~/.config/gogen/automations.json` plus a bounded run-history file
   (`automation_runs.json`, newest-first, 25 runs per automation). Every
-  write is atomic; a corrupted store file surfaces as an error message
-  (never a panic, and never overwritten).
+  write is atomic and takes an advisory file lock (`automations.lock`) on the
+  store directory, re-reading the file before applying a change — so the CLI
+  and a running host, or two hosts, never overwrite each other's records. A
+  corrupted store file surfaces as an error message (never a panic, and never
+  overwritten).
 - **Schedules**: `once` (RFC 3339 `--at`, or `2006-01-02 15:04` interpreted
   in `--timezone`), `hourly` (`--minute`), `daily` / `weekdays` /
   `weekly <0=Sun…6=Sat>` at `--time`, all evaluated in an IANA `--timezone`
@@ -866,13 +869,16 @@ How it works:
   overdue (e.g. GoGen opened shortly after the scheduled time); anything
   older — missed while no host was running — is recorded as a `missed` run
   and the schedule advances without firing. `once` schedules disarm
-  themselves after their fire (or miss); runs left `running` by a previous
-  host session are marked `interrupted` at startup.
+  themselves after their fire (or miss); runs left `running` by a host that
+  is gone are marked `interrupted` at startup (each run row records the host
+  and pid that started it, so a run another live host is executing is left
+  alone).
 - **The flag**: `automations: on` (config file, `GOGEN_AUTOMATIONS`, or the
   web Settings → Agent toggle) gates firing only — the CLI manages records
   whether or not the flag is on. Automations fire only while a GoGen host
-  is running; running two hosts (e.g. TUI and web server) with the flag on
-  fires each schedule in both — keep one host with the flag on.
+  is running. Two hosts with the flag on (e.g. TUI and web server) are safe:
+  the claim advances `next_run_at` under the store's cross-process lock, so
+  each occurrence fires exactly once between them.
 - **Web tab**: with the flag on, an **Automations** tab appears in the web
   UI next to Board — the saved jobs with their schedule, next run and last
   status, per-job Edit / Pause / Enable / Delete, an expandable run history

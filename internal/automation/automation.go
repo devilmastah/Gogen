@@ -3,13 +3,16 @@
 // GoGen host (TUI or web server) fires as headless `-p` runs at the
 // scheduled time, recording each run in a small history.
 //
-// Layout (single process, no daemon):
+// Layout (no daemon):
 //   - Automations live in the global config dir as JSON (automations.json);
-//     the run history is a sibling JSON file (automation_runs.json).
+//     the run history is a sibling JSON file (automation_runs.json). Every
+//     write takes an advisory cross-process lock and re-reads the file first,
+//     so the CLI and a running host never overwrite each other's edits.
 //   - A 30 s in-process ticker claims due automations, advances their
-//     next_run_at under the store lock (the dedup guarantee — a claimed row
-//     cannot fire twice), and fires each as a `gogen -p` subprocess in the
-//     configured directory (see ProcessFire).
+//     next_run_at within that read-modify-write (the dedup guarantee — a
+//     claimed row cannot fire twice, and two hosts sweeping at once claim an
+//     occurrence exactly once between them), and fires each as a `gogen -p`
+//     subprocess in the configured directory (see ProcessFire).
 //   - Automations fire only while a GoGen host with `automations: on` is
 //     running. Runs missed while no host was up are governed by the
 //     catch-up policy documented on Scheduler (run once when overdue
@@ -100,6 +103,14 @@ type Run struct {
 	// SessionID is the id of the headless session the run started
 	// ("" when the run failed before a session was created).
 	SessionID string `json:"session_id,omitempty"`
+	// Host is the identity of the host process that started the run (the
+	// machine's hostname, written when the run is recorded as running) and PID
+	// is that process's OS pid. Together they let a starting host leave a run
+	// alone that another LIVE host is executing. Both are empty/0 on rows
+	// written by binaries that predate host identity; such a row is treated as
+	// unowned (see Store.MarkInterruptedRuns).
+	Host string `json:"host,omitempty"`
+	PID  int    `json:"pid,omitempty"`
 }
 
 // NewID returns a fresh automation id ("auto-<hex>").

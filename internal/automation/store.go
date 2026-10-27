@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"gogen/internal/filelock"
 	"gogen/internal/ioutil"
 	"gogen/internal/projectfile"
 )
@@ -18,6 +19,12 @@ import (
 const (
 	AutomationsFile = "automations.json"
 	RunsFile        = "automation_runs.json"
+	// LockFile is the advisory cross-process lock guarding every
+	// read-modify-write of the two files above. It is never renamed,
+	// truncated or deleted: the JSON files are published by temp-file
+	// rename, and deleting a held lock file would let a third process lock a
+	// fresh inode while the previous holder still holds the old one.
+	LockFile = "automations.lock"
 )
 
 // History caps: the run file is deliberately small ("a small history").
@@ -42,36 +49,183 @@ func OpenStore(dir string) (*Store, error) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
-	s := &Store{dir: dir, now: time.Now}
+	s := &Store{dir: dir, host: hostIdentity(), pid: os.Getpid(), now: time.Now}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// Store is the file-backed automation + run-history store. All state lives
-// behind one mutex: the CLI mutates records while the in-process scheduler
-// sweeps and appends runs, and every mutation rewrites the affected JSON
-// file atomically (temp file + rename). Single-writer across processes is
-// NOT guaranteed — see the multi-host note in the package docs.
+// Store is the file-backed automation + run-history store.
+//
+// Concurrency has two layers, and their order is the whole contract:
+//
+//   - In-process: mu serializes every read and mutation (the CLI mutates
+//     records while the in-process scheduler sweeps and appends runs).
+//   - Cross-process: an advisory file lock (filelock, see LockFile) held
+//     across each read-modify-write of the store files. Lock order is mu,
+//     THEN the file lock, and the file lock is released BEFORE mu (defer
+//     order gives this naturally) — never the reverse, or two processes could
+//     each hold one and wait for the other.
+//
+// The file lock alone is not enough: this store used to read the JSON once and
+// write the whole in-memory map back, so even a locked write clobbered
+// whatever another process had written in the meantime. Every mutating method
+// therefore RE-READS the affected file inside the lock, applies only its own
+// change to that fresh state, and writes it back; the in-memory copy becomes
+// the fresh state, so List/Get never serve rows a mutation just made stale.
+// Every write is atomic (temp file + rename + fsync).
+//
+// Run rows also carry the identity of the host process that started them
+// (Run.Host/Run.PID) so a starting host can tell its own leftovers from a run
+// another LIVE host is executing right now — see MarkInterruptedRuns.
 type Store struct {
 	mu  sync.Mutex
 	dir string
+	// host is this process's machine identity (see hostIdentity) and pid its
+	// OS process id; both are stamped on the run rows it writes.
+	host string
+	pid  int
 
 	autos map[string]*Automation
 	runs  []Run
+	// stamps record the file state the in-memory copies were read from, so a
+	// reader can tell that another process wrote the store since (see
+	// refreshAutomationsLocked). Zero stamps mean "not read yet".
+	autosStamp fileStamp
+	runsStamp  fileStamp
 
 	// now is swappable for tests so claim/catch-up math is deterministic.
 	now func() time.Time
 }
 
+// hostIdentity is the machine identity recorded on run rows. Together with the
+// pid it answers "whose run is this?" — this process, another live process on
+// this machine (a TUI plus a `--web` host), or another machine.
+//
+// It is deliberately the MACHINE hostname and not a per-process id: a host
+// that restarts must recognize the rows its previous incarnation left
+// `running` and close them, which a per-process id would hide from it forever.
+//
+// Known limitation: hosts are identified by hostname, so two machines sharing
+// a hostname look like one machine — the pid check then decides, and a pid
+// that is live elsewhere but absent here reads as dead. Hostnames are assumed
+// unique per fleet, as they are for every other machine-identity scheme with
+// no daemon or shared registry.
+func hostIdentity() string {
+	name, err := os.Hostname()
+	if err != nil {
+		// No identity at all is worse than a shared one: an empty Host is the
+		// legacy marker for "owner unknown", which MarkInterruptedRuns closes.
+		return "unknown-host"
+	}
+	return name
+}
+
+// lockStore takes the cross-process store lock. Callers MUST hold s.mu (lock
+// order: mu, then file lock) and must Release the result before returning.
+//
+// A failure here is returned to error-returning callers and logged by the
+// best-effort ones (ClaimDue, RecordLink, MarkInterruptedRuns): a mutation
+// that cannot take the lock must not run at all, because applying it to a
+// state it could not re-read is exactly the lost-update bug the lock exists to
+// prevent.
+func (s *Store) lockStore() (*filelock.Lock, error) {
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create automation store dir %s: %w", s.dir, err)
+	}
+	lock, err := filelock.Acquire(filepath.Join(s.dir, LockFile))
+	if err != nil {
+		return nil, fmt.Errorf("lock automation store %s: %w", s.dir, err)
+	}
+	return lock, nil
+}
+
 // load reads both files. Missing files are an empty store; unparseable
 // files abort the open (see OpenStore).
 func (s *Store) load() error {
-	if err := loadInto(filepath.Join(s.dir, AutomationsFile), &s.autos); err != nil {
+	if err := s.reloadAutomationsLocked(); err != nil {
 		return err
 	}
-	var runs struct {
+	return s.reloadRunsLocked()
+}
+
+// reloadAutomationsLocked replaces the in-memory automations with the current
+// contents of automations.json. Callers hold s.mu — and, when they are about to
+// write, the store file lock too: re-reading is half of the compare-and-set,
+// writing without it is the stale-map overwrite this store used to suffer.
+//
+// The fresh map replaces the old one only on success, so an unreadable file
+// leaves memory (and a subsequent save) untouched.
+// fileStamp identifies one version of a store file: a writer publishes it by
+// temp-file rename, so size+mtime changes on every write.
+type fileStamp struct {
+	size int64
+	mod  time.Time
+}
+
+// stampFor stats a store file, reporting ok=false when it does not exist (a
+// store that was never written).
+func stampFor(path string) (fileStamp, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}, false
+	}
+	return fileStamp{size: fi.Size(), mod: fi.ModTime()}, true
+}
+
+// changedSince reports whether the file at path was written since stamp. A
+// missing file counts as changed only when the stamp is non-zero (it was there
+// before).
+func changedSince(path string, stamp fileStamp) bool {
+	cur, ok := stampFor(path)
+	if !ok {
+		return stamp != fileStamp{}
+	}
+	return !cur.mod.Equal(stamp.mod) || cur.size != stamp.size
+}
+
+// refreshAutomationsLocked re-reads the automations file when another process
+// wrote it, so a reader (List/Get, i.e. the web tab or `gogen automation ls`)
+// never shows a stale view of a store somebody else just edited. It takes no
+// file lock on purpose: writers publish by atomic rename, so a plain read sees
+// either the old or the new file, never a torn one — and the read path must not
+// queue behind a writer's exclusive lock.
+func (s *Store) refreshAutomationsLocked() {
+	if !changedSince(filepath.Join(s.dir, AutomationsFile), s.autosStamp) {
+		return
+	}
+	if err := s.reloadAutomationsLocked(); err != nil {
+		// Keep serving the last consistent copy: a store another process is
+		// mid-write on (or a corrupted one) must not blank the list.
+		log.Printf("automation store: refresh skipped: %v", err)
+	}
+}
+
+// refreshRunsLocked is refreshAutomationsLocked for the run history.
+func (s *Store) refreshRunsLocked() {
+	if !changedSince(filepath.Join(s.dir, RunsFile), s.runsStamp) {
+		return
+	}
+	if err := s.reloadRunsLocked(); err != nil {
+		log.Printf("automation store: run-history refresh skipped: %v", err)
+	}
+}
+
+func (s *Store) reloadAutomationsLocked() error {
+	var m map[string]*Automation
+	if err := loadInto(filepath.Join(s.dir, AutomationsFile), &m); err != nil {
+		return err
+	}
+	s.autos = m
+	s.autosStamp, _ = stampFor(filepath.Join(s.dir, AutomationsFile))
+	return nil
+}
+
+// reloadRunsLocked replaces the in-memory run history with the current
+// contents of automation_runs.json (same discipline as reloadAutomationsLocked).
+func (s *Store) reloadRunsLocked() error {
+	var wrapper struct {
 		Runs []Run `json:"runs"`
 	}
 	path := filepath.Join(s.dir, RunsFile)
@@ -84,12 +238,15 @@ func (s *Store) load() error {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
+		s.runs = nil
+		s.runsStamp = fileStamp{}
 		return nil
 	}
-	if err := json.Unmarshal(data, &runs); err != nil {
+	if err := json.Unmarshal(data, &wrapper); err != nil {
 		return fmt.Errorf("%s is corrupted (not valid JSON): %w", path, err)
 	}
-	s.runs = runs.Runs
+	s.runs = wrapper.Runs
+	s.runsStamp, _ = stampFor(path)
 	return nil
 }
 
@@ -118,7 +275,8 @@ func loadInto(path string, into *map[string]*Automation) error {
 	return nil
 }
 
-// saveAutomations rewrites automations.json atomically.
+// saveAutomations rewrites automations.json atomically and records the new
+// file stamp, so this process's own readers see no spurious refresh.
 //
 // Both store files go through ioutil.WriteFileAtomic: a temp file in the target
 // directory plus fsync and a rename, so a crash or power loss mid-write can
@@ -130,7 +288,12 @@ func (s *Store) saveAutomations() error {
 		list = append(list, *a)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
-	return ioutil.WriteFileAtomic(filepath.Join(s.dir, AutomationsFile), storeFileBody("automations", list), 0o600)
+	path := filepath.Join(s.dir, AutomationsFile)
+	err := ioutil.WriteFileAtomic(path, storeFileBody("automations", list), 0o600)
+	if err == nil {
+		s.autosStamp, _ = stampFor(path)
+	}
+	return err
 }
 
 // saveRuns rewrites automation_runs.json atomically, keeping the history
@@ -170,7 +333,12 @@ func (s *Store) saveRuns() error {
 		runs = runs[len(runs)-maxTotalRuns:]
 	}
 	s.runs = runs
-	return ioutil.WriteFileAtomic(filepath.Join(s.dir, RunsFile), storeFileBody("runs", runs), 0o600)
+	path := filepath.Join(s.dir, RunsFile)
+	err := ioutil.WriteFileAtomic(path, storeFileBody("runs", runs), 0o600)
+	if err == nil {
+		s.runsStamp, _ = stampFor(path)
+	}
+	return err
 }
 
 // initialNextRun computes the first next_run_at for a freshly stored
@@ -207,6 +375,7 @@ func storeFileBody[T any](key string, items []T) []byte {
 func (s *Store) List() []Automation {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.refreshAutomationsLocked()
 	return s.listLocked()
 }
 
@@ -223,6 +392,7 @@ func (s *Store) listLocked() []Automation {
 func (s *Store) Get(id string) (Automation, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.refreshAutomationsLocked()
 	a, ok := s.autos[id]
 	if !ok {
 		return Automation{}, false
@@ -248,15 +418,23 @@ func (s *Store) Create(a *Automation) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	// Append to the CURRENT file contents: a row the CLI created a moment ago
+	// must not disappear because this process still holds the map it read at
+	// open time.
+	if err := s.reloadAutomationsLocked(); err != nil {
+		return err
+	}
 	now := s.now()
 	a.ID = NewID()
 	a.CreatedAt = now
 	a.UpdatedAt = now
 	if a.Enabled {
 		a.NextRunAt = initialNextRun(a.Schedule, now)
-	}
-	if s.autos == nil {
-		s.autos = map[string]*Automation{}
 	}
 	// Store a CLONE, not the caller's pointer: Create only assigns the
 	// caller's fields (id/timestamps/next run) — after it returns, the
@@ -284,8 +462,18 @@ func (s *Store) Create(a *Automation) error {
 func (s *Store) SetEnabled(id string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	if err := s.reloadAutomationsLocked(); err != nil {
+		return err
+	}
 	a, ok := s.autos[id]
 	if !ok {
+		// Includes the row another host deleted since this process read it:
+		// the fresh state is the truth.
 		return fmt.Errorf("no automation with id %s", id)
 	}
 	prev := a.clone()
@@ -313,6 +501,15 @@ func (s *Store) SetEnabled(id string, enabled bool) error {
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		// Nothing was removed anywhere, so memory still matches disk.
+		return err
+	}
+	defer lock.Release()
+	if err := s.reloadAutomationsLocked(); err != nil {
+		return err
+	}
 	a, ok := s.autos[id]
 	if !ok {
 		return fmt.Errorf("no automation with id %s", id)
@@ -320,13 +517,7 @@ func (s *Store) Delete(id string) error {
 	prev := a.clone()
 	prevRuns := s.runs // the filter below builds a NEW slice, so this stays intact
 	delete(s.autos, id)
-	var runs []Run
-	for _, r := range s.runs {
-		if r.AutomationID != id {
-			runs = append(runs, r)
-		}
-	}
-	s.runs = runs
+	s.runs = withoutRuns(s.runs, id)
 	if err := s.saveAutomations(); err != nil {
 		// The automations file is the commit point and nothing was written:
 		// restore the row and its history together so memory and disk keep
@@ -341,7 +532,28 @@ func (s *Store) Delete(id string) error {
 	// Past the commit point the row is durably gone; the history cleanup is
 	// best-effort from here — a failed runs write is retried by the next
 	// saveRuns and can never resurrect the automation.
+	if err := s.reloadRunsLocked(); err != nil {
+		// The history could not be re-read, so it must NOT be rewritten from
+		// this process's copy (that would drop every run another host
+		// appended). Drop the rows from memory instead so Runs() agrees with
+		// the committed delete, and report the failure.
+		s.runs = withoutRuns(s.runs, id)
+		return err
+	}
+	s.runs = withoutRuns(s.runs, id)
 	return s.saveRuns()
+}
+
+// withoutRuns returns the run history without the given automation's rows
+// (Delete's history cleanup).
+func withoutRuns(runs []Run, autoID string) []Run {
+	var out []Run
+	for _, r := range runs {
+		if r.AutomationID != autoID {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Update replaces the user-editable fields of the automation with the given
@@ -368,6 +580,14 @@ func (s *Store) Update(updated *Automation) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	if err := s.reloadAutomationsLocked(); err != nil {
+		return err
+	}
 	stored, ok := s.autos[updated.ID]
 	if !ok {
 		return fmt.Errorf("no automation with id %s", updated.ID)
@@ -430,6 +650,7 @@ func schedulesEqual(a, b Schedule) bool {
 func (s *Store) Runs(id string) []Run {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.refreshRunsLocked()
 	var out []Run
 	for _, r := range s.runs {
 		if r.AutomationID == id {
@@ -468,10 +689,42 @@ type Claim struct {
 func (s *Store) ClaimDue(now time.Time, catchup time.Duration) []Claim {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		// Nothing may fire: a claim whose advance could not be persisted
+		// would be handed to the scheduler again on the next sweep.
+		log.Printf("automation store: claim skipped: %v", err)
+		return nil
+	}
+	defer lock.Release()
+	// seen is what this process last read; the re-read below is what is
+	// actually on disk. A row whose next_run_at MOVED between the two was
+	// claimed (or re-timed) by another process, so this claim skips it: two
+	// hosts sweeping the same due row must fire it exactly once between them.
+	seen := s.autos
+	if err := s.reloadAutomationsLocked(); err != nil {
+		log.Printf("automation store: claim skipped: %v", err)
+		return nil
+	}
+	// The claim writes the history too (missed rows, the Last* mirror), so it
+	// is re-read as well. A history that cannot be read aborts the claim
+	// instead of being clobbered by this process's stale copy.
+	if err := s.reloadRunsLocked(); err != nil {
+		log.Printf("automation store: claim skipped: %v", err)
+		return nil
+	}
 	var claims []Claim
 	changed := false
 	for _, a := range s.autos {
 		if !a.Enabled || a.NextRunAt == nil || a.NextRunAt.After(now) {
+			continue
+		}
+		if prev, known := seen[a.ID]; known && !sameNextRun(prev.NextRunAt, a.NextRunAt) {
+			// Another process owns the row's current time (it claimed this
+			// occurrence or the user re-timed it from the CLI). The refreshed
+			// in-memory copy makes the NEXT sweep compare the new time with
+			// itself, so the occurrence is claimed once — a sweep later —
+			// instead of twice.
 			continue
 		}
 		planned := *a.NextRunAt
@@ -507,6 +760,16 @@ func (s *Store) ClaimDue(now time.Time, catchup time.Duration) []Claim {
 		}
 	}
 	return claims
+}
+
+// sameNextRun reports whether two next_run_at stamps denote the same instant
+// (a nil on either side counts as a difference, so "unset" never compares
+// equal to a real time).
+func sameNextRun(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }
 
 // advanceLocked moves the row to its next fire time. A once row (or a
@@ -548,8 +811,21 @@ func (s *Store) appendRunLocked(run Run) {
 func (s *Store) RecordFire(autoID string, plannedAt time.Time) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		return "", err
+	}
+	defer lock.Release()
+	// Append to the current history and mirror onto the current row: the
+	// history another host just extended must survive this write.
+	if err := s.reloadAutomationsLocked(); err != nil {
+		return "", err
+	}
 	if _, ok := s.autos[autoID]; !ok {
 		return "", fmt.Errorf("no automation with id %s", autoID)
+	}
+	if err := s.reloadRunsLocked(); err != nil {
+		return "", err
 	}
 	now := s.now()
 	run := Run{
@@ -558,6 +834,11 @@ func (s *Store) RecordFire(autoID string, plannedAt time.Time) (string, error) {
 		PlannedAt:    plannedAt,
 		FiredAt:      &now,
 		Status:       RunRunning,
+		// Ownership: the starting host stamps itself on the row so another
+		// host's startup reconciliation can tell a live run from a dead one
+		// (see MarkInterruptedRuns).
+		Host: s.host,
+		PID:  s.pid,
 	}
 	s.appendRunLocked(run)
 	if err := s.saveRuns(); err != nil {
@@ -571,6 +852,17 @@ func (s *Store) RecordFire(autoID string, plannedAt time.Time) (string, error) {
 func (s *Store) RecordFinish(runID, status, detail, sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	if err := s.reloadAutomationsLocked(); err != nil {
+		return err
+	}
+	if err := s.reloadRunsLocked(); err != nil {
+		return err
+	}
 	now := s.now()
 	for i := range s.runs {
 		if s.runs[i].ID != runID {
@@ -597,6 +889,16 @@ func (s *Store) RecordFinish(runID, status, detail, sessionID string) error {
 func (s *Store) RecordLink(runID, sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		log.Printf("automation store: session link skipped: %v", err)
+		return
+	}
+	defer lock.Release()
+	if err := s.reloadRunsLocked(); err != nil {
+		log.Printf("automation store: session link skipped: %v", err)
+		return
+	}
 	for i := range s.runs {
 		if s.runs[i].ID == runID && s.runs[i].SessionID == "" {
 			s.runs[i].SessionID = sessionID
@@ -606,21 +908,53 @@ func (s *Store) RecordLink(runID, sessionID string) {
 	}
 }
 
-// MarkInterruptedRuns closes out run rows still marked running (a previous
-// host process exited before the run finished). Returns the number of rows
-// closed. Called once at scheduler startup.
+// MarkInterruptedRuns closes out run rows still marked running because the host
+// that started them is gone. Returns the number of rows closed. Called once at
+// scheduler startup.
+//
+// Ownership rule (Run.Host/Run.PID; the fields do not exist in files written by
+// older binaries, which load as Host=""):
+//
+//   - Another machine (Host != this host) — left alone. That run belongs to a
+//     host this process cannot observe, and guessing "it must be dead" is how
+//     a starting host used to kill the run a live sibling was executing.
+//   - This machine, another pid, and that pid is still alive (a TUI plus a
+//     `--web` host) — left alone, same reason.
+//   - This machine and that pid is gone — closed: its host crashed.
+//   - This machine, this pid — closed. A run this very process recorded can
+//     only still be `running` because the scheduler was stopped and restarted
+//     inside it; if the fire goroutine is in fact still alive, its own
+//     RecordFinish overwrites this row a moment later.
+//   - No owner (Host="") — a legacy row written before host identity existed.
+//     There is no way to tell a crashed owner from a live older-binary host, so
+//     the row is closed, which is what every host did for every row before this
+//     change: leaving it `running` forever would be a worse lie.
+//
+// A pid that cannot be inspected (permission denied) counts as alive — the
+// conservative side, which leaves a row alone rather than closing a live run.
 func (s *Store) MarkInterruptedRuns() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.lockStore()
+	if err != nil {
+		log.Printf("automation store: interrupted-run sweep skipped: %v", err)
+		return 0
+	}
+	defer lock.Release()
+	if err := s.reloadRunsLocked(); err != nil {
+		log.Printf("automation store: interrupted-run sweep skipped: %v", err)
+		return 0
+	}
 	n := 0
 	now := s.now()
 	for i := range s.runs {
-		if s.runs[i].Status != RunRunning {
+		run := &s.runs[i]
+		if run.Status != RunRunning || ownedByLiveHost(run.Host, run.PID, s.host, s.pid) {
 			continue
 		}
-		s.runs[i].Status = RunInterrupted
-		s.runs[i].Detail = "host exited before the run finished"
-		s.runs[i].EndedAt = &now
+		run.Status = RunInterrupted
+		run.Detail = "host exited before the run finished"
+		run.EndedAt = &now
 		n++
 	}
 	if n > 0 {
@@ -629,4 +963,20 @@ func (s *Store) MarkInterruptedRuns() int {
 		}
 	}
 	return n
+}
+
+// ownedByLiveHost reports whether a running row belongs to a host that is not
+// this process and is still alive — the rows MarkInterruptedRuns must not
+// touch. host/pid identify the current process.
+func ownedByLiveHost(runHost string, runPID int, host string, pid int) bool {
+	if runHost == "" {
+		return false // legacy row: no owner recorded (see MarkInterruptedRuns)
+	}
+	if runHost != host {
+		return true // another machine's run
+	}
+	if runPID == 0 || runPID == pid {
+		return false // this process (or an unrecorded pid we cannot attribute)
+	}
+	return processAlive(runPID)
 }

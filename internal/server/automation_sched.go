@@ -33,13 +33,16 @@ type automationHost struct {
 }
 
 // automationStore returns the shared automation store, opening it on first
-// use. The scheduler and the automations WS ops MUST share this one
-// instance: the sweep reads in-memory state, so rows created/edited from
-// the web tab (or by a later CLI run picked up at open time) would be
-// invisible to it — and overwritten by its next save — if ops wrote to a
-// second instance. An open failure is NOT cached: the next call retries
-// (a corrupted store fixed on disk heals without a restart; each failure
-// surfaces as an error notice to the requesting tab).
+// use. The scheduler and the automations WS ops SHOULD share this one
+// instance: the read paths (List/Get/Runs) serve the store's in-memory copy,
+// which every mutation of that same instance refreshes, so a second instance
+// would show the tab and the sweep slightly different views (and each would
+// wait on the other's file lock). A store mutation from another instance or
+// another process — the CLI — is no longer a corruption risk: every mutation
+// re-reads the file under the cross-process lock (see automation.Store). An
+// open failure is NOT cached: the next call retries (a corrupted store fixed
+// on disk heals without a restart; each failure surfaces as an error notice to
+// the requesting tab).
 func (s *Server) automationStore() (*automation.Store, error) {
 	s.automations.mu.Lock()
 	defer s.automations.mu.Unlock()
