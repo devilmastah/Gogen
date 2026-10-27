@@ -1345,6 +1345,16 @@
             padding: 20px;
             max-width: 480px;
             width: 90%;
+            /* A flex item's automatic minimum size is its min-content
+               width, so a single unbreakable command line could widen the
+               dialog past its 90% / 480px frame. min-width: 0 keeps the
+               dialog at its own width and lets the command block
+               wrap/scroll instead. The dialog scrolls as a whole too, so a
+               long reason plus a tall command can never push the
+               Allow/Deny row off-screen. */
+            min-width: 0;
+            max-height: 85vh;
+            overflow-y: auto;
             box-shadow: var(--shadow-lg);
             color: var(--fg);
         }
@@ -1365,6 +1375,26 @@
             border-radius: var(--radius-sm);
             margin: 12px 0;
             white-space: pre-wrap;
+            color: var(--warn);
+        }
+        /* A blocked command has no length limit — a base64 blob or a long
+           find/rm invocation is one line with no break opportunity. As a bare
+           <pre> it kept the browser's white-space: pre and grew the dialog
+           sideways, so wrap anywhere and cap the height with its own
+           scrollbar (the command stays fully readable by scrolling). */
+        #delete-approval-command {
+            font-family: var(--mono);
+            font-size: 0.85em;
+            background: var(--warn-bg);
+            border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+            padding: 12px;
+            border-radius: var(--radius-sm);
+            margin: 12px 0;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word; /* legacy engine fallback */
+            max-height: 40vh;
+            overflow-y: auto;
             color: var(--warn);
         }
         #delete-approval-actions {
