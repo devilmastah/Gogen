@@ -23,6 +23,12 @@ type FeatureFlags struct {
 	subagentMaxDepth      atomic.Int32
 	subagentMaxConcurrent atomic.Int32
 	reviewAgentEnabled    atomic.Bool
+	// skillsEnabled / terminalEnabled gate the optional feature tools (the
+	// skill tool; the terminal + bash_persistent tools). They live in the
+	// shared store like the board/subagent flags, so the settings-modal
+	// toggle reaches every session with no sweep.
+	skillsEnabled   atomic.Bool
+	terminalEnabled atomic.Bool
 
 	// gen is the store's monotonic change counter, bumped by every setter.
 	// It is a component of the wire-overhead cache key (see overheadKey): a
@@ -124,6 +130,33 @@ func (f *FeatureFlags) SetReviewAgentEnabled(on bool) {
 	f.gen.Add(1)
 }
 
+// SkillsEnabled reports whether the skill tool is active. Opt-in: the
+// config seed and the settings toggle write it.
+func (f *FeatureFlags) SkillsEnabled() bool {
+	return f.skillsEnabled.Load()
+}
+
+// SetSkillsEnabled toggles the skill tool for every agent reading this
+// store.
+func (f *FeatureFlags) SetSkillsEnabled(on bool) {
+	f.skillsEnabled.Store(on)
+	f.gen.Add(1)
+}
+
+// TerminalEnabled reports whether the persistent-terminal feature tools
+// (the terminal tool and bash_persistent) are active. Opt-in: the config
+// seed and the settings toggle write it.
+func (f *FeatureFlags) TerminalEnabled() bool {
+	return f.terminalEnabled.Load()
+}
+
+// SetTerminalEnabled toggles the persistent-terminal feature tools for
+// every agent reading this store.
+func (f *FeatureFlags) SetTerminalEnabled(on bool) {
+	f.terminalEnabled.Store(on)
+	f.gen.Add(1)
+}
+
 // flags returns this agent's feature-flag store, lazily creating a private
 // instance for agents that were never pointed at a shared one (standalone
 // TUI/CLI agents, bare &Agent{} test literals).
@@ -180,30 +213,31 @@ func (a *Agent) SubagentsEnabled() bool {
 }
 
 // SetSkillsEnabled toggles the skill tool for this agent (see
-// SetBoardEnabled for the live-toggle contract; skills is config-only in
-// v1, so this is set at construction).
+// SetBoardEnabled for the live-toggle contract: in web mode this writes the
+// workspace's shared store, so the settings toggle reaches every session).
+// The tool additionally requires an installed SkillsManager.
 func (a *Agent) SetSkillsEnabled(on bool) {
-	a.skillsEnabled.Store(on)
-	a.noteToolsChanged()
+	// No noteToolsChanged: the store's generation covers feature-flag
+	// changes (see overheadKey), exactly like SetBoardEnabled.
+	a.flags().SetSkillsEnabled(on)
 }
 
 // SetTerminalEnabled toggles the persistent-terminal feature tools for this
-// agent. Config-only in v1: set once at construction from the config flag
-// (there is no live web toggle), so a change here is only expected in tests.
+// agent (see SetBoardEnabled for the live-toggle contract: web mode writes
+// the workspace's shared store).
 func (a *Agent) SetTerminalEnabled(on bool) {
-	a.terminalEnabled.Store(on)
-	a.noteToolsChanged()
+	a.flags().SetTerminalEnabled(on)
 }
 
 // TerminalEnabled reports whether the persistent-terminal feature tools are
 // registered for this agent.
 func (a *Agent) TerminalEnabled() bool {
-	return a.terminalEnabled.Load()
+	return a.flags().TerminalEnabled()
 }
 
 // SkillsEnabled reports whether the skill tool is registered for this agent.
 func (a *Agent) SkillsEnabled() bool {
-	return a.skillsEnabled.Load()
+	return a.flags().SkillsEnabled()
 }
 
 // SetSubagentMaxDepth sets the maximum subagent nesting depth (main agent =
@@ -289,18 +323,16 @@ type featureWiring struct {
 	// enabled; the nil-guard mirrors the MCP registry contract.
 	boardManager atomic.Pointer[BoardManager]
 
-	// skillsEnabled mirrors the config skills flag; skillsManager is the
-	// shared skill discovery manager (one per workspace in web mode, per
-	// agent in TUI/CLI). Both follow the board pattern: the tool is exposed
-	// only when the flag is on AND the manager is installed.
-	skillsEnabled atomic.Bool
+	// skillsManager is the shared skill discovery manager (one per
+	// workspace in web mode, per agent in TUI/CLI). The skill tool is
+	// exposed only when the shared skillsEnabled flag is on AND the manager
+	// is installed.
 	skillsManager atomic.Pointer[skills.Manager]
 
-	// terminalEnabled mirrors the config terminal flag (config-only in v1,
-	// set at construction). When off, the persistent-terminal feature tools
-	// (the terminal tool and bash_persistent) appear nowhere — llmTools,
+	// The persistent-terminal feature tools (the terminal tool and
+	// bash_persistent) are gated by the shared FeatureFlags store's
+	// terminalEnabled flag: when off they appear nowhere — llmTools,
 	// AllowedToolNames, and executeTool all derive from featureTools.
-	terminalEnabled atomic.Bool
 
 	// mcpConfigured / mcpNested are the MCP exposure policy, resolved ONCE at
 	// construction from the session config (never from the live registry —
@@ -312,11 +344,12 @@ type featureWiring struct {
 	mcpConfigured atomic.Bool
 	mcpNested     atomic.Bool
 
-	// instructionsEnabled mirrors the config agent_instructions flag
-	// (config-only, set at construction). workspaceInstructions is the
-	// rendered AGENTS.md/CLAUDE.md section for the CURRENT working dir,
-	// refreshed on every working-dir change so the system prompt never
-	// carries a stale project's instructions.
+	// instructionsEnabled mirrors the config agent_instructions flag (set at
+	// construction and toggled live by the web settings sweep).
+	// workspaceInstructions is the rendered AGENTS.md/CLAUDE.md section for
+	// the CURRENT working dir, refreshed on every working-dir change (and on
+	// a live enable) so the system prompt never carries a stale project's
+	// instructions.
 	instructionsEnabled   atomic.Bool
 	instructionsMu        sync.RWMutex
 	workspaceInstructions string

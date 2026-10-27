@@ -331,20 +331,24 @@ type Config struct {
 	// instruction files ("on"/"off"; default off). When disabled the files
 	// are never read; when enabled they are appended BELOW the project
 	// guidelines (.gogen/gogen.md stays authoritative) with byte caps.
+	// Live: the web settings modal toggles it (the sweep re-renders every
+	// session's instruction section).
 	AgentInstructions string
 	// Skills enables the skill tool ("on"/"off"; default off). When
-	// disabled the tool is not registered. Config-only in v1 (env/file —
-	// no web settings toggle).
+	// disabled the tool is not registered. Live: the web settings modal
+	// exposes it as a feature toggle (shared flag store, no restart).
 	Skills string
 	// Terminal enables the persistent-terminal feature tools (the terminal
 	// tool's open/send/read/signal/list/close actions and bash_persistent)
 	// ("on"/"off"; default off). When disabled the tools are not registered.
-	// Config-only in v1 (env/file — no web settings toggle).
+	// Live: the web settings modal exposes it as a feature toggle (shared
+	// flag store, no restart).
 	Terminal string
 	// JobNotices enables background-job completion notices ("on"/"off";
 	// default off): when a background shell job finishes naturally, a
 	// summary is injected into the session as a user message and a turn
-	// runs on it. Config-only in v1 (env/file — no web settings toggle).
+	// runs on it. Live: the web settings modal toggles it (the sweep
+	// installs/removes each session's notice hook).
 	JobNotices string
 
 	// Automations enables the file-based cron scheduler ("on"/"off";

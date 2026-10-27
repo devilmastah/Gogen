@@ -135,6 +135,7 @@ func (sp *tuiSubagentSpawner) newChildAgent(parent *agent.Agent) *agent.Agent {
 		SubagentMaxConcurrent: parent.SubagentMaxConcurrent(),
 		BoardManager:          parent.BoardManager(),
 		SkillsManager:         parent.SkillsManager(),
+		SkillsEnabled:         parent.SkillsEnabled(),
 		TerminalEnabled:       parent.TerminalEnabled(),
 		InstructionsEnabled:   parent.InstructionsEnabled(),
 		SubagentSpawner:       sp, // nesting allowed up to the configured depth

@@ -116,32 +116,20 @@ settingsOverlay.addEventListener('click', (e) => {
 // server: the toggle applies live to every session and is persisted
 // to .gogen/gogen.conf. The select state follows the config push
 // (applyFeatureSettings), so multiple tabs stay in sync.
-const boardEnabledSelect = document.getElementById('board-enabled-select');
-const subagentEnabledSelect = document.getElementById('subagent-enabled-select');
-const reviewAgentEnabledSelect = document.getElementById('review-agent-enabled-select');
+// Every `channel: 'feature'` SELECT is wired generically off its
+// featureKey: a change sends that single field and the config push
+// (applyFeatureSettings) syncs it back. The numeric feature rows
+// (subagent depth/limit) keep their bespoke clamping below.
+const FEATURE_SELECTS = SETTINGS_SCHEMA
+    .filter((e) => e.channel === 'feature' && e.type === 'select')
+    .map((e) => ({ id: e.id, featureKey: e.featureKey }));
+for (const f of FEATURE_SELECTS) {
+    const el = document.getElementById(f.id);
+    if (!el) continue;
+    el.addEventListener('change', () => sendFeatureConfig({ [f.featureKey]: el.value }));
+}
 const subagentDepthInput = document.getElementById('subagent-depth-input');
 const subagentLimitInput = document.getElementById('subagent-limit-input');
-if (boardEnabledSelect) {
-    boardEnabledSelect.addEventListener('change', () => {
-        sendFeatureConfig({ board: boardEnabledSelect.value });
-    });
-}
-if (reviewAgentEnabledSelect) {
-    reviewAgentEnabledSelect.addEventListener('change', () => {
-        sendFeatureConfig({ reviewAgent: reviewAgentEnabledSelect.value });
-    });
-}
-if (subagentEnabledSelect) {
-    subagentEnabledSelect.addEventListener('change', () => {
-        sendFeatureConfig({ subagent: subagentEnabledSelect.value });
-    });
-}
-const automationsEnabledSelect = document.getElementById('automations-enabled-select');
-if (automationsEnabledSelect) {
-    automationsEnabledSelect.addEventListener('change', () => {
-        sendFeatureConfig({ automations: automationsEnabledSelect.value });
-    });
-}
 if (subagentDepthInput) {
     subagentDepthInput.addEventListener('change', () => {
         const n = parseInt(subagentDepthInput.value, 10);
@@ -177,20 +165,22 @@ export function applyFeatureSettings(data) {
     const boardOn = data.board === 'on';
     const subagentOn = data.subagent === 'on';
     const reviewAgentOn = data.reviewAgent === 'on';
+    const automationsOn = data.automations === 'on';
+    // Sync every feature SELECT from the push (board / subagents / skills /
+    // terminal / review agent / automations): the toggle state follows the
+    // server, so multiple tabs stay in sync without localStorage.
+    for (const f of FEATURE_SELECTS) {
+        const el = document.getElementById(f.id);
+        const v = data[f.featureKey];
+        if (el && typeof v === 'string' && el.value !== v) el.value = v;
+    }
     const boardTab = document.getElementById('board-tab');
     const wasVisible = boardTab && !boardTab.hidden;
     if (boardTab && boardTab.hidden === boardOn) boardTab.hidden = !boardOn;
-    const boardSel = document.getElementById('board-enabled-select');
-    if (boardSel && boardSel.value !== (boardOn ? 'on' : 'off')) boardSel.value = boardOn ? 'on' : 'off';
     // The board agent prompt is meaningful only while the board
     // feature is on (like the subagent model picker).
     const boardPromptRow = document.getElementById('board-prompt-row');
     if (boardPromptRow) boardPromptRow.hidden = !boardOn;
-    const subSel = document.getElementById('subagent-enabled-select');
-    if (subSel && subSel.value !== (subagentOn ? 'on' : 'off')) subSel.value = subagentOn ? 'on' : 'off';
-    const automationsOn = data.automations === 'on';
-    const autoSel = document.getElementById('automations-enabled-select');
-    if (autoSel && autoSel.value !== (automationsOn ? 'on' : 'off')) autoSel.value = automationsOn ? 'on' : 'off';
     // The automations TAB follows the flag exactly like the board tab:
     // shown only while the scheduler may fire. Turning it on requests the
     // snapshot; turning it off falls back to chat when the pane was active.
@@ -224,8 +214,6 @@ export function applyFeatureSettings(data) {
     // agent is on AND the board is on (the reviewer works on board
     // tickets; the trigger rides on the board manager).
     const reviewAgentRowsVisible = reviewAgentOn && boardOn;
-    const reviewSel = document.getElementById('review-agent-enabled-select');
-    if (reviewSel && reviewSel.value !== (reviewAgentOn ? 'on' : 'off')) reviewSel.value = reviewAgentOn ? 'on' : 'off';
     const reviewModelPicker = document.getElementById('review-agent-model-row');
     if (reviewModelPicker) reviewModelPicker.hidden = !reviewAgentRowsVisible;
     const reviewThinkingPicker = document.getElementById('review-agent-thinking-row');
@@ -398,24 +386,27 @@ export function applyRuntimeSettings(data) {
     }
 }
 
-// === MCP test: server-backed (test_mcp WS message) ===
-// The configured server list follows the config push (applyMCPSettings);
-// row Test buttons probe a saved server by name (stored command/args/
-// env resolved server-side), the form probes a typed command/args/env
-// before adding it to the config file by hand. Never registers anything.
+// === MCP server list: server-backed (mcp_save / mcp_delete / test_mcp) ===
+// The configured server list follows the config push (applyMCPSettings).
+// The form is the editor: Add / Save upserts by name (mcp_save), a row's
+// Edit fills it, Delete removes it (mcp_delete), and Test probes either a
+// saved row by name or the typed command/args/env (test_mcp) — the probe
+// never registers anything. Changes are restart-scoped: the server persists
+// the list and pushes it back, but the MCP manager is built at startup.
 const mcpServerListEl = document.getElementById('mcp-server-list');
 const mcpTestNameInput = document.getElementById('mcp-test-name');
 const mcpTestCommandInput = document.getElementById('mcp-test-command');
 const mcpTestArgsInput = document.getElementById('mcp-test-args');
 const mcpTestEnvInput = document.getElementById('mcp-test-env');
 const mcpTestBtn = document.getElementById('mcp-test-btn');
+const mcpSaveBtn = document.getElementById('mcp-save-btn');
 const mcpTestResult = document.getElementById('mcp-test-result');
 
 function renderMCPServerList(servers) {
     if (!mcpServerListEl || !Array.isArray(servers)) return;
     mcpServerListEl.innerHTML = '';
     if (servers.length === 0) {
-        mcpServerListEl.textContent = 'No MCP servers configured (mcp_servers in the config file).';
+        mcpServerListEl.textContent = 'No MCP servers configured. Fill in the form below and press Add / Save.';
         mcpServerListEl.className = 'settings-note';
         return;
     }
@@ -429,6 +420,9 @@ function renderMCPServerList(servers) {
         row.appendChild(info);
         const actions = document.createElement('span');
         actions.className = 'provider-row-actions';
+        // Host servers (GOGEN_MCP_EXTRA) are started by the host: they are
+        // listed for visibility only — not testable, editable or deletable
+        // here (the host owns their command line).
         if (!s.host) {
             const testBtn = document.createElement('button');
             testBtn.type = 'button';
@@ -436,13 +430,45 @@ function renderMCPServerList(servers) {
             testBtn.title = 'Test connectivity and list tools';
             testBtn.addEventListener('click', () => {
                 showMCPTest('Testing ' + s.name + '…', '');
+                // Probed by name: the server resolves the stored
+                // command/args/env (the env values never reach the page).
                 sendMCPTest({ name: s.name });
             });
             actions.appendChild(testBtn);
+            const editBtn = document.createElement('button');
+            editBtn.type = 'button';
+            editBtn.textContent = 'Edit';
+            editBtn.title = 'Load this server into the form below';
+            editBtn.addEventListener('click', () => {
+                mcpTestNameInput.value = s.name;
+                mcpTestCommandInput.value = s.command || '';
+                mcpTestArgsInput.value = (s.args || []).join(' ');
+                // Leave env blank: an empty env on save keeps the stored
+                // values, so editing a row cannot wipe its secrets.
+                mcpTestEnvInput.value = '';
+                mcpTestNameInput.focus();
+            });
+            actions.appendChild(editBtn);
+            const delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.textContent = 'Delete';
+            delBtn.title = 'Remove this MCP server (restart required)';
+            delBtn.addEventListener('click', () => {
+                if (!window.confirm(`Remove MCP server ${s.name}? It keeps running until gogen restarts.`)) return;
+                sendMCPOp('mcp_delete', { name: s.name });
+            });
+            actions.appendChild(delBtn);
         }
         row.appendChild(actions);
         mcpServerListEl.appendChild(row);
     }
+}
+
+// sendMCPOp sends one MCP server-list mutation (mcp_save / mcp_delete).
+function sendMCPOp(type, op) {
+    const ws = deps.getWs();
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type, mcpOp: op }));
 }
 
 export function showMCPTest(text, kind) {
@@ -486,6 +512,29 @@ if (mcpTestBtn) {
             args: rawArgs ? rawArgs.split(/\s+/) : [],
             env: parseEnvInput(mcpTestEnvInput.value),
         });
+    });
+}
+
+// Add / Save: upserts the form's entry by name. A blank env keeps the stored
+// values for an existing server (the form never shows them), and a blank
+// command on an existing server keeps the stored command.
+if (mcpSaveBtn) {
+    mcpSaveBtn.addEventListener('click', () => {
+        const name = mcpTestNameInput.value.trim();
+        if (!name) {
+            showMCPTest('A server name is required.', 'error');
+            mcpTestNameInput.focus();
+            return;
+        }
+        const rawArgs = mcpTestArgsInput.value.trim();
+        const op = {
+            name,
+            command: mcpTestCommandInput.value.trim(),
+            args: rawArgs ? rawArgs.split(/\s+/) : [],
+            env: parseEnvInput(mcpTestEnvInput.value),
+        };
+        sendMCPOp('mcp_save', op);
+        showMCPTest('Saved ' + name + ' — restart gogen for MCP changes to take effect.', '');
     });
 }
 

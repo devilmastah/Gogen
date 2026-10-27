@@ -6,6 +6,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	llmtest "gogen/internal/llm/llmtest"
+	"gogen/internal/skills"
 )
 
 // TestFeatureFlagsDefaultOff verifies the live feature flags default to off
@@ -182,5 +183,57 @@ func TestSessionAgentFactorySharedFlags(t *testing.T) {
 	shared.SetSubagentsEnabled(true)
 	if !a.SubagentsEnabled() {
 		t.Fatal("later shared write not visible to the factory-created agent")
+	}
+}
+
+// TestSharedFlagStoreGatesOptionalTools pins the WEB contract for the
+// optional-tool flags: the settings toggle writes only the shared store, so
+// an already-built session agent must pick the change up (no per-agent
+// setter, no sweep) and the tool must appear in llmTools/AllowedToolNames —
+// which is what featureTools feeds.
+func TestSharedFlagStoreGatesOptionalTools(t *testing.T) {
+	prov := llmtest.NewMockProvider()
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
+	shared := NewFeatureFlags(false, false, 0, 0)
+	a.SetFeatureFlags(shared)
+
+	has := func(name string) bool {
+		if _, ok := a.AllowedToolNames()[name]; !ok {
+			return false
+		}
+		for _, d := range a.llmTools() {
+			if d.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	if has("terminal") || has("bash_persistent") {
+		t.Fatal("terminal tools must be off by default")
+	}
+	shared.SetTerminalEnabled(true)
+	if !has("terminal") || !has("bash_persistent") {
+		t.Fatal("a shared-store terminal toggle must reach the agent's tool set")
+	}
+	shared.SetTerminalEnabled(false)
+	if has("terminal") {
+		t.Fatal("turning the shared terminal flag off must remove the tool")
+	}
+
+	// Skills additionally requires an installed manager, so the flag alone
+	// must not register the tool.
+	shared.SetSkillsEnabled(true)
+	if has("skill") {
+		t.Fatal("the skill tool must not register without a skills manager")
+	}
+	a.SetSkillsManager(skills.NewManager(t.TempDir(), false))
+	if !has("skill") {
+		t.Fatal("a shared-store skills toggle plus a manager must register the skill tool")
+	}
+	shared.SetSkillsEnabled(false)
+	if has("skill") {
+		t.Fatal("turning the shared skills flag off must remove the tool")
 	}
 }

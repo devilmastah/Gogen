@@ -232,7 +232,6 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	a.SetFeatureFlags(ws.FeatureFlags())
 	a.SetBoardManager(ws.GetBoardManager())
 	a.SetSkillsManager(ws.skillsManager)
-	a.SetTerminalEnabled(ws.terminalEnabled)
 	// The subagent spawner needs the registry, so it is installed after the
 	// server is constructed; NewSessionAgent seeds it on every later session.
 	// The spawner is the host half of the shared continuable-subagent
@@ -261,14 +260,16 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 		return false
 	}
 	// Job-completion notices: the deliverer resolves a session id to its
-	// live runtime; NewSessionAgent installs per-agent hooks on top of it
-	// for later sessions, this install covers the initial agent.
-	if ws.jobNotices {
-		ws.jobNoticeDeliverer = func(id, summary string) {
-			if rt, ok := s.registry.get(id); ok {
-				rt.deliverToSession(summary)
-			}
+	// live runtime and is installed UNCONDITIONALLY (it is just a closure), so
+	// the settings toggle can install hooks later; the per-agent hook is what
+	// follows the job_notices flag. NewSessionAgent installs the hook for
+	// later sessions, this install covers the initial agent.
+	ws.jobNoticeDeliverer = func(id, summary string) {
+		if rt, ok := s.registry.get(id); ok {
+			rt.deliverToSession(summary)
 		}
+	}
+	if ws.GetJobNotices() {
 		a.SetJobNoticeHook(func(summary string) {
 			ws.jobNoticeDeliverer(a.SessionID, summary)
 		})

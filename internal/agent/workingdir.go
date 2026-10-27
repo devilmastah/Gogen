@@ -41,6 +41,16 @@ func (a *Agent) SetWorkingDir(dir string) {
 	}
 }
 
+// WorkingDirSnapshot returns the agent's current working directory.
+// Thread-safe: SetWorkingDir publishes the field under statsMu, so callers
+// that run OUTSIDE the turn goroutine (the web settings sweeps, context
+// stats) must read it here rather than touching the field.
+func (a *Agent) WorkingDirSnapshot() string {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	return a.WorkingDir
+}
+
 // AfterWorkingDirChange persists the session and retargets the models.dev
 // cache for the new project dir. Both steps do disk (and possibly background
 // network) I/O. The web server calls it under the session's turnMu so it is

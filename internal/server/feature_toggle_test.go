@@ -102,6 +102,69 @@ func TestFeatureToggleSubagentAndDepth(t *testing.T) {
 	})
 }
 
+// TestFeatureToggleSkillsAndTerminal verifies the optional-tool flags (the
+// skill tool; the persistent-terminal feature tools) ride the same config
+// message as the board/subagent flags: they apply live to the shared flag
+// store every session agent reads, and they persist for the next start.
+func TestFeatureToggleSkillsAndTerminal(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	sid := cfg.SessionID
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.SessionID == sid })
+
+	if cfg.Skills != "off" || cfg.Terminal != "off" {
+		t.Fatalf("initial config push flags: skills=%q terminal=%q, want off/off", cfg.Skills, cfg.Terminal)
+	}
+
+	if err := conn.WriteJSON(WSMessage{Type: "config", Skills: "on", Terminal: "on", SessionID: sid}); err != nil {
+		t.Fatalf("send skills/terminal on: %v", err)
+	}
+	onCfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "config" && m.Skills == "on" && m.Terminal == "on"
+	})
+	if onCfg.Board != "off" || onCfg.Subagent != "off" {
+		t.Fatalf("skills/terminal toggle must not touch other flags: board=%q subagent=%q", onCfg.Board, onCfg.Subagent)
+	}
+	// The shared store is what per-turn tool derivation reads: the initial
+	// agent must see the change with no sweep, and so must a later session.
+	waitForCond(t, 5*time.Second, func() bool {
+		return s.ws.GetSkillsEnabled() && s.ws.GetTerminalEnabled() &&
+			a.SkillsEnabled() && a.TerminalEnabled()
+	})
+
+	// Persisted for the next start (both keys are written back).
+	cfgPath := filepath.Join(dir, ".gogen", "gogen.conf")
+	waitForCond(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return false
+		}
+		// yaml.v3 quotes on/off values (`skills: "on"`), which parses
+		// identically to the unquoted spelling.
+		s := string(data)
+		return (strings.Contains(s, "skills: on") || strings.Contains(s, `skills: "on"`)) &&
+			(strings.Contains(s, "terminal: on") || strings.Contains(s, `terminal: "on"`))
+	})
+
+	if err := conn.WriteJSON(WSMessage{Type: "config", Skills: "off", Terminal: "off", SessionID: sid}); err != nil {
+		t.Fatalf("send skills/terminal off: %v", err)
+	}
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "config" && m.Skills == "off" && m.Terminal == "off"
+	})
+	waitForCond(t, 5*time.Second, func() bool {
+		return !s.ws.GetSkillsEnabled() && !s.ws.GetTerminalEnabled() && !a.SkillsEnabled() && !a.TerminalEnabled()
+	})
+}
+
 // TestFeatureToggleInvalidValueRejected verifies invalid on/off spellings
 // and negative depths are rejected without changing any state.
 func TestFeatureToggleInvalidValueRejected(t *testing.T) {

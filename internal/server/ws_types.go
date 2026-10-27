@@ -180,6 +180,26 @@ type ProviderTestResult struct {
 	Error     string       `json:"error,omitempty"`
 }
 
+// MCPOpRequest is one MCP server-list mutation (mcp_save / mcp_delete).
+//
+// Save upserts by name: a blank Command on an EXISTING entry keeps the
+// stored command, and an empty Env keeps the stored env (so re-saving a row
+// without retyping secrets cannot wipe them). The per-server timeout
+// overrides are kept unless explicitly provided (0 = keep). Delete removes
+// by name. Both are restart-scoped (the MCP manager is built at startup):
+// the list is persisted for the next start and pushed back immediately, but
+// no server is started or stopped live.
+type MCPOpRequest struct {
+	Name    string            `json:"name"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	// InitTimeoutSecs / ToolTimeoutSecs: 0 keeps the stored value on an
+	// existing entry (and means "client default" on a new one).
+	InitTimeoutSecs int `json:"initTimeoutSecs,omitempty"`
+	ToolTimeoutSecs int `json:"toolTimeoutSecs,omitempty"`
+}
+
 // MCPTestRequest carries one MCP server test (test_mcp, client→server):
 // either a registered server name (stored command/args/env resolved
 // server-side) or the raw command/args/env to probe (add form).
@@ -332,6 +352,11 @@ type WSMessage struct {
 	// means "not provided" in either direction.
 	Board    string `json:"board,omitempty"`
 	Subagent string `json:"subagent,omitempty"`
+	// Skills and Terminal are the live optional-tool feature flags ("on"/
+	// "off"): the skill tool and the persistent-terminal feature tools.
+	// Same contract as Board/Subagent.
+	Skills   string `json:"skills,omitempty"`
+	Terminal string `json:"terminal,omitempty"`
 	// SubagentMaxDepth is the live subagent nesting-depth limit (0 = not
 	// provided in client→server messages; the server normalizes <= 0 to the
 	// config default when seeding agents).
@@ -407,6 +432,26 @@ type WSMessage struct {
 	ProviderOp *ProviderOpRequest `json:"providerOp,omitempty"`
 	// ProviderTest carries the test_provider reply (server→client).
 	ProviderTest *ProviderTestResult `json:"providerTest,omitempty"`
+	// AgentInstructions / JobNotices are two more live agent feature flags
+	// ("on"/"off"), same contract as Board/Subagent: agent_instructions
+	// loads AGENTS.md/CLAUDE.md workspace instructions into the prompt,
+	// job_notices posts a follow-up turn when a background job finishes.
+	AgentInstructions string `json:"agentInstructions,omitempty"`
+	JobNotices        string `json:"jobNotices,omitempty"`
+	// TestCommand / LintCommand override the auto-detected project commands
+	// (client→server inside ConfigFields; server→client current value in
+	// config pushes). "" = auto-detect.
+	TestCommand string `json:"testCommand,omitempty"`
+	LintCommand string `json:"lintCommand,omitempty"`
+	// MCPToolMode is the MCP tool-exposure mode ("nested" = the single
+	// `mcp` gateway tool, "inline" = one definition per server tool).
+	// Client→server inside ConfigFields; server→client carries the
+	// effective mode in config pushes. It is part of the fixed request
+	// prefix, so a change applies to NEW sessions only.
+	MCPToolMode string `json:"mcpToolMode,omitempty"`
+	// MCPOp carries an MCP server-list mutation (mcp_save / mcp_delete,
+	// client→server). The saved list is pushed back as MCPServers.
+	MCPOp *MCPOpRequest `json:"mcpOp,omitempty"`
 	// MCPTest carries a test_mcp request (client→server).
 	MCPTest *MCPTestRequest `json:"mcpTest,omitempty"`
 	// MCPTestResult carries the test_mcp reply (server→client).

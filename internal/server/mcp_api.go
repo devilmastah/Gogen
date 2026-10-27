@@ -134,3 +134,166 @@ func mcpEntry(m config.MCPServerConfig, host bool) MCPEntry {
 		Host:    host,
 	}
 }
+
+// wsHandleMCPSave upserts one MCP server into the runtime overlay
+// (mcp_save from the settings modal). The list is RESTART-SCOPED: the MCP
+// manager was built from the startup config, so nothing is started or
+// stopped here — the entry is persisted for the next start, pushed back to
+// every tab immediately, and the client is told to restart. Env values can
+// hold secrets, so the persist forces the 0600 secret write (the same
+// policy as provider saves).
+func wsHandleMCPSave(req *wsRequest) {
+	s, ws, msg := req.server, req.conn, req.msg
+	op := msg.MCPOp
+	if op == nil {
+		writeNoticeError(ws, "mcp", "Error: missing MCP save request")
+		return
+	}
+	name := strings.TrimSpace(op.Name)
+	if name == "" {
+		writeNoticeError(ws, "mcp", "Error: MCP server name is required")
+		return
+	}
+	if s.isHostMCPServer(name) {
+		writeNoticeError(ws, "mcp", fmt.Sprintf("Error: MCP server %q is started by this process (GOGEN_MCP_EXTRA) and cannot be edited", name))
+		return
+	}
+	r := s.ws.GetRuntimeConfig()
+	idx := -1
+	for i, m := range r.MCPServers {
+		if m.Name == name {
+			idx = i
+			break
+		}
+	}
+	entry := config.MCPServerConfig{Name: name}
+	entry.Args = cleanMCPArgs(op.Args)
+	if idx >= 0 {
+		// Edit: blank command / empty env keep the stored values, so a row
+		// saved without retyping its secrets cannot wipe them.
+		stored := r.MCPServers[idx]
+		entry.Command = strings.TrimSpace(op.Command)
+		if entry.Command == "" {
+			entry.Command = stored.Command
+		}
+		entry.Env = cloneMCPEnv(stored.Env)
+		if len(op.Env) > 0 {
+			entry.Env = cloneMCPEnv(op.Env)
+		}
+		entry.InitTimeoutSecs = stored.InitTimeoutSecs
+		entry.ToolTimeoutSecs = stored.ToolTimeoutSecs
+	} else {
+		entry.Command = strings.TrimSpace(op.Command)
+		if entry.Command == "" {
+			writeNoticeError(ws, "mcp", "Error: MCP server command is required")
+			return
+		}
+		entry.Env = cloneMCPEnv(op.Env)
+	}
+	if op.InitTimeoutSecs > 0 {
+		entry.InitTimeoutSecs = op.InitTimeoutSecs
+	}
+	if op.ToolTimeoutSecs > 0 {
+		entry.ToolTimeoutSecs = op.ToolTimeoutSecs
+	}
+	if idx >= 0 {
+		r.MCPServers[idx] = entry
+	} else {
+		r.MCPServers = append(r.MCPServers, entry)
+	}
+	s.ws.SetRuntimeConfig(r)
+	s.persistMCPChange(ws, "Saved")
+}
+
+// wsHandleMCPDelete removes one configured MCP server (mcp_delete). Host
+// servers (GOGEN_MCP_EXTRA) are process-local and cannot be deleted.
+func wsHandleMCPDelete(req *wsRequest) {
+	s, ws, msg := req.server, req.conn, req.msg
+	op := msg.MCPOp
+	if op == nil {
+		writeNoticeError(ws, "mcp", "Error: missing MCP delete request")
+		return
+	}
+	name := strings.TrimSpace(op.Name)
+	if name == "" {
+		writeNoticeError(ws, "mcp", "Error: MCP server name is required")
+		return
+	}
+	if s.isHostMCPServer(name) {
+		writeNoticeError(ws, "mcp", fmt.Sprintf("Error: MCP server %q is started by this process (GOGEN_MCP_EXTRA) and cannot be deleted", name))
+		return
+	}
+	r := s.ws.GetRuntimeConfig()
+	idx := -1
+	for i, m := range r.MCPServers {
+		if m.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeNoticeError(ws, "mcp", fmt.Sprintf("Error: MCP server %q is not configured", name))
+		return
+	}
+	r.MCPServers = append(r.MCPServers[:idx], r.MCPServers[idx+1:]...)
+	s.ws.SetRuntimeConfig(r)
+	s.persistMCPChange(ws, "Deleted")
+}
+
+// persistMCPChange persists the effective config (forced secrets: MCP env
+// values are user-entered and must survive the restart this change is staged
+// for), broadcasts a fresh config to every tab, and reports the restart
+// requirement off the read loop.
+func (s *Server) persistMCPChange(ws *wsConn, verb string) {
+	go func() {
+		if s.config != nil {
+			s.persistConfigForced(s.effectiveConfig())
+		}
+		s.broadcastConfigAll()
+	}()
+	writeNotice(ws, "mcp", true, verb+" — restart gogen for MCP changes to take effect")
+}
+
+// isHostMCPServer reports whether name belongs to a process-local host
+// server (GOGEN_MCP_EXTRA): those are started by the host, never written to
+// a config file, and must not be editable from the settings modal.
+func (s *Server) isHostMCPServer(name string) bool {
+	if s == nil || s.ws == nil || s.ws.Config == nil {
+		return false
+	}
+	for _, m := range s.ws.Config.HostMCPServers {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanMCPArgs trims the arg list and drops empty entries (the add form
+// splits a typed command line, which can leave blanks on trailing spaces).
+func cleanMCPArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// cloneMCPEnv copies an MCP env map. The runtime overlay is copied by value
+// (GetRuntimeConfig), so nested maps would otherwise be shared between the
+// stored entry and the request; cloning keeps the overlay copy-on-write.
+func cloneMCPEnv(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(env))
+	for k, v := range env {
+		out[k] = v
+	}
+	return out
+}

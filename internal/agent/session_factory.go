@@ -82,13 +82,18 @@ type SessionAgentOptions struct {
 	// agent renders the AGENTS.md/CLAUDE.md section from its working dir
 	// at construction and on every working-dir change.
 	InstructionsEnabled bool
-	// SkillsManager is the shared skill discovery manager (nil when
-	// disabled). Skills is config-only in v1: the flag and manager are set
-	// once at construction, never toggled live.
+	// SkillsManager is the shared skill discovery manager (nil when the
+	// host has none). The skill tool is exposed only when this is non-nil
+	// AND the live skills flag is on.
 	SkillsManager *skills.Manager
-	// TerminalEnabled enables the persistent-terminal feature tools
-	// (the terminal tool's open/send/read/signal/list/close actions and
-	// bash_persistent). Config-only in v1, seeded at construction.
+	// SkillsEnabled is the live skills flag, used only when FeatureFlags is
+	// nil (the web path reads the shared store instead). The tool also
+	// requires SkillsManager.
+	SkillsEnabled bool
+	// TerminalEnabled enables the persistent-terminal feature tools (the
+	// terminal tool's open/send/read/signal/list/close actions and
+	// bash_persistent). Used only when FeatureFlags is nil — the web path
+	// reads the shared store's live flag instead.
 	TerminalEnabled bool
 	// MCPConfigured reports that MCP is enabled with at least one server in
 	// the session's config (config.MCPActive), and MCPNested selects the
@@ -149,19 +154,20 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	if opts.FeatureFlags != nil {
 		// Shared store (web mode): the agent reads the workspace's live
 		// flags directly, so a settings toggle reaches it with no sweep.
+		// The shared store owns skills/terminal too — the per-session value
+		// options are deliberately NOT written here, or creating one session
+		// would clobber the workspace-wide state.
 		a.SetFeatureFlags(opts.FeatureFlags)
 	} else {
 		a.SetBoardEnabled(opts.BoardEnabled)
 		a.SetSubagentsEnabled(opts.SubagentsEnabled)
 		a.SetSubagentMaxDepth(opts.SubagentMaxDepth)
 		a.SetSubagentMaxConcurrent(opts.SubagentMaxConcurrent)
+		a.SetSkillsEnabled(opts.SkillsEnabled && opts.SkillsManager != nil)
+		a.SetTerminalEnabled(opts.TerminalEnabled)
 	}
 	a.SetBoardManager(opts.BoardManager)
 	a.SetSkillsManager(opts.SkillsManager)
-	if opts.SkillsManager != nil {
-		a.SetSkillsEnabled(true)
-	}
-	a.SetTerminalEnabled(opts.TerminalEnabled)
 	a.SetSubagentSpawner(opts.SubagentSpawner)
 	if snap != nil {
 		a.RestoreSession(*snap, id)

@@ -44,6 +44,8 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	// Live feature flags: the settings modal renders and toggles these.
 	msg.Board = onOff(a.BoardEnabled())
 	msg.Subagent = onOff(a.SubagentsEnabled())
+	msg.Skills = onOff(a.SkillsEnabled())
+	msg.Terminal = onOff(a.TerminalEnabled())
 	msg.ReviewAgent = onOff(a.ReviewAgentEnabled())
 	msg.Automations = onOff(a.AutomationsEnabled())
 	msg.SubagentMaxDepth = a.SubagentMaxDepth()
@@ -262,7 +264,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	if msg.WorkingDir != "" {
 		s.handleWSWorkingDir(ws, ctx, pane, msg)
 	}
-	if msg.Board != "" || msg.Subagent != "" || msg.ReviewAgent != "" || msg.Automations != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
+	if msg.Board != "" || msg.Subagent != "" || msg.Skills != "" || msg.Terminal != "" || msg.ReviewAgent != "" || msg.Automations != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
 		s.handleWSFeatureFlags(ws, msg)
 	}
 	if len(msg.ConfigFields) > 0 {
@@ -270,7 +272,8 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	}
 }
 
-// handleWSFeatureFlags handles the Board / Subagent / SubagentMaxDepth
+// handleWSFeatureFlags handles the Board / Subagent / Skills / Terminal /
+// ReviewAgent / Automations / SubagentMaxDepth / SubagentMaxConcurrent
 // branches of the config message (the live settings-modal toggles). Any
 // invalid value rejects the whole request with an error reply; on success
 // the workspace flags are written to the shared store every session agent
@@ -298,6 +301,26 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 			return
 		}
 		subagentSet = true
+	}
+	var skills, skillsSet bool
+	if msg.Skills != "" {
+		var ok bool
+		skills, ok = onoff.Parse(msg.Skills)
+		if !ok {
+			writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid skills value %q (want on or off)", msg.Skills))
+			return
+		}
+		skillsSet = true
+	}
+	var terminal, terminalSet bool
+	if msg.Terminal != "" {
+		var ok bool
+		terminal, ok = onoff.Parse(msg.Terminal)
+		if !ok {
+			writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid terminal value %q (want on or off)", msg.Terminal))
+			return
+		}
+		terminalSet = true
 	}
 	var reviewAgent bool
 	var reviewAgentSet bool
@@ -334,6 +357,12 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 	}
 	if subagentSet {
 		s.ws.SetSubagentEnabled(subagent)
+	}
+	if skillsSet {
+		s.ws.SetSkillsEnabled(skills)
+	}
+	if terminalSet {
+		s.ws.SetTerminalEnabled(terminal)
 	}
 	if reviewAgentSet {
 		s.ws.SetReviewAgentEnabled(reviewAgent)
@@ -389,6 +418,8 @@ func (s *Server) effectiveConfig() *config.Config {
 	// Feature flags + provider list live in their own workspace stores.
 	out.Board = onOff(s.ws.GetBoardEnabled())
 	out.Subagent = onOff(s.ws.GetSubagentEnabled())
+	out.Skills = onOff(s.ws.GetSkillsEnabled())
+	out.Terminal = onOff(s.ws.GetTerminalEnabled())
 	out.ReviewAgent = onOff(s.ws.GetReviewAgentEnabled())
 	out.Automations = onOff(s.ws.GetAutomationsEnabled())
 	out.SubagentMaxDepth = s.ws.GetSubagentMaxDepth()

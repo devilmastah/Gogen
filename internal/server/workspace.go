@@ -34,8 +34,6 @@ type Workspace struct {
 	// Project context shared by all session agents.
 	ProjectFilePath   string
 	ProjectGuidelines string
-	TestCommand       string
-	LintCommand       string
 
 	DebugCompareMessages bool
 	// MCPRegistry is shared by all session agents (thread-safe, E20).
@@ -77,22 +75,26 @@ type Workspace struct {
 	boardManager   *agent.BoardManager
 
 	// skillsManager is the shared skill discovery manager for this
-	// workspace. Skills is config-only in v1 (no live toggle): the manager
-	// is set once at construction and never reassigned, so plain-field
-	// reads at session creation are race-free.
+	// workspace. The manager is created once by the host and never
+	// reassigned (so plain-field reads at session creation are race-free);
+	// whether the skill tool is EXPOSED is the live flag in the shared
+	// feature-flag store, so a settings toggle applies without a sweep.
 	skillsManager *skills.Manager
 
-	// jobNotices mirrors the config job_notices flag (config-only, set at
-	// construction). jobNoticeDeliverer is installed by NewServer (it needs
-	// the registry) and resolves a session id to its live runtime at fire
-	// time; NewSessionAgent installs the per-agent hook on top of it.
+	// jobNotices is the live job_notices flag (the settings modal toggles
+	// it; the switch installs/removes each session's hook). jobNoticeDeliverer
+	// is installed unconditionally by NewServer (it needs the registry) and
+	// resolves a session id to its live runtime at fire time; NewSessionAgent
+	// installs the per-agent hook on top of it while the flag is on.
+	// jobNoticesMu guards jobNotices: the handler writes it while session
+	// creation reads it.
+	jobNoticesMu       sync.RWMutex
 	jobNotices         bool
 	jobNoticeDeliverer func(agentID, summary string)
 
-	// terminalEnabled mirrors the config terminal flag (config-only, set at
-	// construction). Every session agent spawned by NewSessionAgent is seeded
-	// with it, so the persistent-terminal feature tools are on/off uniformly.
-	terminalEnabled bool
+	// The persistent-terminal feature tools ride on the shared flag
+	// store's terminalEnabled flag (see Get/SetTerminalEnabled), like the
+	// board and subagent flags — no per-workspace mirror to desync.
 
 	// BoardChangedHook is invoked after any board mutation made through a
 	// session agent's board tool, with the mutation's output message; the
@@ -319,6 +321,51 @@ func (ws *Workspace) SetSubagentEnabled(on bool) {
 	ws.flags().SetSubagentsEnabled(on)
 }
 
+// GetSkillsEnabled returns the live skills feature flag (the skill tool is
+// additionally gated on the workspace having a skills manager).
+func (ws *Workspace) GetSkillsEnabled() bool {
+	return ws.flags().SkillsEnabled()
+}
+
+// SetSkillsEnabled updates the live skills feature flag (shared store, see
+// SetBoardEnabled).
+func (ws *Workspace) SetSkillsEnabled(on bool) {
+	ws.flags().SetSkillsEnabled(on)
+}
+
+// GetTerminalEnabled returns the live persistent-terminal feature flag.
+func (ws *Workspace) GetTerminalEnabled() bool {
+	return ws.flags().TerminalEnabled()
+}
+
+// SetTerminalEnabled updates the live persistent-terminal feature flag
+// (shared store, see SetBoardEnabled).
+func (ws *Workspace) SetTerminalEnabled(on bool) {
+	ws.flags().SetTerminalEnabled(on)
+}
+
+// GetJobNotices reports whether background-job completion notices are on
+// for this workspace (the per-agent hooks are installed while it is).
+func (ws *Workspace) GetJobNotices() bool {
+	if ws == nil {
+		return false
+	}
+	ws.jobNoticesMu.RLock()
+	defer ws.jobNoticesMu.RUnlock()
+	return ws.jobNotices
+}
+
+// SetJobNotices updates the live job_notices flag (the settings handler
+// installs/removes the per-agent hooks; this is the seed new sessions read).
+func (ws *Workspace) SetJobNotices(on bool) {
+	if ws == nil {
+		return
+	}
+	ws.jobNoticesMu.Lock()
+	ws.jobNotices = on
+	ws.jobNoticesMu.Unlock()
+}
+
 // GetReviewAgentEnabled returns the live board auto-review flag.
 func (ws *Workspace) GetReviewAgentEnabled() bool {
 	return ws.flags().ReviewAgentEnabled()
@@ -517,19 +564,26 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		GlobalMode:        ws.GlobalMode,
 		ProjectFilePath:   ws.ProjectFilePath,
 		ProjectGuidelines: ws.ProjectGuidelines,
-		TestCommand:       ws.TestCommand,
-		LintCommand:       ws.LintCommand,
-		WorkingDir:        ws.GetWorkingDir(),
-		MCPRegistry:       ws.MCPRegistry,
-		// Exposure policy comes from the STARTUP config, not the runtime
+		// The test/lint overrides come from the live overlay, so a
+		// settings-modal change reaches sessions created afterwards (the
+		// settings handler also sweeps every live agent).
+		TestCommand: runtimeCfg.TestCommand,
+		LintCommand: runtimeCfg.LintCommand,
+		WorkingDir:  ws.GetWorkingDir(),
+		MCPRegistry: ws.MCPRegistry,
+		// Whether MCP is ACTIVE comes from the STARTUP config, not the runtime
 		// overlay and not the live registry. The MCP manager's lifecycle is
 		// bound to startup config (the settings modal marks `mcp` as
-		// restart-scoped), so a live toggle must not add or remove the gateway
-		// while the servers keep running (or stay stopped) underneath; and a
-		// registry-derived answer would move the request prefix mid-session,
-		// because the tool set and system prompt lead it.
+		// restart-scoped), so a staged toggle must not add or remove the
+		// gateway while the servers keep running (or stay stopped)
+		// underneath; and a registry-derived answer would move the request
+		// prefix mid-session, because the tool set and system prompt lead it.
+		// The EXPOSURE MODE has no server lifecycle, so it is read from the
+		// live overlay: a settings-modal mcp_tool_mode change reaches the next
+		// session (still resolved once per session — an existing session's
+		// prefix never moves).
 		MCPConfigured:        ws.Config.MCPActive(),
-		MCPNested:            ws.Config.MCPNested(),
+		MCPNested:            runtimeCfg.MCPNested(),
 		ToolHandlers:         ws.buildToolHandlers(),
 		DebugCompareMessages: ws.DebugCompareMessages,
 		ThinkingLevel:        agent.ThinkingLevel(ws.ThinkingLevel),
@@ -538,7 +592,8 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		SkillsManager:        ws.skillsManager,
 		InstructionsEnabled:  runtimeCfg.AgentInstructionsEnabled(),
 		SubagentSpawner:      ws.SubagentSpawner,
-		TerminalEnabled:      ws.terminalEnabled,
+		SkillsEnabled:        ws.GetSkillsEnabled(),
+		TerminalEnabled:      ws.GetTerminalEnabled(),
 	}
 	if ws.Store != nil {
 		// Assigned conditionally on purpose: ws.Store is a concrete
@@ -550,7 +605,7 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	}
 	a := agent.NewSessionAgent(opts, snap, id)
 	a.SetOnBoardChanged(ws.BoardChangedHook)
-	if ws.jobNotices && ws.jobNoticeDeliverer != nil {
+	if ws.GetJobNotices() && ws.jobNoticeDeliverer != nil {
 		// Job-completion notices: the hook resolves THIS session's live
 		// runtime at fire time (the deliverer is registry-backed), so a
 		// notice never targets a stale runtime.
@@ -586,15 +641,12 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		GlobalMode:           a.GlobalMode,
 		ProjectFilePath:      a.ProjectFilePath,
 		ProjectGuidelines:    a.ProjectGuidelines,
-		TestCommand:          a.TestCommand,
-		LintCommand:          a.LintCommand,
 		DebugCompareMessages: a.DebugCompareMessages,
 		MCPRegistry:          a.MCPRegistry,
 		Model:                a.CurrentModel(),
 		ThinkingLevel:        string(a.ThinkingLevel),
 		WorkingDir:           a.Executor.GetWorkingDir(),
 		jobNotices:           cfg != nil && cfg.JobNoticesEnabled(),
-		terminalEnabled:      cfg != nil && cfg.TerminalEnabled(),
 		OpenAIProviders:      providerListFromConfig(cfg),
 		runtime:              runtimeSeed(cfg),
 	}
@@ -609,6 +661,8 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 	if cfg != nil {
 		ws.flags().SetReviewAgentEnabled(cfg.ReviewAgentEnabled())
 		ws.flags().SetAutomationsEnabled(cfg.AutomationsEnabled())
+		ws.flags().SetSkillsEnabled(cfg.SkillsEnabled())
+		ws.flags().SetTerminalEnabled(cfg.TerminalEnabled())
 	}
 	if cfg != nil && cfg.BoardEnabled() {
 		// The workspace owns the single board manager; session agents are

@@ -7,7 +7,9 @@ import (
 )
 
 // SetInstructionsEnabled toggles AGENTS.md/CLAUDE.md loading for this
-// agent (config-only in v1; set at construction).
+// agent (set at construction; the web settings sweep toggles it live, and
+// follows an enable with RefreshWorkspaceInstructions so the section is not
+// left empty).
 func (a *Agent) SetInstructionsEnabled(on bool) {
 	a.instructionsEnabled.Store(on)
 }

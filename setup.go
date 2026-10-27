@@ -96,14 +96,17 @@ func newAgent(cfg *config.Config, isGlobalMode bool, restoreSession bool) (*agen
 		// via AfterWorkingDirChange.
 		a.SetBoardManager(agent.NewBoardManager(cfg.WorkingDir, isGlobalMode))
 	}
-	if cfg.SkillsEnabled() {
-		// Skills: per-process discovery manager (project .gogen/skills plus
-		// the global config dir; global mode → user root only).
-		a.SetSkillsManager(skills.NewManager(cfg.WorkingDir, isGlobalMode))
-		a.SetSkillsEnabled(true)
-	}
-	// Persistent terminal tools (terminal_* and bash_persistent): config-only,
-	// act-mode feature tools gated through featureTools().
+	// Skills: per-process discovery manager (project .gogen/skills plus the
+	// global config dir; global mode → user root only). Installed
+	// UNCONDITIONALLY (the manager is a stateless directory pointer and only
+	// scans on demand), so enabling the skills flag from the web settings
+	// modal can expose the tool live — the flag, not the manager, is the
+	// gate (see featureTools).
+	a.SetSkillsManager(skills.NewManager(cfg.WorkingDir, isGlobalMode))
+	a.SetSkillsEnabled(cfg.SkillsEnabled())
+	// Persistent terminal tools (terminal_* and bash_persistent): act-mode
+	// feature tools gated through featureTools(), toggled live from the web
+	// settings modal.
 	a.SetTerminalEnabled(cfg.TerminalEnabled())
 	// Workspace instructions (AGENTS.md/CLAUDE.md): merged below the
 	// project guidelines at view-build time from the CURRENT working dir

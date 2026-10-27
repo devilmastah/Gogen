@@ -40,6 +40,8 @@ var wsHandlers = map[string]wsHandlerEntry{
 	"provider_delete":    {handle: wsHandleProviderDelete},
 	"test_provider":      {handle: wsHandleTestProvider},
 	"test_mcp":           {handle: wsHandleTestMCP},
+	"mcp_save":           {handle: wsHandleMCPSave},
+	"mcp_delete":         {handle: wsHandleMCPDelete},
 	"session_attach":     {handle: wsHandleAttach},
 	"session_detach":     {handle: wsHandleDetach},
 	"session_close":      {handle: wsHandleClose},

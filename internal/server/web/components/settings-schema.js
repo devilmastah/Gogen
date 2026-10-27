@@ -47,6 +47,7 @@ export var SETTINGS_TABS = [
     { id: 'appearance', label: 'Appearance' },
     { id: 'agent', label: 'Agent' },
     { id: 'subagents', label: 'Subagents' },
+    { id: 'project', label: 'Project' },
     { id: 'automations', label: 'Automations' },
     { id: 'tools', label: 'Tools' },
     { id: 'context', label: 'Context' },
@@ -83,6 +84,8 @@ export var SETTINGS_SCHEMA = [
     { custom: 'review-agent-thinking-row', tab: 'agent' },
     { id: 'board-review-prompt-input', tab: 'agent', type: 'textarea', label: 'Board review prompt', storage: 'server', channel: 'runtime', field: 'boardReviewPrompt', rows: 6, rowId: 'board-review-prompt-row', resetToDefault: true, resetId: 'board-review-prompt-reset-btn', note: 'Template for the auto review agent started when a ticket enters in_review. Placeholders: {id} {title} {description} {priority} {context} {assignee}. Empty = built-in default.' },
     { id: 'system-prompt-input', tab: 'agent', type: 'textarea', label: 'System prompt', storage: 'server', channel: 'runtime', field: 'systemPrompt', rows: 6, resetToDefault: true, resetId: 'system-prompt-reset-btn', note: 'Replaces the built-in system prompt; {working_dir} is substituted. Project rules and plan mode still apply. Empty = built-in default.' },
+    { id: 'agent-instructions-select', tab: 'agent', type: 'select', label: 'Workspace instructions (AGENTS.md / CLAUDE.md)', storage: 'server', channel: 'runtime', field: 'agentInstructions', options: [['off', 'Off'], ['on', 'On']], note: 'When on, AGENTS.md / CLAUDE.md files in the working directory are loaded and appended BELOW the project rules (.gogen/gogen.md stays authoritative), with byte caps. Applies live to every session.' },
+    { id: 'job-notices-select', tab: 'agent', type: 'select', label: 'Background job notices', storage: 'server', channel: 'runtime', field: 'jobNotices', options: [['off', 'Off'], ['on', 'On']], note: 'When on, a background shell job that finishes on its own posts a one-line summary into the session and starts a turn on it (off = a finished job stays silent). Applies live to every session.' },
 
     // ── Subagents (split out of Agent) ─────────────────────────────────
     { id: 'subagent-enabled-select', tab: 'subagents', type: 'select', label: 'Subagents', storage: 'server', channel: 'feature', featureKey: 'subagent', options: [['off', 'Off'], ['on', 'On']] },
@@ -91,6 +94,10 @@ export var SETTINGS_SCHEMA = [
     { custom: 'row-subagent-model-picker', tab: 'subagents' },
     { custom: 'row-subagent-thinking-picker', tab: 'subagents' },
     { id: 'subagent-prompt-input', tab: 'subagents', type: 'textarea', label: 'Subagent prompt', storage: 'server', channel: 'runtime', field: 'subagentPrompt', rows: 4, resetToDefault: true, resetId: 'subagent-prompt-reset-btn', note: 'Wraps the subagent job; {job} is substituted. Empty = built-in default.' },
+
+    // ── Project (server runtime; the workspace profile) ────────────────
+    { id: 'test-command-input', tab: 'project', type: 'text', label: 'Test command', storage: 'server', channel: 'runtime', field: 'testCommand', placeholder: 'make test', note: 'Overrides the auto-detected test command (Makefile / go test / cargo …). Empty = auto-detect. Applies to every session on its next turn.' },
+    { id: 'lint-command-input', tab: 'project', type: 'text', label: 'Lint command', storage: 'server', channel: 'runtime', field: 'lintCommand', placeholder: 'make vet', note: 'Overrides the auto-detected lint command (gofmt/vet, eslint, ruff …). Empty = auto-detect. Applies to every session on its next turn.' },
 
     // ── Automations (server feature toggle) ────────────────────────────
     { id: 'automations-enabled-select', tab: 'automations', type: 'select', label: 'Automations', storage: 'server', channel: 'feature', featureKey: 'automations', options: [['off', 'Off'], ['on', 'On']], note: 'When on, GoGen sweeps the saved automations every 30 s and fires each due one as a headless run in its working directory (runs recorded with their session id). Create automations with `gogen automation create <title> --prompt ... --daily|--hourly|--weekly ...`; list them with `gogen automation ls`. Automations fire only while GoGen is running.' },
@@ -104,6 +111,8 @@ export var SETTINGS_SCHEMA = [
     { id: 'web-search-api-key-input', tab: 'tools', type: 'password', label: 'Search API key', ariaLabel: 'Web search API key', storage: 'server', channel: 'runtime', field: 'webSearchApiKey', placeholder: 'API key' },
     { id: 'treesitter-select', tab: 'tools', type: 'select', label: 'Tree-sitter', storage: 'server', channel: 'runtime', field: 'treesitter', options: [['on', 'On'], ['off', 'Off']] },
     { id: 'treesitter-langs-input', tab: 'tools', type: 'text', label: 'Tree-sitter languages (comma-separated)', storage: 'server', channel: 'runtime', field: 'treesitterLangs' },
+    { id: 'skills-enabled-select', tab: 'tools', type: 'select', label: 'Skills (skill tool)', storage: 'server', channel: 'feature', featureKey: 'skills', options: [['off', 'Off'], ['on', 'On']], note: 'Exposes the skill tool: list/read over .gogen/skills and ~/.config/gogen/skills. Applies live to every session.' },
+    { id: 'terminal-enabled-select', tab: 'tools', type: 'select', label: 'Persistent terminal tools', storage: 'server', channel: 'feature', featureKey: 'terminal', options: [['off', 'Off'], ['on', 'On']], note: 'Exposes the agent-facing terminal tool (open/send/read/signal/list/close) and bash_persistent: a per-session shell whose cwd/env persist across calls. Separate from this web UI\'s own terminal tab.' },
 
     // ── Status display (server runtime; a LAN ttgo/status screen) ──────
     { id: 'status-display-select', tab: 'tools', type: 'select', label: 'Status display (LAN status screen)', storage: 'server', channel: 'runtime', field: 'statusDisplay', options: [['off', 'Off'], ['auto', 'Auto (probe at startup)'], ['on', 'On'], ['browser', 'Browser (web UI fallback)']], note: 'Pushes live turn status to an ESP32 status screen running the ttgo/status firmware: one row per top-level turn, progress = context usage, state = running / done / error / idle. Auto probes for the screen (GET /info) in the background and enables reporting when it answers. Browser probes too, and only when the server cannot reach the display does this web UI POST the rows instead — use it when your browser can reach the display and the server cannot (web mode only). Updates are best-effort and never affect a turn.' },
@@ -140,6 +149,7 @@ export var SETTINGS_SCHEMA = [
 
     // ── MCP (simple toggle + composite list/form) ──────────────────────
     { id: 'mcp-select', tab: 'mcp', type: 'select', label: 'MCP (restart)', storage: 'server', channel: 'runtime', field: 'mcp', options: [['off', 'Off'], ['on', 'On']], note: 'MCP changes take effect after a restart.' },
+    { id: 'mcp-tool-mode-select', tab: 'mcp', type: 'select', label: 'MCP tool exposure', storage: 'server', channel: 'runtime', field: 'mcpToolMode', options: [['nested', 'Nested (one `mcp` gateway tool)'], ['inline', 'Inline (one tool per server tool)']], note: 'Nested keeps a small fixed tool surface and a stable request prefix; inline inlines every discovered server tool into the request. Applies to new sessions (the tool set is fixed for the life of a session).' },
     { custom: 'mcp-block', tab: 'mcp' },
 
     // ── Server (restart-staged, server runtime) ────────────────────────

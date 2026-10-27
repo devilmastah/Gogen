@@ -129,6 +129,54 @@ func (s *Server) applyContextField(r *config.Config, copy func(next *contextmgr.
 	}
 }
 
+// applyAgentInstructionsToAll pushes the agent_instructions flag to every
+// live session agent. Enabling also RE-RENDERS the section from the agent's
+// current working dir (the render is skipped while the flag is off, so
+// flipping the flag alone would leave the section empty), and disabling
+// makes EffectiveGuidelines return the project guidelines alone.
+func (s *Server) applyAgentInstructionsToAll(r *config.Config) {
+	on := r.AgentInstructionsEnabled()
+	for _, rt := range s.registry.runtimes() {
+		rt.agent.SetInstructionsEnabled(on)
+		if on {
+			// Snapshot accessor: this runs off the turn goroutine while a
+			// working-dir change may be publishing the field.
+			rt.agent.RefreshWorkspaceInstructions(rt.agent.WorkingDirSnapshot())
+		}
+	}
+}
+
+// applyJobNoticesToAll installs or removes every live session's job-notice
+// hook: with the feature on, a background job finishing naturally delivers
+// its summary into that session (which starts a turn on it); with it off the
+// hook is cleared, so a finished job stays silent. The deliverer itself is
+// installed once by NewServer regardless of the flag.
+func (s *Server) applyJobNoticesToAll(r *config.Config) {
+	on := r.JobNoticesEnabled()
+	s.ws.SetJobNotices(on)
+	deliverer := s.ws.jobNoticeDeliverer
+	for _, rt := range s.registry.runtimes() {
+		if !on || deliverer == nil {
+			rt.agent.SetJobNoticeHook(nil)
+			continue
+		}
+		sid := rt.agent.SessionID
+		rt.agent.SetJobNoticeHook(func(summary string) { deliverer(sid, summary) })
+	}
+}
+
+// applyTestLintCommandsToAll pushes the configured test/lint command
+// overrides to every live session agent. Each agent drops its cached project
+// profile, so the next turn re-detects the project profile with the new
+// overrides; sessions created afterwards seed them from the runtime overlay.
+// No turn locks: the agent stores both under its stats lock.
+func (s *Server) applyTestLintCommandsToAll(r *config.Config) {
+	testCommand, lintCommand := r.TestCommand, r.LintCommand
+	for _, rt := range s.registry.runtimes() {
+		rt.agent.SetTestLintCommands(testCommand, lintCommand)
+	}
+}
+
 // applyPreserveReasoningToAll pushes the preserve_reasoning mode to every
 // live session's OpenAI provider.
 func (s *Server) applyPreserveReasoningToAll(mode string) {

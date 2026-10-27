@@ -6,6 +6,7 @@ let panel = null;
 const TABS = [
   { id: "agent", label: "Agent" },
   { id: "subagents", label: "Subagents" },
+  { id: "project", label: "Project" },
   { id: "automations", label: "Automations" },
   { id: "tools", label: "Tools" },
   { id: "context", label: "Context" },
@@ -31,12 +32,17 @@ const FIELDS = [
   { tab: "agent", kind: "model", field: "reviewAgentModel", thinking: "reviewAgentThinkingLevel", label: "Default review model", inherit: "Cascade (ticket override, else workspace default)", thinkingLabel: "Review agent reasoning effort", thinkingInherit: "Inherit the workspace level", when: "review", note: "Empty model = the ticket's review override, else the workspace default. Empty effort = inherit the workspace level." },
   { tab: "agent", kind: "runtime", field: "boardReviewPrompt", label: "Board review prompt", control: "textarea", rows: 6, reset: true, when: "review", note: "Template for the auto review agent. Placeholders: {id} {title} {description} {priority} {context} {assignee}. Empty = built-in default." },
   { tab: "agent", kind: "runtime", field: "systemPrompt", label: "System prompt", control: "textarea", rows: 6, reset: true, note: "Replaces the built-in system prompt; {working_dir} is substituted. Project rules and plan mode still apply. Empty = built-in default." },
+  { tab: "agent", kind: "runtime", field: "agentInstructions", label: "Workspace instructions (AGENTS.md / CLAUDE.md)", options: ON_OFF, note: "When on, AGENTS.md / CLAUDE.md files in the working directory are loaded below the project rules (.gogen/gogen.md stays authoritative). Applies live." },
+  { tab: "agent", kind: "runtime", field: "jobNotices", label: "Background job notices", options: ON_OFF, note: "When on, a background shell job that finishes on its own posts a one-line summary into the session and starts a turn on it." },
 
   { tab: "subagents", kind: "feature", key: "subagent", label: "Subagents", options: ON_OFF },
   { tab: "subagents", kind: "feature", key: "subagentMaxDepth", label: "Max subagent depth", control: "number", min: 1, max: 10, step: 1 },
   { tab: "subagents", kind: "feature", key: "subagentMaxConcurrent", label: "Max concurrent subagents", control: "number", min: 1, max: 32, step: 1, note: "Per session. Spawning beyond the limit is refused. The terminal UI runs subagents one at a time." },
   { tab: "subagents", kind: "model", field: "subagentModel", thinking: "subagentThinkingLevel", label: "Default subagent model", inherit: "Inherit (parent's model)", thinkingLabel: "Subagent reasoning effort", thinkingInherit: "Inherit the parent session's level", when: "subagent", note: "Empty model = inherit the parent's model. The subagent tool's explicit model argument always wins. Empty effort = inherit the parent's level." },
   { tab: "subagents", kind: "runtime", field: "subagentPrompt", label: "Subagent prompt", control: "textarea", rows: 4, reset: true, note: "Wraps the subagent job; {job} is substituted. Empty = built-in default." },
+
+  { tab: "project", kind: "runtime", field: "testCommand", label: "Test command", placeholder: "make test", note: "Overrides the auto-detected test command (Makefile / go test / cargo …). Empty = auto-detect. Applies to every session on its next turn." },
+  { tab: "project", kind: "runtime", field: "lintCommand", label: "Lint command", placeholder: "make vet", note: "Overrides the auto-detected lint command (gofmt/vet, eslint, ruff …). Empty = auto-detect. Applies to every session on its next turn." },
 
   { tab: "automations", kind: "feature", key: "automations", label: "Automations", options: ON_OFF, note: "When on, GoGen sweeps saved automations every 30s and fires each due one as a headless run. Create them with gogen automation create. They fire only while GoGen is running." },
 
@@ -48,6 +54,8 @@ const FIELDS = [
   { tab: "tools", kind: "runtime", field: "webSearchApiKey", label: "Search API key", control: "password", secret: "webSearchApiKeySet", placeholder: "API key" },
   { tab: "tools", kind: "runtime", field: "treesitter", label: "Tree-sitter", options: ON_OFF },
   { tab: "tools", kind: "runtime", field: "treesitterLangs", label: "Tree-sitter languages (comma-separated)" },
+  { tab: "tools", kind: "feature", key: "skills", label: "Skills (skill tool)", options: ON_OFF, note: "Exposes the skill tool: list/read over .gogen/skills and ~/.config/gogen/skills. Applies live." },
+  { tab: "tools", kind: "feature", key: "terminal", label: "Persistent terminal tools", options: ON_OFF, note: "Exposes the agent-facing terminal tool and bash_persistent (a per-session shell whose cwd/env persist across calls)." },
   { tab: "tools", kind: "runtime", field: "statusDisplay", label: "Status display (LAN status screen)", options: [["off", "Off"], ["auto", "Auto (probe at startup)"], ["on", "On"], ["browser", "Browser (web UI fallback)"]], note: "Pushes live turn status to an ESP32 status screen. Auto probes and enables reporting when the screen answers. Browser uses this web UI to post the rows when the server cannot reach the display." },
   { tab: "tools", kind: "runtime", field: "statusDisplayHost", label: "Status display host", when: "status", note: "mDNS name, IP, or base URL. Empty falls back to the firmware default." },
   { tab: "tools", kind: "runtime", field: "statusDisplayToken", label: "Status display token", control: "password", secret: "statusDisplayTokenSet", placeholder: "Token", when: "status", note: "Only needed when the display has a shared secret set." },
@@ -75,6 +83,9 @@ const FIELDS = [
   { tab: "sessions", kind: "runtime", field: "sessionMaxAgeDays", label: "Session retention (days, -1 = keep forever)", control: "number", min: -1, step: 1 },
 
   { tab: "mcp", kind: "runtime", field: "mcp", label: "MCP (restart)", options: ON_OFF, note: "MCP changes take effect after a restart." },
+  // The MCP server LIST is edited in the web settings modal (mcp_save /
+  // mcp_delete); this sidebar keeps the toggle + exposure mode only.
+  { tab: "mcp", kind: "runtime", field: "mcpToolMode", label: "MCP tool exposure", options: [["nested", "Nested (one `mcp` gateway tool)"], ["inline", "Inline (one tool per server tool)"]], note: "Nested keeps a small fixed tool surface and a stable request prefix; inline inlines every discovered server tool. Applies to new sessions." },
 
   { tab: "server", kind: "runtime", field: "webAllowedOrigins", label: "Allowed origins (restart)" },
   { tab: "server", kind: "runtime", field: "webAuthToken", label: "Auth token (restart)", control: "password", secret: "webAuthTokenSet", placeholder: "Auth token" },

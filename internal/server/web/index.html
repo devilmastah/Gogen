@@ -553,12 +553,13 @@
                 <div id="mcp-block">
                     <div id="mcp-server-list" class="mcp-server-list"></div>
                     <div class="provider-form">
-                        <input type="text" id="mcp-test-name" placeholder="Name (for saved servers)" autocomplete="off" aria-label="MCP server name">
+                        <input type="text" id="mcp-test-name" placeholder="Name (e.g. rea)" autocomplete="off" aria-label="MCP server name">
                         <input type="text" id="mcp-test-command" placeholder="Command (e.g. npx)" autocomplete="off" aria-label="MCP server command">
                         <input type="text" id="mcp-test-args" placeholder="Args (space-separated)" autocomplete="off" aria-label="MCP server args">
-                        <input type="text" id="mcp-test-env" placeholder="Env KEY=VALUE (space-separated)" autocomplete="off" aria-label="MCP server env">
+                        <input type="text" id="mcp-test-env" placeholder="Env KEY=VALUE (space-separated, blank keeps stored)" autocomplete="off" aria-label="MCP server env">
                         <div class="provider-form-actions">
                             <button type="button" id="mcp-test-btn" class="settings-btn-secondary">Test</button>
+                            <button type="button" id="mcp-save-btn">Add / Save</button>
                         </div>
                     </div>
                     <div id="mcp-test-result" class="settings-note"></div>

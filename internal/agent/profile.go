@@ -114,9 +114,18 @@ func topLevelLayout(workingDir string) string {
 func (a *Agent) SetProjectContext(path, guidelines, testCommand, lintCommand string) {
 	a.ProjectFilePath = path
 	a.ProjectGuidelines = guidelines
+	a.SetTestLintCommands(testCommand, lintCommand)
+}
+
+// SetTestLintCommands overrides the auto-detected test/lint commands for
+// this agent and drops the cached project profile so the next turn
+// re-detects with them. Live settings toggle: the web workspace sweeps
+// every session agent (the values are guarded by statsMu because
+// ensureProjectProfile reads them off the turn goroutine).
+func (a *Agent) SetTestLintCommands(testCommand, lintCommand string) {
+	a.statsMu.Lock()
 	a.TestCommand = strings.TrimSpace(testCommand)
 	a.LintCommand = strings.TrimSpace(lintCommand)
-	a.statsMu.Lock()
 	a.projectProfile = ""
 	a.statsMu.Unlock()
 }
@@ -142,11 +151,14 @@ func (a *Agent) ensureProjectProfile() string {
 	}
 	// WorkingDir is published under statsMu (SetWorkingDir), and this runs on
 	// the shutdown/eviction flush paths with no turnMu, so read it under the
-	// lock instead of racing a concurrent working-dir change.
+	// lock instead of racing a concurrent working-dir change. The test/lint
+	// overrides are read under the same lock (SetTestLintCommands writes
+	// them from the settings handler), then detection runs outside it.
 	a.statsMu.RLock()
 	wd := a.WorkingDir
+	testCommand, lintCommand := a.TestCommand, a.LintCommand
 	a.statsMu.RUnlock()
-	profile := DetectProjectProfile(wd, a.TestCommand, a.LintCommand)
+	profile := DetectProjectProfile(wd, testCommand, lintCommand)
 	a.statsMu.Lock()
 	if a.projectProfile == "" {
 		a.projectProfile = profile

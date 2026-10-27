@@ -687,6 +687,25 @@ func buildConfigFields() map[string]fieldSpec {
 	}
 
 	{
+		f := strSpec("mcpToolMode",
+			func(r *config.Config) *string { return &r.MCPToolMode },
+			func(m *WSMessage) *string { return &m.MCPToolMode })
+		f.normalize = enumNormalize("mcpToolMode", config.MCPToolModeNested, config.MCPToolModeInline)
+		// Pushed as the EFFECTIVE mode: an unset file value means the
+		// default (nested), so the select is never stuck on a blank option.
+		// No applyLive: the mode is part of the fixed request prefix, so a
+		// change applies to new sessions only (never mid-session).
+		f.project = func(r *config.Config, m *WSMessage) {
+			m.MCPToolMode = r.MCPToolMode
+			if strings.TrimSpace(m.MCPToolMode) == "" {
+				m.MCPToolMode = config.DefaultMCPToolMode
+			}
+		}
+		f.sample = config.MCPToolModeInline
+		add(f)
+	}
+
+	{
 		f := strSpec("mcp",
 			func(r *config.Config) *string { return &r.MCP },
 			func(m *WSMessage) *string { return &m.MCP })
@@ -914,6 +933,59 @@ func buildConfigFields() map[string]fieldSpec {
 		// Live for every spawner (web + TUI): jobs are wrapped at spawn time.
 		f.applyLive = func(s *Server, r *config.Config) { agent.ConfigureSubagentPrompt(r.SubagentPrompt) }
 		f.sample = "sub tmpl {job}"
+		add(f)
+	}
+
+	// --- workspace instructions / job notices --------------------------------
+	{
+		f := strSpec("agentInstructions",
+			func(r *config.Config) *string { return &r.AgentInstructions },
+			func(m *WSMessage) *string { return &m.AgentInstructions })
+		f.normalize = onOffNormalize("agentInstructions")
+		// Live: each session agent flips the flag and re-renders its
+		// AGENTS.md/CLAUDE.md section from its CURRENT working dir (enabling
+		// without the refresh would leave the section empty until the next
+		// working-dir change).
+		f.applyLive = func(s *Server, r *config.Config) { s.applyAgentInstructionsToAll(r) }
+		f.sample = "on"
+		add(f)
+	}
+
+	{
+		f := strSpec("jobNotices",
+			func(r *config.Config) *string { return &r.JobNotices },
+			func(m *WSMessage) *string { return &m.JobNotices })
+		f.normalize = onOffNormalize("jobNotices")
+		// Live: install or remove every session's notice hook (the
+		// deliverer is process-wide and always installed).
+		f.applyLive = func(s *Server, r *config.Config) { s.applyJobNoticesToAll(r) }
+		f.sample = "on"
+		add(f)
+	}
+
+	// --- project profile (test / lint commands) ------------------------------
+	// Both override the auto-detection (DetectProjectProfile) for the
+	// project; they are per-session agent state, so applyLive sweeps every
+	// live session and the runtime overlay seeds sessions created later.
+	{
+		f := strSpec("testCommand",
+			func(r *config.Config) *string { return &r.TestCommand },
+			func(m *WSMessage) *string { return &m.TestCommand })
+		// Trimmed only: the command line itself is free text (flags, paths),
+		// and "" means "auto-detect".
+		f.normalize = func(v any) (any, string) { return strings.TrimSpace(v.(string)), "" }
+		f.applyLive = func(s *Server, r *config.Config) { s.applyTestLintCommandsToAll(r) }
+		f.sample = "make test"
+		add(f)
+	}
+
+	{
+		f := strSpec("lintCommand",
+			func(r *config.Config) *string { return &r.LintCommand },
+			func(m *WSMessage) *string { return &m.LintCommand })
+		f.normalize = func(v any) (any, string) { return strings.TrimSpace(v.(string)), "" }
+		f.applyLive = func(s *Server, r *config.Config) { s.applyTestLintCommandsToAll(r) }
+		f.sample = "make vet"
 		add(f)
 	}
 
