@@ -189,13 +189,9 @@ func wsHandleTestProvider(req *wsRequest) {
 // write + sweep).
 func (s *Server) applyProviderList(ws *wsConn, providers []config.OpenAIProviderConfig) {
 	s.ws.SetOpenAIProviders(providers)
-	go func() {
-		s.applyProviderProfilesToAll()
-		if s.config != nil {
-			s.persistConfigForced(s.effectiveConfig())
-		}
-		s.broadcastConfigAll()
-	}()
+	// Provider keys are user-entered in this call, so the write forces the
+	// 0600 secret form.
+	s.persistAndBroadcast(s.applyProviderProfilesToAll, true)
 }
 
 // applyProviderProfilesToAll refreshes every live session provider with the

@@ -245,12 +245,8 @@ func wsHandleMCPDelete(req *wsRequest) {
 // for), broadcasts a fresh config to every tab, and reports the restart
 // requirement off the read loop.
 func (s *Server) persistMCPChange(ws *wsConn, verb string) {
-	go func() {
-		if s.config != nil {
-			s.persistConfigForced(s.effectiveConfig())
-		}
-		s.broadcastConfigAll()
-	}()
+	// MCP env values are user-entered, so the write forces the secret form.
+	s.persistAndBroadcast(nil, true)
 	writeNotice(ws, "mcp", true, verb+" — restart gogen for MCP changes to take effect")
 }
 

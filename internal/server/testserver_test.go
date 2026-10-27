@@ -50,6 +50,12 @@ func drainServer(s *Server) {
 	// t.TempDir() removal ("directory not empty", the suite's documented flake).
 	s.closeWSConns()
 	s.WaitWSHandlers(wsHandlerDrainWait)
+	// Join the settings handlers' persist+broadcast goroutines: they outlive
+	// the handler that launched them, and a config write still in flight when
+	// the caller's t.TempDir() is removed either fails its rename or races
+	// RemoveAll ("directory not empty"). Safe to Wait here because the handler
+	// goroutines were joined above — no handler can launch another one now.
+	s.waitPersistsWithin(2 * time.Second)
 	s.stopAutomations()
 	s.ShutdownSessions()
 

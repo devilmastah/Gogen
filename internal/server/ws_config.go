@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
@@ -388,13 +389,52 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 	// persistence is a file write and the broadcast fans out to every
 	// attached socket. The flag writes above already reached every session
 	// (shared store); only the board manager pointer needs pushing.
+	s.persistAndBroadcast(s.applyBoardManagerToAll, false)
+}
+
+// persistAndBroadcast writes the effective config and pushes a fresh one to
+// every tab, OFF the read loop: the persistence is a file write and the
+// broadcast fans out to every attached socket. pre (optional) runs inside the
+// goroutine before the write, for handlers that must also sweep live state.
+//
+// The goroutine is tracked by persistWg so teardown can join it: it outlives
+// the handler that launched it, and a write still in flight when a caller
+// removes the config directory (tests) fails the rename or, worse, races
+// t.TempDir's RemoveAll ("directory not empty").
+func (s *Server) persistAndBroadcast(pre func(), forceSecrets bool) {
+	s.persistWg.Add(1)
 	go func() {
-		s.applyBoardManagerToAll()
+		defer s.persistWg.Done()
+		if pre != nil {
+			pre()
+		}
 		if s.config != nil {
-			s.persistConfig(s.effectiveConfig())
+			if forceSecrets {
+				s.persistConfigForced(s.effectiveConfig())
+			} else {
+				s.persistConfig(s.effectiveConfig())
+			}
 		}
 		s.broadcastConfigAll()
 	}()
+}
+
+// waitPersistsWithin waits up to d for the in-flight persist+broadcast
+// goroutines to finish, reporting whether they all did. Teardown paths (the
+// test drain) use it so a half-finished config write cannot outlive the
+// directory it writes into.
+func (s *Server) waitPersistsWithin(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.persistWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // effectiveConfig returns the config snapshot used for persistence: the

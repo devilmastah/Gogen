@@ -85,16 +85,7 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 			forceSecrets = true
 		}
 	}
-	go func() {
-		if s.config != nil {
-			if forceSecrets {
-				s.persistConfigForced(s.effectiveConfig())
-			} else {
-				s.persistConfig(s.effectiveConfig())
-			}
-		}
-		s.broadcastConfigAll()
-	}()
+	s.persistAndBroadcast(nil, forceSecrets)
 	if len(restartChanged) > 0 {
 		writeNotice(ws, "settings", true, "Saved — restart gogen for these to take effect: "+strings.Join(restartChanged, ", "))
 	}

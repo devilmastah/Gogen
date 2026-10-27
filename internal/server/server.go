@@ -92,6 +92,12 @@ type Server struct {
 	// acquisition on the same object (the workspace lock it takes inside is
 	// always acquired in this order, and nothing takes them the other way).
 	persistMu sync.Mutex
+	// persistWg tracks the persist+broadcast goroutines the settings handlers
+	// launch off the read loop (see persistAndBroadcast). Nothing on the read
+	// path waits for them, so orderly teardown — the test drain in particular —
+	// joins them before a caller removes the config directory from under a
+	// half-finished write.
+	persistWg sync.WaitGroup
 	wsConnsMu sync.Mutex
 	wsConns   []*websocket.Conn
 	// wsLive counts the live /ws and /ws/editor handler goroutines.
