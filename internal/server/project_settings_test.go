@@ -162,6 +162,16 @@ func TestNewSessionSeedsLiveSettings(t *testing.T) {
 		return len(m.ConfigFields) == 0 && m.Skills == "on" && m.MCPToolMode == "inline"
 	})
 
+	// One config message with BOTH a feature flag (skills) and ConfigFields
+	// (mcpToolMode) persists twice — each branch persists before it pushes, and
+	// the pushes are separate goroutines. Wait for the writes to settle here:
+	// otherwise the second one can still be in flight when the test returns and
+	// its rename lands in an already-removed TempDir ("config save failed").
+	waitForCond(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(projectfile.DefaultSavePath(dir))
+		return err == nil && strings.Contains(string(data), "mcp_tool_mode: inline")
+	})
+
 	child := s.ws.NewSessionAgent(nil, "child-session")
 	if child.TestCommand != "go test ./pkg/..." || child.LintCommand != "go vet ./pkg/..." {
 		t.Fatalf("new session commands = %q/%q, want the configured overrides", child.TestCommand, child.LintCommand)

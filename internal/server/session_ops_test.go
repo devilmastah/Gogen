@@ -259,7 +259,15 @@ func TestSessionAttachLoadsInactiveSession(t *testing.T) {
 	var hist WSMessage
 	for gotCfg, gotHist := false, false; !gotCfg || !gotHist; {
 		m := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
-			return m.Type == "config" || m.Type == "history"
+			if m.Type != "config" && m.Type != "history" {
+				return false
+			}
+			// The connect handshake sends session_state first and its own
+			// config/history AFTERWARDS from a goroutine (a running turn must
+			// never delay the handshake), so on a loaded box that pair can
+			// land between this attach reply's frames. Only frames for the
+			// attached session are this test's subject.
+			return m.SessionID == "disk-session"
 		})
 		switch m.Type {
 		case "config":
