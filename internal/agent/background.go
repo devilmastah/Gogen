@@ -2,10 +2,8 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"slices"
 	"strings"
 	"sync"
@@ -13,6 +11,7 @@ import (
 	"time"
 
 	"gogen/internal/contextmgr"
+	"gogen/internal/procutil"
 	"gogen/internal/randhex"
 )
 
@@ -313,22 +312,6 @@ func (a *Agent) backgroundJob(jobID string) *BackgroundJob {
 	return a.bgJobs[jobID]
 }
 
-// exitCodeOf extracts the process exit code from err. A clean exit (nil err)
-// yields 0. An *exec.ExitError yields its real exit code (or -1 when the
-// process was killed by a signal). Any other error is an unusual failure
-// (I/O error, etc.) and yields fallback, which callers pass as -1 so it stays
-// distinct from a genuine non-zero exit such as 1.
-func exitCodeOf(err error, fallback int) int {
-	if err == nil {
-		return 0
-	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return ee.ExitCode()
-	}
-	return fallback
-}
-
 // BackgroundJobStatus reports the state of a background job: whether it is
 // still running, its exit code when finished, and the tail of its output.
 // Finished jobs stay registered for a bounded retention window, so the agent
@@ -344,23 +327,13 @@ func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
 	}
 	elapsed := time.Since(job.Start).Round(time.Millisecond)
 
-	running := true
-	var exitErr error
-	select {
-	case <-job.done:
-		running = false
-		job.mu.Lock()
-		exitErr = job.exitErr
-		job.mu.Unlock()
-	default:
-	}
-	switch {
-	case running:
+	state, exitCode := jobState(job)
+	switch state {
+	case "RUNNING":
 		return fmt.Sprintf("Job %s is RUNNING (%s elapsed).\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job, true)), nil
-	case job.cancelled.Load():
+	case "CANCELLED":
 		return fmt.Sprintf("Job %s was CANCELLED after %s.\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job, false)), nil
 	}
-	exitCode := exitCodeOf(exitErr, -1)
 	return fmt.Sprintf("Job %s FINISHED in %s with exit code %d.\nCommand: %s\n%s", job.ID, elapsed, exitCode, job.Command, formatJobOutput(job, false)), nil
 }
 
@@ -514,22 +487,36 @@ func (a *Agent) BackgroundJobsList() string {
 	return b.String()
 }
 
+// jobState reports a shell job's lifecycle state and its exit code at one
+// instant: "RUNNING", "CANCELLED", or "FINISHED" (with the code; -1 for a
+// signal kill or an unusual failure). The status reply and the list view both
+// render from it, so they can never disagree about whether a job finished or
+// about its code — they used to read the done channel, the cancel flag and
+// exitErr independently.
+func jobState(job *BackgroundJob) (state string, exitCode int) {
+	select {
+	case <-job.done:
+	default:
+		return "RUNNING", 0
+	}
+	if job.cancelled.Load() {
+		return "CANCELLED", 0
+	}
+	job.mu.Lock()
+	err := job.exitErr
+	job.mu.Unlock()
+	return "FINISHED", procutil.ExitCode(err)
+}
+
 // backgroundJobState renders a shell job's one-word state for the list view:
 // RUNNING, CANCELLED, or FINISHED with the exit code (-1 for a signal kill
 // or an unusual failure).
 func backgroundJobState(job *BackgroundJob) string {
-	select {
-	case <-job.done:
-		if job.cancelled.Load() {
-			return "CANCELLED"
-		}
-		job.mu.Lock()
-		err := job.exitErr
-		job.mu.Unlock()
-		return fmt.Sprintf("FINISHED exit %d", exitCodeOf(err, -1))
-	default:
-		return "RUNNING"
+	state, code := jobState(job)
+	if state == "FINISHED" {
+		return fmt.Sprintf("FINISHED exit %d", code)
 	}
+	return state
 }
 
 // CancelBackgroundJob cancels a running background job, killing its process
@@ -681,7 +668,7 @@ const maxJobNoticeCommandLen = 120
 // command, and exit code (-1 for unusual failures such as I/O errors).
 // Called from the job's wait goroutine after exitErr is final.
 func jobExitSummary(job *BackgroundJob) string {
-	code := exitCodeOf(job.exitErr, -1)
+	code := procutil.ExitCode(job.exitErr)
 	// Truncate makes a rune-safe cut: a raw byte slice could split a
 	// multi-byte character and emit invalid UTF-8 into the transcript.
 	cmd := contextmgr.Truncate(job.Command, maxJobNoticeCommandLen,

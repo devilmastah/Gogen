@@ -8,6 +8,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/session"
+	"gogen/internal/textutil"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -765,7 +766,7 @@ func summarizeResult(result string, success bool) string {
 			first = first[:idx]
 		}
 		if len(first) > 120 {
-			first = truncateRunes(first, 117) + "..."
+			first = textutil.TruncateRunes(first, 117) + "..."
 		}
 		return fmt.Sprintf("%s (%d chars)", first, chars)
 	}

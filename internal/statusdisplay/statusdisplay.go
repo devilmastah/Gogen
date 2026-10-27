@@ -31,6 +31,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/debuglog"
+	"gogen/internal/textutil"
 )
 
 // DefaultSource is the display row (feed) name used when neither the config
@@ -215,7 +216,7 @@ func Configure(enabled bool, host, token, source, workdir string) {
 		// name from the then-current directory.
 		autoSource = ""
 	}
-	source = truncate(strings.TrimSpace(source), sourceMax)
+	source = textutil.TruncateRunes(strings.TrimSpace(source), sourceMax)
 	if source == "" {
 		source = DefaultSource
 	}
@@ -578,7 +579,7 @@ func sourceForDir(dir string) string {
 		}
 		return r
 	}, base)
-	return DefaultSource + "-" + truncate(base, 24)
+	return DefaultSource + "-" + textutil.TruncateRunes(base, 24)
 }
 
 // displayName names a target in logs without ever printing the token.

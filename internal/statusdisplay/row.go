@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/textutil"
 )
 
 // Display limits from the ttgo/status firmware (TITLE_MAX / MSG_MAX in
@@ -73,8 +74,8 @@ func buildRow(ev agent.TurnEvent, c Config, elapsed time.Duration) ([]byte, erro
 	default:
 		row.Message = asciiOnly(joinContext(appendElapsed(activityFor(ev), elapsed), ctx))
 	}
-	row.Title = truncate(row.Title, titleMax)
-	row.Message = truncate(row.Message, msgMax)
+	row.Title = textutil.TruncateRunes(row.Title, titleMax)
+	row.Message = textutil.TruncateRunes(row.Message, msgMax)
 	return json.Marshal(row)
 }
 
@@ -178,7 +179,7 @@ func projectTag(dir string) string {
 	if base == "" {
 		return ""
 	}
-	return truncate(asciiOnly(base), 10)
+	return textutil.TruncateRunes(asciiOnly(base), 10)
 }
 
 // activityFor is the short human-readable activity for a phase. ASCII only:
@@ -253,16 +254,6 @@ func asciiOnly(s string) string {
 // display's single-line message field.
 func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
-}
-
-// truncate cuts s to at most n runes (the firmware's limits are byte
-// counts; cutting on a rune boundary keeps UTF-8 intact).
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n])
 }
 
 // dirBase returns the base name of a project directory for display use, or ""

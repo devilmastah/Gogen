@@ -9,6 +9,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/llm"
 	"gogen/internal/session"
+	"gogen/internal/textutil"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
@@ -820,7 +821,7 @@ const sidebarFooterButtonsLen = len(sidebarFooterNewLabel) + 2 + len(sidebarFoot
 func (m *Model) renderSidebarFooter(inner int) string {
 	if inner < sidebarFooterButtonsLen {
 		// Reserve one cell before the right border like the button form.
-		return ansiDimOn + "│ " + truncateRunes(sidebarFooterPlain, max(0, inner-1)) +
+		return ansiDimOn + "│ " + textutil.TruncateRunes(sidebarFooterPlain, max(0, inner-1)) +
 			" " + ansiReset
 	}
 	btn := func(b int) string {
@@ -831,7 +832,7 @@ func (m *Model) renderSidebarFooter(inner int) string {
 	}
 	tail := "  " + sidebarFooterRest
 	if inner < len(sidebarFooterPlain)+1 {
-		tail = truncateRunes(tail, inner-sidebarFooterButtonsLen-1)
+		tail = textutil.TruncateRunes(tail, inner-sidebarFooterButtonsLen-1)
 	}
 	line := btn(sidebarFooterNew) + sidebarFooterNewLabel + ansiReset + "  " +
 		btn(sidebarFooterClose) + sidebarFooterCloseLabel + ansiReset + "  " +

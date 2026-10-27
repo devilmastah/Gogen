@@ -95,8 +95,11 @@ func GlobalConfigDir() string {
 	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
 		return filepath.Join(d, "gogen")
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "gogen")
+	// One policy for an unresolvable home: HomeDir's "." (relative to the
+	// working directory). The two global dirs used to ignore the error
+	// instead, which resolved HOME="" to the same relative path by accident —
+	// now it is the documented rule rather than a coincidence.
+	return filepath.Join(HomeDir(), ".config", "gogen")
 }
 
 // GlobalDataDir returns the platform-appropriate global data directory
@@ -105,8 +108,7 @@ func GlobalDataDir() string {
 	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
 		return filepath.Join(d, "gogen")
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "gogen")
+	return filepath.Join(HomeDir(), ".local", "share", "gogen")
 }
 
 // GlobalConfigPath returns the path to the global config YAML file.

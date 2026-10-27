@@ -8,6 +8,7 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/textutil"
 )
 
 // reasoningExcerptRunes is the tail of a cut thinking round kept with the
@@ -344,12 +345,15 @@ func reasoningExcerpt(s string) string {
 	return "..." + string(r[len(r)-reasoningExcerptRunes:])
 }
 
+// clipRunes cuts s to n runes and appends "..." — the marker sits BEYOND the
+// budget, unlike textutil.TruncateRunesEllipsis, because this bounds displayed
+// argument text rather than filling a fixed-width field: keeping the rune
+// count exact would silently shorten what the model gets to see by three.
 func clipRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
+	if t := textutil.TruncateRunes(s, n); t != s {
+		return t + "..."
 	}
-	return string(r[:n]) + "..."
+	return s
 }
 
 func pausedToolBlock(calls []llm.ToolCall, reasoning string) string {

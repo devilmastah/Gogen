@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"gogen/internal/contextmgr"
+	"gogen/internal/procutil"
 )
 
 // DefaultMaxScroll bounds the retained scrollback of a Session (bytes). Older
@@ -438,7 +439,7 @@ func (s *Session) waitLoop() {
 	time.Sleep(30 * time.Millisecond)
 	s.exitMu.Lock()
 	s.waitErr = err
-	s.exitCode = exitCodeOf(err)
+	s.exitCode = procutil.ExitCode(err)
 	s.exitMu.Unlock()
 	_ = s.closeHandle()
 	close(s.done)
@@ -457,13 +458,3 @@ func (s *Session) closeHandle() error {
 
 // exitCodeOf extracts the exit code from a Wait error: 0 for a clean exit, the
 // real code for an *exec.ExitError, and -1 for a signal kill or unusual error.
-func exitCodeOf(err error) int {
-	if err == nil {
-		return 0
-	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return ee.ExitCode()
-	}
-	return -1
-}

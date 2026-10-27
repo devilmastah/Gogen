@@ -12,6 +12,7 @@ import (
 
 	"gogen/internal/debuglog"
 	"gogen/internal/llm"
+	"gogen/internal/textutil"
 )
 
 // ViewDriftCompiledIn reports whether this binary includes the view-drift
@@ -189,11 +190,12 @@ const driftPreviewMaxRunes = 160
 func driftPreview(s string) string {
 	s = strings.ReplaceAll(s, "\n", "\\n")
 	s = strings.ReplaceAll(s, "\t", "\\t")
-	if utf8.RuneCountInString(s) <= driftPreviewMaxRunes {
-		return s
+	// The marker sits beyond the budget (like clipRunes): this is a log/diff
+	// preview, not a fixed-width field.
+	if t := textutil.TruncateRunes(s, driftPreviewMaxRunes); t != s {
+		return t + "…"
 	}
-	runes := []rune(s)
-	return string(runes[:driftPreviewMaxRunes]) + "…"
+	return s
 }
 
 func messageChangedFields(prev, cur *llm.Message) []string {

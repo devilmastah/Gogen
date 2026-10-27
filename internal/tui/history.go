@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"gogen/internal/llm"
+	"gogen/internal/textutil"
 )
 
 // renderMessages converts a slice of LLM messages into styled display lines
@@ -184,7 +185,7 @@ func formatArgsMap(args map[string]any, maxLen int, skip func(string) bool) stri
 		// maxLen counts RUNES (truncateRunes); comparing bytes made a CJK value
 		// get an ellipsis without actually being shortened.
 		if utf8.RuneCountInString(val) > maxLen {
-			val = truncateRunes(val, maxLen-3) + "..."
+			val = textutil.TruncateRunes(val, maxLen-3) + "..."
 		}
 		parts = append(parts, fmt.Sprintf("%s=%q", k, val))
 	}

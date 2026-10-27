@@ -10,6 +10,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/debuglog"
 	"gogen/internal/steerq"
+	"gogen/internal/textutil"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -384,7 +385,7 @@ func (m *Model) renderQueueModal() string {
 			if it.Kind != steerq.User {
 				label = "[delivery] " + label
 			}
-			label = truncateRunes(label, 58)
+			label = textutil.TruncateRunes(label, 58)
 			prefix := "  "
 			if i == cursor {
 				prefix = "> "

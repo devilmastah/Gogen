@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gogen/internal/onoff"
+	"gogen/internal/textutil"
 )
 
 // RunCLI executes the `gogen automation` subcommand tree:
@@ -561,11 +562,7 @@ func onOff(v bool) string {
 
 func clip(s string, n int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n-1]) + "…"
+	return textutil.TruncateRunesEllipsis(s, n, "…")
 }
 
 func formatTime(t *time.Time) string {
