@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -818,7 +819,13 @@ func TestCompileSearchPatternIgnoreCase(t *testing.T) {
 // value, so a PATH change (a test, or rg installed mid-session) is still seen.
 func TestRGAvailableFollowsPath(t *testing.T) {
 	dir := t.TempDir()
-	rg := filepath.Join(dir, "rg")
+	// exec.LookPath appends PATHEXT on Windows, so the probe binary must be
+	// rg.exe there (a bare "rg" is never found, however executable it is).
+	name := "rg"
+	if runtime.GOOS == "windows" {
+		name = "rg.exe"
+	}
+	rg := filepath.Join(dir, name)
 	if err := os.WriteFile(rg, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}

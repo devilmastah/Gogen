@@ -73,6 +73,23 @@ func schedulerTestLogger(t *testing.T) func(format string, args ...any) {
 	}
 }
 
+// stopScheduler stops s and WAITS for the sweep loop to exit. Stop alone only
+// signals the loop, so a sweep already past its tick check could still claim a
+// row (and touch the store directory) after the test body returned — which is
+// harmless on Linux but makes t.TempDir cleanup fail on Windows ("The
+// directory is not empty"). Every scheduler test must use this.
+func stopScheduler(t *testing.T, s *Scheduler) {
+	t.Helper()
+	s.Stop()
+	if done := s.Done(); done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Log("scheduler sweep loop did not exit after Stop")
+		}
+	}
+}
+
 // newSchedulerTest builds a store + scheduler with millisecond sweeps and a
 // controllable clock.
 func newSchedulerTest(t *testing.T, fire FireFunc) (*Scheduler, *Store, *timeCursor) {
@@ -130,7 +147,7 @@ func TestSchedulerFiresDueAndRecords(t *testing.T) {
 
 	ctx := context.Background()
 	s.Start(ctx)
-	defer s.Stop()
+	defer stopScheduler(t, s)
 
 	waitCond(t, 2*time.Second, "automation fired", func() bool { return fire.count() == 1 })
 	waitCond(t, 2*time.Second, "run recorded", func() bool {
@@ -162,7 +179,7 @@ func TestSchedulerSpawnFailureRecorded(t *testing.T) {
 	a := dueAutomation(t, st, cursor)
 
 	s.Start(context.Background())
-	defer s.Stop()
+	defer stopScheduler(t, s)
 
 	waitCond(t, 2*time.Second, "failed run recorded", func() bool {
 		runs := st.Runs(a.ID)
@@ -184,7 +201,7 @@ func TestSchedulerRunFailureRecorded(t *testing.T) {
 	a := dueAutomation(t, st, cursor)
 
 	s.Start(context.Background())
-	defer s.Stop()
+	defer stopScheduler(t, s)
 
 	waitCond(t, 2*time.Second, "failed run recorded", func() bool {
 		runs := st.Runs(a.ID)
@@ -206,7 +223,7 @@ func TestSchedulerMissedRunsAreNotFired(t *testing.T) {
 	setStoredNextRun(t, st, a.ID, cursor.t.Add(-48*time.Hour))
 
 	s.Start(context.Background())
-	defer s.Stop()
+	defer stopScheduler(t, s)
 
 	waitCond(t, 2*time.Second, "missed run recorded", func() bool {
 		return len(st.Runs(a.ID)) == 1 && st.Runs(a.ID)[0].Status == RunMissed
@@ -237,7 +254,7 @@ func TestSchedulerInterruptedRunsMarked(t *testing.T) {
 	setStoredNextRun(t, st, a.ID, cursor.t.Add(time.Hour))
 
 	s.Start(context.Background())
-	defer s.Stop()
+	defer stopScheduler(t, s)
 
 	waitCond(t, 2*time.Second, "run marked interrupted", func() bool {
 		for _, r := range st.Runs(a.ID) {

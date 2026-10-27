@@ -15,7 +15,10 @@ import (
 // detach that armed the timer.
 func TestApprovalHoldTimerSparesReattachedClient(t *testing.T) {
 	rt := newTestRuntime(t)
-	rt.approvalHold = 50 * time.Millisecond
+	// The margin must survive a scheduling stall between detach and
+	// re-attach: 50 ms was tight enough that a loaded CI runner (Windows)
+	// lost the race — the timer fired before the client was back.
+	rt.approvalHold = 400 * time.Millisecond
 
 	ws := newFakeWSConn()
 	rt.clientsMu.Lock()
@@ -40,7 +43,7 @@ func TestApprovalHoldTimerSparesReattachedClient(t *testing.T) {
 	select {
 	case approved := <-done:
 		t.Fatalf("the hold timer denied a pending approval despite a re-attached client (approved=%v)", approved)
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(900 * time.Millisecond): // > 2x the hold: the timer has certainly expired
 	}
 
 	// The re-attached client's answer still decides it.

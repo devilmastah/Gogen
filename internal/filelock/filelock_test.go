@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -32,7 +33,9 @@ func TestAcquireReleaseRoundTrip(t *testing.T) {
 	}
 	defer l2.Release()
 
-	if Supported() {
+	// Locking itself is supported on Windows (LockFileEx), but POSIX mode
+	// bits are not: Stat reports 0666 for any writable file there.
+	if Supported() && runtime.GOOS != "windows" {
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatalf("lock file not created: %v", err)

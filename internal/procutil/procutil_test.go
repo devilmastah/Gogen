@@ -3,6 +3,7 @@ package procutil
 import (
 	"errors"
 	"os/exec"
+	"runtime"
 	"testing"
 )
 
@@ -26,6 +27,11 @@ func TestExitCode(t *testing.T) {
 }
 
 func TestWasSignaled(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// TerminateProcess gives the child a plain exit code (1), never the
+		// negative "signaled" status Wait reports on POSIX.
+		t.Skip("Windows terminates processes without POSIX signal semantics")
+	}
 	// A child killed by SIGKILL reports a negative exit code from exec.
 	cmd := exec.Command("sh", "-c", "sleep 30")
 	if err := cmd.Start(); err != nil {
