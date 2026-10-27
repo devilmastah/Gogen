@@ -86,10 +86,17 @@ func newRecordingServer(t *testing.T) (*httptest.Server, *sync.Mutex, *[]recorde
 	return srv, &mu, &reqs
 }
 
+// testWaitBudget bounds the polling helpers below. Every one of them waits
+// for the reporter goroutine to apply an update, so under -race with the
+// other packages running in parallel a fixed 3s budget failed intermittently
+// on a loaded machine (the update landed ~3s late). The budget only bounds
+// the WAIT; nothing asserts on elapsed time.
+const testWaitBudget = 15 * time.Second
+
 // waitForReqs waits until at least n requests were recorded.
 func waitForReqs(t *testing.T, mu *sync.Mutex, reqs *[]recordedReq, n int) {
 	t.Helper()
-	waitForReqsWithin(t, mu, reqs, n, 3*time.Second)
+	waitForReqsWithin(t, mu, reqs, n, testWaitBudget)
 }
 
 // waitForReqsWithin is waitForReqs with an explicit timeout (the liveness
@@ -363,7 +370,7 @@ func newProbeServer(t *testing.T, info string, status int) *httptest.Server {
 // waitForEnabled polls the package config until Enabled matches want.
 func waitForEnabled(t *testing.T, want bool) Config {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testWaitBudget)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		got := cfg
@@ -475,7 +482,7 @@ func TestProcessKeepsTheQueueTimeTransport(t *testing.T) {
 // waitForRelayed waits until n sink calls were recorded.
 func waitForRelayed(t *testing.T, mu *sync.Mutex, got *[]relayed, n int) []relayed {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testWaitBudget)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		if len(*got) >= n {
@@ -544,7 +551,7 @@ func TestProbeStaysOffWhenAbsent(t *testing.T) {
 // active sender.
 func waitForTransport(t *testing.T, wantRelay bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testWaitBudget)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		active := sink != nil
@@ -590,7 +597,7 @@ func TestProbeWithRelayPrefersServer(t *testing.T) {
 	waitForTransport(t, false)
 	Notify(agent.TurnEvent{Phase: agent.TurnPhaseStarted})
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testWaitBudget)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		posts := statusPosts
@@ -635,7 +642,7 @@ func TestProbeWithRelayFallsBackToRelay(t *testing.T) {
 	})
 
 	Notify(agent.TurnEvent{Phase: agent.TurnPhaseStarted})
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testWaitBudget)
 	for time.Now().Before(deadline) {
 		if atomic.LoadInt32(&relayCalls) >= 1 {
 			break

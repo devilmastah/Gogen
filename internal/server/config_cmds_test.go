@@ -134,12 +134,24 @@ func TestSetModelIsPerSession(t *testing.T) {
 	if err := conn.WriteJSON(WSMessage{Type: "set_model", Model: "m2", SessionID: sidA}); err != nil {
 		t.Fatalf("send set_model: %v", err)
 	}
-	echo := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
-	if echo.SessionID != sidA {
-		t.Fatalf("first config after set_model(A) is for session %q, want %q (cross-pane broadcast)", echo.SessionID, sidA)
-	}
-	if echo.Model != "m2" {
-		t.Fatalf("set_model config Model = %q, want m2", echo.Model)
+	// Read up to the A echo carrying m2. The discriminating check is that no
+	// frame for ANOTHER session shows up before it (that would be the
+	// rejected cross-pane broadcast). Extra A frames are legitimate: a stats
+	// echo generated before set_model can still be queued behind the
+	// request, and asserting on "the first config frame" made this test fail
+	// intermittently under -race when the scheduler delayed that drain.
+	msgs := readMessagesUntil(t, conn, 10*time.Second, func(all []WSMessage) bool {
+		for _, m := range all {
+			if m.Type == "config" && m.SessionID == sidA && m.Model == "m2" {
+				return true
+			}
+		}
+		return false
+	})
+	for _, m := range msgs {
+		if m.Type == "config" && m.SessionID != "" && m.SessionID != sidA {
+			t.Fatalf("a config for session %q arrived before set_model(A)'s echo (cross-pane broadcast)", m.SessionID)
+		}
 	}
 	if s.ws.Model != defaultModel {
 		t.Fatalf("workspace default mutated by set_model: %q → %q (per-session D1)", defaultModel, s.ws.Model)
