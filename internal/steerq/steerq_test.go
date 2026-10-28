@@ -88,30 +88,97 @@ func TestUserItemsDoNotCompeteWithSystemItems(t *testing.T) {
 }
 
 // TestBatch pins the batching rule the two hosts used to duplicate: a
-// contiguous head run of notices is one turn, and anything else is its own.
+// contiguous head run of notices is one turn, a run of user messages is one
+// turn only with join_queued, and anything else is its own.
 func TestBatch(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		kinds []Kind
+		join  bool
 		want  int
 	}{
-		{"single notice", []Kind{Notice}, 1},
-		{"notice run", []Kind{Notice, Notice, Notice}, 3},
-		{"notice run then user", []Kind{Notice, Notice, User, Notice}, 2},
-		{"notice run then reply", []Kind{Notice, Reply, Notice}, 1},
-		{"user head", []Kind{User, Notice}, 1},
-		{"reply head", []Kind{Reply, Notice}, 1},
+		{"single notice", []Kind{Notice}, false, 1},
+		{"notice run", []Kind{Notice, Notice, Notice}, false, 3},
+		{"notice run then user", []Kind{Notice, Notice, User, Notice}, false, 2},
+		{"notice run then reply", []Kind{Notice, Reply, Notice}, false, 1},
+		{"user head", []Kind{User, Notice}, false, 1},
+		{"user run without join", []Kind{User, User, User}, false, 1},
+		{"user run with join", []Kind{User, User, User}, true, 3},
+		{"joined user run then notice", []Kind{User, User, Notice}, true, 2},
+		{"reply head with join", []Kind{Reply, Reply}, true, 1},
+		{"reply head", []Kind{Reply, Notice}, false, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := New(0, 0)
 			for i, k := range tc.kinds {
 				q.Append(Item{ID: string(rune('a' + i)), Text: string(rune('a' + i)), Kind: k})
 			}
-			if got := len(q.Batch()); got != tc.want {
-				t.Fatalf("Batch() = %d items, want %d", got, tc.want)
+			if got := len(q.Batch(tc.join)); got != tc.want {
+				t.Fatalf("Batch(%v) = %d items, want %d", tc.join, got, tc.want)
 			}
 			if q.Len() != len(tc.kinds) {
 				t.Fatalf("Batch mutated the queue: len = %d", q.Len())
+			}
+		})
+	}
+}
+
+// TestJoin pins the one prompt a batch runs as: texts in queue order with a
+// blank line between them, and every item's images in that same order.
+func TestJoin(t *testing.T) {
+	a := llm.ImageInput{DataURL: "data:image/png;base64,AA"}
+	b := llm.ImageInput{DataURL: "data:image/png;base64,BB"}
+	for _, tc := range []struct {
+		name       string
+		batch      []Item
+		wantText   string
+		wantImages []llm.ImageInput
+	}{
+		{"single item", []Item{{Text: "one", Images: []llm.ImageInput{a}}}, "one", []llm.ImageInput{a}},
+		{"run", []Item{{Text: "one", Images: []llm.ImageInput{a}}, {Text: "two"}, {Text: "three", Images: []llm.ImageInput{b}}},
+			"one\n\ntwo\n\nthree", []llm.ImageInput{a, b}},
+		{"run without images", []Item{{Text: "one"}, {Text: "two"}}, "one\n\ntwo", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text, images := Join(tc.batch)
+			if text != tc.wantText {
+				t.Fatalf("text = %q, want %q", text, tc.wantText)
+			}
+			if len(images) != len(tc.wantImages) {
+				t.Fatalf("images = %d, want %d", len(images), len(tc.wantImages))
+			}
+			for i := range images {
+				if images[i].DataURL != tc.wantImages[i].DataURL {
+					t.Fatalf("image %d = %q, want %q", i, images[i].DataURL, tc.wantImages[i].DataURL)
+				}
+			}
+		})
+	}
+}
+
+// TestSendNowReady pins when Send now may stop the running turn: only while
+// a user message it would deliver is still queued.
+func TestSendNowReady(t *testing.T) {
+	q := New(0, 0)
+	q.Append(Item{ID: "n1", Kind: Notice})
+	for _, tc := range []struct {
+		name string
+		user bool
+		id   string
+		want bool
+	}{
+		{"only notices queued", false, "", false},
+		{"notice id is not a user item", false, "n1", false},
+		{"any user item", true, "", true},
+		{"that user item", true, "u1", true},
+		{"a user item that left", true, "u-gone", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.user && !q.Has("u1", User) {
+				q.Append(Item{ID: "u1", Kind: User})
+			}
+			if got := q.SendNowReady(tc.id); got != tc.want {
+				t.Fatalf("SendNowReady(%q) = %v, want %v", tc.id, got, tc.want)
 			}
 		})
 	}
@@ -188,7 +255,7 @@ func TestRemoveAndHas(t *testing.T) {
 // runtime/session whose queue was never created must not panic on a read).
 func TestNilQueueIsInert(t *testing.T) {
 	var q *Queue
-	if q.Len() != 0 || q.Count(User) != 0 || q.Items() != nil || q.Batch() != nil {
+	if q.Len() != 0 || q.Count(User) != 0 || q.Items() != nil || q.Batch(true) != nil || q.SendNowReady("") {
 		t.Fatal("nil queue must read as empty")
 	}
 	if _, ok := q.Peek(); ok {

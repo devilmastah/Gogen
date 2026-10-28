@@ -438,6 +438,9 @@ type WSMessage struct {
 	// job_notices posts a follow-up turn when a background job finishes.
 	AgentInstructions string `json:"agentInstructions,omitempty"`
 	JobNotices        string `json:"jobNotices,omitempty"`
+	// JoinQueued ("on"/"off") is join_queued: user messages queued during
+	// one turn leave together as one message.
+	JoinQueued string `json:"joinQueued,omitempty"`
 	// TestCommand / LintCommand override the auto-detected project commands
 	// (client→server inside ConfigFields; server→client current value in
 	// config pushes). "" = auto-detect.

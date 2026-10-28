@@ -963,6 +963,17 @@ func buildConfigFields() map[string]fieldSpec {
 		add(f)
 	}
 
+	{
+		f := strSpec("joinQueued",
+			func(r *config.Config) *string { return &r.JoinQueued },
+			func(m *WSMessage) *string { return &m.JoinQueued })
+		f.normalize = onOffNormalize("joinQueued")
+		// Live: every runtime's drain reads the workspace flag at its next pop.
+		f.applyLive = func(s *Server, r *config.Config) { s.ws.SetJoinQueued(r.JoinQueuedEnabled()) }
+		f.sample = "on"
+		add(f)
+	}
+
 	// --- project profile (test / lint commands) ------------------------------
 	// Both override the auto-detection (DetectProjectProfile) for the
 	// project; they are per-session agent state, so applyLive sweeps every

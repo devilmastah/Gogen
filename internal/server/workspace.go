@@ -92,6 +92,10 @@ type Workspace struct {
 	jobNotices         bool
 	jobNoticeDeliverer func(agentID, summary string)
 
+	// joinQueued is the live join_queued flag. Each runtime's delivery
+	// worker reads it at its pop, and the settings handler writes it.
+	joinQueued atomic.Bool
+
 	// The persistent-terminal feature tools ride on the shared flag
 	// store's terminalEnabled flag (see Get/SetTerminalEnabled), like the
 	// board and subagent flags — no per-workspace mirror to desync.
@@ -364,6 +368,19 @@ func (ws *Workspace) SetJobNotices(on bool) {
 	ws.jobNoticesMu.Lock()
 	ws.jobNotices = on
 	ws.jobNoticesMu.Unlock()
+}
+
+// JoinQueued reports whether user messages queued during one turn leave
+// together as one message (join_queued).
+func (ws *Workspace) JoinQueued() bool {
+	return ws != nil && ws.joinQueued.Load()
+}
+
+// SetJoinQueued updates the live join_queued flag.
+func (ws *Workspace) SetJoinQueued(on bool) {
+	if ws != nil {
+		ws.joinQueued.Store(on)
+	}
 }
 
 // GetReviewAgentEnabled returns the live board auto-review flag.
@@ -658,6 +675,7 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		subagentDepthFrom(cfg),
 		subagentLimitFrom(cfg),
 	))
+	ws.joinQueued.Store(cfg.JoinQueuedEnabled())
 	if cfg != nil {
 		ws.flags().SetReviewAgentEnabled(cfg.ReviewAgentEnabled())
 		ws.flags().SetAutomationsEnabled(cfg.AutomationsEnabled())

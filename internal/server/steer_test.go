@@ -100,10 +100,8 @@ func TestUserSteerEnqueueDrainsFIFO(t *testing.T) {
 	}
 	// Each queued item ran as its OWN turn: an assistant reply between the
 	// two user messages.
-	for i := ia; i < ib; i++ {
-		if m := a.SnapshotMessages()[i]; m.Role == "assistant" {
-			break
-		}
+	if !hasAssistantBetween(a, ia, ib) {
+		t.Fatalf("no assistant reply between steer-a@%d and steer-b@%d, want one turn each", ia, ib)
 	}
 
 	stub.releaseN(4)
@@ -111,6 +109,111 @@ func TestUserSteerEnqueueDrainsFIFO(t *testing.T) {
 	// (the store-wait pattern used across this suite): three completed
 	// turns (steer-a, steer-b, sys notice).
 	waitTurnsPersisted(t, store, dir, a.SessionID, 3)
+}
+
+// hasAssistantBetween reports whether an assistant message sits between the
+// messages at indexes from and to.
+func hasAssistantBetween(a *agent.Agent, from, to int) bool {
+	msgs := a.SnapshotMessages()
+	for i := from + 1; i < to && i < len(msgs); i++ {
+		if msgs[i].Role == "assistant" {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUserSteerJoinQueued pins join_queued: user messages queued during one
+// turn leave together as ONE user message, with every image in queue order,
+// the queue_update that starts it carries every id and the delivered text,
+// and the notice behind them stays its own turn.
+func TestUserSteerJoinQueued(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	s.ws.SetJoinQueued(true)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	startBlockedTurn(t, rt, stub, "block me")
+	imgA := llm.ImageInput{DataURL: "data:image/png;base64,AAAA"}
+	imgB := llm.ImageInput{DataURL: "data:image/png;base64,BBBB"}
+	if !rt.enqueueUserTurn("q1", "steer-a", []llm.ImageInput{imgA}) || !rt.enqueueUserTurn("q2", "steer-b", []llm.ImageInput{imgB}) {
+		t.Fatal("steer enqueue refused")
+	}
+	rt.deliverToSession("sys notice")
+
+	rt.stream.cancelInFlight()
+	started := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "queue_update" && len(m.QueueLeft) > 0
+	})
+	if strings.Join(started.QueueLeft, ",") != "q1,q2" || started.Content != "steer-a\n\nsteer-b" {
+		t.Fatalf("start frame = left %v content %q, want both ids and the joined text", started.QueueLeft, started.Content)
+	}
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
+	ia := userMsgIndex(a, "steer-a")
+	if ib := userMsgIndex(a, "steer-b"); ib != ia {
+		t.Fatalf("steer-a@%d steer-b@%d, want one joined message", ia, ib)
+	}
+	images := a.SnapshotMessages()[ia].Images
+	if len(images) != 2 || images[0].DataURL != imgA.DataURL || images[1].DataURL != imgB.DataURL {
+		t.Fatalf("joined message images = %+v, want both in queue order", images)
+	}
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "sys notice") >= 0 })
+	if is := userMsgIndex(a, "sys notice"); !hasAssistantBetween(a, ia, is) {
+		t.Fatalf("sys notice @%d ran in the joined turn @%d, want its own turn", is, ia)
+	}
+	stub.releaseN(3)
+	waitTurnsPersisted(t, store, dir, a.SessionID, 2)
+}
+
+// TestSendNowGating pins when Send now may stop the running turn: only while
+// a turn runs and the named user item (or, unnamed, any user item) is still
+// queued. Anything else must leave the turn alone.
+func TestSendNowGating(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	if rt.sendNow("") {
+		t.Fatal("Send now with no turn running asked for a yield")
+	}
+
+	startBlockedTurn(t, rt, stub, "block me")
+	if rt.sendNow("") {
+		t.Fatal("Send now with an empty queue asked for a yield")
+	}
+	rt.deliverToSession("sys notice")
+	if rt.sendNow("") {
+		t.Fatal("Send now with only a notice queued asked for a yield")
+	}
+	if !rt.enqueueUserTurn("q1", "steer-a", nil) {
+		t.Fatal("steer enqueue refused")
+	}
+	if rt.sendNow("q-gone") {
+		t.Fatal("Send now for an item that is no longer queued asked for a yield")
+	}
+	if !rt.sendNow("q1") || !rt.sendNow("") {
+		t.Fatal("Send now with a queued user item did not ask for a yield")
+	}
+
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "sys notice") >= 0 })
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
+	stub.releaseN(3)
+	waitTurnsPersisted(t, store, dir, a.SessionID, 2)
 }
 
 // TestUserQueueCapRejects pins the user-side overflow policy: user text is

@@ -51,6 +51,7 @@ var wsHandlers = map[string]wsHandlerEntry{
 	"compact":            {handle: wsHandleCompact},
 	"queue_remove":       {handle: wsHandleQueueRemove},
 	"queue_clear":        {handle: wsHandleQueueClear},
+	"queue_send_now":     {handle: wsHandleQueueSendNow},
 	"message":            {handle: wsHandleMessage},
 }
 
@@ -64,6 +65,17 @@ func wsHandleQueueRemove(req *wsRequest) {
 	}
 	if target.removeQueuedItem(req.msg.QueueID) {
 		target.broadcastQueueState()
+	}
+}
+
+// wsHandleQueueSendNow asks the running turn to stop at the next round
+// boundary so the queued messages can run (see sendNow). It does not cancel
+// the turn and it does not clear the queue: a hard cancel means "stop what
+// you're doing" and drops the user's queued text, and Send now exists to
+// deliver that text.
+func wsHandleQueueSendNow(req *wsRequest) {
+	if target := req.target; target != nil && target.agent != nil {
+		target.sendNow(req.msg.QueueID)
 	}
 }
 

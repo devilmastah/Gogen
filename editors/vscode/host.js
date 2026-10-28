@@ -4,6 +4,7 @@ const vscode = require("vscode");
 const { Sidecar } = require("./sidecar");
 const { resolveBinary } = require("./binary");
 const { EditorBridge } = require("./editorBridge");
+const { queueIdOk } = require("./queueId");
 const {
   projectConfRels,
   templateSources,
@@ -326,6 +327,21 @@ class GogenHost {
         break;
       case "session_state":
         this.setTurn(!!msg.turnActive);
+        this.emit({ type: "queue", items: Array.isArray(msg.queue) ? msg.queue : [], left: [] });
+        break;
+      case "queue_update":
+        // content is the message the started turn runs (queueLeft non-empty).
+        this.emit({
+          type: "queue",
+          items: Array.isArray(msg.queue) ? msg.queue : [],
+          left: Array.isArray(msg.queueLeft) ? msg.queueLeft : [],
+          text: msg.content || "",
+        });
+        break;
+      case "user_acked":
+        // The server's turn for this message has started.
+        this.setTurn(true);
+        this.emit({ type: "userAcked" });
         break;
       case "config":
         if (Array.isArray(msg.providers)) {
@@ -453,11 +469,32 @@ class GogenHost {
     this.emit({ type: "turn", active: this.turnActive, tokensPerSec: this.tokensPerSec || 0 });
   }
 
-  sendChat(text) {
+  // sendChat sends a message the chat has already drawn, tagged with its
+  // queue id. The server either queues it or, when no turn is running, runs
+  // it, and the chat moves the text when queue_update or user_acked says so.
+  // A queue id that is not a short token is omitted; the server then assigns
+  // its own.
+  sendChat(text, queueId) {
     this.chatted = true;
-    this.sidecar.send(text);
-    this.emit({ type: "user", text });
-    this.setTurn(true);
+    const msg = { type: "message", content: text };
+    if (queueIdOk(queueId)) msg.queueId = queueId;
+    this.sidecar.sendRaw(msg);
+  }
+
+  // sendQueueNow names the queued message the control is on. The server
+  // ignores the request once that message has left the queue.
+  sendQueueNow(id) {
+    if (!queueIdOk(id)) {
+      return;
+    }
+    this.sidecar.sendRaw({ type: "queue_send_now", queueId: id });
+  }
+
+  removeQueued(id) {
+    if (!queueIdOk(id)) {
+      return;
+    }
+    this.sidecar.sendRaw({ type: "queue_remove", queueId: id });
   }
 
   setMode(mode) {

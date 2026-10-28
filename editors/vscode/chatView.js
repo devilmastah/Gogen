@@ -39,16 +39,17 @@ class ChatViewProvider {
       if (!text) {
         return;
       }
+      const queueId = typeof msg.queueId === "string" ? msg.queueId : "";
       this.host.ensureStarted().then(() => {
         try {
-          this.host.sendChat(text);
+          this.host.sendChat(text, queueId);
         } catch (err) {
           this.post({ type: "notice", text: err.message });
-          this.post({ type: "restoreInput", text });
+          this.post({ type: "restoreInput", text, queueId });
         }
       }).catch((err) => {
         this.post({ type: "notice", text: err.message || String(err) });
-        this.post({ type: "restoreInput", text });
+        this.post({ type: "restoreInput", text, queueId });
       });
       return;
     }
@@ -78,6 +79,22 @@ class ChatViewProvider {
     }
     if (msg.type === "pickThinking") {
       this.host.pickThinking();
+      return;
+    }
+    if (msg.type === "queueSendNow") {
+      try {
+        this.host.sendQueueNow(msg.id);
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
+      return;
+    }
+    if (msg.type === "queueRemove") {
+      try {
+        this.host.removeQueued(msg.id);
+      } catch (err) {
+        this.post({ type: "notice", text: err.message });
+      }
       return;
     }
     if (msg.type === "cancel") {
@@ -259,6 +276,32 @@ function chatHtml(webview) {
     border-radius: 14px 14px 4px 14px;
     background: color-mix(in srgb, var(--vscode-button-background) 18%, var(--vscode-input-background));
     border: 1px solid color-mix(in srgb, var(--vscode-button-background) 35%, transparent);
+  }
+  /* Queued sends sit outside the scrolling transcript, so a later token
+     cannot push them up into the reply that is still being written. */
+  #queue {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    padding: 0 12px 8px;
+  }
+  #queue:empty { display: none; padding: 0; }
+  .queue-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .queue-actions button {
+    font: inherit;
+    font-size: 11px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--vscode-foreground) 28%, transparent);
+    background: transparent;
+    color: var(--vscode-foreground);
+    padding: 1px 8px;
+    cursor: pointer;
   }
   .assistant {
     align-self: stretch;
@@ -561,6 +604,7 @@ function chatHtml(webview) {
 </div>
 <div id="stage">
 <div id="log"></div>
+<div id="queue"></div>
 <button id="tools" type="button" hidden>Hide tools</button>
 <div id="near" hidden>
   <span>Context is nearly full.</span>
@@ -622,6 +666,7 @@ function chatHtml(webview) {
 const vscodeApi = acquireVsCodeApi();
 const status = document.getElementById("status");
 const log = document.getElementById("log");
+const queueEl = document.getElementById("queue");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
 const modelBtn = document.getElementById("model");
@@ -649,6 +694,11 @@ let contextData = null;
 let catalog = [];
 let compactDismissed = false;
 let turnActive = false;
+let serverQueue = [];
+// Sends gogen has not answered for yet, oldest first (queue id -> text).
+const pendingSends = new Map();
+// user_acked frames still owed to turns a queue_update reported as started.
+let startedAcks = 0;
 
 function setStatus(state, text) {
   status.textContent = text;
@@ -766,7 +816,11 @@ function setThink(level, efforts, unsupported) {
 function setTurn(active) {
   turnActive = !!active;
   cancelBtn.hidden = !turnActive;
-  if (!turnActive) rateEl.textContent = "";
+  if (!turnActive) {
+    rateEl.textContent = "";
+    // A turn that failed before its user_acked owes nothing after it ends.
+    startedAcks = 0;
+  }
 }
 
 function setRate(tokensPerSec) {
@@ -984,6 +1038,8 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (msg.type === "restoreInput") {
+    // The send never reached gogen: the drawn copy goes, the draft comes back.
+    if (msg.queueId) dropUnsent(msg.queueId);
     if (!input.value) {
       input.value = msg.text || "";
       fitInput();
@@ -1045,12 +1101,16 @@ window.addEventListener("message", (event) => {
     renderHistory(msg.entries);
     return;
   }
-  if (msg.type === "user") {
-    live = null;
-    add("user", msg.text);
+  if (msg.type === "queue") {
+    applyQueue(msg.items, msg.left, msg.text);
+    return;
+  }
+  if (msg.type === "userAcked") {
+    takePendingSend();
     return;
   }
   if (msg.type === "thinking") {
+    setTurn(true);
     const box = ensureLive();
     // A tool call closed the previous bubble. This stretch is a new one,
     // placed under that call. Switching to an answer does the same.
@@ -1063,6 +1123,7 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (msg.type === "token") {
+    setTurn(true);
     const box = ensureLive();
     if (!box.answer) {
       box.thinking = null;
@@ -1073,6 +1134,7 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (msg.type === "tool") {
+    setTurn(true);
     const box = ensureLive();
     box.thinking = null;
     box.answer = null;
@@ -1160,10 +1222,126 @@ document.getElementById("form").addEventListener("submit", (event) => {
   event.preventDefault();
   const text = input.value.trim();
   if (!text || send.disabled) return;
-  vscodeApi.postMessage({ type: "send", text });
+  const id = newQueueId();
+  pendingSends.set(id, text);
+  if (turnActive) {
+    paintQueue();
+  } else {
+    // The server may still be in the turn when this view thinks it is idle.
+    // The bubble is tagged so a queue frame can lift it back out of the
+    // transcript instead of leaving a copy that scrolls away.
+    live = null;
+    const el = add("user", text);
+    el.dataset.qid = id;
+  }
+  vscodeApi.postMessage({ type: "send", text, queueId: id });
   input.value = "";
   fitInput();
 });
+
+function newQueueId() {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let hex = "";
+  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+  return "q-" + hex;
+}
+
+// paintQueue pins the server's queue, then the sends gogen has not answered
+// yet. A pending send drawn in the transcript (sent while idle) is not pinned.
+function paintQueue() {
+  queueEl.replaceChildren();
+  const shown = serverQueue.slice();
+  for (const [id, text] of pendingSends) {
+    if (!logBubble(id)) shown.push({ id, text });
+  }
+  shown.forEach((it, i) => {
+    const row = document.createElement("div");
+    row.className = "msg user queued";
+    const body = document.createElement("div");
+    body.textContent = it.text;
+    const actions = document.createElement("div");
+    actions.className = "queue-actions";
+    if (i === shown.length - 1) {
+      const now = document.createElement("button");
+      now.type = "button";
+      now.textContent = "Send now";
+      now.addEventListener("click", () => {
+        now.disabled = true;
+        now.textContent = "Sending…";
+        vscodeApi.postMessage({ type: "queueSendNow", id: it.id });
+      });
+      actions.append(now);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => {
+      vscodeApi.postMessage({ type: "queueRemove", id: it.id });
+    });
+    actions.append(remove);
+    row.append(body, actions);
+    queueEl.append(row);
+  });
+}
+
+function logBubble(id) {
+  return log.querySelector('.user[data-qid="' + CSS.escape(id) + '"]');
+}
+
+// settle forgets a send gogen has answered for and removes its early copy
+// from the transcript, because the queue now shows it, or the turn it
+// started draws it.
+function settle(id) {
+  pendingSends.delete(id);
+  const premature = logBubble(id);
+  if (premature) premature.remove();
+}
+
+// applyQueue takes the server's queue. left lists the ids whose turn just
+// started, and text is the one message that turn runs.
+function applyQueue(items, left, text) {
+  const next = [];
+  for (const it of items || []) {
+    if (it && typeof it.id === "string" && typeof it.text === "string") {
+      next.push(it);
+      settle(it.id);
+    }
+  }
+  if (left && left.length) {
+    left.forEach(settle);
+    startedAcks++;
+    live = null;
+    add("user", text);
+  }
+  serverQueue = next;
+  paintQueue();
+}
+
+// takePendingSend handles user_acked. The ack after a queue start belongs to
+// that start. Any other ack is the oldest send that ran without being queued.
+function takePendingSend() {
+  if (startedAcks > 0) {
+    startedAcks--;
+    return;
+  }
+  const first = pendingSends.entries().next();
+  if (first.done) return;
+  const [id, text] = first.value;
+  pendingSends.delete(id);
+  if (!logBubble(id)) {
+    live = null;
+    const el = add("user", text);
+    el.dataset.qid = id;
+  }
+  paintQueue();
+}
+
+// dropUnsent removes a send that never reached gogen.
+function dropUnsent(id) {
+  settle(id);
+  paintQueue();
+}
 input.addEventListener("input", fitInput);
 input.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {

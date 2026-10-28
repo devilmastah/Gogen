@@ -183,7 +183,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	if a.SessionID == "" {
 		a.SetSessionID(sesspkg.NewID())
 	}
-	rt := newSessionRuntimeWithHold(a, ws.ApprovalHold())
+	rt := newWorkspaceRuntime(a, ws)
 	reg.register(a.SessionID, rt)
 	// In web mode the registry is the sole pruner: Save's
 	// internal auto-prune protects only one session and could delete another
@@ -302,12 +302,12 @@ func (s *Server) SetDefaultModel(name string) {
 	s.ws.SetDefaultModel(name)
 }
 
-// newSessionRuntimeFor builds a session runtime carrying the server's
-// configured approval-hold window (see web_approval_hold_secs / F2). Reads
-// the live runtime overlay, so a settings-modal change applies to runtimes
-// created afterwards.
+// newSessionRuntimeFor builds a session runtime that follows the server's
+// workspace settings (see newWorkspaceRuntime). The approval hold is read
+// from the live runtime overlay, so a settings-modal change applies to
+// runtimes created afterwards.
 func (s *Server) newSessionRuntimeFor(a *agent.Agent) *sessionRuntime {
-	return newSessionRuntimeWithHold(a, s.ws.ApprovalHold())
+	return newWorkspaceRuntime(a, s.ws)
 }
 
 // wsRequest is the connection-scoped context for one inbound message: the

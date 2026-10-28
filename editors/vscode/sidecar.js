@@ -128,10 +128,6 @@ class Sidecar {
     });
   }
 
-  send(text) {
-    this.sendRaw({ type: "message", content: text });
-  }
-
   // sendRaw writes one socket message. sessionId is filled here so every
   // call, including settings, hits this sidecar's session.
   sendRaw(msg) {

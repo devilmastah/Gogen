@@ -402,9 +402,31 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	return a.StreamProcessInputWithImages(ctx, input, nil, h)
 }
 
+// RequestYield asks the running turn to stop at the next round boundary
+// and reports whether the request was recorded. The model call already in
+// flight finishes, and so do the tools that call already asked for. The
+// next model call does not start.
+//
+// ready is the host's check that something is waiting to run (see
+// steerq.Queue.SendNowReady). It runs after the turn is identified, so a
+// queued message that starts its own turn in between is no longer waiting,
+// and that new turn is not the one asked to stop. A request recorded for a
+// turn that has already ended does not apply to the next one.
+func (a *Agent) RequestYield(ready func() bool) bool {
+	gen := a.turnGen.Load()
+	if gen == 0 || !ready() {
+		return false
+	}
+	a.yieldFor.Store(gen)
+	return true
+}
+
 // StreamProcessInputWithImages is StreamProcessInput with optional
 // user-attached images (vision input). images is nil for text-only prompts.
 func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, images []llm.ImageInput, h *llm.StreamHandlers) (out string, err error) {
+	// Taken first so a yield requested anywhere in this call targets this
+	// turn and not the one after it.
+	gen := a.turnGen.Add(1)
 	// Downscale user-attached images before they join the transcript: a
 	// pasted screenshot is re-uploaded on every subsequent request, so the
 	// attached size is paid once per round (see image_scale.go).
@@ -483,6 +505,16 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	// tool-call branch); the turn-start reset covers the first round.
 	a.ghostRetries.Store(0)
 	for first := true; ; first = false {
+		// A queued message asked to run. The previous round, including the
+		// tools it already requested, has finished. Stop before the next
+		// model call. This is not a cancel: the context stays live, the
+		// tool results already appended stay, and the host's queue is left
+		// for the next turn.
+		if !first && a.yieldFor.Load() == gen {
+			a.yieldFor.CompareAndSwap(gen, 0)
+			a.FlushSession()
+			return "", nil
+		}
 		resetSmartCompact()
 		result, err := a.runTurn(ctx, h, first)
 		if err != nil {
@@ -771,7 +803,8 @@ func (a *Agent) RepairOrphanToolCalls() bool {
 
 // turnCounters groups the retry/strike counters the agent loop uses to bound
 // model failure loops (patch retries, context-window overflow recovery,
-// ghost rounds).
+// ghost rounds), plus the yield that lets a queued message take the next
+// round without aborting the one already running.
 type turnCounters struct {
 	// patchFailStreak counts consecutive patch_file failures so the agent loop
 	// can steer the model away from retrying the same stale diff indefinitely.
@@ -808,4 +841,16 @@ type turnCounters struct {
 	// back-to-back — a second consecutive ghost round surfaces the
 	// "model returned no output" error to the user.
 	ghostRetries atomic.Int32
+
+	// turnGen is the generation of the turn StreamProcessInput is in.
+	// It only increases. RequestYield records this value, and the loop
+	// stops only when the recorded value is the turn that is running, so a
+	// request that lands as the turn ends cannot cut the next turn short.
+	turnGen atomic.Uint64
+	// yieldFor is the turnGen a host asked to stop at the next round
+	// boundary. Zero means no request. The turn that matches it finishes
+	// the model call already in flight and the tools that call already
+	// asked for, then returns. It does not cancel the context, so a tool
+	// that is running runs to completion.
+	yieldFor atomic.Uint64
 }

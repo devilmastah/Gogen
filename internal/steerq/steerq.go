@@ -18,7 +18,11 @@
 // keeps its own.
 package steerq
 
-import "gogen/internal/llm"
+import (
+	"strings"
+
+	"gogen/internal/llm"
+)
 
 // Kind classifies a queued item. It decides both presentation and policy.
 type Kind int
@@ -38,8 +42,9 @@ const (
 	// replies drops an arriving notice instead of a pending answer.
 	Reply
 	// User is text the user typed into a busy session. It runs as its own
-	// turn (one message, one turn) and is never silently dropped: reaching
-	// the cap REFUSES the enqueue so the host can tell the user.
+	// turn, or joined with the User items behind it when join_queued is on
+	// (see Batch). It is never silently dropped: reaching the cap REFUSES
+	// the enqueue so the host can tell the user.
 	User
 )
 
@@ -222,24 +227,55 @@ func (q *Queue) Take(n int) []Item {
 	return out
 }
 
-// Batch returns a COPY of the contiguous head run of Notice items — one item
-// for a User or Reply head — which the drain delivers as ONE turn. Batched
-// notices share a single provider request; a User message is its own turn and a
-// Reply's capture is armed per turn. Strict FIFO across kinds is preserved
-// because only a contiguous head run is ever taken.
-func (q *Queue) Batch() []Item {
+// Batch returns a COPY of the contiguous head run that drains as ONE turn.
+// A run of Notices shares one provider request. With joinUser (the
+// join_queued setting) a run of User messages does too: several things typed
+// while a turn was busy are delivered as one message, in the order they were
+// typed. Without it each User message is its own turn. A Reply is always
+// alone, because its capture is armed per turn. The run stops at the first
+// different kind, so FIFO across kinds is preserved.
+func (q *Queue) Batch(joinUser bool) []Item {
 	if q == nil || len(q.items) == 0 {
 		return nil
 	}
 	n := 1
-	if q.items[0].Kind == Notice {
-		for n < len(q.items) && q.items[n].Kind == Notice {
+	head := q.items[0].Kind
+	if head == Notice || (joinUser && head == User) {
+		for n < len(q.items) && q.items[n].Kind == head {
 			n++
 		}
 	}
 	out := make([]Item, n)
 	copy(out, q.items[:n])
 	return out
+}
+
+// Join merges a batch into the one prompt its turn runs: the texts in queue
+// order, blank-line separated, and every item's images in the same order.
+func Join(batch []Item) (string, []llm.ImageInput) {
+	if len(batch) == 1 {
+		return batch[0].Text, batch[0].Images
+	}
+	var b strings.Builder
+	var images []llm.ImageInput
+	for i, it := range batch {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(it.Text)
+		images = append(images, it.Images...)
+	}
+	return b.String(), images
+}
+
+// SendNowReady reports whether a Send now request has something to deliver:
+// the User item id is still queued, or, for an empty id, any User item is.
+// A request with nothing to deliver must not stop the running turn.
+func (q *Queue) SendNowReady(id string) bool {
+	if id == "" {
+		return q.Count(User) > 0
+	}
+	return q.Has(id, User)
 }
 
 // Remove drops one item by id and kind, reporting what left the queue.

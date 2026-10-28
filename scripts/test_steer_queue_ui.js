@@ -115,6 +115,12 @@ async function main() {
   check('queue_update adopted the bubble instead of duplicating it', userBubbles().length === 2);
   check('adopted bubble shows the queued chip',
     queuedBubbles().length === 1 && !!queuedBubbles()[0].querySelector('.queued-chip'));
+  const sendNow = queuedBubbles()[0].querySelector('.queue-send-btn');
+  check('queued bubble has Send now', !!sendNow && sendNow.textContent === 'Send now');
+  sendNow.click();
+  const yielded = ws.sent.filter((m) => m.type === 'queue_send_now').pop();
+  check('Send now asks the server to yield this session', !!yielded && yielded.sessionId === 'A');
+  check('Send now names the queued item', !!yielded && yielded.queueId === sent.queueId);
   check('pane mirror carries the queued item', evalJs('activePane().queueItems.length') === 1);
 
   // 3. A user_acked must not stamp a still-queued bubble: with the local
@@ -226,6 +232,32 @@ async function main() {
     afterLeft[rq1].dataset.queueId === undefined && !afterLeft[rq1].classList.contains('queued'));
   check('C: the remaining queued bubble is still last',
     afterLeft[afterLeft.length - 1].dataset.queueId === cq2.queueId);
+
+  // 6. Only the newest queued bubble offers Send now, and a run that starts
+  //    as one joined message (join_queued on) leaves one bubble with the
+  //    server's text.
+  send('C queued three');
+  const cq3 = lastSentMessage();
+  recv({
+    type: 'queue_update', sessionId: 'C',
+    queue: [{ id: cq2.queueId, text: 'C queued two' }, { id: cq3.queueId, text: 'C queued three' }],
+  });
+  const visibleSendNow = queuedBubbles().filter((el) => {
+    const btn = el.querySelector('.queue-send-btn');
+    return btn && !btn.hidden;
+  });
+  check('C: only the last queued bubble shows Send now',
+    visibleSendNow.length === 1 && visibleSendNow[0].dataset.queueId === cq3.queueId);
+  const before = userBubbles().length;
+  recv({
+    type: 'queue_update', sessionId: 'C', queue: [],
+    queueLeft: [cq2.queueId, cq3.queueId], content: 'C queued two\n\nC queued three',
+  });
+  const joined = userBubbles().filter((el) => el.textContent.includes('C queued two'));
+  check('C: the joined run left one bubble', userBubbles().length === before - 1 && joined.length === 1);
+  check('C: the joined bubble shows both texts',
+    joined.length === 1 && joined[0].textContent.includes('C queued three'));
+  check('C: the joined bubble is no longer queued', queuedBubbles().length === 0);
 
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

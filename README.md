@@ -83,6 +83,49 @@ extraction):
 CGO_ENABLED=0 go build -o gogen-nocgo .
 ```
 
+<details>
+<summary><strong>Building on Windows</strong></summary>
+
+Tree-sitter needs a C compiler on `PATH`. Without one, Go turns CGO off
+silently and you get the smaller build without syntax checks. A MinGW `gcc`
+works, for example WinLibs from winget:
+
+```powershell
+winget install BrechtSanders.WinLibs.POSIX.UCRT
+# open a new terminal so PATH picks up gcc, then:
+gcc --version
+go env CGO_ENABLED   # must print 1
+```
+
+Build from the repository root in PowerShell. `-s -w` strips debug symbols
+and makes the binary smaller:
+
+```powershell
+go build -ldflags="-s -w" -o gogen-windows-amd64.exe .
+```
+
+Check that tree-sitter made it in. The output should include
+`CGO_ENABLED=1`:
+
+```powershell
+go version -m .\gogen-windows-amd64.exe | Select-String CGO_ENABLED
+```
+
+To use your own build in the VS Code sidebar, set `gogen.executable` in your
+user settings to the full path of the `.exe`. A running gogen can be replaced
+by renaming the old `.exe` first, because Windows does not allow overwriting
+a running program but does allow renaming it. Reload the VS Code window
+afterwards.
+
+The command tests need the Unix tools that come with Git for Windows. Put
+them on `PATH` before running `go test ./...`:
+
+```powershell
+$env:PATH = "C:\Program Files\Git\usr\bin;" + $env:PATH
+```
+
+</details>
+
 ### Flags
 
 | Flag | Description |
@@ -126,7 +169,7 @@ While in the TUI:
 | `/resume del <id>` | Delete a saved session |
 | `sessions` | Alias for `/resume` (list sessions) |
 | `/fork` | Fork a new session from the last assistant message (`/fork <N>` from message N) |
-| `/queue` (or `ctrl+q`) | Show the queued messages for the focused session; `d` removes the selected one, `D` clears the user's queued items |
+| `/queue` (or `ctrl+q`) | Show the queued messages for the focused session; `d` removes the selected one, `D` clears the user's queued items, `s` sends the queue after the current round |
 | `/verbose` | Toggle verbose tool output |
 | `/save-config` | Write effective config to `.gogen/gogen.conf` |
 
@@ -182,6 +225,7 @@ review_agent: off  # auto-review: a ticket moved into in_review spawns a review 
 review_agent_model: gpt-4o-mini  # default review model (empty = ticket override, else workspace default)
 review_agent_thinking_level: high  # review agent reasoning effort (empty = inherit the workspace level)
 job_notices: off   # notify the session when a background command finishes
+join_queued: off   # send messages queued during a turn as one message
 automations: off   # file-based cron scheduler: fire saved prompts as headless runs on a schedule
 status_display: auto  # off | auto (probe for the screen at startup) | on
 status_display_host: statusscreen.local  # mDNS name, IP, or base URL of the display
@@ -503,6 +547,7 @@ the server process):
 | `GOGEN_SYSTEM_PROMPT` | *(empty)* | Custom system prompt template (`{working_dir}`; replaces the built-in base prompt; the MCP hint when MCP is enabled, the auto-detected project profile, the project rules, and plan mode are still appended; empty = built-in default) |
 | `GOGEN_SUBAGENT_PROMPT` | *(empty)* | Template wrapping subagent jobs (`{job}`; empty = built-in default) |
 | `GOGEN_JOB_NOTICES` | off | Set to `on` to notify the session when a background command finishes (injects a summary + runs a turn); live-toggleable from the web settings modal (Agent) |
+| `GOGEN_JOIN_QUEUED` | off | Set to `on` to send the user messages queued back to back during a turn as one message instead of one turn each; live-toggleable from the Agent settings in the browser and the VS Code sidebar |
 | `GOGEN_SKILLS` | off | Set to `on` to enable the skill tool (`skill` list/read over `.gogen/skills` + `~/.config/gogen/skills`); live-toggleable from the web settings modal (Tools) |
 | `GOGEN_TERMINAL` | off | Set to `on` to enable the persistent-terminal feature tools: `terminal` (actions `open`/`send`/`read`/`signal`/`list`/`close` over session-scoped PTY sessions) and `bash_persistent` (a per-session shell whose cwd/env persist across calls; it bypasses the fresh-process model of `execute_command`). The command guard applies to `bash_persistent`; the PTY `send` action writes raw stdin, so the guard does not apply to it. Live-toggleable from the web settings modal (Tools) |
 | `GOGEN_AGENT_INSTRUCTIONS` | off | Set to `on` to load `AGENTS.md` / `CLAUDE.md` workspace instruction files (below the project guidelines); live-toggleable from the web settings modal (Agent) |
@@ -641,13 +686,21 @@ mode it is fixed to the project directory and the input is hidden.
   stop the current turn — it completes server-side and is saved. When you
   reconnect, open panes re-attach automatically and show "Resuming…" while a
   still-running turn finishes. The **Cancel** button (or `Esc` while
-  streaming) is the only way to stop a turn, and it works even from a fresh
-  connection.
+  streaming) stops a turn immediately, including from a fresh connection, and
+  clears the user's queued messages. **Send now** on a queued message stops
+  at the next round instead and keeps that queue.
 - **Steering**: the composer stays editable while a turn runs and typing a
-  message QUEUES it (FIFO, one item per turn) instead of interrupting — it is
-  delivered as the next user turn when the in-flight one ends, on the session
-  it was typed into. The queued bubble shows a **queued** chip whose ✕ removes
-  that one item; the input bar counts them ("· N queued") and **Cancel**
+  message QUEUES it (FIFO) instead of interrupting. Each queued message runs
+  as its own turn, in order, on the session it was typed into. With
+  `join_queued: on` (`GOGEN_JOIN_QUEUED`, or **Join queued messages** in the
+  Agent settings of the browser and the VS Code sidebar), the messages queued
+  back to back leave together as one message, texts separated by a blank line
+  and images in order. A machine notice stays its own turn either way. Each queued
+  bubble shows a **queued** chip and a ✕ that removes that one item. **Send
+  now**, on the last queued message, lets the model call already running
+  finish, including the tools that call already asked for, and then the queue
+  runs. In the terminal UI the same action is `s` in `/queue`. The
+  input bar counts them ("· N queued") and **Cancel**
   clears the user's own queued items (machine notices keep draining — they
   are one-way deliveries and a run of them drains as one batched turn, so a
   burst of job/child completions costs one request). Command

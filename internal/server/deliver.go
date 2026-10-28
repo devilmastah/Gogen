@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -235,17 +234,38 @@ func (rt *sessionRuntime) countUser() int {
 
 // broadcastQueueState sends a queue_update frame describing the runtime's
 // queued items. Called on every queue mutation so every attached client
-// (all tabs, background panes) renders the same queue state. left lists
-// item ids that left the queue because their turn STARTED (the drain's
-// pop — the frame reaches every client before the started turn's
-// user_acked): the client clears those items' queued chips and resolves
-// the paired user_acked normally. Ids absent from the frame entirely were
-// REMOVED before running (per-item ✕, clear-all, interrupt) and render as
-// cancelled-before-running. Deliberately OUTSIDE deliverMu (same
-// self-deadlock chain as deliverToSession's overflow notice: broadcast →
-// detach → evictOrphaned → deliverMu).
-func (rt *sessionRuntime) broadcastQueueState(left ...string) {
-	rt.broadcast(WSMessage{Type: "queue_update", SessionID: rt.agent.SessionID, Queue: rt.queueItems(), QueueLeft: left})
+// (all tabs, background panes) renders the same queue state. Ids absent
+// from the frame were REMOVED before running (per-item ✕, clear-all,
+// interrupt) and render as cancelled-before-running. Deliberately OUTSIDE
+// deliverMu (same self-deadlock chain as deliverToSession's overflow
+// notice: broadcast → detach → evictOrphaned → deliverMu).
+func (rt *sessionRuntime) broadcastQueueState() {
+	rt.broadcastQueueStarted("", nil)
+}
+
+// broadcastQueueStarted is broadcastQueueState for the drain's pop. left
+// lists the user item ids whose turn STARTED (the frame reaches every
+// client before that turn's user_acked), and text is the message that turn
+// runs, so a client shows the delivered text instead of rebuilding a
+// joined run itself.
+func (rt *sessionRuntime) broadcastQueueStarted(text string, left []string) {
+	rt.broadcast(WSMessage{Type: "queue_update", SessionID: rt.agent.SessionID, Queue: rt.queueItems(), QueueLeft: left, Content: text})
+}
+
+// sendNow asks the running turn to stop at its next round boundary so the
+// queue can deliver, and reports whether that was recorded. id names the
+// queued user item the client showed the control on ("" = any user item).
+// Nothing is asked when no turn is running or that item is no longer
+// queued, so a late request cannot cut short the turn that item started.
+func (rt *sessionRuntime) sendNow(id string) bool {
+	if active, _ := rt.turnState(); !active {
+		return false
+	}
+	return rt.agent.RequestYield(func() bool {
+		rt.deliverMu.Lock()
+		defer rt.deliverMu.Unlock()
+		return rt.pendingDeliver.SendNowReady(id)
+	})
 }
 
 // queueItems snapshots the queue for the wire (user items only are sent:
@@ -506,7 +526,6 @@ func (rt *sessionRuntime) deliverLoop() {
 		// actually starting. Popping first opened a handoff window (queue
 		// empty, turnMu still free) where the just-ended turn's orphan
 		// re-check could evict the runtime and drop the item.
-		// Peek, do NOT pop: see the handoff-window note below.
 		head, _ := rt.pendingDeliver.Peek()
 		item := itemFromSteerq(head)
 		rt.deliverMu.Unlock()
@@ -564,43 +583,39 @@ func (rt *sessionRuntime) deliverLoop() {
 			rt.releaseTurn()
 			continue
 		}
-		// Pop the head item; when it is a one-way NOTICE, also pop the
-		// contiguous run of notices behind it and deliver the run as ONE
-		// turn (one provider request) instead of one turn per notice. The
-		// run stops at a USER steering message (each typed message is its
-		// own turn) and at a TARGETED send_message delivery (its reply
-		// capture is armed per turn and must stay 1:1 with the tool call);
-		// strict FIFO across kinds is preserved because only a contiguous
-		// head run is taken.
-		//
-		// Batch computes that head run (steerq.Batch is the one definition of
-		// the rule; it keys on the shared kind, where a targeted delivery is a
-		// Reply and never batches).
-		batch := rt.pendingDeliver.Batch()
+		// Pop the head run that drains as ONE turn and deliver it. steerq.Batch
+		// is the one definition of that run: a contiguous run of one-way
+		// notices (one provider request instead of one per notice), a run of
+		// user messages when join_queued is on, and otherwise the head item
+		// alone. A TARGETED send_message delivery is a Reply and never
+		// batches, because its reply capture is armed per turn and must stay
+		// 1:1 with the tool call. Only a contiguous head run is taken, so
+		// FIFO across kinds is preserved.
+		batch := rt.pendingDeliver.Batch(rt.joinQueued != nil && rt.joinQueued())
 		// Capture everything the delivery needs BEFORE dropping the run:
 		// dropDeliveredLocked zeroes the popped slots (so their text/images
 		// are no longer retained by the backing array). batch is a COPY, and
-		// joinDeliveryTexts builds a new string, so both stay valid after the
-		// clear.
+		// steerq.Join builds a new string, so both stay valid after the clear.
 		item = itemFromSteerq(batch[0])
-		text := item.Text
-		if len(batch) > 1 {
-			text = joinDeliveryTexts(batch)
-		}
+		text, images := steerq.Join(batch)
 		rt.dropDeliveredLocked(len(batch))
 		rt.deliverMu.Unlock()
-		// A USER item left the queue to run: every attached client must see
+		// USER items left the queue to run: every attached client must see
 		// the queue state converge (the sending tab's optimistic queued
-		// bubble resolves against this frame; the paired user_acked —
+		// bubbles resolve against this frame; the paired user_acked —
 		// emitted by the turn this pop starts, after this broadcast —
-		// resolves its pending ack and carries the real history index).
-		// The frame carries the id in queueLeft so the client clears the
-		// queued chip instead of rendering the bubble
-		// cancelled-before-running. SYSTEM deliveries are not on the wire
-		// queue (queueItems sends user items only), so their pops change
-		// nothing client-visible — no frame.
+		// resolves the pending ack and carries the real history index).
+		// Every id of the run is in queueLeft, so the client clears those
+		// chips instead of rendering the bubbles cancelled-before-running.
+		// A batch is a single kind, and SYSTEM deliveries are not on the
+		// wire queue (queueItems sends user items only), so their pops
+		// change nothing client-visible — no frame.
 		if item.Kind == deliverUser {
-			rt.broadcastQueueState(item.ID)
+			left := make([]string, 0, len(batch))
+			for _, it := range batch {
+				left = append(left, it.ID)
+			}
+			rt.broadcastQueueStarted(text, left)
 		}
 		// The delivery-start hook arms per-delivery state exactly when the
 		// delivered turn begins — and ONLY for a send_message delivery
@@ -615,11 +630,9 @@ func (rt *sessionRuntime) deliverLoop() {
 			onResult = rt.deliverResultFunc
 		}
 		// The turn-end signal wakes the worker for the next pop, so queued
-		// items drain in FIFO order across consecutive turns. A batched
-		// notice run is ONE turn (one provider request); user and targeted
-		// items keep one turn each. `text` was captured before the pop cleared
-		// the batch slots.
-		rt.startTurnWithResult(nil, text, item.Images, onResult)
+		// items drain in FIFO order across consecutive turns. `text` and
+		// `images` were captured before the pop cleared the batch slots.
+		rt.startTurnWithResult(nil, text, images, onResult)
 	}
 }
 
@@ -645,19 +658,4 @@ func (rt *sessionRuntime) hasPendingDeliveries() bool {
 	rt.deliverMu.Lock()
 	defer rt.deliverMu.Unlock()
 	return rt.pendingDeliver.Len() > 0
-}
-
-// joinDeliveryTexts merges a batch of one-way system notices into a single
-// turn input: one block per notice, blank-line separated so the model reads
-// them as distinct deliveries (each already carries its own "[job …]" /
-// "[subagent …]" prefix).
-func joinDeliveryTexts(batch []steerq.Item) string {
-	var b strings.Builder
-	for i, it := range batch {
-		if i > 0 {
-			b.WriteString("\n\n")
-		}
-		b.WriteString(it.Text)
-	}
-	return b.String()
 }

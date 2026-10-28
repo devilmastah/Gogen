@@ -3357,8 +3357,10 @@
            (always visible — this is the queue's display) and a hover ✕ that
            removes the item from the queue; the chip clears when the turn
            actually starts (user_acked), and a removed item's bubble reads
-           "cancelled before running". */
-        .queued-chip {
+           "cancelled before running". The last queued bubble also carries
+           Send now, drawn like the chip. */
+        .queued-chip,
+        .queue-send-btn {
             display: inline-block;
             margin-left: 8px;
             padding: 1px 7px;
@@ -3369,8 +3371,10 @@
             color: var(--warn);
             background: transparent;
             vertical-align: middle;
-            user-select: none;
         }
+        .queued-chip { user-select: none; }
+        .queue-send-btn { cursor: pointer; }
+        .queue-send-btn:hover { background: var(--bg-elevated); }
         .queue-remove-btn {
             display: none;
             position: absolute;

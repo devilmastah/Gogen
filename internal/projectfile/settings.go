@@ -188,6 +188,7 @@ var settings = []setting{
 	{key: "skills", env: "GOGEN_SKILLS", cfg: "Skills", file: "Skills", writer: "Skills", kind: kString, omitDefault: true},
 	{key: "terminal", env: "GOGEN_TERMINAL", cfg: "Terminal", file: "Terminal", writer: "Terminal", kind: kString, omitDefault: true},
 	{key: "job_notices", env: "GOGEN_JOB_NOTICES", cfg: "JobNotices", file: "JobNotices", writer: "JobNotices", kind: kString, omitDefault: true},
+	{key: "join_queued", env: "GOGEN_JOIN_QUEUED", cfg: "JoinQueued", file: "JoinQueued", writer: "JoinQueued", kind: kString, omitDefault: true},
 	{key: "automations", env: "GOGEN_AUTOMATIONS", cfg: "Automations", file: "Automations", writer: "Automations", kind: kString, omitDefault: true},
 
 	// --- prompts ----------------------------------------------------------

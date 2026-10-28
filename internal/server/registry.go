@@ -140,6 +140,9 @@ type sessionRuntime struct {
 	pendingDeliver *steerq.Queue
 	deliverWorker  atomic.Bool
 	deliverNotify  chan struct{}
+	// joinQueued reports the live join_queued flag at each pop (nil = off).
+	// Set once at construction; never reassigned.
+	joinQueued func() bool
 
 	// deliverStartHook is invoked by the delivery worker immediately before
 	// it starts a delivered turn (see deliver.go) — for a send_message
@@ -215,13 +218,15 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 	return rt
 }
 
-// newSessionRuntimeWithHold builds a runtime whose pending delete approvals
-// are auto-denied `hold` after the last attached client detaches (instead of
-// immediately). Tests and non-server embeddings keep using newSessionRuntime
-// (hold = 0, immediate deny).
-func newSessionRuntimeWithHold(a *agent.Agent, hold time.Duration) *sessionRuntime {
+// newWorkspaceRuntime builds a runtime that follows ws's live settings: its
+// pending delete approvals are auto-denied after ws's approval hold once the
+// last attached client detaches (instead of immediately), and its drain
+// reads ws's join_queued flag. ws may be nil (both then read as off). Tests
+// and non-server embeddings keep using newSessionRuntime.
+func newWorkspaceRuntime(a *agent.Agent, ws *Workspace) *sessionRuntime {
 	rt := newSessionRuntime(a)
-	rt.approvalHold = hold
+	rt.approvalHold = ws.ApprovalHold()
+	rt.joinQueued = ws.JoinQueued
 	return rt
 }
 
