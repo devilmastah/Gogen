@@ -83,6 +83,49 @@ extraction):
 CGO_ENABLED=0 go build -o gogen-nocgo .
 ```
 
+<details>
+<summary><strong>Building on Windows</strong></summary>
+
+Tree-sitter needs a C compiler on `PATH`. Without one, Go turns CGO off
+silently and you get the smaller build without syntax checks. A MinGW `gcc`
+works, for example WinLibs from winget:
+
+```powershell
+winget install BrechtSanders.WinLibs.POSIX.UCRT
+# open a new terminal so PATH picks up gcc, then:
+gcc --version
+go env CGO_ENABLED   # must print 1
+```
+
+Build from the repository root in PowerShell. `-s -w` strips debug symbols
+and makes the binary smaller:
+
+```powershell
+go build -ldflags="-s -w" -o gogen-windows-amd64.exe .
+```
+
+Check that tree-sitter made it in. The output should include
+`CGO_ENABLED=1`:
+
+```powershell
+go version -m .\gogen-windows-amd64.exe | Select-String CGO_ENABLED
+```
+
+To use your own build in the VS Code sidebar, set `gogen.executable` in your
+user settings to the full path of the `.exe`. A running gogen can be replaced
+by renaming the old `.exe` first, because Windows does not allow overwriting
+a running program but does allow renaming it. Reload the VS Code window
+afterwards.
+
+The command tests need the Unix tools that come with Git for Windows. Put
+them on `PATH` before running `go test ./...`:
+
+```powershell
+$env:PATH = "C:\Program Files\Git\usr\bin;" + $env:PATH
+```
+
+</details>
+
 ### Flags
 
 | Flag | Description |
