@@ -202,19 +202,50 @@ async function main() {
       /tail text/.test(el.querySelector('.md-tail').textContent));
   }
 
-  // ── 6. A fence that does not start the block is never patched ──
+  // ── 6. A fence that interrupts a paragraph is split into its own block ──
+  // "intro\n```js…" used to stay ONE block, so the tail was never a bare
+  // fence: it took the full-render path on every flush and re-created the
+  // <pre>/<code> (and its copy wrapper) ~30x/s — the streaming flicker. In
+  // CommonMark a fenced block may interrupt a paragraph, so splitting is
+  // render-equivalent AND makes the tail patchable.
   {
+    // A CONNECTED container: the incremental renderer treats a detached frozen
+    // block as a stale cache (that check exists for pane re-caching) and would
+    // re-render from scratch on every flush, which the real transcript never
+    // does.
     const el = mkEl();
+    window.document.body.appendChild(el);
     const a = 'intro\n```js\nx = 1';
     stream(el, a, 4);
+    const prose = el.querySelector('.md-block:not(.md-tail)');
+    check('lead-in: the paragraph becomes its own stable block',
+      !!prose && prose.textContent.includes('intro'));
+    check('lead-in: the fence is the tail block', !!el.querySelector('.md-tail pre code'));
     const codeA = el.querySelector('.md-tail pre code');
     const b = a + ' + 2';
     streamFrom(el, a, b, 3);
     const codeB = el.querySelector('.md-tail pre code');
-    check('fence after text: full renders (code element recreated)', codeA !== codeB);
-    check('fence after text: rendering still equals the one-shot render',
+    check('lead-in: the code element is patched in place (not recreated)', codeA === codeB);
+    check('lead-in: rendering equals the one-shot render',
       norm(livePre(el.querySelector('.md-tail'))) === norm(oneShotPre(b)),
       norm(livePre(el.querySelector('.md-tail'))) + '\n    vs ' + norm(oneShotPre(b)));
+    // The split must not change what the blocks render as: the paragraph is a
+    // <p> (not a run-on), so the end-of-stream full render has nothing to fix.
+    check('lead-in: the split paragraph renders as a <p>',
+      !!prose && !!prose.firstElementChild && prose.firstElementChild.tagName === 'P');
+    el.remove();
+  }
+
+  // ── 6a. An INDENTED fence stays glued to its list item (marked nests it) ──
+  {
+    const el = mkEl();
+    const text = '- item\n  ```js\n  x = 1';
+    stream(el, text, 4);
+    const tail = el.querySelector('.md-tail');
+    const li = tail && tail.querySelector('li');
+    check('indented fence: stays inside the list item (no split)',
+      !!li && !!li.querySelector('pre code'),
+      tail ? tail.innerHTML.slice(0, 80) : 'no tail');
   }
 
   // ── 6b. Perf contract: a long continuously-streamed fence materializes

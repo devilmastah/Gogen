@@ -1194,6 +1194,16 @@
             // was captured; rebuild it from the restored DOM (same nodes, so
             // the dot ↔ message wiring is preserved).
             rebuildToc();
+            // Re-derive the code colorization for the restored subtree. While
+            // this pane sat in its offscreen cache, its parked colorize jobs
+            // could be dropped: clearing ANOTHER pane's transcript runs
+            // disposeChatEditors → releaseColorizeTargets, which clears the
+            // shared park map and queue (only a restored subtree can be woken
+            // by the IntersectionObserver again). colorizeNode is idempotent
+            // now — blocks that are already colored are skipped by their
+            // stamp — so this costs one traversal, and the rest hit the cache
+            // or park on the viewport observer as on a first render.
+            colorizeNode(messagesDiv);
             if (cache.pinned) {
                 pinToBottom();
             } else {

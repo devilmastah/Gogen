@@ -94,7 +94,13 @@ function enhanceCodeBlocksWithCopy(root) {
             e.preventDefault();
             e.stopPropagation();
             const code = pre.querySelector('code') || pre;
-            const text = code.textContent || '';
+            // __gogenPlain is the authoritative source text. Monaco's colorize
+            // output separates lines with <br/>, whose textContent is empty, so
+            // reading textContent from a HIGHLIGHTED block copied the code with
+            // every newline stripped.
+            const text = code.__gogenPlain !== undefined
+                ? code.__gogenPlain
+                : (code.textContent || '');
             const ok = await deps.copyTextToClipboard(text);
             if (ok) {
                 btn.textContent = 'Copied';
@@ -458,6 +464,23 @@ function splitStreamBlocks(text) {
         }
         const m = /^\s*(```+|~~~+)/.exec(line);
         if (m) {
+            // A fenced code block may INTERRUPT a paragraph in CommonMark, so
+            // an unindented fence that starts right after a non-blank line is
+            // its OWN block, not part of the paragraph. Splitting here is what
+            // keeps the in-flight block a bare fence — the only shape the tail
+            // patcher can append to. Left glued to the paragraph ("Here is the
+            // code:\n```go …"), the tail took the full-render path on every
+            // flush, which re-created the <pre>/<code> (and its copy wrapper)
+            // ~30x/s and made the coloring flicker.
+            // Only UNINDENTED fences split: an INDENTED fence is a list
+            // item's continuation, which the one-shot parse keeps inside the
+            // <li> (verified against marked: "- item\n  ```js" nests the
+            // <pre> in the item, while an unindented fence ends the list).
+            if (cur !== '' && /^(```+|~~~+)/.test(line)) {
+                blocks.push(cur);
+                lastStart = curStart;
+                cur = '';
+            }
             if (cur === '') curStart = offset;
             cur += line + '\n';
             list = null; // a fence (even indented) ends list-continuation terms
