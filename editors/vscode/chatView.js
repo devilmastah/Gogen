@@ -695,10 +695,74 @@ let catalog = [];
 let compactDismissed = false;
 let turnActive = false;
 let serverQueue = [];
-// Sends gogen has not answered for yet, oldest first (queue id -> text).
-const pendingSends = new Map();
-// user_acked frames still owed to turns a queue_update reported as started.
-let startedAcks = 0;
+
+// pending-sends:begin
+// pendingSendsTracker keeps the sends gogen has not answered yet, oldest
+// first. gogen answers each send once: a queue_update that lists it, the
+// user_acked of the turn it started, or a response. A response that names a
+// queue id answers that send. Any other response outside a turn answers the
+// oldest send, because gogen handles sends in order. The tracker only decides.
+// The view draws.
+function pendingSendsTracker() {
+  const sends = new Map();
+  // user_acked frames still owed to turns a queue_update reported as started.
+  let startedAcks = 0;
+  function take(id) {
+    const text = sends.get(id);
+    sends.delete(id);
+    return { id, text };
+  }
+  function oldest() {
+    const first = sends.keys().next();
+    return first.done ? null : take(first.value);
+  }
+  return {
+    add(id, text) {
+      sends.set(id, text);
+    },
+    list() {
+      return Array.from(sends, ([id, text]) => ({ id, text }));
+    },
+    // queue settles the sends a queue frame lists, queued or started.
+    queue(items, left) {
+      for (const it of items || []) sends.delete(it.id);
+      for (const id of left || []) sends.delete(id);
+      if (left && left.length) startedAcks++;
+    },
+    // acked returns the send whose turn started without being queued, or
+    // null when the ack belongs to a turn a queue frame already started.
+    acked() {
+      if (startedAcks > 0) {
+        startedAcks--;
+        return null;
+      }
+      return oldest();
+    },
+    // replied returns the send a response answers, or null when the
+    // response belongs to the running turn. failed means the send did not
+    // run: gogen's refusals and errors start with "Error:".
+    replied(queueId, reply, turnRunning) {
+      let sent = null;
+      if (queueId) sent = sends.has(queueId) ? take(queueId) : null;
+      else if (!turnRunning && startedAcks === 0) sent = oldest();
+      if (sent) sent.failed = String(reply || "").startsWith("Error:");
+      return sent;
+    },
+    drop(id) {
+      sends.delete(id);
+    },
+    turnEnded() {
+      startedAcks = 0;
+    },
+    reset() {
+      sends.clear();
+      startedAcks = 0;
+    },
+  };
+}
+// pending-sends:end
+
+const pending = pendingSendsTracker();
 
 function setStatus(state, text) {
   status.textContent = text;
@@ -819,7 +883,7 @@ function setTurn(active) {
   if (!turnActive) {
     rateEl.textContent = "";
     // A turn that failed before its user_acked owes nothing after it ends.
-    startedAcks = 0;
+    pending.turnEnded();
   }
 }
 
@@ -897,8 +961,12 @@ function refreshToolToggle() {
 
 function renderHistory(entries) {
   // A full history frame follows clear_chat. Replacing the log is the clear.
+  // Unanswered sends go with the old transcript. The queue rows stay:
+  // session_state, which carries the queue, arrives before this frame.
   log.replaceChildren();
   live = null;
+  pending.reset();
+  paintQueue();
   const cards = new Map();
   for (const entry of entries || []) {
     if (entry.role === "user") {
@@ -1039,11 +1107,9 @@ window.addEventListener("message", (event) => {
   }
   if (msg.type === "restoreInput") {
     // The send never reached gogen: the drawn copy goes, the draft comes back.
-    if (msg.queueId) dropUnsent(msg.queueId);
-    if (!input.value) {
-      input.value = msg.text || "";
-      fitInput();
-    }
+    if (msg.queueId) unsend(msg.queueId);
+    restoreDraft(msg.text);
+    paintQueue();
     return;
   }
   if (msg.type === "status") {
@@ -1149,7 +1215,10 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (msg.type === "notice") {
-    add("notice", msg.text);
+    if (msg.reply) settleReply(msg.queueId, msg.text);
+    if (msg.text) add("notice", msg.text);
+    // A refused Send now: repainting gives the button back.
+    if (msg.kind === "queue") paintQueue();
     return;
   }
   if (msg.type === "turnEnd") {
@@ -1223,7 +1292,7 @@ document.getElementById("form").addEventListener("submit", (event) => {
   const text = input.value.trim();
   if (!text || send.disabled) return;
   const id = newQueueId();
-  pendingSends.set(id, text);
+  pending.add(id, text);
   if (turnActive) {
     paintQueue();
   } else {
@@ -1239,6 +1308,8 @@ document.getElementById("form").addEventListener("submit", (event) => {
   fitInput();
 });
 
+// newQueueId need not match the web client's ids. Both only have to pass the
+// server's queue-id rule, which queueId.js and its test pin.
 function newQueueId() {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
@@ -1252,8 +1323,8 @@ function newQueueId() {
 function paintQueue() {
   queueEl.replaceChildren();
   const shown = serverQueue.slice();
-  for (const [id, text] of pendingSends) {
-    if (!logBubble(id)) shown.push({ id, text });
+  for (const it of pending.list()) {
+    if (!logBubble(it.id)) shown.push(it);
   }
   shown.forEach((it, i) => {
     const row = document.createElement("div");
@@ -1289,28 +1360,41 @@ function logBubble(id) {
   return log.querySelector('.user[data-qid="' + CSS.escape(id) + '"]');
 }
 
-// settle forgets a send gogen has answered for and removes its early copy
-// from the transcript, because the queue now shows it, or the turn it
-// started draws it.
-function settle(id) {
-  pendingSends.delete(id);
+// unsend forgets a send and removes its early copy from the transcript.
+function unsend(id) {
+  pending.drop(id);
   const premature = logBubble(id);
   if (premature) premature.remove();
 }
 
+// restoreDraft puts the text of a send that did not run back into the
+// composer, ahead of anything typed since.
+function restoreDraft(text) {
+  if (!text) return;
+  input.value = input.value ? text + "\\n\\n" + input.value : text;
+  fitInput();
+}
+
+// drawSent shows a send that ran, unless it is already in the transcript.
+function drawSent(id, text) {
+  if (logBubble(id)) return;
+  live = null;
+  const el = add("user", text);
+  el.dataset.qid = id;
+}
+
 // applyQueue takes the server's queue. left lists the ids whose turn just
-// started, and text is the one message that turn runs.
+// started, and text is the one message that turn runs. The queue rows show
+// queued sends, and the started turn is drawn once, so the early copies go.
 function applyQueue(items, left, text) {
   const next = [];
   for (const it of items || []) {
-    if (it && typeof it.id === "string" && typeof it.text === "string") {
-      next.push(it);
-      settle(it.id);
-    }
+    if (it && typeof it.id === "string" && typeof it.text === "string") next.push(it);
   }
+  pending.queue(next, left);
+  for (const it of next) unsend(it.id);
   if (left && left.length) {
-    left.forEach(settle);
-    startedAcks++;
+    left.forEach(unsend);
     live = null;
     add("user", text);
   }
@@ -1318,28 +1402,25 @@ function applyQueue(items, left, text) {
   paintQueue();
 }
 
-// takePendingSend handles user_acked. The ack after a queue start belongs to
-// that start. Any other ack is the oldest send that ran without being queued.
+// takePendingSend handles user_acked.
 function takePendingSend() {
-  if (startedAcks > 0) {
-    startedAcks--;
-    return;
-  }
-  const first = pendingSends.entries().next();
-  if (first.done) return;
-  const [id, text] = first.value;
-  pendingSends.delete(id);
-  if (!logBubble(id)) {
-    live = null;
-    const el = add("user", text);
-    el.dataset.qid = id;
-  }
+  const sent = pending.acked();
+  if (sent) drawSent(sent.id, sent.text);
   paintQueue();
 }
 
-// dropUnsent removes a send that never reached gogen.
-function dropUnsent(id) {
-  settle(id);
+// settleReply handles a response. A send that did not run goes back into the
+// composer. Any other answered send was a command gogen handled without a
+// turn.
+function settleReply(queueId, text) {
+  const sent = pending.replied(queueId, text, turnActive);
+  if (!sent) return;
+  if (sent.failed) {
+    unsend(sent.id);
+    restoreDraft(sent.text);
+  } else {
+    drawSent(sent.id, sent.text);
+  }
   paintQueue();
 }
 input.addEventListener("input", fitInput);

@@ -402,19 +402,20 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	return a.StreamProcessInputWithImages(ctx, input, nil, h)
 }
 
-// RequestYield asks the running turn to stop at the next round boundary
-// and reports whether the request was recorded. The model call already in
-// flight finishes, and so do the tools that call already asked for. The
-// next model call does not start.
-//
-// ready is the host's check that something is waiting to run (see
-// steerq.Queue.SendNowReady). It runs after the turn is identified, so a
-// queued message that starts its own turn in between is no longer waiting,
-// and that new turn is not the one asked to stop. A request recorded for a
-// turn that has already ended does not apply to the next one.
-func (a *Agent) RequestYield(ready func() bool) bool {
-	gen := a.turnGen.Load()
-	if gen == 0 || !ready() {
+// TurnGeneration returns the generation of the turn that is running, or 0
+// when none is (between turns, or during a compaction outside a turn).
+func (a *Agent) TurnGeneration() uint64 {
+	return a.runningTurn.Load()
+}
+
+// RequestYieldFor asks turn gen (from TurnGeneration) to stop at its next
+// round boundary and reports whether gen is still the running turn. The
+// model call already in flight finishes, and so do the tools that call
+// already asked for. The next model call does not start. A host reads gen
+// before its own checks, so a turn that starts in between is not the one
+// asked to stop.
+func (a *Agent) RequestYieldFor(gen uint64) bool {
+	if gen == 0 || a.runningTurn.Load() != gen {
 		return false
 	}
 	a.yieldFor.Store(gen)
@@ -427,6 +428,8 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	// Taken first so a yield requested anywhere in this call targets this
 	// turn and not the one after it.
 	gen := a.turnGen.Add(1)
+	a.runningTurn.Store(gen)
+	defer a.runningTurn.CompareAndSwap(gen, 0)
 	// Downscale user-attached images before they join the transcript: a
 	// pasted screenshot is re-uploaded on every subsequent request, so the
 	// attached size is paid once per round (see image_scale.go).
@@ -803,8 +806,7 @@ func (a *Agent) RepairOrphanToolCalls() bool {
 
 // turnCounters groups the retry/strike counters the agent loop uses to bound
 // model failure loops (patch retries, context-window overflow recovery,
-// ghost rounds), plus the yield that lets a queued message take the next
-// round without aborting the one already running.
+// ghost rounds).
 type turnCounters struct {
 	// patchFailStreak counts consecutive patch_file failures so the agent loop
 	// can steer the model away from retrying the same stale diff indefinitely.
@@ -841,16 +843,25 @@ type turnCounters struct {
 	// back-to-back — a second consecutive ghost round surfaces the
 	// "model returned no output" error to the user.
 	ghostRetries atomic.Int32
+}
 
-	// turnGen is the generation of the turn StreamProcessInput is in.
-	// It only increases. RequestYield records this value, and the loop
-	// stops only when the recorded value is the turn that is running, so a
-	// request that lands as the turn ends cannot cut the next turn short.
+// turnYield lets a queued message take the next round without aborting the
+// one already running (RequestYieldFor). All fields are atomics: a host
+// goroutine requests the yield while the turn goroutine reads it.
+type turnYield struct {
+	// turnGen counts the turns StreamProcessInputWithImages has started.
+	// It only increases.
 	turnGen atomic.Uint64
+	// runningTurn is the turnGen of the turn that is running, or 0 between
+	// turns. A host reads it with TurnGeneration and names it in
+	// RequestYieldFor, so a turn that starts in between is not the one
+	// asked to stop.
+	runningTurn atomic.Uint64
 	// yieldFor is the turnGen a host asked to stop at the next round
 	// boundary. Zero means no request. The turn that matches it finishes
 	// the model call already in flight and the tools that call already
 	// asked for, then returns. It does not cancel the context, so a tool
-	// that is running runs to completion.
+	// that is running runs to completion. A value left by a turn that has
+	// ended never matches a later turn.
 	yieldFor atomic.Uint64
 }

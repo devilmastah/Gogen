@@ -75,6 +75,27 @@ func (s *liveSession) removeSteerItem(id string) bool {
 	return ok
 }
 
+// sendNow asks the session's running turn to stop at its next round
+// boundary so the queue can deliver (steerq.CheckSendNow), and returns the
+// outcome. Update thread only.
+func (s *liveSession) sendNow() steerq.SendNowResult {
+	if s == nil || s.agent == nil {
+		return steerq.SendNowIdle
+	}
+	turn := s.agent.TurnGeneration()
+	replying := false
+	if s.child != nil {
+		if c := s.child.childOf(); c != nil {
+			replying = c.PendingReply()
+		}
+	}
+	res := steerq.CheckSendNow(s.streaming || s.compacting, turn, replying, s.steerQ.SendNowReady(""))
+	if res == steerq.SendNowRecorded && !s.agent.RequestYieldFor(turn) {
+		res = steerq.SendNowIdle
+	}
+	return res
+}
+
 // enqueueSteer queues the user's text against the FOCUSED session while it
 // is busy (a turn running or a compaction in flight): strictly FIFO with
 // system deliveries, delivered as the next user turn at the next terminal
@@ -258,9 +279,10 @@ func (m *Model) drainSessionQueue(s *liveSession) tea.Cmd {
 	// stay 1:1 with the tool call. The head-run rule is steerq.Batch.
 	batch := s.steerQ.Take(len(s.steerQ.Batch(m.cfg.JoinQueuedEnabled())))
 	item := batch[0]
-	// text is the turn prompt (steerq.Join); display is the focused
-	// transcript's system line (one notice per visual line).
-	text, _ := steerq.Join(batch)
+	// text is the turn prompt (steerq.JoinText: TUI turns carry no images);
+	// display is the focused transcript's system line (one notice per
+	// visual line).
+	text := steerq.JoinText(batch)
 	display := text
 	if len(batch) > 1 {
 		texts := make([]string, len(batch))
@@ -434,14 +456,7 @@ func (m *Model) handleQueueKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		// Send now stops the running turn at its next round boundary. The
 		// queue itself stays: a hard cancel is what drops queued text.
-		switch {
-		case s == nil || s.agent == nil || !s.streaming:
-			m.statusMsg = "The current turn has already finished."
-		case s.agent.RequestYield(func() bool { return s.steerQ.SendNowReady("") }):
-			m.statusMsg = "Queued messages send after this round."
-		default:
-			m.statusMsg = "No queued message to send."
-		}
+		m.statusMsg = s.sendNow().Message()
 	case "d":
 		if s != nil && n > 0 {
 			if it := s.steerQ.Items()[m.queueCursor]; it.Kind != steerq.User {

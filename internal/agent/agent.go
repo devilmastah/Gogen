@@ -11,7 +11,7 @@ import (
 //
 // The unexported state is grouped into embedded domain structs
 // (sessionPersist, sessionStats, compactionState, backgroundState,
-// featureWiring, subagentWiring, toolRegistry, turnCounters,
+// featureWiring, subagentWiring, toolRegistry, turnCounters, turnYield,
 // sessionMeta), defined in the matching domain files; their fields
 // are promoted, so a.field access is unchanged. New per-session
 // state belongs in a domain group, not a flat field here.
@@ -97,6 +97,7 @@ type Agent struct {
 	subagentWiring
 	toolRegistry
 	turnCounters
+	turnYield
 	sessionMeta
 	terminalState
 }

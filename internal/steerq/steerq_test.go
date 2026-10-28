@@ -123,6 +123,46 @@ func TestBatch(t *testing.T) {
 	}
 }
 
+// TestBatchImageCap pins that a joined user run never carries more than
+// MaxImagesPerMessage images: it stops before the message that would go over,
+// and that message heads the next run.
+func TestBatchImageCap(t *testing.T) {
+	img := llm.ImageInput{DataURL: "data:image/png;base64,AA"}
+	images := func(n int) []llm.ImageInput {
+		out := make([]llm.ImageInput, n)
+		for i := range out {
+			out[i] = img
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name   string
+		counts []int
+		want   int
+	}{
+		{"text only joins", []int{0, 0, 0}, 3},
+		{"exactly the cap joins", []int{2, 2}, 2},
+		{"over the cap stops before it", []int{2, 2, 1}, 2},
+		{"a full head stays alone", []int{MaxImagesPerMessage, 1}, 1},
+		{"a full head still takes text", []int{MaxImagesPerMessage, 0, 1}, 2},
+		{"many small ones stop at the cap", []int{1, 1, 1, 1, 1, 1}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := New(0, 0)
+			for i, n := range tc.counts {
+				q.Append(Item{ID: string(rune('a' + i)), Text: "m", Kind: User, Images: images(n)})
+			}
+			batch := q.Batch(true)
+			if len(batch) != tc.want {
+				t.Fatalf("Batch(true) = %d items, want %d", len(batch), tc.want)
+			}
+			if _, joined := Join(batch); len(joined) > MaxImagesPerMessage {
+				t.Fatalf("joined run carries %d images, over the cap %d", len(joined), MaxImagesPerMessage)
+			}
+		})
+	}
+}
+
 // TestJoin pins the one prompt a batch runs as: texts in queue order with a
 // blank line between them, and every item's images in that same order.
 func TestJoin(t *testing.T) {
@@ -143,6 +183,9 @@ func TestJoin(t *testing.T) {
 			text, images := Join(tc.batch)
 			if text != tc.wantText {
 				t.Fatalf("text = %q, want %q", text, tc.wantText)
+			}
+			if got := JoinText(tc.batch); got != text {
+				t.Fatalf("JoinText = %q, want Join's text %q", got, text)
 			}
 			if len(images) != len(tc.wantImages) {
 				t.Fatalf("images = %d, want %d", len(images), len(tc.wantImages))
@@ -179,6 +222,37 @@ func TestSendNowReady(t *testing.T) {
 			}
 			if got := q.SendNowReady(tc.id); got != tc.want {
 				t.Fatalf("SendNowReady(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckSendNow pins the Send now rule and its order: idle first, then no
+// model turn (a compaction), then a send_message reply, then the queue.
+func TestCheckSendNow(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		busy     bool
+		turn     uint64
+		replying bool
+		queued   bool
+		want     SendNowResult
+	}{
+		{"idle session", false, 0, false, true, SendNowIdle},
+		{"idle even with a stale turn", false, 3, false, true, SendNowIdle},
+		{"compaction has no model turn", true, 0, false, true, SendNowNoModelCall},
+		{"reply turn is left alone", true, 3, true, true, SendNowReply},
+		{"reply wins over an empty queue", true, 3, true, false, SendNowReply},
+		{"nothing queued", true, 3, false, false, SendNowNotQueued},
+		{"queued message stops the turn", true, 3, false, true, SendNowRecorded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CheckSendNow(tc.busy, tc.turn, tc.replying, tc.queued)
+			if got != tc.want {
+				t.Fatalf("CheckSendNow = %v, want %v", got, tc.want)
+			}
+			if got.Message() == "" {
+				t.Fatalf("%v has no message", got)
 			}
 		})
 	}

@@ -88,6 +88,7 @@ func (sp *subagentSpawner) ArmReplyCapture(c *subagents.Child[*sessionRuntime]) 
 	c.Handle.deliverStartHook = func() {
 		c.BeginReply()
 	}
+	c.Handle.replyPending = c.PendingReply
 	c.Handle.deliverResultFunc = func(reply string, replyErr error) {
 		// An evicted runtime can no longer deliver the work the capture
 		// protects: dropping it keeps a released child's record from

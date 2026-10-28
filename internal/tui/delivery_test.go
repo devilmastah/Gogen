@@ -504,7 +504,7 @@ func TestQueueModal(t *testing.T) {
 	// `s` while nothing is running does not drop the queue. The queue here
 	// was already cleared by D, so this only pins the idle status.
 	model, _ = m4.handleQueueKey(keyPress("s"))
-	if model.(*Model).statusMsg != "The current turn has already finished." {
+	if model.(*Model).statusMsg != steerq.SendNowIdle.Message() {
 		t.Fatalf("idle send-now status = %q", model.(*Model).statusMsg)
 	}
 	// esc closes the modal.
@@ -547,31 +547,39 @@ func startRunningTurn(t *testing.T) (a *agent.Agent, finish func()) {
 
 // TestQueueSendNow pins the modal's send-now key against a turn that is
 // really running: it asks that turn to yield only while a user message is
-// queued, and it never removes queued text (a hard cancel does that).
+// queued, it refuses during a compaction (no model turn to stop), and it
+// never removes queued text (a hard cancel does that). A yield the "user
+// message queued" case records stays on the running turn; finish lets that
+// turn's only model call answer, so nothing is left to stop.
 func TestQueueSendNow(t *testing.T) {
-	a, finish := startRunningTurn(t)
+	running, finish := startRunningTurn(t)
 	defer finish()
+	idle := agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)
 	for _, tc := range []struct {
-		name  string
-		queue *steerq.Queue
-		want  string
+		name       string
+		agent      *agent.Agent
+		compacting bool
+		queue      *steerq.Queue
+		want       steerq.SendNowResult
 	}{
-		{"nothing queued", testQueue(), "No queued message to send."},
-		{"only a delivery queued", testQueue(notice("n1", "job done")), "No queued message to send."},
-		{"a user message queued", testQueue(userItem("u1", "first queued message")), "Queued messages send after this round."},
+		{"nothing queued", running, false, testQueue(), steerq.SendNowNotQueued},
+		{"only a delivery queued", running, false, testQueue(notice("n1", "job done")), steerq.SendNowNotQueued},
+		{"a user message queued", running, false, testQueue(userItem("u1", "first queued message")), steerq.SendNowRecorded},
+		{"during a compaction", idle, true, testQueue(userItem("u1", "first queued message")), steerq.SendNowNoModelCall},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newQueueTestModelFor(a)
+			m := newQueueTestModelFor(tc.agent)
 			s := m.focusedSession()
 			s.steerQ = tc.queue
-			s.streaming = true
+			s.streaming = !tc.compacting
+			s.compacting = tc.compacting
 			m.modal = ModalQueue
 			queued := tc.queue.Len()
 
 			model, _ := m.handleQueueKey(keyPress("s"))
 			m2 := model.(*Model)
-			if m2.statusMsg != tc.want {
-				t.Fatalf("status = %q, want %q", m2.statusMsg, tc.want)
+			if m2.statusMsg != tc.want.Message() {
+				t.Fatalf("status = %q, want %q", m2.statusMsg, tc.want.Message())
 			}
 			if m2.focusedSession().steerQ.Len() != queued {
 				t.Fatal("send now must keep the queue")

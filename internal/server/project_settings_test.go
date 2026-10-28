@@ -39,12 +39,13 @@ func TestProjectAndAgentSettingsLive(t *testing.T) {
 	msg := WSMessage{
 		Type: "config",
 		ConfigFields: []string{
-			"testCommand", "lintCommand", "agentInstructions", "jobNotices", "mcpToolMode",
+			"testCommand", "lintCommand", "agentInstructions", "jobNotices", "joinQueued", "mcpToolMode",
 		},
 		TestCommand:       "make test",
 		LintCommand:       "make vet",
 		AgentInstructions: "on",
 		JobNotices:        "on",
+		JoinQueued:        "on",
 		MCPToolMode:       "inline",
 	}
 	if err := conn.WriteJSON(msg); err != nil {
@@ -57,8 +58,9 @@ func TestProjectAndAgentSettingsLive(t *testing.T) {
 	if cfg.TestCommand != "make test" || cfg.LintCommand != "make vet" {
 		t.Fatalf("config echo commands = %q/%q, want make test / make vet", cfg.TestCommand, cfg.LintCommand)
 	}
-	if cfg.AgentInstructions != "on" || cfg.JobNotices != "on" {
-		t.Fatalf("config echo flags: agentInstructions=%q jobNotices=%q, want on/on", cfg.AgentInstructions, cfg.JobNotices)
+	if cfg.AgentInstructions != "on" || cfg.JobNotices != "on" || cfg.JoinQueued != "on" {
+		t.Fatalf("config echo flags: agentInstructions=%q jobNotices=%q joinQueued=%q, want on/on/on",
+			cfg.AgentInstructions, cfg.JobNotices, cfg.JoinQueued)
 	}
 
 	// Live targets: the session agent owns the commands (its cached project
@@ -77,11 +79,20 @@ func TestProjectAndAgentSettingsLive(t *testing.T) {
 	if !s.ws.GetJobNotices() {
 		t.Fatal("job_notices did not reach the workspace")
 	}
+	// join_queued is read by each runtime's delivery worker at its pop, so
+	// the session that was already running must follow the workspace too.
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	if !s.ws.JoinQueued() || !rt.joinQueued() {
+		t.Fatalf("join_queued did not reach the workspace (%v) and the running session (%v)", s.ws.JoinQueued(), rt.joinQueued())
+	}
 
 	// The runtime overlay is the source of truth for the push, new sessions,
 	// and persistence.
 	if r := s.ws.GetRuntimeConfig(); r.TestCommand != "make test" || r.LintCommand != "make vet" ||
-		!r.AgentInstructionsEnabled() || !r.JobNoticesEnabled() {
+		!r.AgentInstructionsEnabled() || !r.JobNoticesEnabled() || !r.JoinQueuedEnabled() {
 		t.Fatalf("runtime overlay not updated: %+v", r)
 	}
 
@@ -92,7 +103,7 @@ func TestProjectAndAgentSettingsLive(t *testing.T) {
 	}
 	for _, want := range []string{
 		"test_command: make test", "lint_command: make vet",
-		`agent_instructions: "on"`, `job_notices: "on"`, "mcp_tool_mode: inline",
+		`agent_instructions: "on"`, `job_notices: "on"`, `join_queued: "on"`, "mcp_tool_mode: inline",
 	} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("expected %q in persisted config:\n%s", want, data)
@@ -104,9 +115,10 @@ func TestProjectAndAgentSettingsLive(t *testing.T) {
 	// the fields are named in ConfigFields).
 	clear := WSMessage{
 		Type:              "config",
-		ConfigFields:      []string{"testCommand", "lintCommand", "agentInstructions", "jobNotices", "mcpToolMode"},
+		ConfigFields:      []string{"testCommand", "lintCommand", "agentInstructions", "jobNotices", "joinQueued", "mcpToolMode"},
 		AgentInstructions: "off",
 		JobNotices:        "off",
+		JoinQueued:        "off",
 		MCPToolMode:       "nested",
 	}
 	if err := conn.WriteJSON(clear); err != nil {
@@ -126,6 +138,9 @@ func TestProjectAndAgentSettingsLive(t *testing.T) {
 	}
 	if s.ws.GetJobNotices() {
 		t.Fatal("job_notices off did not reach the workspace")
+	}
+	if s.ws.JoinQueued() || rt.joinQueued() {
+		t.Fatal("join_queued off did not reach the workspace and the running session")
 	}
 }
 

@@ -83,49 +83,6 @@ extraction):
 CGO_ENABLED=0 go build -o gogen-nocgo .
 ```
 
-<details>
-<summary><strong>Building on Windows</strong></summary>
-
-Tree-sitter needs a C compiler on `PATH`. Without one, Go turns CGO off
-silently and you get the smaller build without syntax checks. A MinGW `gcc`
-works, for example WinLibs from winget:
-
-```powershell
-winget install BrechtSanders.WinLibs.POSIX.UCRT
-# open a new terminal so PATH picks up gcc, then:
-gcc --version
-go env CGO_ENABLED   # must print 1
-```
-
-Build from the repository root in PowerShell. `-s -w` strips debug symbols
-and makes the binary smaller:
-
-```powershell
-go build -ldflags="-s -w" -o gogen-windows-amd64.exe .
-```
-
-Check that tree-sitter made it in. The output should include
-`CGO_ENABLED=1`:
-
-```powershell
-go version -m .\gogen-windows-amd64.exe | Select-String CGO_ENABLED
-```
-
-To use your own build in the VS Code sidebar, set `gogen.executable` in your
-user settings to the full path of the `.exe`. A running gogen can be replaced
-by renaming the old `.exe` first, because Windows does not allow overwriting
-a running program but does allow renaming it. Reload the VS Code window
-afterwards.
-
-The command tests need the Unix tools that come with Git for Windows. Put
-them on `PATH` before running `go test ./...`:
-
-```powershell
-$env:PATH = "C:\Program Files\Git\usr\bin;" + $env:PATH
-```
-
-</details>
-
 ### Flags
 
 | Flag | Description |
@@ -695,11 +652,17 @@ mode it is fixed to the project directory and the input is hidden.
   `join_queued: on` (`GOGEN_JOIN_QUEUED`, or **Join queued messages** in the
   Agent settings of the browser and the VS Code sidebar), the messages queued
   back to back leave together as one message, texts separated by a blank line
-  and images in order. A machine notice stays its own turn either way. Each queued
+  and images in order. A joined message carries at most 4 images, like a typed
+  one: the message that would go over starts the next turn instead. A machine
+  notice stays its own turn either way. Each queued
   bubble shows a **queued** chip and a ✕ that removes that one item. **Send
   now**, on the last queued message, lets the model call already running
   finish, including the tools that call already asked for, and then the queue
-  runs. In the terminal UI the same action is `s` in `/queue`. The
+  runs. In the terminal UI the same action is `s` in `/queue`. Send now says
+  so when it does nothing: no turn is running, a compaction is running (there
+  is no model call to stop), the turn is a subagent answering its parent's
+  `send_message` (its reply is waited for), or the message already left the
+  queue. A refused send comes back into the VS Code sidebar's composer. The
   input bar counts them ("· N queued") and **Cancel**
   clears the user's own queued items (machine notices keep draining — they
   are one-way deliveries and a run of them drains as one batched turn, so a

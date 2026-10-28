@@ -253,19 +253,23 @@ func (rt *sessionRuntime) broadcastQueueStarted(text string, left []string) {
 }
 
 // sendNow asks the running turn to stop at its next round boundary so the
-// queue can deliver, and reports whether that was recorded. id names the
-// queued user item the client showed the control on ("" = any user item).
-// Nothing is asked when no turn is running or that item is no longer
-// queued, so a late request cannot cut short the turn that item started.
-func (rt *sessionRuntime) sendNow(id string) bool {
-	if active, _ := rt.turnState(); !active {
-		return false
+// queue can deliver (steerq.CheckSendNow), and returns the outcome. id names
+// the queued user item the client showed the control on ("" = any user
+// item). The turn is read before the queue, so a queued item that starts
+// its own turn in between is no longer queued, and that turn is not the
+// one asked to stop.
+func (rt *sessionRuntime) sendNow(id string) steerq.SendNowResult {
+	busy, _ := rt.turnState()
+	turn := rt.agent.TurnGeneration()
+	rt.deliverMu.Lock()
+	queued := rt.pendingDeliver.SendNowReady(id)
+	rt.deliverMu.Unlock()
+	replying := rt.replyPending != nil && rt.replyPending()
+	res := steerq.CheckSendNow(busy, turn, replying, queued)
+	if res == steerq.SendNowRecorded && !rt.agent.RequestYieldFor(turn) {
+		res = steerq.SendNowIdle
 	}
-	return rt.agent.RequestYield(func() bool {
-		rt.deliverMu.Lock()
-		defer rt.deliverMu.Unlock()
-		return rt.pendingDeliver.SendNowReady(id)
-	})
+	return res
 }
 
 // queueItems snapshots the queue for the wire (user items only are sent:
@@ -493,15 +497,15 @@ func (r *sessionRegistry) clearParentDeliveries(id string) {
 }
 
 // deliverLoop is the per-runtime queue worker (at most one per runtime,
-// guarded by deliverWorker). It pops the queue head — a user steering
-// message, a targeted send_message delivery, or a contiguous run of one-way
-// notices (strict FIFO arrival order across kinds: a batch stops at the
-// first user/targeted item) — waits for the session turn lock (the idle
-// check), hands the lock to startTurn (whose goroutine defers the unlock),
-// and repeats until the queue is empty. Notice runs share ONE turn so a
-// burst of completions costs one provider request instead of one per
-// notice; user and targeted items keep their own turns (each typed message
-// is its own turn, and the send_message reply capture is armed per turn).
+// guarded by deliverWorker). It pops the head run that drains as one turn
+// (steerq.Batch: a run of one-way notices, a run of user messages when
+// join_queued is on, otherwise the head item alone; a run stops at a
+// different kind, so FIFO arrival order holds across kinds), waits for the
+// session turn lock (the idle check), hands the lock to startTurn (whose
+// goroutine defers the unlock), and repeats until the queue is empty. A
+// notice run shares ONE turn so a burst of completions costs one provider
+// request instead of one per notice. A targeted send_message delivery always
+// keeps its own turn, because its reply capture is armed per turn.
 //
 // The worker wakes without polling when either a turn-lock holder releases
 // the lock (releaseTurn's broadcast — covering both a turn end and a brief
@@ -591,7 +595,7 @@ func (rt *sessionRuntime) deliverLoop() {
 		// batches, because its reply capture is armed per turn and must stay
 		// 1:1 with the tool call. Only a contiguous head run is taken, so
 		// FIFO across kinds is preserved.
-		batch := rt.pendingDeliver.Batch(rt.joinQueued != nil && rt.joinQueued())
+		batch := rt.pendingDeliver.Batch(rt.joinQueued())
 		// Capture everything the delivery needs BEFORE dropping the run:
 		// dropDeliveredLocked zeroes the popped slots (so their text/images
 		// are no longer retained by the backing array). batch is a COPY, and

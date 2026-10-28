@@ -140,8 +140,10 @@ type sessionRuntime struct {
 	pendingDeliver *steerq.Queue
 	deliverWorker  atomic.Bool
 	deliverNotify  chan struct{}
-	// joinQueued reports the live join_queued flag at each pop (nil = off).
-	// Set once at construction; never reassigned.
+	// joinQueued reports the live join_queued flag at each pop. Never nil:
+	// newSessionRuntime installs "off", and newWorkspaceRuntime replaces it
+	// with the workspace's flag before the runtime is used. Never
+	// reassigned after that.
 	joinQueued func() bool
 
 	// deliverStartHook is invoked by the delivery worker immediately before
@@ -155,6 +157,11 @@ type sessionRuntime struct {
 	// runTurnBody already knows which response belongs to this invocation.
 	// Set once at child creation; never reassigned.
 	deliverResultFunc func(string, error)
+	// replyPending reports that the child's send_message reply is armed and
+	// not yet delivered (subagents.Child.PendingReply), so Send now leaves
+	// that turn alone. nil for a session that is not a continuable child.
+	// Set once at child creation; never reassigned.
+	replyPending func() bool
 	// approverOverride replaces the default deleteApprover when non-nil
 	// (the subagent spawner installs the D6 forwarding approver; the board
 	// start installs a deny-when-unattended approver).
@@ -207,6 +214,7 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 		deliverNotify:  make(chan struct{}, 1),
 		pendingDeliver: steerq.New(maxUserQueueCap, maxSystemDeliveryQueue),
 		turnRelease:    make(chan struct{}),
+		joinQueued:     func() bool { return false },
 	}
 	// When this session's background work drains, re-check whether it has
 	// become an evictable orphan. Both eviction paths refuse to evict a
@@ -226,7 +234,9 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 func newWorkspaceRuntime(a *agent.Agent, ws *Workspace) *sessionRuntime {
 	rt := newSessionRuntime(a)
 	rt.approvalHold = ws.ApprovalHold()
-	rt.joinQueued = ws.JoinQueued
+	if ws != nil {
+		rt.joinQueued = ws.JoinQueued
+	}
 	return rt
 }
 

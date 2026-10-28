@@ -304,9 +304,9 @@ class GogenHost {
         });
         break;
       case "response":
-        if (msg.content) {
-          this.emit({ type: "notice", text: msg.content });
-        }
+        // A reply can answer a send that never started a turn. The chat
+        // view settles that send.
+        this.emit({ type: "notice", reply: true, queueId: msg.queueId || "", text: msg.content || "" });
         break;
       case "delete_approval":
       case "command_approval":
