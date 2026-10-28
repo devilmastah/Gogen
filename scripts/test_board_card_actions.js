@@ -198,6 +198,28 @@ async function main() {
   recv(boardState([{ id: '5', title: 'back', status: 'backlog' }]));
   check('non-empty board hides the empty-state hint', document.getElementById('board-empty').hidden);
 
+  // ── Activity timestamps use the ONE relative-time policy ──
+  // The board used to carry its own copy (boardRelTime) that rounded
+  // differently and said "just now" for anything under 45 s — so the same
+  // event read "just now" on the board and "30s ago" in the sidebar, and
+  // "2m ago" on the board vs "1m ago" in the sidebar after 90 s.
+  const isoAgo = (secs) => new Date(Date.now() - secs * 1000).toISOString();
+  recv(boardState([{
+    id: '7', title: 'aged', status: 'backlog',
+    activity: [
+      { at: isoAgo(30), by: 'gompa', text: 'created' },
+      { at: isoAgo(90), by: 'gompa', text: 'commented' },
+    ],
+  }]));
+  const agedCard = cardByID('7');
+  click(agedCard);
+  const stamps = Array.from(agedCard.querySelectorAll('.board-activity-time')).map((el) => el.textContent);
+  check('activity times rendered', stamps.length === 2);
+  check('30s-old activity uses the sidebar policy ("30s ago", not "just now")',
+    stamps[0] === window.formatRelativeTime(new Date(Date.now() - 30 * 1000)));
+  check('30s-old activity is not the old board-local "just now"', stamps[0] !== 'just now');
+  check('90s-old activity floors like the sidebar ("1m ago", not "2m ago")', stamps[1] === '1m ago');
+
   if (failures === 0) {
     console.log('\nAll board card-action checks passed.');
     process.exit(0);

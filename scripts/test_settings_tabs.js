@@ -69,6 +69,9 @@ async function main() {
   const activeTabBtn = () => tabBtns().find((b) => b.classList.contains('active'));
   const picker = document.getElementById('subagent-model-picker');
   const pickerList = document.getElementById('subagent-model-list');
+  // The .setting-row that carries the picker's label: the feature gate hides
+  // the WHOLE row (label + picker), not just the picker.
+  const pickerRow = document.getElementById('row-subagent-model-picker');
   const subagentSelect = document.getElementById('subagent-enabled-select');
 
   let failures = 0;
@@ -144,6 +147,7 @@ async function main() {
   // Server push: subagents on, no default model yet.
   window.applyServerConfig({ board: 'off', subagent: 'on', subagentMaxDepth: 1, subagentModel: '' });
   check('picker is visible while subagents are enabled', picker && !picker.hidden);
+  check('picker row visible while subagents are enabled', !!pickerRow && !pickerRow.hidden);
   // Catalog reply (the toolbar shares this flow). The server marks the
   // pane's model with `current: true` — the picker must ignore that flag.
   window.handleModels({
@@ -192,7 +196,11 @@ async function main() {
 
   // Feature off hides the picker.
   window.applyServerConfig({ board: 'off', subagent: 'off', subagentMaxDepth: 1, subagentModel: '' });
-  check('picker hidden while subagents are disabled', picker.hidden);
+  // The row is what hides: gating the inner picker alone left the "Default
+  // subagent model" label dangling over empty space.
+  check('picker row hidden while subagents are disabled', !!pickerRow && pickerRow.hidden);
+  check('reasoning-effort row hidden while subagents are disabled',
+    document.getElementById('row-subagent-thinking-picker').hidden === true);
 
   // ── Max concurrent subagents input ──
   // Re-enable subagents (the picker section ended with the feature off).
@@ -212,6 +220,22 @@ async function main() {
   limitInput.value = '0';
   limitInput.dispatchEvent(new window.Event('change', { bubbles: true }));
   check('below-range limit reset to 1', limitInput.value === '1');
+  // The clamp bound is the CONTROL's own max (the renderer took it from the
+  // schema), not a hardcoded copy: narrowing the bound must narrow the clamp.
+  const savedMax = limitInput.max;
+  limitInput.max = '12';
+  limitInput.value = '50';
+  limitInput.dispatchEvent(new window.Event('change', { bubbles: true }));
+  check('clamp follows the control max, not a hardcoded 32', limitInput.value === '12');
+  check('narrowed clamp sent', sent.some((s) => s.includes('"subagentMaxConcurrent":12')));
+  limitInput.max = savedMax;
+  // Depth carries its own bound (10), also rendered from the schema.
+  const depthInput = document.getElementById('subagent-depth-input');
+  check('depth input carries the schema max', depthInput.max === '10');
+  depthInput.value = '99';
+  depthInput.dispatchEvent(new window.Event('change', { bubbles: true }));
+  check('depth clamped to its schema max (10)', depthInput.value === '10');
+  check('clamped depth sent', sent.some((s) => s.includes('"subagentMaxDepth":10')));
 
   // ── Schema-driven tab order + grouping ──
   // The sidebar/panels come from components/settings-schema.js (evaluated

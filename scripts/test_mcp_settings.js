@@ -116,6 +116,28 @@ async function main() {
     check('mcp_save parses the env', op.env && op.env.TOKEN === 'v1' && op.env.DEBUG === '1', JSON.stringify(op.env));
   }
 
+  // ── "Saved" is claimed from the server's config push, never optimistically ──
+  // A refused save (host server, blank command, persist error) arrives as a
+  // notice error; the modal must not keep saying "Saved" next to that toast.
+  const note = () => doc.getElementById('mcp-test-result').textContent;
+  check('save reports progress first (not "Saved")',
+    note().startsWith('Saving') && !note().includes('Saved'), note());
+  // A push that does NOT contain the server cannot confirm it.
+  window.applyServerConfig({ mcpServers: [{ name: 'other', command: 'x' }] });
+  check('an unrelated push does not claim the save', !note().includes('Saved'), note());
+  // The refused-save notice clears the pending line (the toast carries the error).
+  window.handleNotice({ success: false, kind: 'mcp', content: 'Error: MCP server "fetch" is started by this process' });
+  check('a refused save clears the pending line', note() === '', note());
+  // A push WITH the saved row confirms it, and says the restart is needed.
+  doc.getElementById('mcp-save-btn').click();
+  window.applyServerConfig({ mcpServers: [{ name: 'fetch', command: 'node', args: ['server.js'] }] });
+  check('the confirming push reports the save', note().includes('Saved fetch'), note());
+  check('the confirmation mentions the restart', note().includes('restart gogen'), note());
+  // A host row with the same name must not count as confirmation.
+  doc.getElementById('mcp-save-btn').click();
+  window.applyServerConfig({ mcpServers: [{ name: 'fetch', command: 'node', host: true }] });
+  check('a host row does not confirm a save', !note().includes('Saved'), note());
+
   // ── An empty name is refused client-side ──
   doc.getElementById('mcp-test-name').value = '   ';
   const before = ws.sent.length;

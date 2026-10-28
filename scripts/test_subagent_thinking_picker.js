@@ -12,7 +12,7 @@
 //     including the server-push echo and the empty (inherit) clear,
 //   - switching the subagent model to one that does not accept the stored
 //     effort resets it to "Inherit" (and sends the clear),
-//   - the picker hides while the subagent feature is off.
+//   - the picker's whole .setting-row hides while the subagent feature is off.
 // Run: node scripts/test_subagent_thinking_picker.js
 const fs = require('fs');
 const path = require('path');
@@ -64,7 +64,8 @@ async function main() {
     settingsBtn.click();
   };
 
-  const picker = document.getElementById('subagent-thinking-picker');
+  // The feature gate hides the row that carries the label, not the inner block.
+  const pickerRow = document.getElementById('row-subagent-thinking-picker');
   const optionsEl = document.getElementById('subagent-thinking-options');
   const modelList = document.getElementById('subagent-model-list');
   const chips = () => Array.from(optionsEl.querySelectorAll('.tb-thinking-chip'));
@@ -91,9 +92,11 @@ async function main() {
   // ── Visibility follows the subagent feature ──
   openFromPane('board'); // Agent tab
   push({ subagent: 'off' });
-  check('picker hidden while subagents are disabled', picker.hidden);
+  // Hiding only the inner block left "Subagent reasoning effort" dangling
+  // over empty space, so the gate hides the whole .setting-row.
+  check('picker row hidden while subagents are disabled', pickerRow.hidden === true);
   push({ subagent: 'on' });
-  check('picker visible while subagents are enabled', !picker.hidden);
+  check('picker row visible while subagents are enabled', pickerRow.hidden === false);
 
   // ── Inherit model: options follow the PANE model's efforts ──
   // The pane model accepts high/max (from the config push above).

@@ -136,6 +136,7 @@
             getShowReplyModelPref,
             initSettings,
             isSettingsOpen,
+            noteMCPOpFailed,
             openSettings,
             sendNotification,
             sendRuntimeConfig,
@@ -487,10 +488,39 @@
         // lives in components/model-picker.js — shared with the settings
         // subagent picker and the board "Start agent" popover.
 
+        // Canonical key of the selected model ("" = none): the model flagged
+        // `current`, else the caller's `current` selector resolved against the
+        // catalog (payloads without the per-row flag, and callers that pass a
+        // bare id). Both the render sites and the config frame derive the key
+        // the same way, so the "did the selection move?" check below is not
+        // fooled by the bare-vs-qualified form of the selection.
+        function toolbarSelectionKey(models, current) {
+            const list = models || [];
+            const flagged = list.find((m) => m.current);
+            if (flagged) return (flagged.provider || 'default') + '/' + flagged.id;
+            if (!current) return '';
+            const owner = list.find((m) => {
+                const prov = m.provider || 'default';
+                return (prov === 'default' ? m.id : prov + '/' + m.id) === current || m.id === current;
+            });
+            return owner ? (owner.provider || 'default') + '/' + owner.id : '';
+        }
+
+        // The selection the toolbar list was last RENDERED with. A config
+        // frame re-derives every row's `current` flag, but when the resulting
+        // selection is unchanged the rendered rows are identical — and a
+        // config frame arrives on every attach, mode/thinking change and
+        // feature-toggle broadcast, so rebuilding a several-hundred-row list
+        // (fresh nodes + listeners) for an unchanged selection is pure waste.
+        // Open (toggleModelPopover) and filter (input) re-render regardless,
+        // and a catalog reply (updateModelSelect) always renders once.
+        let toolbarListSelection = null;
+
         // Toolbar wrapper: behavior unchanged (per-session set_model +
         // popover close), just routed through the shared renderer.
         function renderToolbarModelList(models, current) {
             if (!tbModelList) return;
+            toolbarListSelection = toolbarSelectionKey(models, current);
             renderModelList(tbModelList, modelFilterQuery, tbModelFilter ? tbModelFilter.value : modelFilterQuery, models, current, (id, active) => {
                 if (active) { closeModelPopover(); return; }
                 if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -923,8 +953,19 @@
             updateToolbarContext(data);
         }
 
+        // Last working directory a config frame carried. The explorer is
+        // rebuilt only when this actually changes: a config frame arrives on
+        // every attach, model switch, mode/thinking change, feature toggle
+        // broadcast and provider save, and each refresh is a directory walk
+        // plus a git-status round trip (plus the tree DOM rebuild) for an
+        // event that never touched the working dir. A pane switch to the
+        // editor and the editor socket's reconnect refresh it explicitly.
+        let lastWorkingDir = '';
+
         function applyServerConfig(data) {
+            const workingDirChanged = !!data.workingDir && data.workingDir !== lastWorkingDir;
             if (data.workingDir) {
+                lastWorkingDir = data.workingDir;
                 dirInput.value = data.workingDir;
                 if (workingDirPath) workingDirPath.textContent = data.workingDir;
             }
@@ -939,7 +980,12 @@
                 for (const m of availableModels) {
                     m.current = (m.id === data.model) && ((m.provider || 'default') === provider);
                 }
-                renderToolbarModelList(availableModels, provider === 'default' ? data.model : provider + '/' + data.model);
+                const selector = provider === 'default' ? data.model : provider + '/' + data.model;
+                // The flags above are what every consumer reads; the DOM only
+                // needs the rebuild when the rendered selection moves.
+                if (toolbarSelectionKey(availableModels, selector) !== toolbarListSelection) {
+                    renderToolbarModelList(availableModels, selector);
+                }
             } else if (!data.model && availableModels.length > 0) {
                 // Model cleared (validation dropped a stale restored model):
                 // nothing is current — a leftover checkmark would keep
@@ -947,7 +993,7 @@
                 for (const m of availableModels) {
                     m.current = false;
                 }
-                renderToolbarModelList(availableModels, '');
+                if (toolbarSelectionKey(availableModels, '') !== toolbarListSelection) renderToolbarModelList(availableModels, '');
             }
             // Remember the active model's accepted efforts + description so
             // pane switches and focus restores re-render the correct chips
@@ -993,8 +1039,9 @@
                 sessionInfoDiv.textContent = data.sessionId;
                 updateCurrentSessionLabel(data.sessionLabel);
             }
-            // Refresh explorer when working dir changes
-            if (document.getElementById('editor-pane').classList.contains('active')) {
+            // Refresh the explorer when the working dir changed (only then —
+            // see lastWorkingDir above).
+            if (workingDirChanged && document.getElementById('editor-pane').classList.contains('active')) {
                 refreshExplorer().catch(() => {});
             }
         }
@@ -6118,6 +6165,9 @@
             // disabled must not re-trigger another op (toast/resync loop).
             if (data.kind === 'board' && boardTabVisible()) requestBoardState();
             if (data.kind === 'automations' && automationsPaneVisible()) requestAutomationsState();
+            // A refused mcp_save must drop its pending "Saving…" line: the
+            // error itself is the toast above.
+            if (data.kind === 'mcp') noteMCPOpFailed();
         }
 
         function sendMessage() {
@@ -6818,6 +6868,10 @@
             },
             getModels: () => availableModels,
             getPane: () => activePane(),
+            // The same relative-age policy the sidebar rows and the
+            // transcript timestamps use (board activity rows used to carry
+            // their own copy that rounded differently).
+            relativeTime: (value, now) => relativeTime(value, now),
         });
 
         // === Automations tab (scheduled jobs) ===
