@@ -19,6 +19,9 @@
 //   deps.getModels()              — the model catalog array
 //   deps.getPane()                — the active pane (the picker's
 //                                   "Workspace default" row)
+//   deps.relativeTime(value, now) — the ONE relative-age formatter the
+//                                   sidebar/transcript use (app.js passes
+//                                   it, like it does for sessions.js)
 
 import { createPopover } from '/components/popover.js';
 import { icon } from '/components/icons.js';
@@ -630,7 +633,7 @@ function buildBoardActivity(activity) {
         row.className = 'board-activity-row kind-' + boardActivityKind(String(act.text || ''));
         const time = document.createElement('span');
         time.className = 'board-activity-time';
-        time.textContent = boardRelTime(act.at);
+        time.textContent = deps.relativeTime(act.at);
         time.title = act.at ? new Date(act.at).toLocaleString() : '';
         const who = document.createElement('span');
         who.className = 'board-activity-who';
@@ -655,23 +658,6 @@ function boardActivityKind(text) {
     if (t.startsWith('agent session')) return 'agent';
     if (t === 'created' || t === 'claimed' || t === 'marked done' || t.startsWith('edited')) return 'system';
     return 'comment';
-}
-
-// boardRelTime formats an ISO timestamp as a short relative age ("5m ago"),
-// falling back to the locale date for anything older than a week.
-function boardRelTime(iso) {
-    if (!iso) return '';
-    const then = new Date(iso).getTime();
-    if (Number.isNaN(then)) return '';
-    const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
-    if (secs < 45) return 'just now';
-    const mins = Math.round(secs / 60);
-    if (mins < 60) return mins + 'm ago';
-    const hours = Math.round(mins / 60);
-    if (hours < 24) return hours + 'h ago';
-    const days = Math.round(hours / 24);
-    if (days < 7) return days + 'd ago';
-    return new Date(iso).toLocaleDateString();
 }
 
 // boardBlockReason returns the most recent block reason for a blocked

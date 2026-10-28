@@ -575,12 +575,29 @@ function colorizeCacheGet(key) {
   return hit;
 }
 
-function colorizeCachePut(key, html) {
+// Keys whose cached HTML colors only a PREFIX of the source they are filed
+// under, mapped to the source it actually covers. A streaming block is
+// painted progressively (colored prefix + plain tail), so sealing it under
+// its full display text used to record a half-colored rendering that the
+// stable path then took as final — the block froze part-colored and no
+// further tokenize ever ran. Sealing now records the coverage, and the
+// stable path applies such an entry (no flash) and finishes the block in the
+// background.
+const colorizePartial = new Map();
+
+function colorizeCachePut(key, html, coveredSource) {
   if (colorizeCache.size >= COLORIZE_CACHE_MAX) {
     const oldest = colorizeCache.keys().next().value;
-    if (oldest !== undefined) colorizeCache.delete(oldest);
+    if (oldest !== undefined) {
+      colorizeCache.delete(oldest);
+      colorizePartial.delete(oldest);
+    }
   }
   colorizeCache.set(key, html);
+  // coveredSource === null|undefined: the HTML colors the whole source
+  // (a real tokenize result). Anything else is a prefix rendering.
+  if (coveredSource === null || coveredSource === undefined) colorizePartial.delete(key);
+  else colorizePartial.set(key, coveredSource);
 }
 
 /**
@@ -592,7 +609,10 @@ function colorizeCachePut(key, html) {
 function cachedColorize(m, source, lang) {
   const key = lang + '\u0000' + source;
   const hit = colorizeCacheGet(key);
-  if (hit !== undefined) return Promise.resolve(hit);
+  // A prefix-only entry (see colorizePartial) is a MISS here: this path wants
+  // the coloring of the whole source, and returning the partial would freeze
+  // whatever it paints.
+  if (hit !== undefined && !colorizePartial.has(key)) return Promise.resolve(hit);
   return m.editor.colorize(source, lang, {}).then((raw) => {
     const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
     colorizeCachePut(key, html);
@@ -853,6 +873,40 @@ function applyColorized(code, html) {
   window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
 }
 
+// Key of one coloring: the language id the shared cache uses plus the source
+// it covers. EVERY producer and consumer goes through this one function, so
+// the synchronous lookup in colorizeNode cannot key differently from the async
+// write in enqueueColorize. (It could: a fence the static alias map does not
+// know — "c++" -> cpp, "c#" -> csharp, "xhtml" -> html — was written under the
+// RESOLVED id but looked up under the static one, so it missed forever and
+// repainted plain on every re-render. Tool results resolve before they reach
+// cachedColorize, so they stay self-consistent either way.)
+function colorizeStamp(lang, source) {
+  return lang + '\u0000' + source;
+}
+
+// What a code element's DOM currently shows (undefined = plain). Applying a
+// coloring used to be an unconditional `innerHTML = html`, so every streaming
+// flush (~32ms) and every repeat render rewrote a whole subtree with identical
+// markup — tearing down the very spans the tail patcher exists to keep, and
+// repainting blocks that were already correct. Writers stamp; readers compare
+// and skip. A re-rendered element simply has no stamp, so it still gets its
+// one apply.
+function markColorized(code, lang, source) {
+  code.__gogenColoredFor = colorizeStamp(lang, source);
+}
+
+// The source a code element's current coloring actually covers, or null when
+// it carries no stamp for `lang`. The streaming governor paints a growing
+// block as "colored prefix + plain tail", so this is what tells a sealer
+// whether the element is fully colored or only partly.
+function coloredCoverage(code, lang) {
+  const stamp = code.__gogenColoredFor;
+  if (!stamp) return null;
+  const prefix = lang + '\u0000';
+  return stamp.startsWith(prefix) ? stamp.slice(prefix.length) : null;
+}
+
 /**
  * Publish every colorized code block under `root` to the shared LRU, keyed by
  * the text it currently displays. The streaming governor deliberately never
@@ -879,8 +933,13 @@ export function sealStreamColorize(root) {
     // element will hit that entry, so re-serializing this element's
     // span-heavy HTML would be pure cost. Map.has, not colorizeCacheGet —
     // this must not disturb LRU order.
-    if (colorizeCache.has(lang + '\u0000' + display)) continue;
-    colorizeCachePut(lang + '\u0000' + display, code.innerHTML);
+    const key = colorizeStamp(lang, display);
+    if (colorizeCache.has(key)) continue;
+    // Coverage: the governor paints a growing block as a colored PREFIX plus
+    // a plain tail, so the element may not color all of `display`. Record
+    // what it covers; filing it as final would freeze the block part-colored.
+    const covered = coloredCoverage(code, lang);
+    colorizeCachePut(key, code.innerHTML, covered === display ? null : (covered === null ? display : covered));
   }
 }
 
@@ -911,8 +970,14 @@ function enqueueColorize(code, source, lang) {
       // in-place patch/colorize that changed it invalidates the result).
       if (code.__gogenPlain !== undefined && code.__gogenPlain !== source) return;
       const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
-      colorizeCachePut(resolved + '\u0000' + source, html);
+      // Keyed by the id the CALLER asked with, not the resolved one: every
+      // reader (the sync lookup in colorizeNode, sealStreamColorize, the
+      // streaming publish) only knows the static id and cannot resolve
+      // synchronously. See colorizeStamp.
+      const key = colorizeStamp(lang, source);
+      colorizeCachePut(key, html);
       applyColorized(code, html);
+      markColorized(code, lang, source);
     } catch (_) {
       // Unknown / unloaded language or init failure — leave plain text.
     }
@@ -928,8 +993,11 @@ function enqueueColorize(code, source, lang) {
 //   - ONE tokenize per tail node in flight; a request that arrives while
 //     one runs is coalesced into a single trailing retry that reads the
 //     element's text at retry time (always the newest content),
-//   - at most one START per interval, stretched to 4x the previous
-//     tokenize's duration, so colorize can never saturate the main thread,
+//   - a CPU-SHARE budget: a tokenize's own duration earns the next one's gap
+//     (at most STREAM_COLORIZE_CPU_SHARE of the main thread). Measured on
+//     real hardware, 2 KB tokenizes in ~0.6ms, so ordinary blocks re-color on
+//     every ~32ms flush — the colors arrive WITH the text — while an 18 KB
+//     block (~11ms) backs off to ~75ms and the cap bounds a huge one's lag,
 //   - sources past STREAM_COLORIZE_MAX_BYTES stay plain until the block is
 //     completed or finalized (those paths colorize once, cached),
 //   - the last applied (lang, source) result is remembered per node, so a
@@ -940,8 +1008,14 @@ function enqueueColorize(code, source, lang) {
 // suffix: the tokenize may finish after more text arrived, so the element's
 // current text is preserved verbatim (re-appended as a text node) instead
 // of discarding the result — every paid tokenize becomes visible.
-const STREAM_COLORIZE_INTERVAL_MS = 250;
-const STREAM_COLORIZE_SLOWDOWN = 4;
+// Minimum gap: one render flush, so colorization keeps up with the text
+// instead of trailing it by a quarter second. The old fixed 250ms floor
+// protected nothing: the blocks people stream tokenize in well under 1ms.
+const STREAM_COLORIZE_MIN_GAP_MS = 32;
+// Ceiling: bounds a very large block's worst-case lag.
+const STREAM_COLORIZE_MAX_GAP_MS = 1000;
+// Share of the main thread streaming colorization may use.
+const STREAM_COLORIZE_CPU_SHARE = 0.15;
 const STREAM_COLORIZE_MAX_BYTES = 32 * 1024;
 
 const streamColorize = new WeakMap(); // host node -> governor state
@@ -970,10 +1044,13 @@ function streamColorizeSource(code) {
 // re-appended as plain text, so the element's text is preserved exactly —
 // never a gap, never a duplicate. Returns false (nothing applied) when the
 // element's text no longer extends `source` (a rewrite/replacement).
-function applyStreamColored(code, html, source) {
+function applyStreamColored(code, html, source, lang) {
   const display = code.__gogenPlain !== undefined ? code.__gogenPlain : (code.textContent || '');
   if (display !== source && !display.startsWith(source)) return false;
   applyColorized(code, html);
+  // Record what the element now shows, so the next flush re-applies nothing
+  // when the memo has not moved (see markColorized).
+  markColorized(code, lang, source);
   const tail = display.slice(source.length);
   if (tail) code.appendChild(document.createTextNode(tail));
   return true;
@@ -991,23 +1068,27 @@ function startStreamColorize(node, gov, code, lang, source) {
   gov.inFlight = true;
   gov.pending = false;
   gov.lastAt = Date.now();
-  const started = gov.lastAt;
+  // Cost is measured from AFTER initMonaco: the first call of a page also
+  // awaits the ~4.5MB bundle import, and letting that one-off load set
+  // lastCost would stall the first block's coloring for the whole cap.
+  let costFrom = 0;
   (async () => {
     try {
       const m = await initMonaco();
       if (!code.isConnected) return;
       const resolved = resolveMonacoLanguage(lang);
       if (!resolved || resolved === 'plaintext') return;
+      costFrom = Date.now();
       const raw = await m.editor.colorize(source, resolved, {});
       if (!code.isConnected) return;
       const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
-      if (applyStreamColored(code, html, source)) {
+      if (applyStreamColored(code, html, source, lang)) {
         gov.memo = { lang, source, html };
       }
     } catch (_) {
       // Unknown / unloaded language or init failure — leave plain text.
     } finally {
-      gov.lastCost = Date.now() - started;
+      gov.lastCost = costFrom ? Date.now() - costFrom : 0;
       gov.inFlight = false;
       if (gov.pending) {
         // A flush arrived while this tokenize ran: re-gate immediately for
@@ -1057,10 +1138,25 @@ export function colorizeNode(node, opts) {
     if (!streamingTail) {
       const source = code.__gogenPlain;
       if (!source.trim()) continue;
-      const key = lang + '\u0000' + source;
+      const key = colorizeStamp(lang, source);
+      // Already showing exactly this coloring (a repeat render of the same
+      // node): nothing to write, nothing to tokenize.
+      if (code.__gogenColoredFor === key) continue;
       const hit = colorizeCacheGet(key);
       if (hit !== undefined) {
         applyColorized(code, hit);
+        const covered = colorizePartial.get(key);
+        if (covered === undefined) {
+          markColorized(code, lang, source);
+        } else {
+          // Prefix-only entry (sealed while the streaming governor was
+          // behind): paint it so nothing flashes, then FINISH the block in
+          // the background. Without this the block stayed part-colored
+          // forever — the entry occupied the full-text key and nothing ever
+          // re-tokenized it.
+          markColorized(code, lang, covered);
+          scheduleColorizeJob(code, () => enqueueColorize(code, source, lang));
+        }
       } else {
         // Queued through the scheduler: no Monaco import mid-replay, and
         // no tokenize for code that is not near the viewport.
@@ -1081,11 +1177,17 @@ export function colorizeNode(node, opts) {
     // of its prefixes would only evict useful entries.
     if (code.dataset.monacoColorized === '1' && code.__gogenRaw !== undefined
         && code.__gogenRaw === code.__gogenPlain
-        && !colorizeCache.has(lang + '\u0000' + code.__gogenPlain)) {
+        && !colorizeCache.has(colorizeStamp(lang, code.__gogenPlain))) {
       // Map.has guard: a closed fence can sit in the tail across several
       // flushes, and re-serializing its span-heavy innerHTML every flush
       // would be pure cost once published.
-      colorizeCachePut(lang + '\u0000' + code.__gogenPlain, code.innerHTML);
+      // Coverage matters here too: the fence closing does not mean the
+      // governor had caught up (its next tokenize may be a full second away on
+      // a large block), so the published HTML can color only a prefix.
+      const display = code.__gogenPlain;
+      const covered = coloredCoverage(code, lang);
+      colorizeCachePut(colorizeStamp(lang, display), code.innerHTML,
+        covered === display ? null : (covered === null ? display : covered));
     }
     // Re-apply the governor's last result whenever its source still covers
     // the element's text — equal, or a PREFIX of it (the element grew since
@@ -1100,19 +1202,28 @@ export function colorizeNode(node, opts) {
     const memo = gov.memo;
     let applied = false;
     if (memo && memo.lang === lang && (memo.source === source || source.startsWith(memo.source))) {
-      if (applyStreamColored(code, memo.html, memo.source)) {
+      // Skip the write when this element already shows the memo's coloring:
+      // the tail patcher appends grown text to the existing nodes, so a flush
+      // that changed nothing (or only grew the plain tail) must not rebuild
+      // the colored prefix. This is what keeps a patched block's spans alive.
+      if (code.__gogenColoredFor === colorizeStamp(lang, memo.source)) {
         applied = true;
-        if (memo.source === source) continue; // unchanged: nothing new to tokenize
+      } else if (applyStreamColored(code, memo.html, memo.source, lang)) {
+        applied = true;
       }
+      if (applied && memo.source === source) continue; // unchanged: nothing new to tokenize
     }
     if (!applied) {
       // Sync cache hits still apply instantly (a closed fence's source can
       // match a cached completed block); the governor only owns the tokenize
       // path. Never a cache WRITE from here: the source is still growing, so
       // the key would only evict useful entries.
-      const hit = colorizeCacheGet(lang + '\u0000' + source);
-      if (hit !== undefined) {
-        applyStreamColored(code, hit, source);
+      const hit = colorizeCacheGet(colorizeStamp(lang, source));
+      // A prefix-only entry cannot serve a growing element: applyStreamColored
+      // would keep the colors for `source` but the HTML covers less of it, and
+      // the uncovered middle would be lost. Treat it as a miss.
+      if (hit !== undefined && !colorizePartial.has(colorizeStamp(lang, source))) {
+        applyStreamColored(code, hit, source, lang);
         continue;
       }
     }
@@ -1121,7 +1232,10 @@ export function colorizeNode(node, opts) {
       gov.pending = true;
       continue;
     }
-    const gap = Math.max(STREAM_COLORIZE_INTERVAL_MS, gov.lastCost * STREAM_COLORIZE_SLOWDOWN);
+    const gap = Math.min(
+      STREAM_COLORIZE_MAX_GAP_MS,
+      Math.max(STREAM_COLORIZE_MIN_GAP_MS, (gov.lastCost || 0) / STREAM_COLORIZE_CPU_SHARE),
+    );
     const wait = gap - (Date.now() - gov.lastAt);
     if (wait > 0) {
       armStreamColorizeRetry(node, gov, wait);

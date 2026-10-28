@@ -48,6 +48,34 @@ export function initSettings(d) {
     deps = d;
 }
 
+// === Uncommitted-edit tracking (see holdsDraft) ===
+// Lives here, above the control wiring, because the feature-select/number
+// wiring below runs at module evaluation and needs trackDraft: a `const`
+// declared next to its use further down would be in its temporal dead zone.
+const draftControls = new WeakSet();
+
+// Marks `el` as "being edited" on the first keystroke and clears it again when
+// the edit is committed by `change` (blur or Enter — the same event that sends
+// it to the server).
+function trackDraft(el) {
+    el.addEventListener('input', () => draftControls.add(el));
+    el.addEventListener('change', () => draftControls.delete(el));
+}
+
+// True when a server push must NOT overwrite `el`. A config push lands on
+// every attached client (another tab, another pane, a background agent, a
+// feature toggle) and carries every runtime value, so syncing blindly threw
+// away whatever was being typed at that moment.
+//
+// Only a control the user actually typed into and has not committed yet
+// counts as a draft: a merely focused (or still unpopulated) field keeps
+// syncing, so no value can be stranded. Skipping a draft loses nothing — the
+// commit sends it and the echo that follows is what syncs the field.
+function holdsDraft(el, serverValue) {
+    if (!el || !draftControls.has(el)) return false;
+    return String(el.value) !== String(serverValue);
+}
+
 // === Settings modal ===
 const settingsBtn = document.getElementById('settings-btn');
 const settingsOverlay = document.getElementById('settings-overlay');
@@ -119,7 +147,8 @@ settingsOverlay.addEventListener('click', (e) => {
 // Every `channel: 'feature'` SELECT is wired generically off its
 // featureKey: a change sends that single field and the config push
 // (applyFeatureSettings) syncs it back. The numeric feature rows
-// (subagent depth/limit) keep their bespoke clamping below.
+// (subagent depth/limit) are wired the same way, with their clamp bounds
+// read from the control's own min/max (see FEATURE_NUMBERS below).
 const FEATURE_SELECTS = SETTINGS_SCHEMA
     .filter((e) => e.channel === 'feature' && e.type === 'select')
     .map((e) => ({ id: e.id, featureKey: e.featureKey }));
@@ -128,30 +157,31 @@ for (const f of FEATURE_SELECTS) {
     if (!el) continue;
     el.addEventListener('change', () => sendFeatureConfig({ [f.featureKey]: el.value }));
 }
-const subagentDepthInput = document.getElementById('subagent-depth-input');
-const subagentLimitInput = document.getElementById('subagent-limit-input');
-if (subagentDepthInput) {
-    subagentDepthInput.addEventListener('change', () => {
-        const n = parseInt(subagentDepthInput.value, 10);
-        if (!Number.isFinite(n) || n < 1) {
-            subagentDepthInput.value = '1';
+// Numeric feature rows are wired generically too, and their clamp bounds
+// come from the control's own min/max — which the renderer took from the
+// schema. A second copy of "10" / "32" here used to be the only
+// enforcement of the documented maximum (the server rejects only
+// negatives), so editing the schema would have left the clamp silently
+// disagreeing with the control the user sees.
+const FEATURE_NUMBERS = SETTINGS_SCHEMA
+    .filter((e) => e.channel === 'feature' && e.type === 'number')
+    .map((e) => ({ id: e.id, featureKey: e.featureKey }));
+for (const f of FEATURE_NUMBERS) {
+    const el = document.getElementById(f.id);
+    if (!el) continue;
+    trackDraft(el);
+    el.addEventListener('change', () => {
+        const min = el.min === '' ? 0 : Number(el.min);
+        const max = el.max === '' ? Infinity : Number(el.max);
+        const n = parseInt(el.value, 10);
+        if (!Number.isFinite(n) || n < min) {
+            // Out of range on the low side: restore the minimum, send nothing.
+            el.value = String(min);
             return;
         }
-        const clamped = Math.min(n, 10);
-        subagentDepthInput.value = String(clamped);
-        sendFeatureConfig({ subagentMaxDepth: clamped });
-    });
-}
-if (subagentLimitInput) {
-    subagentLimitInput.addEventListener('change', () => {
-        const n = parseInt(subagentLimitInput.value, 10);
-        if (!Number.isFinite(n) || n < 1) {
-            subagentLimitInput.value = '1';
-            return;
-        }
-        const clamped = Math.min(n, 32);
-        subagentLimitInput.value = String(clamped);
-        sendFeatureConfig({ subagentMaxConcurrent: clamped });
+        const clamped = Math.min(n, max);
+        el.value = String(clamped);
+        sendFeatureConfig({ [f.featureKey]: clamped });
     });
 }
 
@@ -192,11 +222,15 @@ export function applyFeatureSettings(data) {
         if (automationsPane && automationsPane.classList.contains('active')) deps.switchMainPane('chat');
     }
     const depthInput = document.getElementById('subagent-depth-input');
-    if (depthInput && data.subagentMaxDepth > 0 && String(depthInput.value) !== String(data.subagentMaxDepth)) {
+    if (depthInput && data.subagentMaxDepth > 0
+        && String(depthInput.value) !== String(data.subagentMaxDepth)
+        && !holdsDraft(depthInput, data.subagentMaxDepth)) {
         depthInput.value = String(data.subagentMaxDepth);
     }
     const limitInput = document.getElementById('subagent-limit-input');
-    if (limitInput && data.subagentMaxConcurrent > 0 && String(limitInput.value) !== String(data.subagentMaxConcurrent)) {
+    if (limitInput && data.subagentMaxConcurrent > 0
+        && String(limitInput.value) !== String(data.subagentMaxConcurrent)
+        && !holdsDraft(limitInput, data.subagentMaxConcurrent)) {
         limitInput.value = String(data.subagentMaxConcurrent);
     }
     if (boardOn && !wasVisible) requestBoardState();
@@ -205,11 +239,15 @@ export function applyFeatureSettings(data) {
         if (boardPane && boardPane.classList.contains('active')) deps.switchMainPane('chat');
     }
     // The subagent model + effort pickers are meaningful only while
-    // subagents are enabled.
-    const subModelPicker = document.getElementById('subagent-model-picker');
-    if (subModelPicker) subModelPicker.hidden = !subagentOn;
-    const subThinkingPicker = document.getElementById('subagent-thinking-picker');
-    if (subThinkingPicker) subThinkingPicker.hidden = !subagentOn;
+    // subagents are enabled. Gate the whole ROW (label + picker), like the
+    // review-agent rows below: hiding only the inner picker left the
+    // "Default subagent model" / "Subagent reasoning effort" labels
+    // dangling over empty space whenever the feature is off (its default,
+    // see config.Default), so the Subagents tab showed two orphan labels.
+    for (const id of ['row-subagent-model-picker', 'row-subagent-thinking-picker']) {
+        const row = document.getElementById(id);
+        if (row) row.hidden = !subagentOn;
+    }
     // The review-agent controls are meaningful only while the review
     // agent is on AND the board is on (the reviewer works on board
     // tickets; the trigger rides on the board manager).
@@ -224,13 +262,13 @@ export function applyFeatureSettings(data) {
     const models = deps.getModels();
     const needsModels = isSettingsOpen() && (!models || models.length === 0)
         && ws && ws.readyState === WebSocket.OPEN;
-    if (needsModels && subagentOn && !subModelPicker.hidden) {
-        // Just enabled while the modal is open: fetch the catalog so
-        // the subagent picker is not stuck on "No models loaded".
-        ws.send(JSON.stringify({ type: 'list_models' }));
-    }
-    if (needsModels && reviewAgentRowsVisible) {
-        // Same for the review-agent model picker.
+    // ONE request for both pickers: a models reply refreshes every model
+    // list at once (toolbar, subagent picker, board picker), so asking
+    // twice for the subagent and the review-agent picker was a duplicated
+    // round-trip that also re-rendered the toolbar list twice.
+    if (needsModels && (subagentOn || reviewAgentRowsVisible)) {
+        // Just enabled while the modal is open: fetch the catalog so the
+        // picker is not stuck on "No models loaded".
         ws.send(JSON.stringify({ type: 'list_models' }));
     }
 }
@@ -274,6 +312,9 @@ export function sendRuntimeConfig(changes) {
 function wireRuntimeControl(ctrl) {
     const el = document.getElementById(ctrl.id);
     if (!el) return;
+    // Track the draft lifecycle so a config push cannot eat an in-progress
+    // edit (see holdsDraft).
+    trackDraft(el);
     el.addEventListener('change', () => {
         let value = el.value;
         if (el.type === 'number') {
@@ -312,6 +353,8 @@ export function applyRuntimeSettings(data) {
         if (!el) continue;
         const v = data[ctrl.prop || ctrl.field];
         if (v === undefined) continue;
+        // Do not overwrite an in-progress edit (see holdsDraft).
+        if (holdsDraft(el, v)) continue;
         if (el.type === 'number') {
             if (String(el.value) !== String(v)) el.value = String(v);
         } else if (el.value !== String(v)) {
@@ -496,10 +539,36 @@ function parseEnvInput(raw) {
     return env;
 }
 
+// Name of an mcp_save whose confirmation we are waiting for. The server
+// answers a save with a config push (the row appears) or a notice error
+// (nothing was persisted), so "Saved" is claimed from the PUSH, never
+// optimistically: a refused save (host server, blank command, persist
+// error) used to leave "Saved <name>" in the modal next to the error toast.
+let pendingMCPSave = null;
+
 export function applyMCPSettings(data) {
     if (Array.isArray(data.mcpServers)) {
         renderMCPServerList(data.mcpServers);
+        if (pendingMCPSave !== null) {
+            // A non-host row with that name means the server persisted it.
+            const saved = data.mcpServers.some((s) => s && s.name === pendingMCPSave && !s.host);
+            if (saved) {
+                const name = pendingMCPSave;
+                pendingMCPSave = null;
+                showMCPTest('Saved ' + name + ' — restart gogen for MCP changes to take effect.', '');
+            }
+        }
     }
+}
+
+/**
+ * Clears the pending mcp_save marker when the server refused the op (the
+ * error itself arrives as a notice toast, see app.js handleNotice).
+ */
+export function noteMCPOpFailed() {
+    if (pendingMCPSave === null) return;
+    pendingMCPSave = null;
+    showMCPTest('', '');
 }
 
 if (mcpTestBtn) {
@@ -533,8 +602,9 @@ if (mcpSaveBtn) {
             args: rawArgs ? rawArgs.split(/\s+/) : [],
             env: parseEnvInput(mcpTestEnvInput.value),
         };
+        pendingMCPSave = name;
+        showMCPTest('Saving ' + name + '…', '');
         sendMCPOp('mcp_save', op);
-        showMCPTest('Saved ' + name + ' — restart gogen for MCP changes to take effect.', '');
     });
 }
 
