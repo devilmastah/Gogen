@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	charm.land/bubbles/v2 v2.2.1
-	charm.land/bubbletea/v2 v2.1.0
+	charm.land/bubbletea/v2 v2.1.1
 	charm.land/lipgloss/v2 v2.0.6
 	codeberg.org/readeck/go-readability/v2 v2.1.3
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
@@ -15,7 +15,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/gortexhq/tree-sitter-dockerfile v0.1.0
 	github.com/makiuchi-d/gozxing v0.1.1
-	github.com/openai/openai-go/v3 v3.86.0
+	github.com/openai/openai-go/v3 v3.89.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/tiktoken-go/tokenizer v0.10.0
 	github.com/tree-sitter-grammars/tree-sitter-hcl v1.2.0
@@ -43,7 +43,7 @@ require (
 	github.com/tree-sitter/tree-sitter-scala v0.26.3
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
 	github.com/wippyai/tree-sitter-sql v0.0.4
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
 	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
