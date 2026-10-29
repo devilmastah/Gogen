@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"unsafe"
 
 	"gogen/internal/llm"
 
@@ -194,7 +195,13 @@ func TestNormalizeCRFastPathDoesNotAllocate(t *testing.T) {
 	if got := normalizeCR(line); got != line {
 		t.Fatalf("no-CR line changed: %q", got)
 	}
-	if allocs := testing.AllocsPerRun(100, func() { normalizeCR(line) }); allocs != 0 {
-		t.Fatalf("normalizeCR allocated %v times for a CR-free line, want 0", allocs)
+	// "Returned as-is, with no copy" is asserted by the string's data pointer,
+	// NOT by testing.AllocsPerRun: AllocsPerRun reads the process-wide mallocs
+	// counter, so anything else allocating in this test binary during the
+	// measurement window makes a fast path that never allocated look guilty
+	// (it read 299 allocs/run on a loaded machine, 0 on an idle one). Pointer
+	// identity is exact and independent of load and of -race.
+	if unsafe.StringData(normalizeCR(line)) != unsafe.StringData(line) {
+		t.Fatal("normalizeCR copied a CR-free line; the fast path must return it as-is")
 	}
 }
