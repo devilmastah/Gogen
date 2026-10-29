@@ -256,6 +256,16 @@ func TestCheckSendNow(t *testing.T) {
 			}
 		})
 	}
+	// The zero value must not read as an accepted request: every host tests
+	// against SendNowRecorded, so an uninitialised result has to be a refusal
+	// with a message of its own.
+	var unset SendNowResult
+	if unset != SendNowUnknown || unset == SendNowRecorded {
+		t.Fatalf("zero SendNowResult = %v, want SendNowUnknown and not SendNowRecorded", unset)
+	}
+	if unset.Message() == "" {
+		t.Fatal("SendNowUnknown has no message")
+	}
 }
 
 // TestTakeZeroesPoppedSlots is the M3 contract, now enforced in one place: a

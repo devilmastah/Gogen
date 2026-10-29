@@ -15,6 +15,7 @@ import (
 	"gogen/internal/llm"
 	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
+	"gogen/internal/steerq"
 	"gogen/internal/subagents"
 )
 
@@ -1608,6 +1609,64 @@ func TestChildSystemNoticeDoesNotArmReplyCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "reaction to message") })
+}
+
+// TestChildSendNowRefusedWhileReplyArmed pins the wiring behind the Send now
+// reply guard: ArmReplyCapture installs replyPending on the child's runtime,
+// the delivery-start hook arms the capture, and a turn whose reply is armed is
+// refused (SendNowReply) even though it is a real model turn with the turn
+// lock held. Clearing the capture lifts the refusal, so the guard reads live
+// state instead of latching.
+func TestChildSendNowRefusedWhileReplyArmed(t *testing.T) {
+	stub := newBlockingStub()
+	s, a := newContinuableServer(t, func() llm.LLMProvider { return stub })
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.Get(id)
+	stub.releaseN(1) // let the job turn answer
+	waitFor(t, 5*time.Second, func() bool { return child.IsFinished() })
+
+	rt := child.Handle
+	if rt.replyPending == nil {
+		t.Fatal("a continuable child's runtime must carry the reply guard (ArmReplyCapture)")
+	}
+	if rt.replyPending() {
+		t.Fatal("no reply is armed right after the job turn")
+	}
+	// Arm the capture the way the drain does: the delivery-start hook the
+	// spawner installed.
+	rt.deliverStartHook()
+	if !rt.replyPending() {
+		t.Fatal("the delivery-start hook did not arm the child's reply capture")
+	}
+
+	// A real model turn on the child, so the gate has a turn to stop at.
+	rt.turnMu.Lock()
+	rt.startTurn(nil, "follow-up", nil)
+	stub.waitBlocked(2)
+	if got := rt.sendNow(""); got != steerq.SendNowReply {
+		t.Fatalf("sendNow during an armed reply = %v, want SendNowReply", got)
+	}
+
+	// Production clears the capture when the turn's result lands
+	// (Child.OnTurnResult); clearing it here directly shows the guard reads
+	// live state instead of latching for the rest of the session.
+	child.SetPendingReply(false)
+	if got := rt.sendNow(""); got != steerq.SendNowNotQueued {
+		t.Fatalf("sendNow after the capture cleared = %v, want SendNowNotQueued", got)
+	}
+
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool {
+		active, _ := rt.turnState()
+		return !active
+	})
 }
 
 // TestListAgentsProgressLineBounded pins the pull-side progress view: each

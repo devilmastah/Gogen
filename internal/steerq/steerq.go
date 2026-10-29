@@ -3,14 +3,14 @@
 // The web host and the TUI each keep one queue per session and drain it at the
 // session's idle boundary. The queue itself — its three item kinds, the two
 // caps, the eviction rules, the batching rule (Batch: notice runs, joined user
-// runs under join_queued and their image cap, Join), the Send now rule
-// (CheckSendNow), and the "zero the popped slots" requirement — used to be
-// implemented twice (internal/server/deliver.go
-// and internal/tui/steering.go), so every fix had to be made twice and the two
-// copies had already drifted in how they expressed the same policy. This
-// package owns it once; each host keeps its own drain machinery, because that
-// part is genuinely transport-specific (a goroutine worker over a WebSocket vs
-// a tea.Cmd on the Update thread).
+// runs under join_queued and their image cap, Join), the Send now rule and its
+// one wording (CheckSendNow, SendNowResult.Message), and the "zero the popped
+// slots" requirement — used to be implemented twice
+// (internal/server/deliver.go and internal/tui/steering.go), so every fix had
+// to be made twice and the two copies had already drifted in how they
+// expressed the same policy. This package owns it once; each host keeps its
+// own drain machinery, because that part is genuinely transport-specific (a
+// goroutine worker over a WebSocket vs a tea.Cmd on the Update thread).
 //
 // Queue is NOT goroutine-safe by design: the web host guards its queue with the
 // runtime's deliverMu (its drain, eviction and orphan-check paths take that lock
@@ -309,9 +309,13 @@ func (q *Queue) SendNowReady(id string) bool {
 type SendNowResult int
 
 const (
+	// SendNowUnknown is the zero value and never a real outcome: hosts test
+	// against SendNowRecorded, so an uninitialised result must not read as
+	// an accepted request.
+	SendNowUnknown SendNowResult = iota
 	// SendNowRecorded: the running turn stops after its current round and
 	// the queue delivers.
-	SendNowRecorded SendNowResult = iota
+	SendNowRecorded
 	// SendNowIdle: no turn is running, so the queue delivers on its own.
 	SendNowIdle
 	// SendNowNoModelCall: the session is busy without a model turn (a
@@ -349,6 +353,8 @@ func CheckSendNow(busy bool, turn uint64, replying, queued bool) SendNowResult {
 // Message is the short status line a host shows for the result.
 func (r SendNowResult) Message() string {
 	switch r {
+	case SendNowUnknown:
+		return "Send now is not available."
 	case SendNowRecorded:
 		return "Sending after this round."
 	case SendNowIdle:
