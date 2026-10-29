@@ -103,6 +103,19 @@ jobs:
         # No -race here: the detector adds ~2min (almost all in
         # internal/agent's tokenizer-heavy compaction tests) and the Linux job
         # already runs the full -race suite, so this buys no extra coverage.
-        run: go test ./...
+        run: |
+          set -o pipefail
+          go test ./... 2>&1 | tee go-test.log
+      # A failing test names itself on stdout, but reading a job log needs
+      # repository admin: a pull request's author (or a fork) cannot see it, so
+      # "windows is red" arrives with no test name. Re-emit the failure lines
+      # as annotations, which the checks API serves to anyone.
+      - name: Report failing tests
+        if: failure()
+        run: |
+          test -f go-test.log || exit 0
+          grep -A2 -E '^--- FAIL' go-test.log | head -30 | while IFS= read -r line; do
+            echo "::error title=go test::$(printf '%s' "$line" | tr -d '\r')"
+          done
       - name: Vet
         run: go vet ./...
