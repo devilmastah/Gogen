@@ -231,6 +231,16 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 			time.AfterFunc(sp.host.Policy().retain(), func() { sp.ReleaseChildIfQuiet(child) })
 			return
 		}
+		if errors.Is(runErr, ErrYielded) {
+			// STEERED: the run stopped at a round boundary with its work kept,
+			// so the queued message can run next. Same shape as an interrupt —
+			// continuable, no terminal event — and never a completion: recording
+			// one here would stamp an empty success and tell the parent the job
+			// finished.
+			child.MarkInterrupted()
+			time.AfterFunc(sp.host.Policy().retain(), func() { sp.ReleaseChildIfQuiet(child) })
+			return
+		}
 		child.Finish(report, runErr)
 		// Persist the final outcome on the child's snapshot: the events are
 		// not replayed after a reload/restart, so the saved session is what
@@ -723,4 +733,45 @@ func spawnCapError(limit, guard int, guardHit bool) error {
 		return fmt.Errorf("subagent limit reached: too many live subagents (running or interrupted); wait for them to finish or be released")
 	}
 	return fmt.Errorf("subagent limit reached (%d concurrent): wait for running subagents to finish or interrupt_agent them", limit)
+}
+
+// ErrYielded reports that a child's turn stopped at a ROUND BOUNDARY because a
+// host asked it to (a steered send_message), not that its job finished. The
+// lifecycle treats it like an interrupt — the child stays continuable, no
+// terminal event is sent — except that the work done so far is kept (the turn
+// flushed itself) and the queued message runs as the next turn.
+var ErrYielded = errors.New("subagent: turn yielded to a queued message")
+
+// Steer delivers text to a child of caller like SendMessage, and additionally
+// asks the child's RUNNING turn to stop at its next round boundary so the
+// message runs immediately after the model call and tools that round already
+// started. That is the difference from SendMessage: a busy child is redirected
+// instead of finishing its turn first, without cancelling anything (the
+// in-flight model call and its tools complete; only the NEXT model call is
+// skipped), so no work is lost.
+//
+// A child that is answering another targeted delivery is never cut: the reply
+// capture is 1:1 with the call, and truncating that turn would hand the other
+// parent a bogus answer — the message then simply queues, exactly as
+// SendMessage would have left it. A child with no turn in flight is not
+// "steered" at all: the delivery starts its own turn.
+func (sp *Spawner[H]) Steer(caller *agent.Agent, agentID, text string) error {
+	if err := sp.SendMessage(caller, agentID, text); err != nil {
+		return err
+	}
+	child := sp.children.get(agentID)
+	if child == nil || child.Agent == nil {
+		return nil
+	}
+	if child.PendingReply() {
+		// Mid-reply: the queued message waits for that turn to end, the same
+		// contract SendNow enforces for a turn that answers a parent.
+		return nil
+	}
+	// Best effort: the turn may have ended (or been replaced) since the
+	// delivery, in which case the queued message starts the next one anyway.
+	if turn := child.Agent.TurnGeneration(); turn != 0 {
+		child.Agent.RequestYieldFor(turn)
+	}
+	return nil
 }

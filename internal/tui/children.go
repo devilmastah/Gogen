@@ -615,6 +615,11 @@ func (m *Model) handleChildAdoptMsg(msg childAdoptMsg) (tea.Model, tea.Cmd) {
 func childTurnResultSink(sp *tuiSubagentSpawner, h *childHandle, deliverResult bool) func(string, error) {
 	return func(out string, err error) {
 		h.turnDone()
+		if deliverResult && err == nil && h.agent != nil && h.agent.TurnYielded() {
+			// A steered run stopped at a round boundary: not a completion, and
+			// the queued message runs next (see subagents.ErrYielded).
+			err = subagents.ErrYielded
+		}
 		if deliverResult {
 			select {
 			case h.result <- childTurnResult{out: out, err: err}:

@@ -224,6 +224,19 @@ type ContinuableSubagentSpawner interface {
 	InterruptAgent(caller *Agent, agentID string) error
 }
 
+// SubagentSteerer is the optional extension of ContinuableSubagentSpawner for
+// STEERING a busy child: the message is delivered like send_message, and the
+// child's running turn is asked to stop at its next round boundary so the
+// message runs immediately after the model call and tools that round already
+// started. A spawner that does not implement it still delivers the message — it
+// just waits for the child's turn to end, as send_message always did.
+type SubagentSteerer interface {
+	// Steer delivers text to a child of caller and, when the child is mid-turn
+	// (and not answering another targeted delivery), asks that turn to yield
+	// at its next round boundary.
+	Steer(caller *Agent, agentID, text string) error
+}
+
 // subagentToolDef is the LLM-facing schema for the subagent tool. Like the
 // board tool it lives OUTSIDE builtinToolDefs (MCP-style gating): exposed
 // only when the subagent feature is enabled AND a spawner is installed.
@@ -318,13 +331,18 @@ func sendMessageToolDef() llm.Tool {
 	return toolDef("send_message",
 		"Send a message to a child subagent of this session (agent_id) — running, interrupted, "+
 			"finished-but-retained, or saved (an inactive child is reopened from its saved session first, "+
-			"so a conversation can continue after a restart); queued if it is mid-turn. Its reply is "+
-			"injected into this session when the turn finishes. Use to queue a follow-up, ask a finished "+
-			"one for more detail, or request a stop-and-report. This does not alter the already-running "+
+			"so a conversation can continue after a restart); queued if it is mid-turn, or run at the "+
+			"next round boundary with steer=true. Its reply is injected into this session when the turn "+
+			"finishes. Use to queue a follow-up, ask a finished one for more detail, redirect a running "+
+			"one (steer), or request a stop-and-report. This does not alter the already-running "+
 			"LLM request; use interrupt_agent first when the current turn must be stopped immediately.",
 		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 			"message":  toolProp("string", "The message to deliver to the subagent"),
+			"steer": toolProp("boolean", "Redirect a child that is mid-turn: the message runs right after "+
+				"the tools its current round already started, instead of waiting for the whole turn to end. "+
+				"The in-flight model call and its tools finish, so no work is lost; only the next model call "+
+				"is skipped. A child answering another message is not cut (it replies first). Default false."),
 		}, "agent_id", "message"),
 	)
 }
@@ -470,6 +488,24 @@ func handleSendMessage(_ context.Context, a *Agent, args map[string]any) (string
 	message, err := stringArg(args, "message")
 	if err != nil {
 		return "", err
+	}
+	steer, err := boolArg(args, "steer", false)
+	if err != nil {
+		return "", err
+	}
+	if steer {
+		if st, ok := cs.(SubagentSteerer); ok {
+			if err := st.Steer(a, agentID, message); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Message delivered to subagent %s (steering: it runs at the next round boundary if the child is mid-turn, otherwise after its current turn).", agentID), nil
+		}
+		// No steering in this mode: deliver anyway rather than refusing a
+		// message the caller already composed, and say what happened.
+		if err := cs.SendMessage(a, agentID, message); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Message delivered to subagent %s (steering is not supported in this mode; it runs after the current turn).", agentID), nil
 	}
 	if err := cs.SendMessage(a, agentID, message); err != nil {
 		return "", err

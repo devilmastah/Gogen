@@ -873,3 +873,92 @@ func TestSendMessageReviveHonoursTheLiveGuard(t *testing.T) {
 		t.Fatal("a refused revive must not register a child")
 	}
 }
+
+// TestSteerDeliversAndSkipsARepliedTurn pins the steering contract at the
+// lifecycle level: the message is delivered like send_message, and the yield is
+// requested only for a turn that is NOT answering another targeted delivery —
+// cutting a reply turn would hand the other parent a truncated answer.
+func TestSteerDeliversAndSkipsARepliedTurn(t *testing.T) {
+	host := newStubHost()
+	host.policy = Policy{Retain: time.Hour}
+	blocking := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	host.run = func(ctx context.Context, _ *Child[*stubHandle], _ string) (string, error) {
+		entered <- struct{}{}
+		select {
+		case <-blocking:
+			return "report", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+	id, err := sp.SpawnBackground(context.Background(), parent, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	defer close(blocking)
+	child := sp.Get(id)
+
+	// Idle-child path: the stub child has no running turn, so steering is just
+	// the delivery (nothing to yield).
+	if err := sp.Steer(parent, id, "please reconsider"); err != nil {
+		t.Fatalf("steer = %v", err)
+	}
+	host.mu.Lock()
+	msgs := append([]string(nil), host.childMessages...)
+	host.mu.Unlock()
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "please reconsider") {
+		t.Fatalf("steer deliveries = %v, want the message", msgs)
+	}
+
+	// A child whose reply is armed must not be steered: the message queues.
+	child.SetPendingReply(true)
+	if err := sp.Steer(parent, id, "second thought"); err != nil {
+		t.Fatal(err)
+	}
+	if !child.PendingReply() {
+		t.Fatal("steering must not clear or complete an armed reply")
+	}
+	child.SetPendingReply(false)
+}
+
+// TestYieldedRunStaysContinuable pins the lifecycle's reading of a steered run:
+// the run reports ErrYielded, so it must NOT be recorded as a completion — the
+// child stays continuable (idle, no terminal event), exactly like an interrupt.
+func TestYieldedRunStaysContinuable(t *testing.T) {
+	host := newStubHost()
+	host.policy = Policy{Retain: time.Hour}
+	host.run = func(context.Context, *Child[*stubHandle], string) (string, error) {
+		return "", ErrYielded
+	}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+	id, err := sp.SpawnBackground(context.Background(), parent, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.Get(id)
+	waitFor(t, 5*time.Second, "child idle", func() bool { return child.StatusOf(host) == "idle" })
+	if child.IsFinished() {
+		t.Fatal("a yielded run must not be recorded as finished")
+	}
+	delivered := len(host.deliverTexts()) // takes its own lock
+	host.mu.Lock()
+	finished := len(host.finished)
+	host.mu.Unlock()
+	if delivered != 0 {
+		t.Fatalf("a yielded run must not deliver a terminal event: %v", delivered)
+	}
+	if finished != 0 {
+		t.Fatalf("a yielded run must not be announced as finished: %d", finished)
+	}
+	// The outcome is untouched: "running" from admission, not an empty success.
+	if status, _ := child.Agent.SubagentOutcome(); status != "running" {
+		t.Fatalf("yielded outcome = %q, want the admission stamp untouched", status)
+	}
+}

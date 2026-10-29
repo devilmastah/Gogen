@@ -1959,3 +1959,90 @@ func TestSendMessageRevivesReleasedChild(t *testing.T) {
 		t.Fatal("the revived child's session must still be the same saved session")
 	}
 }
+
+// TestSteerRedirectsABusyChild is the end-to-end steering contract: a child in a
+// multi-round turn is redirected at its next round boundary — the round's tool
+// work is kept, the queued message runs right after it, the parent gets that
+// turn's reply, and the run is NOT reported as finished (a yield is not a
+// completion).
+func TestSteerRedirectsABusyChild(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	steered := atomic.Bool{}
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.OnStream = func(ctx context.Context, msgs []llm.Message, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+			last := ""
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "user" {
+					last = msgs[i].Content
+					break
+				}
+			}
+			switch {
+			case strings.Contains(last, "change of plan"):
+				return &llm.StreamResult{Content: "redirected as asked"}, nil
+			case steered.Load():
+				// A later round (the yield must prevent this from running
+				// before the steer message's own turn).
+				return &llm.StreamResult{Content: "should not run"}, nil
+			default:
+				// Round 1: block so the steer lands mid-turn, then ask for a
+				// tool. Its result must survive the yield.
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				<-release
+				return &llm.StreamResult{
+					ToolCalls: []llm.ToolCall{{ID: "t1", Name: "list_files", Args: map[string]any{"path": "."}}},
+				}, nil
+			}
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "long job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child turn never entered the provider")
+	}
+	// The parent steers while the child is mid-turn.
+	if err := sp.Steer(a, id, "change of plan"); err != nil {
+		t.Fatalf("steer = %v", err)
+	}
+	steered.Store(true)
+	close(release)
+
+	// The child's turn stops at the round boundary, the steer message runs as
+	// its own turn, and THAT turn's reply reaches the parent.
+	waitFor(t, 10*time.Second, func() bool { return deliveredMessages(a, "redirected as asked") })
+	waitFor(t, 10*time.Second, func() bool { return deliveredMessages(a, "no reply") == false })
+	time.Sleep(300 * time.Millisecond)
+	if deliveredMessages(a, "should not run") {
+		t.Fatal("the yielded turn must not have run another round")
+	}
+	if deliveredMessages(a, "(finished)") {
+		t.Fatal("a steered run must not be reported as finished")
+	}
+	child := sp.Get(id)
+	if child == nil {
+		t.Fatal("the steered child must stay registered (continuable), not be released as finished")
+	}
+	// The round's work is kept: the tool result is in the child's transcript.
+	sawTool := false
+	for _, m := range child.Agent.SnapshotMessages() {
+		if m.Role == "tool" {
+			sawTool = true
+		}
+	}
+	if !sawTool {
+		t.Fatal("the yielded round must keep its tool result")
+	}
+}

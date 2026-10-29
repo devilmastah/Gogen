@@ -299,6 +299,13 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 		// result), no persist warning/usage frame (the spawner flushes the
 		// outcome).
 		out, err := rt.runTurnBody(runCtx, job, nil, turnOpts{})
+		if err == nil && rt.agent.TurnYielded() {
+			// The parent steered this run: the turn stopped at a round boundary
+			// with its work flushed, and the queued message runs next. Report it
+			// as the lifecycle's "no completion" sentinel instead of an empty
+			// successful run.
+			err = subagents.ErrYielded
+		}
 		if errors.Is(err, errTurnEvicted) {
 			// The runtime was released while we waited for the lock
 			// (close/delete/release evict without holding turnMu): nothing

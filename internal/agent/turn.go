@@ -422,6 +422,13 @@ func (a *Agent) RequestYieldFor(gen uint64) bool {
 	return true
 }
 
+// TurnYielded reports whether the turn that just returned stopped at a round
+// boundary because a host called RequestYieldFor — the model did not finish,
+// the work done so far is kept (flushed), and the queued message that asked
+// for the yield runs next. Read it immediately after StreamProcessInput
+// returns: the next turn resets it.
+func (a *Agent) TurnYielded() bool { return a.yielded.Load() }
+
 // StreamProcessInputWithImages is StreamProcessInput with optional
 // user-attached images (vision input). images is nil for text-only prompts.
 func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, images []llm.ImageInput, h *llm.StreamHandlers) (out string, err error) {
@@ -429,6 +436,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	// turn and not the one after it.
 	gen := a.turnGen.Add(1)
 	a.runningTurn.Store(gen)
+	a.yielded.Store(false)
 	defer a.runningTurn.CompareAndSwap(gen, 0)
 	// Downscale user-attached images before they join the transcript: a
 	// pasted screenshot is re-uploaded on every subsequent request, so the
@@ -515,6 +523,9 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 		// for the next turn.
 		if !first && a.yieldFor.Load() == gen {
 			a.yieldFor.CompareAndSwap(gen, 0)
+			// Record WHY this turn ended: a host that owns a longer-running
+			// job (a subagent main run) continues it instead of finishing it.
+			a.yielded.Store(true)
 			a.FlushSession()
 			return "", nil
 		}
@@ -864,4 +875,11 @@ type turnYield struct {
 	// that is running runs to completion. A value left by a turn that has
 	// ended never matches a later turn.
 	yieldFor atomic.Uint64
+	// yielded reports that the turn which just returned stopped at a round
+	// boundary because a host asked it to — NOT because the model finished.
+	// Callers that treat a turn's return as a completed job (a subagent main
+	// run) must tell the two apart: finishing a run on a yield would record an
+	// empty success. Reset when the next turn starts, so a stale value can
+	// never describe a different turn.
+	yielded atomic.Bool
 }
