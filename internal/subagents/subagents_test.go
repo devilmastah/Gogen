@@ -39,6 +39,9 @@ type stubHost struct {
 	finished  []string
 	prompts   []string
 	persisted map[string]string
+	// saved is the store-backed child list PersistedChildren reports
+	// (newest first, as a host returns it).
+	saved []PersistedChild
 }
 
 func newStubHost() *stubHost {
@@ -109,6 +112,12 @@ func (h *stubHost) Finished(c *Child[*stubHandle], report string, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.finished = append(h.finished, c.ID)
+}
+
+func (h *stubHost) PersistedChildren(caller *agent.Agent) []PersistedChild {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]PersistedChild(nil), h.saved...)
 }
 
 func (h *stubHost) PersistedResult(caller *agent.Agent, childID string) (string, bool) {
@@ -483,5 +492,165 @@ func TestLiveGuardRefusesSpawnBeyondNonFinished(t *testing.T) {
 	if _, err := sp.SpawnBackground(context.Background(), parent, "job two", "", 0); err == nil ||
 		!strings.Contains(err.Error(), "too many live subagents") {
 		t.Fatalf("spawn beyond the live guard = %v, want the guard refusal", err)
+	}
+}
+
+// TestBackgroundChildRecordsRunningOutcome pins the admission stamp: a child
+// that never reaches a terminal state (interrupt_agent keeps it continuable,
+// and a process that goes away stamps nothing) must not leave an empty
+// outcome behind — "" is indistinguishable from "never ran", and the hosts
+// render it as DONE. The terminal paths overwrite "running".
+func TestBackgroundChildRecordsRunningOutcome(t *testing.T) {
+	host := newStubHost()
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	host.run = func(ctx context.Context, _ *Child[*stubHandle], _ string) (string, error) {
+		entered <- struct{}{}
+		select {
+		case <-gate:
+			return "report", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+
+	id, err := sp.SpawnBackground(context.Background(), parent, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	status, summary := sp.Get(id).Agent.SubagentOutcome()
+	if status != "running" || summary != "" {
+		t.Fatalf("mid-run outcome = %q/%q, want running/\"\"", status, summary)
+	}
+
+	// The terminal path overwrites it with the real outcome.
+	close(gate)
+	waitFor(t, 5*time.Second, "child finished", func() bool { return sp.Get(id).IsFinished() })
+	status, _ = sp.Get(id).Agent.SubagentOutcome()
+	if status != "success" {
+		t.Fatalf("finished outcome = %q, want success", status)
+	}
+}
+
+// TestInterruptedChildKeepsRunningOutcome pins the interrupted case: the child
+// stays continuable and stamps no terminal outcome, so its recorded status
+// stays "running" — which the hosts render as interrupted, never as done.
+func TestInterruptedChildKeepsRunningOutcome(t *testing.T) {
+	host := newStubHost()
+	host.policy = Policy{Retain: time.Hour}
+	entered := make(chan struct{}, 1)
+	host.run = func(ctx context.Context, _ *Child[*stubHandle], _ string) (string, error) {
+		entered <- struct{}{}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+
+	id, err := sp.SpawnBackground(context.Background(), parent, "job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	if err := sp.InterruptAgent(parent, id); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "child idle", func() bool { return sp.Get(id).StatusOf(host) == "idle" })
+	if status, _ := sp.Get(id).Agent.SubagentOutcome(); status != "running" {
+		t.Fatalf("interrupted outcome = %q, want running (never stamped)", status)
+	}
+}
+
+// TestListAgentsListsSavedChildren pins the restart-surviving half of
+// list_agents: children the live registry no longer tracks (released, evicted,
+// or from a previous process) stay discoverable through the host's store, with
+// their recorded outcome — the live section alone went empty on every restart,
+// leaving the model with no way to find them again.
+func TestListAgentsListsSavedChildren(t *testing.T) {
+	host := newStubHost()
+	host.policy = Policy{Retain: time.Hour}
+	// Stay live through the call so the merge has a live row to dedupe.
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	host.run = func(ctx context.Context, _ *Child[*stubHandle], _ string) (string, error) {
+		entered <- struct{}{}
+		select {
+		case <-gate:
+			return "report", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+	liveID, err := sp.SpawnBackground(context.Background(), parent, "live job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(gate)
+	<-entered
+
+	// The store's view: the live child again (must be skipped) plus the
+	// saved ones, newest first, and one more than the listing bound.
+	host.saved = []PersistedChild{
+		{ID: liveID, Label: "live job", Status: "running", Messages: 1},
+		{ID: "saved-1", Label: "saved one", Status: "success", Messages: 12},
+		{ID: "saved-2", Label: "saved two", Status: "running", Messages: 3},
+		{ID: "saved-3", Label: "saved three", Status: "", Messages: 1},
+	}
+	for i := 0; i < maxPersistedListed; i++ {
+		host.saved = append(host.saved, PersistedChild{
+			ID: fmt.Sprintf("bulk-%d", i), Label: "bulk", Status: "success", Messages: 2,
+		})
+	}
+
+	out, err := sp.ListAgents(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(out, liveID); n != 1 {
+		t.Fatalf("live child appears %d times, want once (live row only): %q", n, out)
+	}
+	for _, want := range []string{
+		"saved one — success — 12 msgs",
+		"saved two — interrupted — 3 msgs",   // "running" never reached a terminal state
+		"saved three — interrupted — 1 msgs", // legacy "" reads the same way
+		"Saved (not live",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("list_agents is missing %q: %q", want, out)
+		}
+	}
+	// The bound: 3 named saved children + 10 bulk = 13 listed, 3 left out.
+	if !strings.Contains(out, "…and 3 more saved children") {
+		t.Fatalf("list_agents must summarize the overflow: %q", out)
+	}
+	if strings.Contains(out, "bulk-9") {
+		t.Fatalf("list_agents listed past its bound: %q", out)
+	}
+	if strings.Contains(out, "saved one — failed") {
+		t.Fatalf("a saved success must not read as failed: %q", out)
+	}
+}
+
+// TestListAgentsWithoutSavedChildren pins the unchanged shape: a caller with
+// neither live nor saved children keeps the short answer, so the merge cannot
+// turn the common case into a section header.
+func TestListAgentsWithoutSavedChildren(t *testing.T) {
+	sp := New[*stubHandle](newStubHost())
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+	out, err := sp.ListAgents(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "No live subagents." {
+		t.Fatalf("empty listing = %q, want the plain answer", out)
 	}
 }

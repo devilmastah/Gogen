@@ -399,6 +399,38 @@ func (sp *tuiSubagentSpawner) Finished(c *subagents.Child[*childHandle], report 
 	sp.addRecord(subagentRecord{label: c.Label, report: agent.TruncateSubagentReport(report), err: err})
 }
 
+// PersistedChildren implements subagents.Host: the caller's saved nested
+// (subagent) sessions, newest first, for list_agents. The ParentID filter is
+// the same authorization boundary PersistedResult applies — a model must never
+// see another parent's children. Best effort: a store error yields no saved
+// section rather than failing the tool call.
+func (sp *tuiSubagentSpawner) PersistedChildren(caller *agent.Agent) []subagents.PersistedChild {
+	if sp.ws == nil || sp.ws.Store == nil || caller == nil {
+		return nil
+	}
+	list, err := sp.ws.Store.List(sp.ws.GetWorkingDir())
+	if err != nil {
+		return nil
+	}
+	var out []subagents.PersistedChild
+	for _, info := range list {
+		if info.ParentID == "" || info.ParentID != caller.SessionID {
+			continue
+		}
+		label := info.Label
+		if label == "" {
+			label = info.ID
+		}
+		out = append(out, subagents.PersistedChild{
+			ID:       info.ID,
+			Label:    label,
+			Status:   info.SubagentStatus,
+			Messages: info.MessageCount,
+		})
+	}
+	return out
+}
+
 // PersistedResult implements subagents.Host: resolve a released child from the
 // session store. The ParentID check is the authorization boundary — a model
 // must not retrieve a nested session belonging to another parent.

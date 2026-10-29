@@ -271,9 +271,11 @@ func subagentForkToolDef() llm.Tool {
 func listAgentsToolDef() llm.Tool {
 	return toolDef("list_agents",
 		"List this session's child subagents: id, label, status (running/idle/finished), depth, and each "+
-			"child's latest progress line. Read-only. Use to resolve agent ids for get_agent_result/"+
-			"wait_agent/send_message/interrupt_agent, to check background status, or to see what a child "+
-			"is doing. Finished children remain listed briefly.",
+			"child's latest progress line, then the saved children that are no longer live (with their "+
+			"recorded outcome) so they stay discoverable after a restart. Read-only. Use to resolve agent "+
+			"ids for get_agent_result/wait_agent/send_message/interrupt_agent, to check background status, "+
+			"or to see what a child is doing. Live children remain listed briefly; a saved child is not "+
+			"reachable with send_message — get_agent_result reads its report.",
 		toolSchema(map[string]any{}),
 	)
 }

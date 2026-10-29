@@ -248,6 +248,11 @@ function nestedRowSig(rec) {
         isCurrent,
         rec.running ? 1 : 0,
         rec.success ? 1 : 0,
+        // A nested row's "interrupted" state is neither failed nor done, so it
+        // needs its own signature bit: without it a status change from
+        // interrupted to failed (the same success=0, running=0, active=0)
+        // would leave the stale label in place.
+        rec.interrupted ? 1 : 0,
         rec.active ? 1 : 0,
         rec.label,
         (rec.summary || '').slice(0, 80),

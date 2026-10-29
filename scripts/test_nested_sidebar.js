@@ -203,6 +203,52 @@ async function main() {
   check('settled closed child shows NO colored dot',
     !!rows[0] && !rows[0].querySelector('.session-state-dot'));
 
+  // 6d. A child that never reached a terminal state — interrupted
+  //     (interrupt_agent leaves it continuable) or killed with its process —
+  //     records status "running" (legacy records: ""). With NO live runtime
+  //     both must read INTERRUPTED, never done: unfinished work used to render
+  //     a green "done" row after a restart.
+  recv({
+    type: 'sessions',
+    sessions: [
+      { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
+      { id: 'I', parentId: 'A', label: 'subagent: killed', messageCount: 3, active: false, subagentStatus: 'running', updatedAt: '' },
+    ],
+  });
+  rows = nestedRows();
+  const metaI = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
+  check('killed child (status running, runtime gone) shows interrupted',
+    metaI.includes('interrupted') && !metaI.includes('done') && !metaI.includes('failed'));
+  check('interrupted child shows NO colored dot',
+    !!rows[0] && !rows[0].querySelector('.session-state-dot'));
+
+  // A legacy record with no recorded status at all reads the same way.
+  recv({
+    type: 'sessions',
+    sessions: [
+      { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
+      { id: 'J', parentId: 'A', label: 'subagent: legacy', messageCount: 1, active: false, updatedAt: '' },
+    ],
+  });
+  rows = nestedRows();
+  const metaJ = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
+  check('legacy child (no recorded status) shows interrupted',
+    metaJ.includes('interrupted') && !metaJ.includes('done'));
+
+  // A LIVE child between turns (status running, still active) is NOT
+  // interrupted: "running" only means interrupted once its runtime is gone.
+  recv({
+    type: 'sessions',
+    sessions: [
+      { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
+      { id: 'K', parentId: 'A', label: 'subagent: live idle', messageCount: 4, active: true, subagentStatus: 'running', updatedAt: '' },
+    ],
+  });
+  rows = nestedRows();
+  const metaK = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
+  check('live child (status running, active) is not interrupted',
+    metaK.includes('done') && !metaK.includes('interrupted'));
+
   // 7. Cross-tab deletion: a child deleted elsewhere (session_removed
   //    broadcast) also stops rendering, and its open pane is replaced.
   recv({

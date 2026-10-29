@@ -119,6 +119,22 @@ func (p Policy) systemQueueCap() int {
 	return DefaultSystemQueueCap
 }
 
+// PersistedChild is one SAVED nested (subagent) session of a caller, as the
+// host's store records it: the view of a child whose runtime is gone —
+// released after finishing, evicted, or left behind by a previous process.
+//
+// Status is the recorded outcome: "success", "failed", or "running" for a
+// child that was mid-run and never reached a terminal state (interrupted, or
+// its process went away). Legacy records may carry "". The report itself is
+// NOT here on purpose: it can be tens of KiB, and get_agent_result already
+// pulls it one child at a time.
+type PersistedChild struct {
+	ID       string
+	Label    string
+	Status   string
+	Messages int
+}
+
 // NewChild is what a host returns from Host.NewChild: its own runtime handle,
 // the child agent, and the label derived from the job.
 type NewChild[H any] struct {
@@ -188,6 +204,13 @@ type Host[H any] interface {
 	// nested session belonging to another parent). ok=false when the store
 	// has no usable record.
 	PersistedResult(caller *agent.Agent, childID string) (string, bool)
+	// PersistedChildren returns the caller's SAVED nested (subagent)
+	// sessions, newest first — the children whose runtime is not live
+	// (released, evicted, or from a previous process). The lifecycle drops
+	// any id it still tracks live, so a child is never listed twice, and it
+	// never sees another parent's children: the ownership boundary is the
+	// same one PersistedResult applies. nil when the host has no store.
+	PersistedChildren(caller *agent.Agent) []PersistedChild
 	// TurnActive reports whether the child is mid-turn on a follow-up
 	// delivery (the status reads "running" until it ends).
 	TurnActive(c *Child[H]) bool

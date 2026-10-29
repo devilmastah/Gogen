@@ -196,6 +196,16 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 	// only now, after the caps passed: a refused child is discarded without
 	// ever being announced.
 	sp.host.Started(child, job)
+	// Record the admission in the child's persisted outcome, BEFORE its first
+	// turn writes a snapshot. A child that is interrupted (interrupt_agent, a
+	// cancelled parent) or whose process goes away never reaches a terminal
+	// state, and an unstamped outcome ("") is indistinguishable from "was
+	// never admitted" — the host's UI then renders it as DONE. Marking it
+	// "running" makes such a child read as interrupted; the terminal paths
+	// overwrite it (FinishSubagentOutcome on completion, "failed"/"cancelled"
+	// on a cancelled release). In-memory only: the child's own persist writes
+	// it, so a refused spawn still leaves no session artifact.
+	child.Agent.SetSubagentOutcome("running", "")
 
 	sp.wg.Add(1)
 	go func() {
@@ -317,8 +327,21 @@ func (sp *Spawner[H]) discardUnstartedChild(c *Child[H]) {
 	sp.host.Release(c, false)
 }
 
-// ListAgents lists the caller's live children (id, label, status, depth, and
-// latest progress line). Implements agent.ContinuableSubagentSpawner.
+// maxPersistedListed bounds the saved-child section of list_agents. A parent
+// can own an unbounded number of saved children over a long life (the live
+// cap only bounds the runtime records), and the listing is a model-facing
+// tool result, so the tail is summarized instead of listed.
+const maxPersistedListed = 10
+
+// ListAgents lists the caller's children: the LIVE ones (id, label, status,
+// depth, latest progress line) followed by the SAVED ones the live registry no
+// longer tracks (id, label, recorded outcome, message count).
+//
+// The saved section is what makes a child survive a restart in the model's
+// view: the live registry is process-local, so after a restart (or once
+// retention released a child) nothing else would tell the caller that its
+// children — and their reports — still exist. Their ids are the handles
+// get_agent_result needs. Implements agent.ContinuableSubagentSpawner.
 func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 	if caller == nil {
 		return "", fmt.Errorf("list_agents: caller agent is nil")
@@ -327,7 +350,8 @@ func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 		return "", fmt.Errorf("list_agents: background subagents are not available in this mode")
 	}
 	children := sp.children.childrenOf(caller.SessionID)
-	if len(children) == 0 {
+	saved, more := sp.savedChildren(caller, children)
+	if len(children) == 0 && len(saved) == 0 {
 		return "No live subagents.", nil
 	}
 	var b strings.Builder
@@ -337,7 +361,64 @@ func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 			fmt.Fprintf(&b, "  last: %s\n", line)
 		}
 	}
+	if len(saved) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("Saved (not live — get_agent_result reads their report; send_message cannot reach them):\n")
+		for _, pc := range saved {
+			fmt.Fprintf(&b, "%s — %s — %s — %d msgs\n", pc.ID, pc.Label, persistedStatusLabel(pc.Status), pc.Messages)
+		}
+		if more > 0 {
+			fmt.Fprintf(&b, "…and %d more saved children\n", more)
+		}
+	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// savedChildren returns the caller's children that the live registry does not
+// track, newest first, bounded to maxPersistedListed, plus the number of extra
+// entries left out. An id the registry still tracks is skipped: it is listed
+// above with its live status, so a child can never appear twice.
+func (sp *Spawner[H]) savedChildren(caller *agent.Agent, live []*Child[H]) ([]PersistedChild, int) {
+	if sp.host == nil {
+		return nil, 0
+	}
+	liveIDs := make(map[string]struct{}, len(live))
+	for _, c := range live {
+		liveIDs[c.ID] = struct{}{}
+	}
+	var out []PersistedChild
+	more := 0
+	for _, pc := range sp.host.PersistedChildren(caller) {
+		if pc.ID == "" {
+			continue
+		}
+		if _, ok := liveIDs[pc.ID]; ok {
+			continue
+		}
+		if len(out) >= maxPersistedListed {
+			more++
+			continue
+		}
+		out = append(out, pc)
+	}
+	return out, more
+}
+
+// persistedStatusLabel renders a stored outcome for list_agents. "" and
+// "running" both mean the child never reached a terminal state — it was
+// interrupted, cancelled, or its process went away — so they read as
+// "interrupted"; nothing here may suggest that unfinished work completed.
+func persistedStatusLabel(status string) string {
+	switch status {
+	case "success":
+		return "success"
+	case "failed":
+		return "failed"
+	default:
+		return "interrupted"
+	}
 }
 
 // ownedChild resolves a live child and enforces direct-parent ownership.

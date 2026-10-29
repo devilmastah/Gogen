@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1781,5 +1782,92 @@ func TestEvictedChildWithArmedCaptureReleases(t *testing.T) {
 	sp.ReleaseChildIfQuiet(child)
 	if sp.Get(id) != nil {
 		t.Fatal("an evicted child must be released, not pinned by the armed capture")
+	}
+}
+
+// TestListAgentsListsSavedChildAfterRelease is the web host's half of the
+// restart-surviving listing: once a child's runtime is gone (released after
+// finishing, evicted, or a previous process), list_agents still reports it —
+// with the outcome its saved session records — because the live registry alone
+// answered "No live subagents." and left the parent with no way to find the
+// child again. The ParentID filter is the same authorization boundary
+// get_agent_result applies.
+func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "saved child report"}}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "restart survivor", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id).IsFinished() })
+	if info := s.ws.Store.Info(s.ws.GetWorkingDir(), id); info == nil || info.SubagentStatus != "success" {
+		t.Fatalf("saved child outcome = %+v, want success", info)
+	}
+
+	// Release the runtime: the child is no longer in the live registry.
+	sp.ReleaseChild(sp.Get(id))
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id) == nil })
+
+	out, err := sp.ListAgents(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Saved (not live") {
+		t.Fatalf("a released child must still be listed: %q", out)
+	}
+	if !strings.Contains(out, id) {
+		t.Fatalf("the saved child's id must be listed (it is the get_agent_result handle): %q", out)
+	}
+	if !strings.Contains(out, "success") {
+		t.Fatalf("the saved child's recorded outcome must be listed: %q", out)
+	}
+
+	// A child interrupted and released without a terminal outcome is NOT
+	// reported as completed.
+	blocking := make(chan struct{})
+	s2, a2 := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		var once sync.Once
+		p.OnStream = func(ctx context.Context, _ []llm.Message, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+			once.Do(func() { close(blocking) })
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return p
+	})
+	sp2 := continuableSpawner(t, s2)
+	keepParentPaneAttached(t, s2)
+	id2, err := sp2.SpawnBackground(context.Background(), a2, "interrupted job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocking:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child turn never entered the provider")
+	}
+	if err := sp2.InterruptAgent(a2, id2); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp2.Get(id2).StatusOf(sp2) == "idle" })
+	// Force the interrupted child's runtime out (the retention timer would
+	// otherwise keep it live for its window).
+	sp2.ReleaseChild(sp2.Get(id2))
+	waitFor(t, 5*time.Second, func() bool { return sp2.Get(id2) == nil })
+	out2, err := sp2.ListAgents(a2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out2, id2) || !strings.Contains(out2, "interrupted") {
+		t.Fatalf("an interrupted child must read as interrupted, not done: %q", out2)
+	}
+	if strings.Contains(out2, "— success") {
+		t.Fatalf("an interrupted child must not read as success: %q", out2)
 	}
 }

@@ -6088,16 +6088,25 @@
                 // (subagentStatus/subagentSummary), so a registered-but-
                 // idle child (open as a pane, resumed after a restart) is
                 // never mistaken for running or failed, and a child that
-                // really failed stays failed. Status '' (not finished /
-                // legacy data) defaults to the green done state.
+                // really failed stays failed.
+                //
+                // A child with NO live runtime and a recorded "running" (or a
+                // legacy "") status never reached a terminal state: it was
+                // interrupted, cancelled with its host, or its process went
+                // away. That must NOT read as done — an unfinished child used
+                // to render green "done" after a restart.
+                const status = s.subagentStatus || '';
+                const live = !!s.active;
+                const interrupted = !live && !s.turnActive && (status === 'running' || status === '');
                 out.push({
                     id: s.id,
                     parentId: s.parentId,
                     label: s.label || s.id,
                     job: '',
                     running: !!s.turnActive,
-                    success: s.subagentStatus !== 'failed',
-                    active: !!s.active,
+                    success: status !== 'failed' && !interrupted,
+                    interrupted,
+                    active: live,
                     summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
                 });
                 rendered.add(s.id);
@@ -6141,6 +6150,12 @@
                 stateLabel = 'responding';
                 stateClass = 'amber';
                 stateDot = true;
+            } else if (rec.interrupted) {
+                // Settled without a terminal outcome (see collectNestedRows):
+                // muted text, not a colored dot — the child is neither live
+                // nor done. Checked BEFORE the failed fallback, because an
+                // interrupted record is neither a success nor a failure.
+                stateLabel = 'interrupted';
             } else if (!rec.success) {
                 stateLabel = 'failed';
                 stateClass = 'red';
