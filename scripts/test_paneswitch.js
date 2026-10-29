@@ -94,7 +94,6 @@ let thinkingLastRender = 0;
 let streamingToolCards = {};
 let pendingToolCards = {};
 let historyToolCallArgs = {};
-let msgIdxCounter = 0;
 // Last sessions payload from the server (cache for the unified sidebar
 // session list — app.js renderSessionList).
 let lastSessions = null;
@@ -227,7 +226,6 @@ function loadActivePaneState() {
 
 function clearChat() {
   messagesDiv.innerHTML = '';
-  msgIdxCounter = 0;
   streamRafPending = false;
   streamLastRender = 0;
   currentStreamDiv = null;

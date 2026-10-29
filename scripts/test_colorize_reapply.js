@@ -273,7 +273,6 @@ async function main() {
         sessionId: 'sess-restored',
         scrollTop: 0,
         pinned: true,
-        msgIdxCounter: 0,
         historyToolCallArgs: {},
       },
     });

@@ -1055,7 +1055,6 @@
             hideTocTooltip();
             rebuildToc();
             enableFollow();
-            msgIdxCounter = 0;
             // The transcript is gone: pending-ack entries point at
             // detached bubbles, and the re-attach re-derives every
             // histIdx from server history, so the tracking starts fresh.
@@ -1168,7 +1167,6 @@
                 sessionId: pane.id,
                 scrollTop: messagesDiv.scrollTop,
                 pinned: isPinned(),
-                msgIdxCounter,
                 historyToolCallArgs,
             };
             while (messagesDiv.firstChild) cache.container.appendChild(messagesDiv.firstChild);
@@ -1188,7 +1186,6 @@
             // Stray content (should not happen — the outgoing pane was moved
             // out or wiped) is dropped, not merged into the restored cache.
             messagesDiv.replaceChildren(...cache.container.childNodes);
-            msgIdxCounter = cache.msgIdxCounter;
             historyToolCallArgs = cache.historyToolCallArgs;
             // resetChatTranscriptState emptied the TOC rail after the cache
             // was captured; rebuild it from the restored DOM (same nodes, so
@@ -1731,9 +1728,6 @@
             if (REPLAY_IMMEDIATE_TYPES.has(data.type)) return true;
             return data.type === 'models' && !data.content;
         }
-        // Monotonic counter for message positions (used for forking)
-        let msgIdxCounter = 0;
-
         // Screen-reader live region: announces turn lifecycle without
         // reading the streaming transcript token-by-token.
         const srLive = document.getElementById('sr-live');
@@ -1906,7 +1900,7 @@
                 renderedHistIdx: -1,
                 // Offscreen transcript cache captured when this pane was
                 // switched away from while settled: { container, sessionId,
-                // scrollTop, pinned, msgIdxCounter, historyToolCallArgs }.
+                // scrollTop, pinned, historyToolCallArgs }.
                 // Focusing the pane restores the DOM directly (no server
                 // round-trip, no replay) and the attach re-verifies the
                 // fingerprint server-side; null = no cache.
@@ -2671,12 +2665,28 @@
         }
         // ==============================
 
+        /** The server-side message index a fork button sends for its bubble.
+         *  It is read at CLICK time, never captured when the button is
+         *  created: the server stamps a live bubble with hist_index when its
+         *  round is appended (handleHistIndex), which can land after the
+         *  button already exists.
+         *  -1 is the only safe fallback — the server reads it as "fork from
+         *  the last assistant message that produced output". Never fall back
+         *  to dataset.msgIdx: that is a page-local bubble counter, not a
+         *  server index, so forking at it silently truncates at the WRONG
+         *  message. */
+        function forkTargetIndex(msgDiv) {
+            const idx = parseInt(msgDiv.dataset.histIdx, 10);
+            return Number.isFinite(idx) && idx >= 0 ? idx : -1;
+        }
+
         /** Send a fork request.
-         *  For history-replayed messages the server-side message index is used.
-         *  For streaming messages (no histIdx) we pass -1 meaning "last assistant".
+         *  The target is the clicked bubble's server-side message index, or
+         *  -1 ("last assistant") when the bubble has none (see
+         *  forkTargetIndex).
          *  The fork opens a NEW pane with the fork's history; the
          *  source session is left untouched. */
-        function forkSession(msgIdx) {
+        function forkSession(messageIndex) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
@@ -2700,7 +2710,7 @@
             transitionToPane(pane);
             ensureEmptyState();
             pendingSessionResponse = true;
-            ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx, sessionId: srcId }));
+            ws.send(JSON.stringify({ type: 'session_fork', messageIndex, sessionId: srcId }));
         }
 
         function cancelActiveTurn() {
@@ -2979,8 +2989,6 @@
             removeEmptyState();
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${role}`;
-            const idx = msgIdxCounter++;
-            msgDiv.dataset.msgIdx = idx;
             if (histIdx !== undefined && histIdx >= 0) {
                 msgDiv.dataset.histIdx = histIdx;
             }
@@ -3027,12 +3035,7 @@
                 forkBtn.title = 'Fork session from this message';
                 forkBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    // Use the server-side history index when available (history replay),
-                    // otherwise fall back to the display index (streaming messages).
-                    const targetIdx = msgDiv.dataset.histIdx !== undefined
-                        ? parseInt(msgDiv.dataset.histIdx)
-                        : parseInt(msgDiv.dataset.msgIdx);
-                    forkSession(targetIdx);
+                    forkSession(forkTargetIndex(msgDiv));
                 });
                 msgDiv.appendChild(forkBtn);
             }
@@ -3414,21 +3417,21 @@
                 setMessageMarkdown(currentStreamDiv, currentStreamRaw || '');
                 currentStreamDiv.classList.remove('cursor');
                 addTimestampToMsg(currentStreamDiv, new Date());
-                // Assign a message index and fork button.
-                // Streaming messages use the server-side "last" target because
-                // the client's clock may not match the server's CreatedAt (which
-                // would cause the wrong message to be matched, or no match at all).
-                const idx = msgIdxCounter++;
-                currentStreamDiv.dataset.msgIdx = idx;
+                // The bubble is final: give it its fork button.
                 const forkBtn = document.createElement('button');
                 forkBtn.className = 'fork-btn';
                 forkBtn.innerHTML = icon('fork');
                 forkBtn.title = 'Fork session from this message';
+                // Read the bubble's own server index at click, like the
+                // history-replayed button does. A live bubble carries one as
+                // soon as its round is appended (hist_index), so a fork from
+                // an EARLIER live bubble truncates there — it must not fall
+                // back to "the last assistant message", which is what the
+                // hardcoded -1 did (silently forking at the newest turn).
+                const forkBubble = currentStreamDiv;
                 forkBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    // Streaming messages don't have a known server-side index,
-                    // so send -1 which the server treats as "last assistant".
-                    forkSession(-1);
+                    forkSession(forkTargetIndex(forkBubble));
                 });
                 currentStreamDiv.appendChild(forkBtn);
                 // The bubble is complete; allow the paint skip off-screen.
