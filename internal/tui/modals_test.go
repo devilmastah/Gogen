@@ -385,6 +385,13 @@ func TestModelsModalThinkingChips(t *testing.T) {
 }
 
 func TestModelsModalThinkingChipHighlight(t *testing.T) {
+	if noColor {
+		// NO_COLOR empties every style prefix, so "highlighted" cannot be told
+		// apart from the chip's own text: the negative check below would then
+		// read "the frame contains [Off]" (it always does) and fail. Asserting
+		// the unstyled render here would only restate that NO_COLOR works.
+		t.Skip("NO_COLOR strips the chip highlighting this test asserts")
+	}
 	p := &modelsTestProvider{current: "m1", efforts: map[string][]string{"m1": {"low", "medium", "high"}}}
 	m := &Model{
 		agent:       &agent.Agent{Provider: p},
