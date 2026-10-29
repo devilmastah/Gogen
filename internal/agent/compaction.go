@@ -12,6 +12,19 @@ import (
 	"gogen/internal/llm"
 )
 
+// SetDeepDive sets context_mode for this session: on is deep_dive, off is
+// default. The compaction layout and the system prompt's context advice
+// follow it from the next model call.
+func (a *Agent) SetDeepDive(on bool) {
+	if a == nil || a.Context == nil {
+		return
+	}
+	a.Context.UpdateSettingsFunc(func(s contextmgr.Settings) contextmgr.Settings {
+		s.DeepDive = on
+		return s
+	})
+}
+
 // baselineState is a consistent snapshot of the per-message token cache and
 // the provider prompt_tokens baseline, taken under a single statsMu read
 // lock so both compaction checks agree on the same conversation state.
@@ -186,12 +199,6 @@ func (a *Agent) compactAttemptDue() bool {
 	defer a.statsMu.RUnlock()
 	return time.Now().After(a.compactBackoffUntil)
 }
-
-// emergencySummaryAllowance is the token budget assumed for the summary
-// output when sizing the emergency compaction middle: the middle must be
-// large enough to save (total - hardLimit) PLUS this much, so the summary
-// itself still lands the conversation under the window.
-const emergencySummaryAllowance = 2000
 
 // emergencyCompactDue reports whether the EMERGENCY compaction tier should
 // fire: the conversation total has reached the hard window

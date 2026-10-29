@@ -42,6 +42,7 @@ type FileConfig struct {
 	CompactReserveTokens      *int                  `yaml:"compact_reserve_tokens"`       // 0 = reserve no tokens
 	CompactLastResort         string                `yaml:"compact_last_resort"`          // condense (default) | error
 	SmartCompact              string                `yaml:"smart_compact"`                // off (default) | on
+	ContextMode               string                `yaml:"context_mode"`                 // default (default) | deep_dive
 	CommandSafety             string                `yaml:"command_safety"`
 	CommandAllowlist          string                `yaml:"command_allowlist"`
 	DeleteApproval            string                `yaml:"delete_approval"`

@@ -104,6 +104,7 @@ type configYAML struct {
 	CompactReserveTokens      int     `yaml:"compact_reserve_tokens"`
 	CompactLastResort         string  `yaml:"compact_last_resort,omitempty"`
 	SmartCompact              string  `yaml:"smart_compact,omitempty"`
+	ContextMode               string  `yaml:"context_mode,omitempty"`
 	CommandSafety             string  `yaml:"command_safety"`
 	CommandAllowlist          string  `yaml:"command_allowlist,omitempty"`
 	DeleteApproval            string  `yaml:"delete_approval"`

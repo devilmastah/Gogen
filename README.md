@@ -154,6 +154,7 @@ While in the TUI:
 | `dir <path>` | Change working directory |
 | `compact` or `/compact` | Manually compact conversation history |
 | `/smartcompact` | Smart compact for a long tool loop: `on`, `off`, or bare to toggle. Applies to this run; `/save-config` stores it. Default off |
+| `/contextmode` | Context mode: `default` or `deep_dive` (see deep dive below); bare shows the current mode. Applies to this run; `/save-config` stores it |
 | `/models` | List available models |
 | `/models <name>` | Switch to a different model |
 | `/plan` | Enable plan mode (read-only) |
@@ -226,6 +227,7 @@ review_agent_model: gpt-4o-mini  # default review model (empty = ticket override
 review_agent_thinking_level: high  # review agent reasoning effort (empty = inherit the workspace level)
 job_notices: off   # notify the session when a background command finishes
 join_queued: off   # send messages queued during a turn as one message
+context_mode: default  # default | deep_dive (long-running tasks: keep the current request through compaction)
 automations: off   # file-based cron scheduler: fire saved prompts as headless runs on a schedule
 status_display: auto  # off | auto (probe for the screen at startup) | on
 status_display_host: statusscreen.local  # mDNS name, IP, or base URL of the display
@@ -342,6 +344,7 @@ is passed.
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
 | `GOGEN_COMPACT_LAST_RESORT` | `condense` | `condense` or `error`: what happens when a single message cannot fit the context window even after all compaction (e.g. a fresh session whose first message is bigger than the window) |
 | `GOGEN_SMART_COMPACT` | `off` | `on` or `off` (`smart_compact` in `.gogen/gogen.conf`). When on, a tool loop that crosses the compact threshold is compacted before the next tool runs, and a thinking stream stops with room left to summarize. A tool call the model has already written runs once, after the summary. Also on the web Context tab and via `/smartcompact` |
+| `GOGEN_CONTEXT_MODE` | `default` | `default` or `deep_dive` (`context_mode` in `.gogen/gogen.conf`, or **Context mode** on the Context tab in the browser and the VS Code sidebar, or `/contextmode` in the terminal UI). See deep dive below |
 
 When a single message is too large for the window, there is no middle history
 to summarize — the message is the head and every request would be refused.
@@ -372,6 +375,39 @@ closes the budget tier and the window-reserve tier alike. The mid-think stop
 still uses the window, but nothing is summarized, so an unfinished tool call is
 dropped and the turn ends with a note to run `/compact`, raise
 `compact_threshold`, or start a new session. A complete tool call still runs.
+
+`context_mode` chooses how the model is told about context, and how
+compaction treats the request it is working on. `default` keeps the usual
+behavior: compaction keeps the first user message and the most recent
+messages verbatim and summarizes everything in between, and the system prompt
+tells the model to pin facts with `context_pin_last` and summarize its
+progress when context gets tight. `deep_dive` is for long-running tasks,
+usually together with smart compact:
+
+- Compaction also keeps your latest request verbatim. History becomes: the
+  first user message, a summary of everything before the request, the
+  request, a progress summary of the work since, and the recent messages. A
+  later compaction in the same turn rewrites only the progress summary, so
+  everything up to the request stays identical (and stays in the provider's
+  prompt cache). Your next message becomes the new request, and the older
+  parts fold into the first summary. Job and subagent notices, and the image
+  messages `read_image` adds, do not count as a request. When your latest
+  request is already among the recent messages, compaction summarizes
+  everything before them as usual. When the conversation no longer fits
+  and this layout cannot shrink it (for example, the request itself is most
+  of the window), compaction uses the single summary instead.
+- The system prompt says that history is compacted automatically, that notes
+  worth keeping belong in the todo list (it survives compaction), and that
+  the model should not stop or shorten its work because of context size. It
+  does not suggest `context_pin_last`: a pin keeps everything after the pinned
+  message verbatim, which in a long turn leaves compaction nothing to free.
+  With `compact_threshold: 0` nothing is compacted automatically, so the
+  prompt keeps the default advice. A custom `system_prompt` without the
+  default sentence is sent unchanged.
+
+In the terminal UI, `/contextmode deep_dive` or `/contextmode default`
+switches every live session from the next model call, and `/contextmode`
+alone shows the current mode. `/save-config` stores it.
 
 After each agent turn, GoGen shows context usage in the CLI (dim line) and web UI (sidebar meter). Use `/context` for a detailed breakdown. When the provider returns usage stats (`prompt_tokens` from the API, including streaming with `include_usage`), the display labels this as **last request**; otherwise it falls back to a local token estimate.
 

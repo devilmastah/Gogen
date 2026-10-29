@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -105,7 +106,7 @@ func handleReadImage(ctx context.Context, a *Agent, args map[string]any) (string
 	if attached.DataURL != original.DataURL {
 		attachedSize = formatByteSize(int64(dataURLRawBytes(attached.DataURL)))
 	}
-	sink.Add(attached, fmt.Sprintf("[read_image] %s — %s, %s", path, mime, attachedSize))
+	sink.Add(attached, contextmgr.ReadImagePrefix+fmt.Sprintf("%s — %s, %s", path, mime, attachedSize))
 	if attached.DataURL != original.DataURL {
 		return fmt.Sprintf("Image attached to context: %s (%s, %s downscaled from %s, detail=%s)",
 			path, mime, attachedSize, formatByteSize(size), displayDetail), nil

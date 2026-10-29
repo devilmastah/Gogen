@@ -183,7 +183,16 @@ func (a *Agent) smartCompactBeforeTools(ctx context.Context, h *llm.StreamHandle
 	res.Reasoning = reasoningExcerpt(res.Reasoning)
 	if complete {
 		if shrunk {
-			a.annotateCompactionSummary(pausedToolBlock(res.ToolCalls, res.Reasoning))
+			block := pausedToolBlock(res.ToolCalls, res.Reasoning)
+			if !a.annotateCompactionSummary(block) {
+				// No summary takes the note (deep dive keeps the one before
+				// the request unchanged): the tool-call message carries it.
+				if strings.TrimSpace(res.Content) == "" {
+					res.Content = block
+				} else {
+					res.Content += "\n\n" + block
+				}
+			}
 		}
 		return smartCompactExecute
 	}
@@ -293,7 +302,7 @@ func (a *Agent) compactIfDue(ctx context.Context, h *llm.StreamHandlers) bool {
 		// included in the middle — summarized, never dropped. -1 (no
 		// compactable middle) keeps the configured keep, which makes the
 		// attempt a documented no-op.
-		needed := total - a.Context.HardLimit() + emergencySummaryAllowance
+		needed := total - a.Context.HardLimit() + contextmgr.EmergencySummaryAllowance
 		if k := a.Context.ChooseCompactKeep(a.Messages, counts, needed, pinned); k > 0 {
 			keep = k
 		}
@@ -302,23 +311,25 @@ func (a *Agent) compactIfDue(ctx context.Context, h *llm.StreamHandlers) bool {
 	return len(a.Messages) < beforeN || summaryBlob(a.Messages) != beforeBlob
 }
 
+// annotateCompactionSummary appends block to the summary NoteSummaryIndex
+// picks and reports whether one took it.
 func (a *Agent) annotateCompactionSummary(block string) bool {
 	block = strings.TrimSpace(block)
 	if block == "" {
 		return false
 	}
+	deepDive := a.Context != nil && a.Context.DeepDive()
 	a.statsMu.Lock()
 	defer a.statsMu.Unlock()
-	for i := len(a.Messages) - 1; i >= 0; i-- {
-		if strings.HasPrefix(a.Messages[i].Content, contextmgr.SummaryPrefix) {
-			a.Messages[i].Content += "\n\n" + block
-			if a.tokenCounts != nil && i < len(a.tokenCounts) {
-				a.tokenCounts[i] = contextmgr.ComputeMessageTokens(a.Messages[i])
-			}
-			return true
-		}
+	i := contextmgr.NoteSummaryIndex(a.Messages, deepDive)
+	if i < 0 {
+		return false
 	}
-	return false
+	a.Messages[i].Content += "\n\n" + block
+	if a.tokenCounts != nil && i < len(a.tokenCounts) {
+		a.tokenCounts[i] = contextmgr.ComputeMessageTokens(a.Messages[i])
+	}
+	return true
 }
 
 func toolBatchExecutable(calls []llm.ToolCall) bool {
@@ -376,7 +387,7 @@ func pausedToolBlock(calls []llm.ToolCall, reasoning string) string {
 func summaryBlob(msgs []llm.Message) string {
 	var b strings.Builder
 	for _, m := range msgs {
-		if strings.HasPrefix(m.Content, contextmgr.SummaryPrefix) {
+		if contextmgr.IsCompactionSummary(m.Content) {
 			b.WriteString(m.Content)
 			b.WriteByte('\n')
 		}

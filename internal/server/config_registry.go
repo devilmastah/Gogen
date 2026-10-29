@@ -380,6 +380,19 @@ func buildConfigFields() map[string]fieldSpec {
 		add(f)
 	}
 
+	// The system prompt reads the mode from each session's context manager,
+	// so the live update reaches the prompt and the compaction layout together.
+	{
+		f := strSpec("contextMode",
+			func(r *config.Config) *string { return &r.ContextMode },
+			func(m *WSMessage) *string { return &m.ContextMode })
+		f.normalize = enumNormalize("contextMode", config.DefaultContextMode, config.ContextModeDeepDive)
+		f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.DeepDive = r.DeepDiveContext() }
+		f.applyLive = contextApplyLive(f.setContext)
+		f.sample = config.ContextModeDeepDive
+		add(f)
+	}
+
 	// --- web features -----------------------------------------------------
 	{
 		f := strSpec("webFetch",

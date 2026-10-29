@@ -2,7 +2,7 @@
   "name": "gogen-ai",
   "displayName": "gogen-ai",
   "description": "Sidebar chat for the gogen coding agent. The open folder is the working directory.",
-  "version": "0.1.10",
+  "version": "0.1.12",
   "publisher": "gogen",
   "license": "AGPL-3.0-only",
   "icon": "media/icon.png",

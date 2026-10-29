@@ -10,7 +10,6 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
-	"gogen/internal/onoff"
 	"gogen/internal/projectfile"
 	"gogen/internal/session"
 	"gogen/internal/skills"
@@ -49,15 +48,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool, restoreSession bool) (*agen
 	provider.SetPromptCacheKey(llm.ProjectPromptCacheKey(cfg.WorkingDir))
 	provider.SetPreserveReasoningMode(cfg.PreserveReasoning)
 
-	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
-		ContextLimit:              cfg.ContextLimit,
-		CompactThreshold:          cfg.CompactThreshold,
-		CompactKeepRecentMessages: cfg.CompactKeepRecentMessages,
-		MaxToolResultBytes:        cfg.MaxToolResultBytes,
-		CompactReserveTokens:      cfg.CompactReserveTokens,
-		CompactLastResort:         cfg.CompactLastResort,
-		SmartCompact:              onoff.Enabled(cfg.SmartCompact),
-	})
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.SettingsFromConfig(cfg))
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
 	exec.SetDeleteApproval(!strings.EqualFold(cfg.DeleteApproval, "off"))

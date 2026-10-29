@@ -238,8 +238,8 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 		// out of the automatic parent turn prevents completion bursts from
 		// flooding the parent's context. The child id makes duplicate or
 		// truncated labels resolvable without guessing.
-		notice := fmt.Sprintf("[subagent %s] %s (%s). Use get_agent_result(agent_id=%q) for the full result.",
-			child.ID, child.Label, verb, child.ID)
+		notice := Notice(child.ID, fmt.Sprintf("%s (%s). Use get_agent_result(agent_id=%q) for the full result.",
+			child.Label, verb, child.ID))
 		child.DeliverEvent(sp.host, Event{Kind: EventTerminal, Text: notice, Err: runErr})
 		// Retention: release the runtime after the window so finished
 		// children cannot accumulate in memory.

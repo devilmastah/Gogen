@@ -6,7 +6,6 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
-	"gogen/internal/onoff"
 	"gogen/internal/skills"
 )
 
@@ -113,19 +112,7 @@ type SessionAgentOptions struct {
 // handlers. When snap is non-nil the agent is restored from it under the
 // given id (multi-session plan §2, session agent factory).
 func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string) *Agent {
-	settings := contextmgr.DefaultSettings()
-	if opts.Config != nil {
-		settings = contextmgr.Settings{
-			ContextLimit:              opts.Config.ContextLimit,
-			CompactThreshold:          opts.Config.CompactThreshold,
-			CompactKeepRecentMessages: opts.Config.CompactKeepRecentMessages,
-			MaxToolResultBytes:        opts.Config.MaxToolResultBytes,
-			CompactReserveTokens:      opts.Config.CompactReserveTokens,
-			CompactLastResort:         opts.Config.CompactLastResort,
-			SmartCompact:              onoff.Enabled(opts.Config.SmartCompact),
-		}
-	}
-	ctxMgr := contextmgr.NewManager(opts.Provider, settings)
+	ctxMgr := contextmgr.NewManager(opts.Provider, contextmgr.SettingsFromConfig(opts.Config))
 	a := NewAgent(opts.Provider, opts.Executor, ctxMgr)
 	a.GlobalMode = opts.GlobalMode
 	a.SetProjectContext(opts.ProjectFilePath, opts.ProjectGuidelines, opts.TestCommand, opts.LintCommand)

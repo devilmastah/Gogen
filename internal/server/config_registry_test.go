@@ -85,6 +85,8 @@ func TestRuntimeConfigFieldErrors(t *testing.T) {
 			`Error: invalid compactLastResort "maybe" (want condense or error)`},
 		{"smartCompact", WSMessage{Type: "config", ConfigFields: []string{"smartCompact"}, SmartCompact: "sometimes"},
 			`Error: invalid smartCompact "sometimes" (want on or off)`},
+		{"contextMode", WSMessage{Type: "config", ConfigFields: []string{"contextMode"}, ContextMode: "deepdive"},
+			`Error: invalid contextMode "deepdive" (want default or deep_dive)`},
 		{"sessionMaxAgeDays", WSMessage{Type: "config", ConfigFields: []string{"sessionMaxAgeDays"}, SessionMaxAgeDays: -2},
 			"Error: sessionMaxAgeDays must be >= -1 (-1 = keep sessions forever)"},
 		{"compactKeepRecentMessages", WSMessage{Type: "config", ConfigFields: []string{"compactKeepRecentMessages"}, CompactKeepRecentMessages: -1},

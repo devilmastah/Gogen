@@ -16,7 +16,7 @@ import "strings"
 // model as a prompt.
 var bareCommandWords = map[string]bool{
 	"help": true, "exit": true, "quit": true,
-	"compact": true, "smartcompact": true, "verbose": true, "subagents": true,
+	"compact": true, "smartcompact": true, "contextmode": true, "verbose": true, "subagents": true,
 	"plan": true, "act": true, "mode": true, "think": true,
 	"context": true, "models": true,
 	"new": true, "sessions": true, "resume": true, "fork": true,
@@ -30,7 +30,7 @@ var bareCommandWords = map[string]bool{
 // "help me debug this" and "new approach?" stay chat instead of being refused
 // as malformed commands.
 var argCommandWords = map[string]bool{
-	"smartcompact": true, "think": true, "models": true, "dir": true,
+	"smartcompact": true, "contextmode": true, "think": true, "models": true, "dir": true,
 	"switch": true, "open": true, "sessions": true, "resume": true, "fork": true,
 }
 

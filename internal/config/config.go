@@ -39,6 +39,13 @@ const (
 	// before the next tool runs, and stops a thinking stream while there is
 	// still room to summarize.
 	DefaultSmartCompact = "off"
+	// DefaultContextMode is the context_mode default: the system prompt's
+	// context advice and the compaction layout as they always were.
+	DefaultContextMode = "default"
+	// ContextModeDeepDive is the context_mode for long-running tasks: the
+	// prompt says compaction is automatic, and compaction keeps the current
+	// request verbatim between two summaries.
+	ContextModeDeepDive = "deep_dive"
 	// DefaultCommandIdleTimeoutSecs is the maximum time a foreground
 	// execute_command may run without producing any output before it is
 	// killed; 0 in the config falls back to this default.
@@ -177,6 +184,11 @@ type Config struct {
 	// CompactThreshold 0 wins: the mid-think cut still happens, but nothing
 	// is summarized and the cut ends the turn with a note.
 	SmartCompact string
+	// ContextMode is "default" or "deep_dive". deep_dive tells the model that
+	// history is compacted automatically (only while compact_threshold > 0)
+	// and makes compaction keep the latest user request verbatim between a
+	// summary of what came before it and a summary of the work since.
+	ContextMode string
 
 	CommandSafetyMode string // blocklist, allowlist, off
 	CommandAllowlist  string // comma-separated when allowlist mode
@@ -397,6 +409,7 @@ func Defaults() Config {
 		CompactReserveTokens:      DefaultCompactReserveTokens,
 		CompactLastResort:         DefaultCompactLastResort,
 		SmartCompact:              DefaultSmartCompact,
+		ContextMode:               DefaultContextMode,
 		CommandSafetyMode:         "blocklist",
 		CommandAllowlist:          "",
 		DeleteApproval:            "required",
@@ -621,6 +634,12 @@ func (c *Config) JobNoticesEnabled() bool {
 // join_queued is explicitly enabled.
 func (c *Config) JoinQueuedEnabled() bool {
 	return c != nil && configOn(c.JoinQueued)
+}
+
+// DeepDiveContext reports whether context_mode is deep_dive, in any case.
+// Any other value, including an empty one, is the default mode.
+func (c *Config) DeepDiveContext() bool {
+	return c != nil && strings.EqualFold(strings.TrimSpace(c.ContextMode), ContextModeDeepDive)
 }
 
 // AutomationsEnabled reports whether the automation scheduler may fire.

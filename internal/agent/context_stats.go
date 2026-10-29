@@ -99,7 +99,7 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	view := msgs
 	if a.Context != nil {
 		// Use cached profile only — do not run DetectProjectProfile here.
-		view = buildSystemView(msgs, workingDir, a.ProjectFilePath, a.EffectiveGuidelines(), projectProfile, mode, a.mcpToolHint())
+		view = buildSystemView(msgs, a.systemPromptBase(workingDir), a.ProjectFilePath, a.EffectiveGuidelines(), projectProfile, mode, a.mcpToolHint())
 	}
 
 	var snap contextmgr.ContextSnapshot

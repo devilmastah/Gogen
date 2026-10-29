@@ -125,6 +125,7 @@ var settings = []setting{
 	{key: "compact_reserve_tokens", env: "GOGEN_COMPACT_RESERVE_TOKENS", cfg: "CompactReserveTokens", file: "CompactReserveTokens", writer: "CompactReserveTokens", kind: kIntPtr},
 	{key: "compact_last_resort", env: "GOGEN_COMPACT_LAST_RESORT", cfg: "CompactLastResort", file: "CompactLastResort", writer: "CompactLastResort", kind: kString, omitDefault: true},
 	{key: "smart_compact", env: "GOGEN_SMART_COMPACT", cfg: "SmartCompact", file: "SmartCompact", writer: "SmartCompact", kind: kString, omitDefault: true},
+	{key: "context_mode", env: "GOGEN_CONTEXT_MODE", cfg: "ContextMode", file: "ContextMode", writer: "ContextMode", kind: kString, omitDefault: true},
 
 	// --- command safety ---------------------------------------------------
 	{key: "command_safety", env: "GOGEN_COMMAND_SAFETY", cfg: "CommandSafetyMode", file: "CommandSafety", writer: "CommandSafety", kind: kString},

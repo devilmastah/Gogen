@@ -486,6 +486,7 @@ type WSMessage struct {
 	CompactReserveTokens      int     `json:"compactReserveTokens,omitempty"`
 	CompactLastResort         string  `json:"compactLastResort,omitempty"` // condense (default) | error
 	SmartCompact              string  `json:"smartCompact,omitempty"`      // off (default) | on
+	ContextMode               string  `json:"contextMode,omitempty"`       // default (default) | deep_dive
 	WebFetch                  string  `json:"webFetch,omitempty"`
 	WebSearch                 string  `json:"webSearch,omitempty"`
 	OutputSpill               string  `json:"outputSpill,omitempty"` // on (default) | off — spill oversized tool output to the session spill dir

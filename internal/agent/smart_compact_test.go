@@ -105,6 +105,59 @@ func TestSmartCompactBeforeToolsRunsCallAfterSummary(t *testing.T) {
 	}
 }
 
+// TestEmergencyDeepDiveFallsBack pins the emergency tier in deep dive when
+// the request itself is the bulk: the layout around it frees nothing, so the
+// single summary runs instead of a refusal that arms the backoff.
+func TestEmergencyDeepDiveFallsBack(t *testing.T) {
+	a, ctxMgr, provider := newEmergencyTestAgent(t, false)
+	a.SetDeepDive(true)
+	big := strings.Repeat("x", 30000)
+	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: contextmgr.SummaryPrefix + "earlier"})
+	a.appendMessage(llm.Message{Role: "user", Content: big})
+	a.appendMessage(llm.Message{Role: "assistant", Content: contextmgr.ProgressSummaryPrefix + "so far"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: "ok"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: "ok2"})
+	_ = a.ContextStats(context.Background())
+	a.recordTurnUsage(&llm.Usage{PromptTokens: ctxMgr.HardLimit() + 100, CompletionTokens: 10})
+
+	if !a.compactIfDue(context.Background(), nil) {
+		t.Fatalf("emergency compaction did not shrink (%d summarizer calls)", provider.calls)
+	}
+	for _, m := range a.Messages {
+		if m.Content == big {
+			t.Fatal("the oversized request is still verbatim")
+		}
+	}
+	if backoff, guard := compactState(a); !backoff.IsZero() || guard != 0 {
+		t.Fatalf("emergency recorded a failure: backoff %v guard %d", backoff, guard)
+	}
+}
+
+// TestSmartCompactDeepDiveKeepsPausedNote pins that the paused-call note is
+// not lost in deep dive when no progress summary can take it: the tool-call
+// message carries it, and the session summary before the request does not.
+func TestSmartCompactDeepDiveKeepsPausedNote(t *testing.T) {
+	a, _, _ := newEmergencyTestAgent(t, false)
+	seedToolLoopOverBudget(t, a)
+	enableSmartCompact(a)
+	a.SetDeepDive(true)
+	res := &llm.StreamResult{ToolCalls: []llm.ToolCall{{
+		ID: "call_2", Name: "read_file", ArgsStr: `{"path":"b.go"}`,
+	}}}
+	if action := a.smartCompactBeforeTools(context.Background(), nil, res); action != smartCompactExecute {
+		t.Fatalf("action = %d, want execute", action)
+	}
+	for _, m := range a.Messages {
+		if strings.HasPrefix(m.Content, contextmgr.SummaryPrefix) && strings.Contains(m.Content, "[Paused before execution]") {
+			t.Fatal("the note landed in the session summary")
+		}
+	}
+	if !strings.Contains(res.Content, "[Paused before execution]") || !strings.Contains(res.Content, "b.go") {
+		t.Fatalf("tool-call message does not carry the note: %q", res.Content)
+	}
+}
+
 func TestSmartCompactOffDoesNotDelayToolCall(t *testing.T) {
 	a, _, provider := newEmergencyTestAgent(t, false)
 	seedToolLoopOverBudget(t, a)

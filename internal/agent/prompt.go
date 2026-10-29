@@ -83,6 +83,42 @@ const (
 	mcpInlineHint = "Additional mcp_* tools may be available."
 )
 
+// contextAdviceDefault is the context advice of the built-in prompt
+// (context_mode: default).
+const contextAdviceDefault = `When context is
+tight, pin critical facts with context_pin_last so they survive compaction, then
+summarize progress in one short message.`
+
+// contextAdviceDeepDive replaces contextAdviceDefault for context_mode:
+// deep_dive while auto-compaction is on. It does not suggest
+// context_pin_last: a pin keeps everything after the pinned message
+// verbatim, which in a long turn leaves compaction nothing to free.
+const contextAdviceDeepDive = `History is compacted
+automatically when the context window fills: the user's first message, the current
+request, and the latest messages stay verbatim, and the rest is summarized. Keep facts
+you will need later as todo items (the todo list survives compaction; todo with action
+list shows it). Do not stop or shorten your work because of context size; continue as
+normal.`
+
+// systemPromptBase is this session's base prompt for workingDir: SystemPrompt
+// with the context advice for its context_mode. The deep-dive advice says
+// history is compacted automatically, so it applies only while
+// auto-compaction is on; with compact_threshold 0 the default advice stays.
+func (a *Agent) systemPromptBase(workingDir string) string {
+	deepDive := a.Context != nil && a.Context.DeepDive() && a.Context.AutoCompactEnabled()
+	return contextAdvice(SystemPrompt(workingDir), deepDive)
+}
+
+// contextAdvice puts the deep-dive advice in place of the default one when
+// deepDive is set. A custom template without the default sentence is left as
+// it is.
+func contextAdvice(prompt string, deepDive bool) string {
+	if !deepDive {
+		return prompt
+	}
+	return strings.Replace(prompt, contextAdviceDefault, contextAdviceDeepDive, 1)
+}
+
 func systemPromptTemplate() string {
 	return `You are GoGen, a coding agent working in the local repository at {working_dir}.
 
@@ -100,9 +136,7 @@ write_file create-only. If an edit fails, re-read and retry; never reuse old pat
 output or transcript text in a new diff. Run tests/lints via execute_command after
 edits.
 
-Tasks: track multi-step work with todo and mark items done as you go. When context is
-tight, pin critical facts with context_pin_last so they survive compaction, then
-summarize progress in one short message.
+Tasks: track multi-step work with todo and mark items done as you go. ` + contextAdviceDefault + `
 
 Safety: never exfiltrate secrets. No destructive commands (rm -rf, sudo, curl|bash).
 For ambiguous tasks, state assumptions and proceed. Summarize changes when done.
@@ -153,7 +187,7 @@ func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode 
 // pipeline: the base system prompt, then the MCP hint (only when mcpHint is
 // set), then the profile suffix, then the project rules header, then the plan-mode
 // suffix, all on the leading system message.
-func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode, mcpHint string) []llm.Message {
+func buildSystemView(messages []llm.Message, basePrompt, projectFilePath, guidelines, projectProfile string, mode Mode, mcpHint string) []llm.Message {
 	if len(messages) == 0 {
 		return messages
 	}
@@ -174,8 +208,7 @@ func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidel
 	}
 
 	// No system message: prepend one with the full content in one copy.
-	content := SystemPrompt(workingDir)
-	content += suffix
+	content := basePrompt + suffix
 	out := make([]llm.Message, 0, len(messages)+1)
 	out = append(out, llm.Message{Role: "system", Content: content})
 	out = append(out, messages...)

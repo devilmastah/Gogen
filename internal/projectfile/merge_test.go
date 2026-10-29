@@ -682,3 +682,25 @@ func TestMergeSmartCompact(t *testing.T) {
 		t.Fatalf("env should override the file: %q, want off", got)
 	}
 }
+
+// context_mode follows the same env > file > defaults rule and defaults to
+// "default", so a config that never mentions it keeps today's prompt and
+// compaction.
+func TestMergeContextMode(t *testing.T) {
+	t.Setenv("GOGEN_CONTEXT_MODE", "")
+	os.Unsetenv("GOGEN_CONTEXT_MODE")
+	if got := Merge(nil, FlagOverrides{}).ContextMode; got != config.DefaultContextMode {
+		t.Fatalf("absent key merged to %q, want default %q", got, config.DefaultContextMode)
+	}
+	pf, err := ParseContent("GOGEN.md", "---\ncontext_mode: deep_dive\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Merge(pf, FlagOverrides{}).ContextMode; got != config.ContextModeDeepDive {
+		t.Fatalf("file value merged to %q, want deep_dive", got)
+	}
+	t.Setenv("GOGEN_CONTEXT_MODE", "default")
+	if got := Merge(pf, FlagOverrides{}).ContextMode; got != "default" {
+		t.Fatalf("env should override the file: %q, want default", got)
+	}
+}

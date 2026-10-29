@@ -673,7 +673,7 @@ func jobExitSummary(job *BackgroundJob) string {
 	// multi-byte character and emit invalid UTF-8 into the transcript.
 	cmd := contextmgr.Truncate(job.Command, maxJobNoticeCommandLen,
 		contextmgr.TruncateOptions{Marker: "…"})
-	return fmt.Sprintf("[job] %s (%s) exited with code %d", job.ID, cmd, code)
+	return contextmgr.JobNoticePrefix + fmt.Sprintf("%s (%s) exited with code %d", job.ID, cmd, code)
 }
 
 // onJobFinished runs in the job's wait goroutine once the process has

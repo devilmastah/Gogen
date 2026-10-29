@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
+	"gogen/internal/config"
 	"gogen/internal/onoff"
 	"gogen/internal/session"
 
@@ -57,6 +58,10 @@ var tuiCommands = []tuiCommand{
 		return trimmed == "smartcompact" || trimmed == "/smartcompact" ||
 			strings.HasPrefix(trimmed, "smartcompact ") || strings.HasPrefix(trimmed, "/smartcompact ")
 	}, run: cmdSmartCompact},
+	{match: func(input, trimmed string) bool {
+		return trimmed == "contextmode" || trimmed == "/contextmode" ||
+			strings.HasPrefix(trimmed, "contextmode ") || strings.HasPrefix(trimmed, "/contextmode ")
+	}, run: cmdContextMode},
 	{match: exactAny("verbose", "/verbose"), run: cmdVerbose},
 	{match: exactAny("subagents", "/subagents"), run: cmdSubagents},
 	// Mode commands: mirror HandleModeCommand's accepted forms.
@@ -257,6 +262,55 @@ func cmdSmartCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		m.workspace.SetRuntimeConfig(cfg)
 	}
 	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Smart compact: %s (all live sessions; /save-config stores it)", state)))
+	return true, false, nil
+}
+
+func cmdContextMode(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	if m.agent == nil || m.agent.Context == nil {
+		m.appendChatLine(SystemStyle.Render("Context mode is unavailable in this session"))
+		return true, false, nil
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) < 2 {
+		mode := config.DefaultContextMode
+		if m.agent.Context.DeepDive() {
+			mode = config.ContextModeDeepDive
+		}
+		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Context mode: %s (use /contextmode %s or %s)", mode, config.DefaultContextMode, config.ContextModeDeepDive)))
+		return true, false, nil
+	}
+	mode := strings.ToLower(fields[1])
+	if mode != config.DefaultContextMode && mode != config.ContextModeDeepDive {
+		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Context mode: use %s or %s", config.DefaultContextMode, config.ContextModeDeepDive)))
+		return true, false, nil
+	}
+	deepDive := mode == config.ContextModeDeepDive
+	apply := func(a *agent.Agent) {
+		if a != nil {
+			a.SetDeepDive(deepDive)
+		}
+	}
+	if m.lives != nil {
+		for _, sess := range m.lives.sessions {
+			if sess != nil {
+				apply(sess.agent)
+			}
+		}
+	}
+	apply(m.agent)
+	if m.cfg != nil {
+		m.cfg.ContextMode = mode
+	}
+	if m.workspace != nil {
+		cfg := m.workspace.GetRuntimeConfig()
+		cfg.ContextMode = mode
+		m.workspace.SetRuntimeConfig(cfg)
+	}
+	note := ""
+	if deepDive && !m.agent.Context.AutoCompactEnabled() {
+		note = "; auto-compaction is off, so the prompt keeps the default context advice"
+	}
+	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Context mode: %s (all live sessions; /save-config stores it%s)", mode, note)))
 	return true, false, nil
 }
 

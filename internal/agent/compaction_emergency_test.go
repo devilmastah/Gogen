@@ -429,7 +429,7 @@ func TestEmergencyLowersKeepToCoverDeficit(t *testing.T) {
 	a.recordTurnUsage(&llm.Usage{PromptTokens: ctxMgr.HardLimit() + 1200, CompletionTokens: 10})
 
 	total := a.compactionTokenTotal()
-	needed := total - ctxMgr.HardLimit() + emergencySummaryAllowance
+	needed := total - ctxMgr.HardLimit() + contextmgr.EmergencySummaryAllowance
 	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed, nil); k != 1 {
 		t.Fatalf("ChooseCompactKeep = %d, want 1 (deficit %d exceeds the keep-2 middle)", k, needed)
 	}
@@ -472,7 +472,7 @@ func TestEmergencyKeepUnchangedWhenMiddleSufficient(t *testing.T) {
 	a.recordTurnUsage(&llm.Usage{PromptTokens: ctxMgr.HardLimit() + 100, CompletionTokens: 10})
 
 	total := a.compactionTokenTotal()
-	needed := total - ctxMgr.HardLimit() + emergencySummaryAllowance
+	needed := total - ctxMgr.HardLimit() + contextmgr.EmergencySummaryAllowance
 	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed, nil); k != ctxMgr.CompactKeepRecentMessages() {
 		t.Fatalf("ChooseCompactKeep = %d, want %d (middle already covers the deficit)",
 			k, ctxMgr.CompactKeepRecentMessages())

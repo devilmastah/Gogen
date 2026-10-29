@@ -30,7 +30,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		Type: "config",
 		ConfigFields: []string{
 			"commandSafety", "commandAllowlist", "deleteApproval", "commandApproval", "commandSandbox", "commandIdleTimeoutSecs",
-			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "outputSpill", "compactReserveTokens", "compactLastResort", "smartCompact",
+			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "outputSpill", "compactReserveTokens", "compactLastResort", "smartCompact", "contextMode",
 			"webFetch", "webSearch", "treesitter", "preserveReasoning",
 			"sessionMaxCount", "sessionMaxAgeDays", "webApprovalHoldSecs",
 			"subagentModel", "subagentThinkingLevel", "boardStartPrompt", "systemPrompt", "subagentPrompt",
@@ -49,6 +49,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		CompactReserveTokens:      1000,
 		CompactLastResort:         "error",
 		SmartCompact:              "on",
+		ContextMode:               "deep_dive",
 		WebFetch:                  "off",
 		WebSearch:                 "off",
 		TreeSitter:                "off",
@@ -82,7 +83,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		cfg.CommandIdleTimeoutSecs != 45 ||
 		cfg.ContextLimitConfig != 20000 || cfg.CompactThreshold != 0.5 ||
 		cfg.CompactKeepRecentMessages != 3 || cfg.MaxToolResultBytes != 65536 || cfg.CompactReserveTokens != 1000 ||
-		cfg.CompactLastResort != "error" || cfg.SmartCompact != "on" ||
+		cfg.CompactLastResort != "error" || cfg.SmartCompact != "on" || cfg.ContextMode != "deep_dive" ||
 		cfg.OutputSpill != "off" ||
 		cfg.WebFetch != "off" || cfg.WebSearch != "off" || cfg.TreeSitter != "off" ||
 		cfg.PreserveReasoning != "on" || cfg.SessionMaxCount != 4 || cfg.SessionMaxAgeDays != 9 ||
@@ -111,7 +112,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	}
 	snap := a.Context.SettingsSnapshot()
 	if snap.ContextLimit != 20000 || snap.CompactThreshold != 0.5 || snap.CompactKeepRecentMessages != 3 ||
-		snap.MaxToolResultBytes != 65536 || snap.CompactReserveTokens != 1000 || snap.CompactLastResort != "error" || !snap.SmartCompact {
+		snap.MaxToolResultBytes != 65536 || snap.CompactReserveTokens != 1000 || snap.CompactLastResort != "error" || !snap.SmartCompact || !snap.DeepDive || !a.Context.DeepDive() {
 		t.Fatalf("context settings = %+v, want applied values", snap)
 	}
 	if s.ws.Store.MaxCount() != 4 || s.ws.Store.MaxAgeDays() != 9 {
@@ -144,7 +145,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "command_idle_timeout_secs: 45", "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", `output_spill: "off"`, "subagent_model: gpt-4o-mini", "subagent_thinking_level: high", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
+	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "command_idle_timeout_secs: 45", "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", `output_spill: "off"`, "context_mode: deep_dive", "subagent_model: gpt-4o-mini", "subagent_thinking_level: high", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("expected %q in persisted config:\n%s", want, data)
 		}

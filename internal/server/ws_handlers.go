@@ -5,6 +5,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/steerq"
+	"gogen/internal/subagents"
 )
 
 // wsHandlers maps inbound message types to their handlers. Unknown types are
@@ -473,7 +474,7 @@ func wsHandleClose(req *wsRequest) {
 		if label == "" {
 			label = target.agent.SessionID
 		}
-		s.registry.deliverToParent(parentID, fmt.Sprintf("[subagent %s] closed by the user — its session stays saved and can be reopened.", label))
+		s.registry.deliverToParent(parentID, subagents.Notice(label, "closed by the user — its session stays saved and can be reopened."))
 	}
 	s.registry.closeRuntime(target)
 }
