@@ -54,10 +54,12 @@ type SessionEntry struct {
 	// ParentID is non-empty for nested (subagent) sessions; the client
 	// renders them as indented rows under their parent.
 	ParentID string `json:"parentId,omitempty"`
-	// SubagentStatus is the persisted final outcome of a nested (subagent)
-	// session: "" (unknown / not finished), "success", or "failed". The
-	// sidebar uses it when the live subagent_started/finished events are
-	// gone (reload / restart), so a failed child stays failed.
+	// SubagentStatus is the persisted outcome of a nested (subagent)
+	// session: "running" (admitted, no terminal state recorded), "success",
+	// "failed", or "" (not a subagent / legacy record). The sidebar uses it
+	// when the live subagent_started/finished events are gone (reload /
+	// restart), so a failed child stays failed and a child that never
+	// finished reads as interrupted rather than done.
 	SubagentStatus string `json:"subagentStatus,omitempty"`
 	// SubagentSummary is the report/error summary written alongside
 	// SubagentStatus.

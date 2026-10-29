@@ -6090,14 +6090,21 @@
                 // never mistaken for running or failed, and a child that
                 // really failed stays failed.
                 //
-                // A child with NO live runtime and a recorded "running" (or a
-                // legacy "") status never reached a terminal state: it was
-                // interrupted, cancelled with its host, or its process went
-                // away. That must NOT read as done — an unfinished child used
-                // to render green "done" after a restart.
+                // A recorded "running" status (or a legacy "") with no
+                // evidence of current activity never reached a terminal state:
+                // the child was interrupted, cancelled with its host, or its
+                // process went away. That must NOT read as done — unfinished
+                // work used to render green "done" after a restart.
+                //
+                // The evidence is the payload's `active` flag, which means
+                // "open in a tab, or a turn is running" (sessionEntries/
+                // activeSet) — NOT "the runtime is registered". Folding in
+                // turnActive keeps a mid-turn child on "responding" and leaves
+                // an idle headless one reading as interrupted, which is the
+                // state it is actually in: continuable, not working.
                 const status = s.subagentStatus || '';
-                const live = !!s.active;
-                const interrupted = !live && !s.turnActive && (status === 'running' || status === '');
+                const attended = !!s.active || !!s.turnActive;
+                const interrupted = !attended && (status === 'running' || status === '');
                 out.push({
                     id: s.id,
                     parentId: s.parentId,
@@ -6106,7 +6113,7 @@
                     running: !!s.turnActive,
                     success: status !== 'failed' && !interrupted,
                     interrupted,
-                    active: live,
+                    active: !!s.active,
                     summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
                 });
                 rendered.add(s.id);

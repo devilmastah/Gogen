@@ -199,9 +199,11 @@ type ContinuableSubagentSpawner interface {
 	// one foreground turn. job may be empty for the default continuation
 	// prompt. Returns the fork's final output.
 	Fork(ctx context.Context, parent *Agent, job string, depth int) (string, error)
-	// ListAgents lists the caller's registered children (id, label, status,
-	// depth, latest progress line). Finished children remain available only for
-	// their retention window; GetAgentResult resolves older persisted results.
+	// ListAgents lists the caller's children: the LIVE ones (id, label,
+	// status, depth, latest progress line) and the SAVED ones the registry no
+	// longer tracks (id, label, recorded outcome), so a child stays
+	// discoverable after its retention window or a restart. GetAgentResult
+	// reads any listed child's report.
 	ListAgents(caller *Agent) (string, error)
 	// GetAgentResult returns the authoritative current/final result for one
 	// of the caller's background children. It remains readable after the
@@ -537,18 +539,19 @@ type subagentOutcome struct {
 	Summary string
 }
 
-// SetSubagentOutcome records the final outcome of a nested (subagent)
-// session. The spawner writes it at every terminal transition (natural
-// completion, cancellation, eviction) so the persisted snapshot carries the
-// truth across restarts; the sidebar reads it from the sessions payload
-// when the live subagent_started/finished events are gone. Empty status
-// means the child has not finished (or is not a subagent).
+// SetSubagentOutcome records the outcome of a nested (subagent) session. The
+// spawner writes "running" when the child is admitted and the terminal status
+// at every terminal transition (natural completion, cancellation, eviction),
+// so the persisted snapshot carries the truth across restarts; the sidebar
+// reads it from the sessions payload when the live subagent_started/finished
+// events are gone. "" means no outcome was ever recorded (not a subagent, or
+// a record written before admission was stamped).
 func (a *Agent) SetSubagentOutcome(status, summary string) {
 	a.subagentOutcome.Store(&subagentOutcome{Status: status, Summary: summary})
 }
 
-// SubagentOutcome returns the recorded final outcome: the status ("" /
-// "success" / "failed") and the summary text.
+// SubagentOutcome returns the recorded outcome: the status ("running" /
+// "success" / "failed" / "") and the summary text.
 func (a *Agent) SubagentOutcome() (string, string) {
 	v := a.subagentOutcome.Load()
 	if v == nil {

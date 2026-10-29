@@ -1870,4 +1870,16 @@ func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
 	if strings.Contains(out2, "— success") {
 		t.Fatalf("an interrupted child must not read as success: %q", out2)
 	}
+
+	// The store query is scoped by ParentID: another session must not see
+	// these children, exactly like get_agent_result's ownership check.
+	other := &agent.Agent{}
+	other.SetSessionID("someone-else")
+	foreign, err := sp.ListAgents(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(foreign, id) || strings.Contains(foreign, id2) {
+		t.Fatalf("another session's children leaked into list_agents: %q", foreign)
+	}
 }

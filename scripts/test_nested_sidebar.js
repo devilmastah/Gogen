@@ -205,9 +205,10 @@ async function main() {
 
   // 6d. A child that never reached a terminal state — interrupted
   //     (interrupt_agent leaves it continuable) or killed with its process —
-  //     records status "running" (legacy records: ""). With NO live runtime
-  //     both must read INTERRUPTED, never done: unfinished work used to render
-  //     a green "done" row after a restart.
+  //     records status "running" (legacy records: ""). With no evidence of
+  //     current activity (the payload's active flag is "open in a tab or a turn
+  //     is running") both must read INTERRUPTED, never done: unfinished work
+  //     used to render a green "done" row after a restart.
   recv({
     type: 'sessions',
     sessions: [
@@ -217,7 +218,7 @@ async function main() {
   });
   rows = nestedRows();
   const metaI = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
-  check('killed child (status running, runtime gone) shows interrupted',
+  check('killed child (status running, nothing running) shows interrupted',
     metaI.includes('interrupted') && !metaI.includes('done') && !metaI.includes('failed'));
   check('interrupted child shows NO colored dot',
     !!rows[0] && !rows[0].querySelector('.session-state-dot'));
