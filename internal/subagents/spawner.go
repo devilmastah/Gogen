@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -327,21 +328,48 @@ func (sp *Spawner[H]) discardUnstartedChild(c *Child[H]) {
 	sp.host.Release(c, false)
 }
 
-// maxPersistedListed bounds the saved-child section of list_agents. A parent
-// can own an unbounded number of saved children over a long life (the live
-// cap only bounds the runtime records), and the listing is a model-facing
-// tool result, so the tail is summarized instead of listed.
-const maxPersistedListed = 10
+// listAgentsRow is one child in the list_agents output, live or saved. The
+// two sources are merged into ONE list so the caller reads it in a single
+// order (most recent activity first) instead of two sections it has to
+// cross-reference.
+type listAgentsRow struct {
+	ID     string
+	Label  string
+	Active bool
+	// Status is the live status (running/idle/finished) for an active child,
+	// or the recorded outcome (success/failed/interrupted) for an inactive
+	// one.
+	Status string
+	// Depth is the live nesting depth (0 for a saved child: depth is not
+	// persisted — see SessionSnapshot).
+	Depth int
+	// Progress is the live one-line snippet of the newest assistant output.
+	Progress string
+	// Messages is the saved session's message count (inactive rows only).
+	Messages int
+	// Activity orders the listing, newest first: a running child is active
+	// NOW, a finished one ended when it finished, a saved one was last
+	// updated when the store says.
+	Activity time.Time
+}
 
-// ListAgents lists the caller's children: the LIVE ones (id, label, status,
-// depth, latest progress line) followed by the SAVED ones the live registry no
-// longer tracks (id, label, recorded outcome, message count).
+// ListAgents lists the caller's children as ONE list, most recent activity
+// first: the LIVE children (status, depth, latest progress line) and the SAVED
+// ones the live registry no longer tracks (recorded outcome, message count).
+// Every row carries an active/inactive flag, so the caller can tell at a
+// glance what send_message can reach — inactive rows are readable only through
+// get_agent_result.
 //
-// The saved section is what makes a child survive a restart in the model's
-// view: the live registry is process-local, so after a restart (or once
-// retention released a child) nothing else would tell the caller that its
-// children — and their reports — still exist. Their ids are the handles
-// get_agent_result needs. Implements agent.ContinuableSubagentSpawner.
+// There is deliberately no cap here: the listing is a model-facing tool result,
+// and the executor already bounds tool results (spilling the full text when it
+// exceeds the configured limit). A cap would silently hide children the caller
+// cannot otherwise discover — which is the whole point of listing saved ones.
+//
+// The saved half is what makes a child survive a restart in the model's view:
+// the live registry is process-local, so after a restart (or once retention
+// released a child) nothing else would tell the caller that its children — and
+// their reports — still exist. Their ids are the handles get_agent_result
+// needs. Implements agent.ContinuableSubagentSpawner.
 func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 	if caller == nil {
 		return "", fmt.Errorf("list_agents: caller agent is nil")
@@ -349,61 +377,109 @@ func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 	if sp == nil || sp.children == nil {
 		return "", fmt.Errorf("list_agents: background subagents are not available in this mode")
 	}
-	children := sp.children.childrenOf(caller.SessionID)
-	saved, more := sp.savedChildren(caller, children)
-	if len(children) == 0 && len(saved) == 0 {
+	rows := sp.agentRows(caller)
+	if len(rows) == 0 {
 		return "No live subagents.", nil
 	}
-	var b strings.Builder
-	for _, c := range children {
-		fmt.Fprintf(&b, "%s — %s — %s (depth %d)\n", c.ID, c.Label, c.StatusOf(sp.host), c.Depth)
-		if line := c.LatestProgress(); line != "" {
-			fmt.Fprintf(&b, "  last: %s\n", line)
+	active := 0
+	for _, r := range rows {
+		if r.Active {
+			active++
 		}
 	}
-	if len(saved) > 0 {
-		if b.Len() > 0 {
-			b.WriteString("\n")
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d child subagents (%d active, %d inactive), most recent activity first:\n", len(rows), active, len(rows)-active)
+	for _, r := range rows {
+		if r.Active {
+			fmt.Fprintf(&b, "%s — %s — active — %s (depth %d)\n", r.ID, r.Label, r.Status, r.Depth)
+			if r.Progress != "" {
+				fmt.Fprintf(&b, "  last: %s\n", r.Progress)
+			}
+			continue
 		}
-		b.WriteString("Saved (not live — get_agent_result reads their report; send_message cannot reach them):\n")
-		for _, pc := range saved {
-			fmt.Fprintf(&b, "%s — %s — %s — %d msgs\n", pc.ID, pc.Label, persistedStatusLabel(pc.Status), pc.Messages)
+		fmt.Fprintf(&b, "%s — %s — inactive — %s — %d msgs", r.ID, r.Label, r.Status, r.Messages)
+		if age := shortAge(time.Since(r.Activity)); age != "" {
+			fmt.Fprintf(&b, " — %s ago", age)
 		}
-		if more > 0 {
-			fmt.Fprintf(&b, "…and %d more saved children\n", more)
-		}
+		b.WriteString("\n")
+	}
+	if active < len(rows) {
+		b.WriteString("get_agent_result reads any child's report; send_message reaches active children only.")
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
-// savedChildren returns the caller's children that the live registry does not
-// track, newest first, bounded to maxPersistedListed, plus the number of extra
-// entries left out. An id the registry still tracks is skipped: it is listed
-// above with its live status, so a child can never appear twice.
-func (sp *Spawner[H]) savedChildren(caller *agent.Agent, live []*Child[H]) ([]PersistedChild, int) {
-	if sp.host == nil {
-		return nil, 0
-	}
-	liveIDs := make(map[string]struct{}, len(live))
-	for _, c := range live {
+// agentRows merges the live children and the caller's saved (non-live) ones
+// into one recency-ordered list. An id the registry still tracks is taken from
+// the registry only, so a child can never appear twice.
+func (sp *Spawner[H]) agentRows(caller *agent.Agent) []listAgentsRow {
+	children := sp.children.childrenOf(caller.SessionID)
+	now := time.Now()
+	rows := make([]listAgentsRow, 0, len(children))
+	liveIDs := make(map[string]struct{}, len(children))
+	for _, c := range children {
 		liveIDs[c.ID] = struct{}{}
+		row := listAgentsRow{
+			ID:       c.ID,
+			Label:    c.Label,
+			Active:   true,
+			Status:   c.StatusOf(sp.host),
+			Depth:    c.Depth,
+			Progress: c.LatestProgress(),
+			Activity: c.CreatedAt,
+		}
+		// Recency of a live child: a turn in flight is activity right now,
+		// a finished one ended when it finished, otherwise it was created
+		// when it was created.
+		if row.Status == "running" {
+			row.Activity = now
+		} else if fin := c.FinishedAt(); !fin.IsZero() {
+			row.Activity = fin
+		}
+		rows = append(rows, row)
 	}
-	var out []PersistedChild
-	more := 0
-	for _, pc := range sp.host.PersistedChildren(caller) {
-		if pc.ID == "" {
-			continue
+	if sp.host != nil {
+		for _, pc := range sp.host.PersistedChildren(caller) {
+			if pc.ID == "" {
+				continue
+			}
+			if _, ok := liveIDs[pc.ID]; ok {
+				continue
+			}
+			rows = append(rows, listAgentsRow{
+				ID:       pc.ID,
+				Label:    pc.Label,
+				Status:   persistedStatusLabel(pc.Status),
+				Messages: pc.Messages,
+				Activity: pc.Updated,
+			})
 		}
-		if _, ok := liveIDs[pc.ID]; ok {
-			continue
-		}
-		if len(out) >= maxPersistedListed {
-			more++
-			continue
-		}
-		out = append(out, pc)
 	}
-	return out, more
+	// Newest first; ties (and missing timestamps) break on the id so the
+	// listing is deterministic between calls.
+	sort.SliceStable(rows, func(i, j int) bool {
+		if !rows[i].Activity.Equal(rows[j].Activity) {
+			return rows[i].Activity.After(rows[j].Activity)
+		}
+		return rows[i].ID < rows[j].ID
+	})
+	return rows
+}
+
+// shortAge renders an update age for an inactive row ("3m", "2h", "4d"). Empty
+// for an unknown (zero) timestamp or an age under a minute, so the common
+// just-finished case stays clean.
+func shortAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return ""
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
 }
 
 // persistedStatusLabel renders a stored outcome for list_agents. "" and

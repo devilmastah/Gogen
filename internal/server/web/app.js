@@ -5383,6 +5383,15 @@
             // a FINISHED child is always persisted, so an absent record
             // that is not running and not open as a pane is stale. Running
             // children may not have hit their first save yet — keep them.
+            // NOTE: the record's `running` flag is deliberately NOT refreshed
+            // from the payload here. It is an optimistic spawn flag, and a
+            // released child's saved session STAYS in the payload, so absence
+            // is the only signal this prune may act on — and a running record
+            // must survive it (a child that has not saved yet is absent by
+            // definition). Rendering does not depend on the flag once the
+            // payload lists the child: collectNestedRows prefers the payload
+            // for any listed child, which is what stops an interrupted child
+            // from being pinned at "responding".
             const payloadIds = new Set((data.sessions || []).map((s) => s.id));
             for (const [id, rec] of nestedSessions) {
                 if (rec.running) continue;
@@ -6075,14 +6084,28 @@
             if (depth > 16) return []; // cycle guard (subagentMaxDepth max is 10)
             const out = [];
             const rendered = new Set();
+            // Live-event records (subagent_started) are OPTIMISTIC: running is
+            // true from the moment the child is announced, and the ONLY event
+            // that clears it is subagent_finished — which an interrupted child
+            // never sends (interrupt leaves it continuable). So once the
+            // sessions payload lists the child, the payload is server truth
+            // (turnActive + the recorded outcome) and the record must not
+            // shadow it, or an interrupted child stays pinned at "responding"
+            // until the page is reloaded. The record still supplies the job
+            // text, and is the whole row while the payload does not list the
+            // child yet (a spawn the in-flight list predates). Absent is NOT
+            // evidence: the list request may be older than the spawn.
+            const listed = new Set((getLastSessions() || []).map((s) => s.id));
             for (const rec of nestedSessions.values()) {
                 if (rec.parentId !== parentId) continue;
+                if (listed.has(rec.id)) continue;
                 out.push(rec);
                 rendered.add(rec.id);
             }
             for (const s of getLastSessions() || []) {
                 if (!s.parentId || s.parentId !== parentId) continue;
                 if (rendered.has(s.id)) continue;
+                const liveRec = nestedSessions.get(s.id);
                 // The payload carries the runtime's LIVE turn state
                 // (turnActive) and the child's PERSISTED outcome
                 // (subagentStatus/subagentSummary), so a registered-but-
@@ -6108,8 +6131,11 @@
                 out.push({
                     id: s.id,
                     parentId: s.parentId,
-                    label: s.label || s.id,
-                    job: '',
+                    // The spawn event carries the label the parent wrote; the
+                    // store's label can lag (or be empty before the first
+                    // save), so prefer the live one when there is one.
+                    label: (liveRec && liveRec.label) || s.label || s.id,
+                    job: (liveRec && liveRec.job) || '',
                     running: !!s.turnActive,
                     success: status !== 'failed' && !interrupted,
                     interrupted,

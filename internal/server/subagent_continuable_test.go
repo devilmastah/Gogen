@@ -1818,13 +1818,13 @@ func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "Saved (not live") {
-		t.Fatalf("a released child must still be listed: %q", out)
+	if !strings.Contains(out, "1 child subagents (0 active, 1 inactive)") {
+		t.Fatalf("a released child must still be listed, flagged inactive: %q", out)
 	}
 	if !strings.Contains(out, id) {
 		t.Fatalf("the saved child's id must be listed (it is the get_agent_result handle): %q", out)
 	}
-	if !strings.Contains(out, "success") {
+	if !strings.Contains(out, "— inactive — success — ") {
 		t.Fatalf("the saved child's recorded outcome must be listed: %q", out)
 	}
 
@@ -1864,8 +1864,8 @@ func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out2, id2) || !strings.Contains(out2, "interrupted") {
-		t.Fatalf("an interrupted child must read as interrupted, not done: %q", out2)
+	if !strings.Contains(out2, id2) || !strings.Contains(out2, "— inactive — interrupted — ") {
+		t.Fatalf("an interrupted child must read as inactive+interrupted, not done: %q", out2)
 	}
 	if strings.Contains(out2, "— success") {
 		t.Fatalf("an interrupted child must not read as success: %q", out2)

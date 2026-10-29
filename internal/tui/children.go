@@ -426,6 +426,7 @@ func (sp *tuiSubagentSpawner) PersistedChildren(caller *agent.Agent) []subagents
 			Label:    label,
 			Status:   info.SubagentStatus,
 			Messages: info.MessageCount,
+			Updated:  info.UpdatedTime(),
 		})
 	}
 	return out

@@ -275,6 +275,42 @@ async function main() {
   check('child removed elsewhere stops rendering', rows.length === 0);
   check('orphaned pane re-keys with session_new', sent('session_new'));
 
+  // 6e. A live-event record is OPTIMISTIC: subagent_started sets running, and
+  //     only subagent_finished clears it — which an INTERRUPTED child never
+  //     sends. Once the sessions payload lists the child it is server truth,
+  //     so the record must not pin the row at "responding" (that is what the
+  //     tab used to show until a reload).
+  recv({
+    type: 'subagent_started', subagentId: 'L', subagentParent: 'A',
+    subagentLabel: 'subagent: interrupted job', subagentJob: 'interrupted job',
+  });
+  recv({
+    type: 'sessions',
+    sessions: [
+      { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
+      { id: 'L', parentId: 'A', label: 'subagent: interrupted job', messageCount: 2, active: true, turnActive: true, subagentStatus: 'running', updatedAt: '' },
+    ],
+  });
+  rows = nestedRows();
+  const metaL1 = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
+  check('started child mid-turn still shows responding', metaL1.includes('responding'));
+
+  // The interrupt lands: no subagent_finished frame, but the runtime is no
+  // longer working — the payload says so.
+  recv({
+    type: 'sessions',
+    sessions: [
+      { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
+      { id: 'L', parentId: 'A', label: '', messageCount: 2, active: false, turnActive: false, subagentStatus: 'running', updatedAt: '' },
+    ],
+  });
+  rows = nestedRows();
+  const metaL2 = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
+  check('interrupted child stops showing responding WITHOUT a reload',
+    !metaL2.includes('responding') && metaL2.includes('interrupted'));
+  check('a listed child keeps the spawn label when the payload has none',
+    !!rows[0] && (rows[0].querySelector('.session-row-title').textContent || '').includes('interrupted job'));
+
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

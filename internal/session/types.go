@@ -49,8 +49,10 @@ type SessionSnapshot struct {
 
 // SessionInfo describes a saved session entry.
 type SessionInfo struct {
-	ID           string
-	Oneshot      bool
+	ID      string
+	Oneshot bool
+	// UpdatedAt is the entry's update time, formatted RFC3339Nano (see
+	// UpdatedTime for the time.Time form).
 	UpdatedAt    string
 	MessageCount int
 	Label        string
@@ -65,6 +67,20 @@ type SessionInfo struct {
 	// SubagentSummary is the report/error summary written alongside
 	// SubagentStatus.
 	SubagentSummary string
+}
+
+// UpdatedTime parses UpdatedAt (the RFC3339Nano form the store writes),
+// returning the zero time when it is absent or malformed — callers sort by it
+// and must tolerate a missing timestamp rather than dropping the entry.
+func (s SessionInfo) UpdatedTime() time.Time {
+	if s.UpdatedAt == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, s.UpdatedAt)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // TodoItem represents a single task.

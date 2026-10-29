@@ -568,9 +568,9 @@ func TestInterruptedChildKeepsRunningOutcome(t *testing.T) {
 
 // TestListAgentsListsSavedChildren pins the restart-surviving half of
 // list_agents: children the live registry no longer tracks (released, evicted,
-// or from a previous process) stay discoverable through the host's store, with
-// their recorded outcome — the live section alone went empty on every restart,
-// leaving the model with no way to find them again.
+// or from a previous process) are merged into the SAME recency-ordered list as
+// the live ones, flagged inactive — the live section alone went empty on every
+// restart, leaving the model with no way to find them again.
 func TestListAgentsListsSavedChildren(t *testing.T) {
 	host := newStubHost()
 	host.policy = Policy{Retain: time.Hour}
@@ -596,17 +596,20 @@ func TestListAgentsListsSavedChildren(t *testing.T) {
 	defer close(gate)
 	<-entered
 
-	// The store's view: the live child again (must be skipped) plus the
-	// saved ones, newest first, and one more than the listing bound.
+	// The store's view: the live child again (must be skipped) plus the saved
+	// ones at descending ages, and enough extra entries to prove the listing
+	// has no cap.
+	now := time.Now()
 	host.saved = []PersistedChild{
-		{ID: liveID, Label: "live job", Status: "running", Messages: 1},
-		{ID: "saved-1", Label: "saved one", Status: "success", Messages: 12},
-		{ID: "saved-2", Label: "saved two", Status: "running", Messages: 3},
-		{ID: "saved-3", Label: "saved three", Status: "", Messages: 1},
+		{ID: liveID, Label: "live job", Status: "success", Messages: 1, Updated: now},
+		{ID: "saved-1", Label: "saved one", Status: "success", Messages: 12, Updated: now.Add(-3 * time.Minute)},
+		{ID: "saved-2", Label: "saved two", Status: "running", Messages: 3, Updated: now.Add(-2 * time.Hour)},
+		{ID: "saved-3", Label: "saved three", Status: "", Messages: 1, Updated: now.Add(-50 * time.Hour)},
 	}
-	for i := 0; i < maxPersistedListed; i++ {
+	for i := 0; i < 20; i++ {
 		host.saved = append(host.saved, PersistedChild{
-			ID: fmt.Sprintf("bulk-%d", i), Label: "bulk", Status: "success", Messages: 2,
+			ID: fmt.Sprintf("bulk-%02d", i), Label: "bulk", Status: "success", Messages: 2,
+			Updated: now.Add(-time.Duration(100+i) * time.Hour),
 		})
 	}
 
@@ -614,27 +617,45 @@ func TestListAgentsListsSavedChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 24 children: the live one plus 23 saved.
+	if !strings.Contains(out, "24 child subagents (1 active, 23 inactive), most recent activity first:") {
+		t.Fatalf("listing header = %q, want the active/inactive counts", out)
+	}
 	if n := strings.Count(out, liveID); n != 1 {
-		t.Fatalf("live child appears %d times, want once (live row only): %q", n, out)
+		t.Fatalf("live child appears %d times, want once: %q", n, out)
+	}
+	if !strings.Contains(out, "— active — running (depth 1)") {
+		t.Fatalf("the live child must be flagged active with its status: %q", out)
 	}
 	for _, want := range []string{
-		"saved one — success — 12 msgs",
-		"saved two — interrupted — 3 msgs",   // "running" never reached a terminal state
-		"saved three — interrupted — 1 msgs", // legacy "" reads the same way
-		"Saved (not live",
+		"saved one — inactive — success — 12 msgs — 3m ago",
+		"saved two — inactive — interrupted — 3 msgs — 2h ago",
+		"saved three — inactive — interrupted — 1 msgs — 2d ago",
+		"get_agent_result reads any child's report; send_message reaches active children only.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("list_agents is missing %q: %q", want, out)
 		}
 	}
-	// The bound: 3 named saved children + 10 bulk = 13 listed, 3 left out.
-	if !strings.Contains(out, "…and 3 more saved children") {
-		t.Fatalf("list_agents must summarize the overflow: %q", out)
+	// No cap: every saved child is listed, including the oldest bulk entry.
+	if !strings.Contains(out, "bulk-19") {
+		t.Fatalf("list_agents capped its output: %q", out)
 	}
-	if strings.Contains(out, "bulk-9") {
-		t.Fatalf("list_agents listed past its bound: %q", out)
+	// Recency order: the running child (activity = now) first, then the saved
+	// children by descending update time.
+	order := []string{liveID, "saved one", "saved two", "saved three", "bulk-00", "bulk-19"}
+	prev := -1
+	for _, needle := range order {
+		at := strings.Index(out, needle)
+		if at < 0 {
+			t.Fatalf("%q missing from the listing: %q", needle, out)
+		}
+		if at <= prev {
+			t.Fatalf("%q is out of recency order: %q", needle, out)
+		}
+		prev = at
 	}
-	if strings.Contains(out, "saved one — failed") {
+	if strings.Contains(out, "saved one — inactive — failed") {
 		t.Fatalf("a saved success must not read as failed: %q", out)
 	}
 }

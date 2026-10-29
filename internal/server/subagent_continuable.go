@@ -235,6 +235,7 @@ func (sp *subagentSpawner) PersistedChildren(caller *agent.Agent) []subagents.Pe
 			Label:    label,
 			Status:   info.SubagentStatus,
 			Messages: info.MessageCount,
+			Updated:  info.UpdatedTime(),
 		})
 	}
 	return out

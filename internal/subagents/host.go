@@ -133,6 +133,10 @@ type PersistedChild struct {
 	Label    string
 	Status   string
 	Messages int
+	// Updated is the session's last-update time, which orders the listing
+	// (newest first). Zero when the store could not supply one; such an
+	// entry sinks to the end instead of being dropped.
+	Updated time.Time
 }
 
 // NewChild is what a host returns from Host.NewChild: its own runtime handle,
