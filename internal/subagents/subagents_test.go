@@ -705,6 +705,19 @@ func TestListAgentsWithoutSavedChildren(t *testing.T) {
 	if out != "No live subagents." {
 		t.Fatalf("empty listing = %q, want the plain answer", out)
 	}
+
+	// One saved child: the header reads as a singular noun.
+	host := newStubHost()
+	host.revivableParent = "parent"
+	host.saved = []PersistedChild{{ID: "only-child", Label: "only", Status: "success", Messages: 1}}
+	one := New[*stubHandle](host)
+	out, err = one.ListAgents(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "1 child subagent (0 active, 1 inactive)") {
+		t.Fatalf("single-child listing = %q, want the singular header", out)
+	}
 }
 
 // TestSendMessageRevivesSavedChild pins the continuation half of the

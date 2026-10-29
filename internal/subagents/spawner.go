@@ -398,7 +398,11 @@ func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 		}
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d child subagents (%d active, %d inactive), most recent activity first:\n", len(rows), active, len(rows)-active)
+	noun := "child subagents"
+	if len(rows) == 1 {
+		noun = "child subagent"
+	}
+	fmt.Fprintf(&b, "%d %s (%d active, %d inactive), most recent activity first:\n", len(rows), noun, active, len(rows)-active)
 	for _, r := range rows {
 		if r.Active {
 			fmt.Fprintf(&b, "%s — %s — active — %s (depth %d)\n", r.ID, r.Label, r.Status, r.Depth)
@@ -763,15 +767,26 @@ func (sp *Spawner[H]) Steer(caller *agent.Agent, agentID, text string) error {
 	if child == nil || child.Agent == nil {
 		return nil
 	}
+	// Read the GENERATION first, then the reply guard — the same order
+	// sendNow/CheckSendNow uses, and it matters: the delivery worker arms
+	// PendingReply BEFORE it starts the turn (deliverLoop's hook runs ahead of
+	// startTurnWithResult), so a turn observed here is a reply turn exactly
+	// when the guard read after it says so. Checking only before the read left
+	// a window where the child's MAIN turn ended and the queued reply turn
+	// started in between: the yield then landed on the reply turn, cutting the
+	// answer the other parent is waiting for down to "no reply".
+	turn := child.Agent.TurnGeneration()
+	if turn == 0 {
+		return nil // idle: the delivery starts its own turn
+	}
 	if child.PendingReply() {
-		// Mid-reply: the queued message waits for that turn to end, the same
-		// contract SendNow enforces for a turn that answers a parent.
+		// Answering another targeted delivery: the capture is 1:1 with that
+		// call, so this message waits for the turn to end (the same contract
+		// SendNow enforces for a turn that answers a parent).
 		return nil
 	}
-	// Best effort: the turn may have ended (or been replaced) since the
-	// delivery, in which case the queued message starts the next one anyway.
-	if turn := child.Agent.TurnGeneration(); turn != 0 {
-		child.Agent.RequestYieldFor(turn)
-	}
+	// Best effort: a turn that ended between the read and this call simply
+	// makes RequestYieldFor a no-op (it compares generations).
+	child.Agent.RequestYieldFor(turn)
 	return nil
 }

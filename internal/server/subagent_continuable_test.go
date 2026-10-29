@@ -1818,7 +1818,7 @@ func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "1 child subagents (0 active, 1 inactive)") {
+	if !strings.Contains(out, "1 child subagent (0 active, 1 inactive)") {
 		t.Fatalf("a released child must still be listed, flagged inactive: %q", out)
 	}
 	if !strings.Contains(out, id) {
@@ -2023,8 +2023,12 @@ func TestSteerRedirectsABusyChild(t *testing.T) {
 	// The child's turn stops at the round boundary, the steer message runs as
 	// its own turn, and THAT turn's reply reaches the parent.
 	waitFor(t, 10*time.Second, func() bool { return deliveredMessages(a, "redirected as asked") })
-	waitFor(t, 10*time.Second, func() bool { return deliveredMessages(a, "no reply") == false })
 	time.Sleep(300 * time.Millisecond)
+	// The steer turn produced a real answer: the reply capture must not have
+	// been cut short into the no-reply fallback.
+	if deliveredMessages(a, "no reply") {
+		t.Fatal("the steered reply turn must deliver its answer, not the no-reply fallback")
+	}
 	if deliveredMessages(a, "should not run") {
 		t.Fatal("the yielded turn must not have run another round")
 	}
