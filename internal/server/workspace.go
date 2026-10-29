@@ -81,16 +81,22 @@ type Workspace struct {
 	// feature-flag store, so a settings toggle applies without a sweep.
 	skillsManager *skills.Manager
 
+	// Live host settings that change no tool are plain atomics here: the
+	// settings handler writes them while session creation and the delivery
+	// workers read them. A setting that gates an agent tool belongs in
+	// featureFlags instead, because its setters also invalidate every
+	// session's cached tool set.
+	//
 	// jobNotices is the live job_notices flag (the settings modal toggles
 	// it; the switch installs/removes each session's hook). jobNoticeDeliverer
 	// is installed unconditionally by NewServer (it needs the registry) and
 	// resolves a session id to its live runtime at fire time; NewSessionAgent
 	// installs the per-agent hook on top of it while the flag is on.
-	// jobNoticesMu guards jobNotices: the handler writes it while session
-	// creation reads it.
-	jobNoticesMu       sync.RWMutex
-	jobNotices         bool
+	jobNotices         atomic.Bool
 	jobNoticeDeliverer func(agentID, summary string)
+	// joinQueued is the live join_queued flag. Each runtime's delivery
+	// worker reads it at its pop.
+	joinQueued atomic.Bool
 
 	// The persistent-terminal feature tools ride on the shared flag
 	// store's terminalEnabled flag (see Get/SetTerminalEnabled), like the
@@ -347,23 +353,28 @@ func (ws *Workspace) SetTerminalEnabled(on bool) {
 // GetJobNotices reports whether background-job completion notices are on
 // for this workspace (the per-agent hooks are installed while it is).
 func (ws *Workspace) GetJobNotices() bool {
-	if ws == nil {
-		return false
-	}
-	ws.jobNoticesMu.RLock()
-	defer ws.jobNoticesMu.RUnlock()
-	return ws.jobNotices
+	return ws != nil && ws.jobNotices.Load()
 }
 
 // SetJobNotices updates the live job_notices flag (the settings handler
 // installs/removes the per-agent hooks; this is the seed new sessions read).
 func (ws *Workspace) SetJobNotices(on bool) {
-	if ws == nil {
-		return
+	if ws != nil {
+		ws.jobNotices.Store(on)
 	}
-	ws.jobNoticesMu.Lock()
-	ws.jobNotices = on
-	ws.jobNoticesMu.Unlock()
+}
+
+// JoinQueued reports whether user messages queued during one turn leave
+// together as one message (join_queued).
+func (ws *Workspace) JoinQueued() bool {
+	return ws != nil && ws.joinQueued.Load()
+}
+
+// SetJoinQueued updates the live join_queued flag.
+func (ws *Workspace) SetJoinQueued(on bool) {
+	if ws != nil {
+		ws.joinQueued.Store(on)
+	}
 }
 
 // GetReviewAgentEnabled returns the live board auto-review flag.
@@ -646,7 +657,6 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		Model:                a.CurrentModel(),
 		ThinkingLevel:        string(a.ThinkingLevel),
 		WorkingDir:           a.Executor.GetWorkingDir(),
-		jobNotices:           cfg != nil && cfg.JobNoticesEnabled(),
 		OpenAIProviders:      providerListFromConfig(cfg),
 		runtime:              runtimeSeed(cfg),
 	}
@@ -658,6 +668,8 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		subagentDepthFrom(cfg),
 		subagentLimitFrom(cfg),
 	))
+	ws.jobNotices.Store(cfg != nil && cfg.JobNoticesEnabled())
+	ws.joinQueued.Store(cfg.JoinQueuedEnabled())
 	if cfg != nil {
 		ws.flags().SetReviewAgentEnabled(cfg.ReviewAgentEnabled())
 		ws.flags().SetAutomationsEnabled(cfg.AutomationsEnabled())

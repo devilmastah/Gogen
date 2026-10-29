@@ -8,6 +8,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/automation"
 	"gogen/internal/llm"
+	"gogen/internal/steerq"
 	"gogen/internal/streambuf"
 )
 
@@ -438,6 +439,9 @@ type WSMessage struct {
 	// job_notices posts a follow-up turn when a background job finishes.
 	AgentInstructions string `json:"agentInstructions,omitempty"`
 	JobNotices        string `json:"jobNotices,omitempty"`
+	// JoinQueued ("on"/"off") is join_queued: user messages queued during
+	// one turn leave together as one message.
+	JoinQueued string `json:"joinQueued,omitempty"`
 	// TestCommand / LintCommand override the auto-detected project commands
 	// (client→server inside ConfigFields; server→client current value in
 	// config pushes). "" = auto-detect.
@@ -556,7 +560,13 @@ type WSMessage struct {
 	// message sent while a turn is running (client→server, on "message"
 	// frames): the server stores it as the queue item's ID and echoes it on
 	// queue_update, so the sending tab can resolve its optimistic queued
-	// bubble without a matching round trip.
+	// bubble without a matching round trip. A "response" that refuses a
+	// message while a turn is running (queue full, busy) echoes its QueueID,
+	// because during a turn the reply order alone does not say which send it
+	// answers. Client→server it also names the queued item a
+	// "queue_remove" drops and the one a "queue_send_now" was shown on (""
+	// = any queued user message). A refused queue_send_now is answered with
+	// a "queue" notice.
 	QueueID string `json:"queueId,omitempty"`
 	// Queue carries the session's pending user steering messages
 	// (server→client, on queue_update frames and session_state) so every
@@ -569,7 +579,10 @@ type WSMessage struct {
 	// resolves the paired user_acked normally. Ids absent from both Queue
 	// and QueueLeft left the queue by REMOVAL (per-item ✕, clear-all,
 	// interrupt) and render as cancelled-before-running. session_state
-	// snapshots never carry it (an attach has no "left" to report).
+	// snapshots never carry it (an attach has no "left" to report). On the
+	// same frame, Content is the one message the started turn runs: the
+	// item's text, or with join_queued the joined texts of every id listed,
+	// so a client draws that text instead of rebuilding the join.
 	QueueLeft    []string       `json:"queueLeft,omitempty"`
 	MessageIndex int            `json:"messageIndex,omitempty"`
 	Sessions     []SessionEntry `json:"sessions,omitempty"`
@@ -691,9 +704,10 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 }
 
 // Limits for user-attached images (vision input). These cap WebSocket frame
-// size and per-message model cost without being overly restrictive.
+// size and per-message model cost without being overly restrictive. The
+// image count is steerq's, because a joined queue run must stay under it too.
 const (
-	maxImagesPerMessage   = 4
+	maxImagesPerMessage   = steerq.MaxImagesPerMessage
 	maxImageDataURLBytes  = 5 * 1024 * 1024
 	imageDataURLPrefix    = "data:image/"
 	imageDataURLBase64Sep = ";base64,"

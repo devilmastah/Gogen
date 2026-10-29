@@ -2,8 +2,10 @@
 //
 // The web host and the TUI each keep one queue per session and drain it at the
 // session's idle boundary. The queue itself — its three item kinds, the two
-// caps, the eviction rules, the notice-batching rule, and the "zero the popped
-// slots" requirement — used to be implemented twice (internal/server/deliver.go
+// caps, the eviction rules, the batching rule (Batch: notice runs, joined user
+// runs under join_queued and their image cap, Join), the Send now rule
+// (CheckSendNow), and the "zero the popped slots" requirement — used to be
+// implemented twice (internal/server/deliver.go
 // and internal/tui/steering.go), so every fix had to be made twice and the two
 // copies had already drifted in how they expressed the same policy. This
 // package owns it once; each host keeps its own drain machinery, because that
@@ -18,7 +20,11 @@
 // keeps its own.
 package steerq
 
-import "gogen/internal/llm"
+import (
+	"strings"
+
+	"gogen/internal/llm"
+)
 
 // Kind classifies a queued item. It decides both presentation and policy.
 type Kind int
@@ -38,8 +44,9 @@ const (
 	// replies drops an arriving notice instead of a pending answer.
 	Reply
 	// User is text the user typed into a busy session. It runs as its own
-	// turn (one message, one turn) and is never silently dropped: reaching
-	// the cap REFUSES the enqueue so the host can tell the user.
+	// turn, or joined with the User items behind it when join_queued is on
+	// (see Batch). It is never silently dropped: reaching the cap REFUSES
+	// the enqueue so the host can tell the user.
 	User
 )
 
@@ -222,24 +229,138 @@ func (q *Queue) Take(n int) []Item {
 	return out
 }
 
-// Batch returns a COPY of the contiguous head run of Notice items — one item
-// for a User or Reply head — which the drain delivers as ONE turn. Batched
-// notices share a single provider request; a User message is its own turn and a
-// Reply's capture is armed per turn. Strict FIFO across kinds is preserved
-// because only a contiguous head run is ever taken.
-func (q *Queue) Batch() []Item {
+// MaxImagesPerMessage is the most images one user message may carry. The web
+// host refuses a message over it, and Batch keeps a joined run under it, so
+// a turn never sends more than this many images.
+const MaxImagesPerMessage = 4
+
+// Batch returns a COPY of the contiguous head run that drains as ONE turn.
+// A run of Notices shares one provider request. With joinUser (the
+// join_queued setting) a run of User messages does too: several things typed
+// while a turn was busy are delivered as one message, in the order they were
+// typed. A joined run stops before a message whose images would take the
+// total over MaxImagesPerMessage, and that message starts the next turn, so
+// nothing is dropped. Without joinUser each User message is its own turn. A
+// Reply is always alone, because its capture is armed per turn. The run
+// stops at the first different kind, so FIFO across kinds is preserved.
+func (q *Queue) Batch(joinUser bool) []Item {
 	if q == nil || len(q.items) == 0 {
 		return nil
 	}
 	n := 1
-	if q.items[0].Kind == Notice {
-		for n < len(q.items) && q.items[n].Kind == Notice {
+	head := q.items[0].Kind
+	if head == Notice || (joinUser && head == User) {
+		images := len(q.items[0].Images)
+		for n < len(q.items) && q.items[n].Kind == head {
+			images += len(q.items[n].Images)
+			if head == User && images > MaxImagesPerMessage {
+				break
+			}
 			n++
 		}
 	}
 	out := make([]Item, n)
 	copy(out, q.items[:n])
 	return out
+}
+
+// Join merges a batch into the one prompt its turn runs: the texts in queue
+// order (JoinText), and every item's images in the same order.
+func Join(batch []Item) (string, []llm.ImageInput) {
+	if len(batch) == 1 {
+		return batch[0].Text, batch[0].Images
+	}
+	var images []llm.ImageInput
+	for _, it := range batch {
+		images = append(images, it.Images...)
+	}
+	return JoinText(batch), images
+}
+
+// JoinText is the text of Join: the texts in queue order, blank-line
+// separated. A host whose turns carry no images uses it, so it does not drop
+// what Join would return.
+func JoinText(batch []Item) string {
+	if len(batch) == 1 {
+		return batch[0].Text
+	}
+	var b strings.Builder
+	for i, it := range batch {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(it.Text)
+	}
+	return b.String()
+}
+
+// SendNowReady reports whether a Send now request has something to deliver:
+// the User item id is still queued, or, for an empty id, any User item is.
+// A request with nothing to deliver must not stop the running turn.
+func (q *Queue) SendNowReady(id string) bool {
+	if id == "" {
+		return q.Count(User) > 0
+	}
+	return q.Has(id, User)
+}
+
+// SendNowResult is the outcome of a Send now request. Every host shows its
+// Message, so the TUI, the browser and the sidebar say the same thing.
+type SendNowResult int
+
+const (
+	// SendNowRecorded: the running turn stops after its current round and
+	// the queue delivers.
+	SendNowRecorded SendNowResult = iota
+	// SendNowIdle: no turn is running, so the queue delivers on its own.
+	SendNowIdle
+	// SendNowNoModelCall: the session is busy without a model turn (a
+	// compaction, or a turn that is still starting). There is no round to
+	// stop at.
+	SendNowNoModelCall
+	// SendNowReply: the running turn's output is the answer to a parent's
+	// send_message. Stopping it would hand the parent an empty reply, and
+	// a Reply stays 1:1 with its call.
+	SendNowReply
+	// SendNowNotQueued: the message already left the queue.
+	SendNowNotQueued
+)
+
+// CheckSendNow is the Send now rule. busy is the host's "session is
+// working" state, turn is the agent's TurnGeneration (0 = no model turn),
+// replying reports an armed send_message reply, and queued is
+// SendNowReady. The host reads turn before queued, then records the yield
+// with RequestYieldFor(turn) only for SendNowRecorded. When that turn has
+// ended in between, the result is SendNowIdle.
+func CheckSendNow(busy bool, turn uint64, replying, queued bool) SendNowResult {
+	switch {
+	case !busy:
+		return SendNowIdle
+	case turn == 0:
+		return SendNowNoModelCall
+	case replying:
+		return SendNowReply
+	case !queued:
+		return SendNowNotQueued
+	}
+	return SendNowRecorded
+}
+
+// Message is the short status line a host shows for the result.
+func (r SendNowResult) Message() string {
+	switch r {
+	case SendNowRecorded:
+		return "Sending after this round."
+	case SendNowIdle:
+		return "No turn is running."
+	case SendNowNoModelCall:
+		return "Nothing to stop yet; queued messages run next."
+	case SendNowReply:
+		return "This turn answers a parent; queued messages run after it."
+	case SendNowNotQueued:
+		return "That message already left the queue."
+	}
+	return ""
 }
 
 // Remove drops one item by id and kind, reporting what left the queue.

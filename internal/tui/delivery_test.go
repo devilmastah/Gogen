@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/lipgloss/v2"
@@ -12,6 +13,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"gogen/internal/agent"
+	"gogen/internal/config"
+	"gogen/internal/llm"
+	"gogen/internal/llm/llmtest"
 	"gogen/internal/steerq"
 )
 
@@ -21,7 +25,11 @@ import (
 // commands are never EXECUTED here (they would drive the zero agent); the
 // tests assert queue state and the returned command's existence.
 func newQueueTestModel() *Model {
-	a := &agent.Agent{}
+	return newQueueTestModelFor(&agent.Agent{})
+}
+
+// newQueueTestModelFor is newQueueTestModel around a given agent.
+func newQueueTestModelFor(a *agent.Agent) *Model {
 	m := &Model{agent: a, ctx: context.Background(), keys: DefaultKeyMap, textarea: textarea.New()}
 	m.lives = newLiveSessions(a)
 	m.viewport.Width = 200
@@ -130,6 +138,37 @@ func TestSystemDeliveriesBatchOneTurn(t *testing.T) {
 	}
 	if s.steerQ.Len() != 0 {
 		t.Fatalf("queue = %v, want empty", s.steerQ)
+	}
+}
+
+// TestUserRunFollowsJoinQueued pins the TUI side of join_queued: a run of
+// queued user messages drains one per turn by default, and as one turn when
+// the setting is on. The delivery behind the run is never joined into it.
+func TestUserRunFollowsJoinQueued(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  *config.Config
+		left []string
+	}{
+		{"off by default", nil, []string{"u2", "s1"}},
+		{"on", &config.Config{JoinQueued: "on"}, []string{"s1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newQueueTestModel()
+			m.cfg = tc.cfg
+			s := m.focusedSession()
+			s.steerQ = testQueue(userItem("u1", "first"), userItem("u2", "second"), notice("s1", "notice"))
+			if cmd := m.drainSessionQueue(s); cmd == nil {
+				t.Fatal("drain must start a turn")
+			}
+			var ids []string
+			for _, it := range s.steerQ.Items() {
+				ids = append(ids, it.ID)
+			}
+			if strings.Join(ids, ",") != strings.Join(tc.left, ",") {
+				t.Fatalf("queue after drain = %v, want %v", ids, tc.left)
+			}
+		})
 	}
 }
 
@@ -462,10 +501,93 @@ func TestQueueModal(t *testing.T) {
 	if q := s4.steerQ.Items(); len(q) != 1 || q[0].Kind == steerq.User {
 		t.Fatalf("queue after D = %v, want [system]", q)
 	}
+	// `s` while nothing is running does not drop the queue. The queue here
+	// was already cleared by D, so this only pins the idle status.
+	model, _ = m4.handleQueueKey(keyPress("s"))
+	if model.(*Model).statusMsg != steerq.SendNowIdle.Message() {
+		t.Fatalf("idle send-now status = %q", model.(*Model).statusMsg)
+	}
 	// esc closes the modal.
 	model, _ = m4.handleQueueKey(keyPress("esc"))
 	if model.(*Model).modal != ModalNone {
 		t.Fatal("esc must close the queue modal")
+	}
+}
+
+// startRunningTurn starts a real turn on a fresh agent and returns once that
+// turn is inside the provider. finish lets the turn answer and waits for it.
+func startRunningTurn(t *testing.T) (a *agent.Agent, finish func()) {
+	t.Helper()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	p := llmtest.NewMockProvider()
+	p.OnStream = func(context.Context, []llm.Message, *llm.StreamHandlers) (*llm.StreamResult, error) {
+		close(entered)
+		<-release
+		return &llm.StreamResult{Content: "done"}, nil
+	}
+	a = agent.NewAgent(p, agent.NewExecutor(t.TempDir()), nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.StreamProcessInput(context.Background(), "run", nil)
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("turn ended before the provider call: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn never reached the provider")
+	}
+	return a, func() {
+		close(release)
+		<-done
+	}
+}
+
+// TestQueueSendNow pins the modal's send-now key against a turn that is
+// really running: it asks that turn to yield only while a user message is
+// queued, it refuses during a compaction (no model turn to stop), and it
+// never removes queued text (a hard cancel does that). A yield the "user
+// message queued" case records stays on the running turn; finish lets that
+// turn's only model call answer, so nothing is left to stop.
+func TestQueueSendNow(t *testing.T) {
+	running, finish := startRunningTurn(t)
+	defer finish()
+	idle := agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)
+	for _, tc := range []struct {
+		name       string
+		agent      *agent.Agent
+		compacting bool
+		queue      *steerq.Queue
+		want       steerq.SendNowResult
+	}{
+		{"nothing queued", running, false, testQueue(), steerq.SendNowNotQueued},
+		{"only a delivery queued", running, false, testQueue(notice("n1", "job done")), steerq.SendNowNotQueued},
+		{"a user message queued", running, false, testQueue(userItem("u1", "first queued message")), steerq.SendNowRecorded},
+		{"during a compaction", idle, true, testQueue(userItem("u1", "first queued message")), steerq.SendNowNoModelCall},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newQueueTestModelFor(tc.agent)
+			s := m.focusedSession()
+			s.steerQ = tc.queue
+			s.streaming = !tc.compacting
+			s.compacting = tc.compacting
+			m.modal = ModalQueue
+			queued := tc.queue.Len()
+
+			model, _ := m.handleQueueKey(keyPress("s"))
+			m2 := model.(*Model)
+			if m2.statusMsg != tc.want.Message() {
+				t.Fatalf("status = %q, want %q", m2.statusMsg, tc.want.Message())
+			}
+			if m2.focusedSession().steerQ.Len() != queued {
+				t.Fatal("send now must keep the queue")
+			}
+			if !strings.Contains(m2.renderQueueModal(), "s send now") {
+				t.Fatal("queue modal hint missing send now")
+			}
+		})
 	}
 }
 

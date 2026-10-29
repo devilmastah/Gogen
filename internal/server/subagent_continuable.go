@@ -21,7 +21,7 @@ import (
 // released child's persisted outcome.
 //
 // Host rules that stay here and are NOT negotiable:
-//   - a child runtime is HELD (newSessionRuntimeWithHold), so orphan eviction
+//   - a child runtime is HELD (sessionRuntime.held), so orphan eviction
 //     never collects it while it is alive or awaiting release;
 //   - the post-turn orphan sweep runs on EVERY exit path: a child write that
 //     lands after a concurrent DELETE of the parent must not resurrect the
@@ -88,6 +88,7 @@ func (sp *subagentSpawner) ArmReplyCapture(c *subagents.Child[*sessionRuntime]) 
 	c.Handle.deliverStartHook = func() {
 		c.BeginReply()
 	}
+	c.Handle.replyPending = c.PendingReply
 	c.Handle.deliverResultFunc = func(reply string, replyErr error) {
 		// An evicted runtime can no longer deliver the work the capture
 		// protects: dropping it keeps a released child's record from
@@ -325,7 +326,7 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 	child := s.ws.NewSessionAgent(snap, newID)
 	child.SetSubagentDepth(depth + 1)
 	child.SetParentID(parent.SessionID)
-	childRt := newSessionRuntimeWithHold(child, sp.approvalHold())
+	childRt := newWorkspaceRuntime(child, sp.workspace())
 	childRt.parentID = parent.SessionID
 	childRt.nested = true
 	// Resolved by id at approval time: the parent pointer captured here goes

@@ -38,12 +38,13 @@ import (
 // turn_end converges it. The compact context derives from
 // context.Background(), not the HTTP request: like a turn, the compaction
 // belongs to the session and survives a disconnect (§4); only an explicit
-// teardown cancels it.
-func (s *Server) handleWSCompact(ws *wsConn, _ *http.Request, rt *sessionRuntime) {
+// teardown cancels it. queueID is the typed /compact's correlation id ("" for
+// the compact frame), echoed on the busy rejection like any refused send.
+func (s *Server) handleWSCompact(ws *wsConn, _ *http.Request, rt *sessionRuntime, queueID string) {
 	if !rt.acquireTurnForHandler(ws) {
 		// /compact is a typed chat command: the busy rejection is its
 		// reply on the conversation channel.
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
+		_ = ws.writeJSON(WSMessage{Type: "response", QueueID: queueID, Content: errAgentBusy})
 		return
 	}
 	// Mark the session as "busy" for the compaction duration so a
@@ -118,7 +119,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 		// queue nor queueLeft, which is exactly the client's "removed before
 		// running" signal (otherwise the phantom queued chip would survive
 		// until some later unrelated queue frame).
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf(
+		_ = ws.writeJSON(WSMessage{Type: "response", QueueID: msg.QueueID, Content: fmt.Sprintf(
 			"Error: too many queued messages (limit %d) — wait for the current turn or stop it.", maxUserQueueCap)})
 		rt.broadcastQueueState()
 		return
@@ -141,7 +142,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 		// message (or a chat command) and the error is its reply. Plain
 		// chat text never reaches this point while busy (queued above);
 		// command-shaped inputs keep the explicit busy rejection.
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
+		_ = ws.writeJSON(WSMessage{Type: "response", QueueID: msg.QueueID, Content: errAgentBusy})
 		return
 	}
 
@@ -241,7 +242,7 @@ func (s *Server) preprocessWSUserMessage(ws *wsConn, r *http.Request, rt *sessio
 	// prompt. /compact is registered TUI-only, but the web banner and command
 	// palette rely on this path.
 	if strings.TrimSpace(msg.Content) == "/compact" {
-		s.handleWSCompact(ws, r, rt)
+		s.handleWSCompact(ws, r, rt, msg.QueueID)
 		return nil, true
 	}
 

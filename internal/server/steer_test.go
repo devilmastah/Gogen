@@ -14,7 +14,13 @@ import (
 // userMsgIndex returns the index of the first user message containing
 // needle (-1 when absent) — the FIFO-order probe for steering delivery.
 func userMsgIndex(a *agent.Agent, needle string) int {
-	for i, m := range a.SnapshotMessages() {
+	return userMsgIndexIn(a.SnapshotMessages(), needle)
+}
+
+// userMsgIndexIn is userMsgIndex over one snapshot, so several indexes and
+// hasAssistantBetween can read the same transcript.
+func userMsgIndexIn(msgs []llm.Message, needle string) int {
+	for i, m := range msgs {
 		if m.Role == "user" && strings.Contains(m.Content, needle) {
 			return i
 		}
@@ -94,16 +100,15 @@ func TestUserSteerEnqueueDrainsFIFO(t *testing.T) {
 	stub.releaseN(3)
 	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "sys notice") >= 0 })
 
-	ia, ib, is := userMsgIndex(a, "steer-a"), userMsgIndex(a, "steer-b"), userMsgIndex(a, "sys notice")
+	msgs := a.SnapshotMessages()
+	ia, ib, is := userMsgIndexIn(msgs, "steer-a"), userMsgIndexIn(msgs, "steer-b"), userMsgIndexIn(msgs, "sys notice")
 	if !(ia < ib && ib < is) {
 		t.Fatalf("FIFO order violated: steer-a@%d, steer-b@%d, sys@%d", ia, ib, is)
 	}
 	// Each queued item ran as its OWN turn: an assistant reply between the
 	// two user messages.
-	for i := ia; i < ib; i++ {
-		if m := a.SnapshotMessages()[i]; m.Role == "assistant" {
-			break
-		}
+	if !hasAssistantBetween(msgs, ia, ib) {
+		t.Fatalf("no assistant reply between steer-a@%d and steer-b@%d, want one turn each", ia, ib)
 	}
 
 	stub.releaseN(4)
@@ -111,6 +116,116 @@ func TestUserSteerEnqueueDrainsFIFO(t *testing.T) {
 	// (the store-wait pattern used across this suite): three completed
 	// turns (steer-a, steer-b, sys notice).
 	waitTurnsPersisted(t, store, dir, a.SessionID, 3)
+}
+
+// hasAssistantBetween reports whether an assistant message sits between the
+// messages at indexes from and to. The indexes must come from msgs.
+func hasAssistantBetween(msgs []llm.Message, from, to int) bool {
+	for i := from + 1; i < to && i < len(msgs); i++ {
+		if msgs[i].Role == "assistant" {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUserSteerJoinQueued pins join_queued: user messages queued during one
+// turn leave together as ONE user message, with every image in queue order,
+// the queue_update that starts it carries every id and the delivered text,
+// and the notice behind them stays its own turn.
+func TestUserSteerJoinQueued(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	s.ws.SetJoinQueued(true)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	startBlockedTurn(t, rt, stub, "block me")
+	imgA := llm.ImageInput{DataURL: "data:image/png;base64,AAAA"}
+	imgB := llm.ImageInput{DataURL: "data:image/png;base64,BBBB"}
+	if !rt.enqueueUserTurn("q1", "steer-a", []llm.ImageInput{imgA}) || !rt.enqueueUserTurn("q2", "steer-b", []llm.ImageInput{imgB}) {
+		t.Fatal("steer enqueue refused")
+	}
+	rt.deliverToSession("sys notice")
+
+	rt.stream.cancelInFlight()
+	started := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "queue_update" && len(m.QueueLeft) > 0
+	})
+	if strings.Join(started.QueueLeft, ",") != "q1,q2" || started.Content != "steer-a\n\nsteer-b" {
+		t.Fatalf("start frame = left %v content %q, want both ids and the joined text", started.QueueLeft, started.Content)
+	}
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
+	ia := userMsgIndex(a, "steer-a")
+	if ib := userMsgIndex(a, "steer-b"); ib != ia {
+		t.Fatalf("steer-a@%d steer-b@%d, want one joined message", ia, ib)
+	}
+	images := a.SnapshotMessages()[ia].Images
+	if len(images) != 2 || images[0].DataURL != imgA.DataURL || images[1].DataURL != imgB.DataURL {
+		t.Fatalf("joined message images = %+v, want both in queue order", images)
+	}
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "sys notice") >= 0 })
+	msgs := a.SnapshotMessages()
+	if ia, is := userMsgIndexIn(msgs, "steer-a"), userMsgIndexIn(msgs, "sys notice"); !hasAssistantBetween(msgs, ia, is) {
+		t.Fatalf("sys notice @%d ran in the joined turn @%d, want its own turn", is, ia)
+	}
+	stub.releaseN(3)
+	waitTurnsPersisted(t, store, dir, a.SessionID, 2)
+}
+
+// TestSendNowGating pins when Send now may stop the running turn: only while
+// a model turn runs, the turn is not a send_message reply, and the named
+// user item (or, unnamed, any user item) is still queued. Anything else must
+// leave the turn alone.
+func TestSendNowGating(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	expect := func(name, id string, want steerq.SendNowResult) {
+		t.Helper()
+		if got := rt.sendNow(id); got != want {
+			t.Fatalf("%s: sendNow(%q) = %v, want %v", name, id, got, want)
+		}
+	}
+	expect("no turn running", "", steerq.SendNowIdle)
+	// A compaction marks the runtime busy without a model turn.
+	rt.setTurnActive(true, time.Now(), nil)
+	expect("busy without a model turn", "", steerq.SendNowNoModelCall)
+	rt.setTurnActive(false, time.Time{}, nil)
+
+	startBlockedTurn(t, rt, stub, "block me")
+	expect("empty queue", "", steerq.SendNowNotQueued)
+	rt.deliverToSession("sys notice")
+	expect("only a notice queued", "", steerq.SendNowNotQueued)
+	if !rt.enqueueUserTurn("q1", "steer-a", nil) {
+		t.Fatal("steer enqueue refused")
+	}
+	expect("item no longer queued", "q-gone", steerq.SendNowNotQueued)
+	rt.replyPending = func() bool { return true }
+	expect("turn is a send_message reply", "q1", steerq.SendNowReply)
+	rt.replyPending = nil
+	expect("named item queued", "q1", steerq.SendNowRecorded)
+	expect("any item queued", "", steerq.SendNowRecorded)
+
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "sys notice") >= 0 })
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
+	stub.releaseN(3)
+	waitTurnsPersisted(t, store, dir, a.SessionID, 2)
 }
 
 // TestUserQueueCapRejects pins the user-side overflow policy: user text is
@@ -421,6 +536,9 @@ func TestSteerQueueFullRevokesOptimisticBubble(t *testing.T) {
 	if resp.Type != "response" || !strings.Contains(resp.Content, "too many queued messages") {
 		t.Fatalf("expected the queue-full rejection first, got %+v", resp)
 	}
+	if resp.QueueID != "q-phantom" {
+		t.Fatalf("rejection queueId = %q, want the refused send's q-phantom", resp.QueueID)
+	}
 	qu := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "queue_update" })
 	if len(qu.Queue) != maxUserQueueCap {
 		t.Fatalf("queue_update queue = %d items, want the unchanged %d", len(qu.Queue), maxUserQueueCap)
@@ -440,4 +558,47 @@ func TestSteerQueueFullRevokesOptimisticBubble(t *testing.T) {
 		stub.releaseN(i)
 	}
 	waitTurnsPersisted(t, store, dir, a.SessionID, maxUserQueueCap)
+}
+
+// TestBusyRejectionEchoesQueueID pins that a command refused because another
+// client's turn holds the session names the refused send, so the sender can
+// tell it apart from the running turn's own replies.
+func TestBusyRejectionEchoesQueueID(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	startBlockedTurn(t, rt, stub, "block me")
+	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "/mode plan", QueueID: "q-busy"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "response" })
+	if resp.Content != errAgentBusy {
+		t.Fatalf("response = %q, want the busy rejection", resp.Content)
+	}
+	if resp.QueueID != "q-busy" {
+		t.Fatalf("busy rejection queueId = %q, want q-busy", resp.QueueID)
+	}
+	stub.releaseN(1)
+	waitFor(t, 10*time.Second, func() bool {
+		snap, err := store.LoadInWorkingDir(dir, a.SessionID)
+		if err != nil {
+			return false
+		}
+		for _, m := range snap.Messages {
+			if m.Role == "assistant" && m.Content == "headless-done" {
+				return true
+			}
+		}
+		return false
+	})
 }

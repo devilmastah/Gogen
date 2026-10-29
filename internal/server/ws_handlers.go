@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"gogen/internal/agent"
+	"gogen/internal/steerq"
 )
 
 // wsHandlers maps inbound message types to their handlers. Unknown types are
@@ -51,6 +52,7 @@ var wsHandlers = map[string]wsHandlerEntry{
 	"compact":            {handle: wsHandleCompact},
 	"queue_remove":       {handle: wsHandleQueueRemove},
 	"queue_clear":        {handle: wsHandleQueueClear},
+	"queue_send_now":     {handle: wsHandleQueueSendNow},
 	"message":            {handle: wsHandleMessage},
 }
 
@@ -64,6 +66,22 @@ func wsHandleQueueRemove(req *wsRequest) {
 	}
 	if target.removeQueuedItem(req.msg.QueueID) {
 		target.broadcastQueueState()
+	}
+}
+
+// wsHandleQueueSendNow asks the running turn to stop at the next round
+// boundary so the queued messages can run (see sendNow). It does not cancel
+// the turn and it does not clear the queue: a hard cancel means "stop what
+// you're doing" and drops the user's queued text, and Send now exists to
+// deliver that text. A refusal answers the sender on the UI channel, so the
+// client can tell it from an accepted request.
+func wsHandleQueueSendNow(req *wsRequest) {
+	target := req.target
+	if target == nil || target.agent == nil {
+		return
+	}
+	if res := target.sendNow(req.msg.QueueID); res != steerq.SendNowRecorded {
+		writeNoticeError(req.conn, "queue", res.Message())
 	}
 }
 
@@ -484,7 +502,7 @@ func wsHandleCompact(req *wsRequest) {
 	if target == nil {
 		return
 	}
-	s.handleWSCompact(ws, r, target)
+	s.handleWSCompact(ws, r, target, "")
 }
 
 // wsHandleMessage routes a user message. The client scopes every message

@@ -140,6 +140,11 @@ type sessionRuntime struct {
 	pendingDeliver *steerq.Queue
 	deliverWorker  atomic.Bool
 	deliverNotify  chan struct{}
+	// joinQueued reports the live join_queued flag at each pop. Never nil:
+	// newSessionRuntime installs "off", and newWorkspaceRuntime replaces it
+	// with the workspace's flag before the runtime is used. Never
+	// reassigned after that.
+	joinQueued func() bool
 
 	// deliverStartHook is invoked by the delivery worker immediately before
 	// it starts a delivered turn (see deliver.go) — for a send_message
@@ -152,6 +157,11 @@ type sessionRuntime struct {
 	// runTurnBody already knows which response belongs to this invocation.
 	// Set once at child creation; never reassigned.
 	deliverResultFunc func(string, error)
+	// replyPending reports that the child's send_message reply is armed and
+	// not yet delivered (subagents.Child.PendingReply), so Send now leaves
+	// that turn alone. nil for a session that is not a continuable child.
+	// Set once at child creation; never reassigned.
+	replyPending func() bool
 	// approverOverride replaces the default deleteApprover when non-nil
 	// (the subagent spawner installs the D6 forwarding approver; the board
 	// start installs a deny-when-unattended approver).
@@ -204,6 +214,7 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 		deliverNotify:  make(chan struct{}, 1),
 		pendingDeliver: steerq.New(maxUserQueueCap, maxSystemDeliveryQueue),
 		turnRelease:    make(chan struct{}),
+		joinQueued:     func() bool { return false },
 	}
 	// When this session's background work drains, re-check whether it has
 	// become an evictable orphan. Both eviction paths refuse to evict a
@@ -215,13 +226,17 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 	return rt
 }
 
-// newSessionRuntimeWithHold builds a runtime whose pending delete approvals
-// are auto-denied `hold` after the last attached client detaches (instead of
-// immediately). Tests and non-server embeddings keep using newSessionRuntime
-// (hold = 0, immediate deny).
-func newSessionRuntimeWithHold(a *agent.Agent, hold time.Duration) *sessionRuntime {
+// newWorkspaceRuntime builds a runtime that follows ws's live settings: its
+// pending delete approvals are auto-denied after ws's approval hold once the
+// last attached client detaches (instead of immediately), and its drain
+// reads ws's join_queued flag. ws may be nil (both then read as off). Tests
+// and non-server embeddings keep using newSessionRuntime.
+func newWorkspaceRuntime(a *agent.Agent, ws *Workspace) *sessionRuntime {
 	rt := newSessionRuntime(a)
-	rt.approvalHold = hold
+	rt.approvalHold = ws.ApprovalHold()
+	if ws != nil {
+		rt.joinQueued = ws.JoinQueued
+	}
 	return rt
 }
 

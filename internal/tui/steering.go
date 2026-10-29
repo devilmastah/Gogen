@@ -75,6 +75,27 @@ func (s *liveSession) removeSteerItem(id string) bool {
 	return ok
 }
 
+// sendNow asks the session's running turn to stop at its next round
+// boundary so the queue can deliver (steerq.CheckSendNow), and returns the
+// outcome. Update thread only.
+func (s *liveSession) sendNow() steerq.SendNowResult {
+	if s == nil || s.agent == nil {
+		return steerq.SendNowIdle
+	}
+	turn := s.agent.TurnGeneration()
+	replying := false
+	if s.child != nil {
+		if c := s.child.childOf(); c != nil {
+			replying = c.PendingReply()
+		}
+	}
+	res := steerq.CheckSendNow(s.streaming || s.compacting, turn, replying, s.steerQ.SendNowReady(""))
+	if res == steerq.SendNowRecorded && !s.agent.RequestYieldFor(turn) {
+		res = steerq.SendNowIdle
+	}
+	return res
+}
+
 // enqueueSteer queues the user's text against the FOCUSED session while it
 // is busy (a turn running or a compaction in flight): strictly FIFO with
 // system deliveries, delivered as the next user turn at the next terminal
@@ -236,14 +257,14 @@ func (m *Model) submitBusy() bool {
 	return false
 }
 
-// drainSessionQueue pops the queue head from s — or, when the head is a
-// system delivery, the contiguous run of system deliveries behind it — and
-// starts its turn. The queue drains at every terminal boundary
-// (handleTurnFinishedMsg, handleCompactResultMsg, drainDeliveries). System
-// notices are one-way injections, so a run of them shares ONE turn (one
-// provider request); USER items keep their own turn each, and a run stops
-// at the first user item so FIFO arrival order is preserved. Returns nil
-// when nothing can start (empty queue, busy session). FOCUSED items render
+// drainSessionQueue pops the queue head from s — or the contiguous run of
+// the same kind behind it — and starts its turn. The queue drains at every
+// terminal boundary (handleTurnFinishedMsg, handleCompactResultMsg,
+// drainDeliveries). A run of system notices shares ONE turn, and so does a
+// run of user messages typed while a turn was busy when join_queued is on.
+// A targeted delivery stays alone. The run stops at a different kind, so
+// FIFO arrival order is preserved. Returns nil when nothing can start
+// (empty queue, busy session). FOCUSED items render
 // through startTurn (chat line + mirrors); BACKGROUND items run on their
 // session's agent without touching the focused transcript — their events
 // buffer in the session's replay queue and their terminal routes back here
@@ -252,23 +273,22 @@ func (m *Model) drainSessionQueue(s *liveSession) tea.Cmd {
 	if s == nil || s.streaming || s.compacting || s.steerQ.Len() == 0 {
 		return nil
 	}
-	// A notice run shares ONE turn (one provider request); a TARGETED
-	// send_message delivery always gets its own turn, because its reply
-	// capture is armed per delivery and must stay 1:1 with the tool call.
-	// The head-run rule itself is the shared queue's (steerq.Batch): only a
-	// contiguous run of Notice items is ever batched.
-	batch := s.steerQ.Take(len(s.steerQ.Batch()))
-	n := len(batch)
+	// A notice run shares ONE turn, and with join_queued a run of user
+	// messages does too. A TARGETED send_message delivery always gets its
+	// own turn, because its reply capture is armed per delivery and must
+	// stay 1:1 with the tool call. The head-run rule is steerq.Batch.
+	batch := s.steerQ.Take(len(s.steerQ.Batch(m.cfg.JoinQueuedEnabled())))
 	item := batch[0]
-	// text is the turn prompt (blank-line separated); display is the
-	// focused transcript's system line (one notice per visual line).
-	text, display := item.Text, item.Text
-	if n > 1 {
-		texts := make([]string, n)
+	// text is the turn prompt (steerq.JoinText: TUI turns carry no images);
+	// display is the focused transcript's system line (one notice per
+	// visual line).
+	text := steerq.JoinText(batch)
+	display := text
+	if len(batch) > 1 {
+		texts := make([]string, len(batch))
 		for i, it := range batch {
 			texts[i] = it.Text
 		}
-		text = strings.Join(texts, "\n\n")
 		display = strings.Join(texts, "\n")
 	}
 	var onResult func(string, error)
@@ -356,8 +376,9 @@ func (m *Model) relayout() {
 // Managed here and by the modal keys below.
 
 // renderQueueModal lists the FOCUSED session's queued items with a cursor;
-// `d` deletes the selected USER item, `D` clears every user item, esc
-// closes. System deliveries are listed for visibility but are not
+// `s` asks the running turn to stop after this round so the queue can
+// send, `d` deletes the selected USER item, `D` clears every user item,
+// esc closes. System deliveries are listed for visibility but are not
 // individually cancellable (machine bookkeeping).
 func (m *Model) renderQueueModal() string {
 	rows := []styleLine{{text: "Queued messages", highlight: true}}
@@ -394,7 +415,7 @@ func (m *Model) renderQueueModal() string {
 		}
 	}
 	rows = append(rows, styleLine{text: "", highlight: false},
-		styleLine{text: "d delete selected   D clear queued   esc close", highlight: false})
+		styleLine{text: "s send now   d delete selected   D clear queued   esc close", highlight: false})
 	return m.renderBorderedModal(rows)
 }
 
@@ -432,6 +453,10 @@ func (m *Model) handleQueueKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.queueCursor > 0 {
 			m.queueCursor--
 		}
+	case "s":
+		// Send now stops the running turn at its next round boundary. The
+		// queue itself stays: a hard cancel is what drops queued text.
+		m.statusMsg = s.sendNow().Message()
 	case "d":
 		if s != nil && n > 0 {
 			if it := s.steerQ.Items()[m.queueCursor]; it.Kind != steerq.User {

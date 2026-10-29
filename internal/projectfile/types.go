@@ -94,6 +94,7 @@ type FileConfig struct {
 	Skills                    string                `yaml:"skills"`
 	Terminal                  string                `yaml:"terminal"`
 	JobNotices                string                `yaml:"job_notices"`
+	JoinQueued                string                `yaml:"join_queued"`
 	Automations               string                `yaml:"automations"`
 	StatusDisplay             string                `yaml:"status_display"`
 	StatusDisplayHost         string                `yaml:"status_display_host"`

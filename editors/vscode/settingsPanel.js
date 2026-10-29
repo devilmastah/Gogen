@@ -34,6 +34,7 @@ const FIELDS = [
   { tab: "agent", kind: "runtime", field: "systemPrompt", label: "System prompt", control: "textarea", rows: 6, reset: true, note: "Replaces the built-in system prompt; {working_dir} is substituted. Project rules and plan mode still apply. Empty = built-in default." },
   { tab: "agent", kind: "runtime", field: "agentInstructions", label: "Workspace instructions (AGENTS.md / CLAUDE.md)", options: ON_OFF, note: "When on, AGENTS.md / CLAUDE.md files in the working directory are loaded below the project rules (.gogen/gogen.md stays authoritative). Applies live." },
   { tab: "agent", kind: "runtime", field: "jobNotices", label: "Background job notices", options: ON_OFF, note: "When on, a background shell job that finishes on its own posts a one-line summary into the session and starts a turn on it." },
+  { tab: "agent", kind: "runtime", field: "joinQueued", label: "Join queued messages", options: ON_OFF, note: "When on, messages you send while a turn is running leave together as one message when that turn ends. Off = each runs as its own turn." },
 
   { tab: "subagents", kind: "feature", key: "subagent", label: "Subagents", options: ON_OFF },
   { tab: "subagents", kind: "feature", key: "subagentMaxDepth", label: "Max subagent depth", control: "number", min: 1, max: 10, step: 1 },

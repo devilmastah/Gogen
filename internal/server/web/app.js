@@ -1476,6 +1476,16 @@
             chip.className = 'queued-chip';
             chip.textContent = 'queued';
             el.appendChild(chip);
+            const now = document.createElement('button');
+            now.className = 'queue-send-btn';
+            now.type = 'button';
+            now.textContent = 'Send now';
+            now.title = 'Stop at the next round and send the queue';
+            now.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                sendQueuedNow(qid);
+            });
+            el.appendChild(now);
             const rm = document.createElement('button');
             rm.className = 'queue-remove-btn';
             rm.type = 'button';
@@ -1488,6 +1498,23 @@
             el.appendChild(rm);
         }
 
+        // Send now is on the last queued bubble only. The pane's map is in
+        // queue order (anchorQueuedBubbles keeps the DOM in that order), so
+        // this walks at most the queue cap instead of the transcript. Called
+        // once after each change to the queued set.
+        function refreshQueuedSendNow(pane) {
+            const bubbles = pane && pane.queuedBubbles;
+            if (!bubbles) return;
+            let last = null;
+            for (const el of bubbles.values()) {
+                const btn = el.querySelector(':scope > .queue-send-btn');
+                if (!btn) continue;
+                btn.hidden = true;
+                last = btn;
+            }
+            if (last) last.hidden = false;
+        }
+
         /** Clear the queued mark (chip + ✕) — the item's turn has started. */
         function clearQueuedMark(el) {
             if (!el || el.dataset.queueId === undefined) return;
@@ -1495,8 +1522,20 @@
             delete el.dataset.queueId;
             const chip = el.querySelector(':scope > .queued-chip');
             if (chip) chip.remove();
+            const now = el.querySelector(':scope > .queue-send-btn');
+            if (now) now.remove();
             const rm = el.querySelector(':scope > .queue-remove-btn');
             if (rm) rm.remove();
+        }
+
+        // sendQueuedNow asks the running turn to finish its current round
+        // and then deliver the queue, in its order. qid is the bubble the
+        // button is on: the server ignores the request once that item has
+        // left the queue, so a late click cannot stop the turn it started.
+        function sendQueuedNow(qid) {
+            const pane = activePane();
+            if (!ws || ws.readyState !== WebSocket.OPEN || !pane || !pane.id) return;
+            ws.send(JSON.stringify({ type: 'queue_send_now', queueId: qid, sessionId: pane.id }));
         }
 
         /**
@@ -5100,6 +5139,7 @@
             // in the map, so the rebuild could land them in reverse order:
             // re-anchor the completed map once, in queue order.
             anchorQueuedBubbles();
+            refreshQueuedSendNow(pane);
         }
 
         /**
@@ -5197,6 +5237,7 @@
                             break;
                         }
                     }
+                    refreshQueuedSendNow(pane);
                 }
             }
 
@@ -5250,16 +5291,21 @@
          */
         function applyQueueUpdate(pane, data, dom) {
             const items = data.queue || [];
-            const left = new Set(data.queueLeft || []);
+            const left = data.queueLeft || [];
+            const leftSet = new Set(left);
             const live = new Set(items.map((it) => it.id));
             const bubbles = queuedBubblesFor(pane);
+            const started = new Map();
             for (const [id, el] of [...bubbles]) {
                 if (!el.isConnected) { bubbles.delete(id); continue; }
                 if (live.has(id)) continue;
                 bubbles.delete(id);
-                if (left.has(id)) clearQueuedMark(el);
+                if (leftSet.has(id)) started.set(id, el);
                 else resolveCancelledQueued(el);
             }
+            // queueLeft is in queue order, and content is the message the
+            // started turn runs.
+            joinStartedBubbles(left.map((id) => started.get(id)).filter(Boolean), data.content || '');
             if (dom) {
                 for (const it of items) {
                     if (bubbles.has(it.id)) continue;
@@ -5281,9 +5327,39 @@
                 // append-time anchor ran: re-anchor the completed set in
                 // queue order.
                 anchorQueuedBubbles();
+                refreshQueuedSendNow(pane);
             }
             pane.queueItems = items;
             if (pane === activePane()) updateQueuedProgressLabel();
+        }
+
+        // joinStartedBubbles turns the bubbles of a run that started as one
+        // turn (join_queued) into that turn's one user message: the first
+        // keeps the delivered text, rendered like any user message, and
+        // takes every image from the others, which are removed. A single
+        // started bubble only loses its queued mark.
+        function joinStartedBubbles(els, text) {
+            if (!els.length) return;
+            const keep = els[0];
+            if (els.length > 1) {
+                const body = msgBody(keep);
+                let row = body.querySelector(':scope > .chat-image-row');
+                for (const el of els.slice(1)) {
+                    for (const img of el.querySelectorAll('.chat-image-row > .chat-image')) {
+                        if (!row) {
+                            row = document.createElement('div');
+                            row.className = 'chat-image-row';
+                            body.insertBefore(row, body.firstChild);
+                        }
+                        row.appendChild(img);
+                    }
+                    dropPendingAck(el);
+                    el.remove();
+                }
+                keep.dataset.rawContent = text;
+                setMessageMarkdown(keep, escapeHtml(text));
+            }
+            clearQueuedMark(keep);
         }
 
         function handleQueueUpdate(data) {
@@ -6301,6 +6377,7 @@
                 // re-anchor now so an older queued bubble cannot end up
                 // behind this one.
                 anchorQueuedBubbles();
+                refreshQueuedSendNow(activePane());
                 updateQueuedProgressLabel();
             }
             inputArea.value = '';

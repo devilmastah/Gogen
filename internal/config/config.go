@@ -350,6 +350,10 @@ type Config struct {
 	// runs on it. Live: the web settings modal toggles it (the sweep
 	// installs/removes each session's notice hook).
 	JobNotices string
+	// JoinQueued joins user messages queued during a busy turn into one
+	// message when that turn ends ("on"/"off"; default off = each queued
+	// message runs as its own turn). Live: the web settings modal toggles it.
+	JoinQueued string
 
 	// Automations enables the file-based cron scheduler ("on"/"off";
 	// default off): when on, a running TUI or web host sweeps the global
@@ -431,6 +435,7 @@ func Defaults() Config {
 		Skills:                    "off",
 		Terminal:                  "off",
 		JobNotices:                "off",
+		JoinQueued:                "off",
 		Automations:               "off",
 		StatusDisplay:             StatusDisplayAuto,
 		StatusDisplayHost:         DefaultStatusDisplayHost,
@@ -609,6 +614,13 @@ func (c *Config) TerminalEnabled() bool {
 // explicitly enabled.
 func (c *Config) JobNoticesEnabled() bool {
 	return c != nil && configOn(c.JobNotices)
+}
+
+// JoinQueuedEnabled reports whether user messages queued during one turn
+// leave together as one message. Opt-in: each runs as its own turn unless
+// join_queued is explicitly enabled.
+func (c *Config) JoinQueuedEnabled() bool {
+	return c != nil && configOn(c.JoinQueued)
 }
 
 // AutomationsEnabled reports whether the automation scheduler may fire.

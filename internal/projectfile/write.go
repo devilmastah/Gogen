@@ -136,6 +136,7 @@ type configYAML struct {
 	Skills                    string  `yaml:"skills,omitempty"`
 	Terminal                  string  `yaml:"terminal,omitempty"`
 	JobNotices                string  `yaml:"job_notices,omitempty"`
+	JoinQueued                string  `yaml:"join_queued,omitempty"`
 	Automations               string  `yaml:"automations,omitempty"`
 	StatusDisplay             string  `yaml:"status_display,omitempty"`
 	StatusDisplayHost         string  `yaml:"status_display_host,omitempty"`

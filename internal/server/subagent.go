@@ -123,7 +123,7 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	// the child's first message carries the wrapped job.
 	rawJob := job
 
-	childRt := newSessionRuntimeWithHold(child, sp.approvalHold())
+	childRt := newWorkspaceRuntime(child, sp.workspace())
 	childRt.parentID = parent.SessionID
 	childRt.nested = true
 	// D6: delete approvals go to the child's own attached clients (the
@@ -251,14 +251,13 @@ func (rt *sessionRuntime) routeApprovalsTo(reg *sessionRegistry, parentID string
 	rt.commandApproverOverride = reg.nestedCommandApprover(rt, parentID)
 }
 
-// approvalHold returns the configured delete-approval hold window. Reads
-// the live runtime overlay (like newSessionRuntimeFor), so a settings-modal
-// web_approval_hold_secs change applies to children spawned afterwards.
-func (sp *subagentSpawner) approvalHold() time.Duration {
+// workspace returns the workspace a child runtime follows (approval hold,
+// join_queued), or nil for a spawner built without a server.
+func (sp *subagentSpawner) workspace() *Workspace {
 	if sp.s != nil {
-		return sp.s.ws.ApprovalHold()
+		return sp.s.ws
 	}
-	return 0
+	return nil
 }
 
 // runChildTurn runs one full agent turn on the child runtime: the child's
