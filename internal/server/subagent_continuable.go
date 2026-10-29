@@ -8,6 +8,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	sesspkg "gogen/internal/session"
+	"gogen/internal/steerq"
 	"gogen/internal/subagents"
 )
 
@@ -148,15 +149,27 @@ func (sp *subagentSpawner) Release(c *subagents.Child[*sessionRuntime], cancelle
 	sp.recheckParent(c.ParentID)
 }
 
-// Deliver implements subagents.Host: route one system message to the parent
-// session, or queue it for the session's next registration when the parent is
+// Deliver implements subagents.Host: route one child event to the parent
+// session, or stash it for the session's next registration when the parent is
 // not live (orphan-evicted, closed). A producer must not lose a completion
-// notice to a parent that merely went idle with no viewers.
-func (sp *subagentSpawner) Deliver(parentID, text string) {
-	if sp == nil || sp.s == nil || sp.s.registry == nil || parentID == "" {
+// notice — or a reply somebody is waiting on — to a parent that merely went
+// idle with no viewers.
+func (sp *subagentSpawner) Deliver(event subagents.Event) {
+	if sp == nil || sp.s == nil || sp.s.registry == nil || event.ParentID == "" {
 		return
 	}
-	sp.s.registry.deliverToParent(parentID, text)
+	sp.s.registry.deliverToParent(event.ParentID, parentStashKind(event.Kind), event.ParentMessage())
+}
+
+// parentStashKind maps a child event onto the kind the offline-parent stash
+// orders by: a reply somebody asked for must never be the eviction victim
+// while the parent is away, while every other event is one-way news whose
+// staleness is worth less than that reply.
+func parentStashKind(k subagents.EventKind) steerq.Kind {
+	if k == subagents.EventReply {
+		return steerq.Reply
+	}
+	return steerq.Notice
 }
 
 // Started implements subagents.Host: announce an ADMITTED child — the sidebar

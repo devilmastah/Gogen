@@ -1527,7 +1527,7 @@ func TestBackgroundSpawnCompletionQueuedUntilParentLive(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		s.registry.parentDeliverMu.Lock()
 		defer s.registry.parentDeliverMu.Unlock()
-		return len(s.registry.parentDeliveries[a.SessionID]) == 1
+		return s.registry.parentDeliveries[a.SessionID].Len() == 1
 	})
 	time.Sleep(200 * time.Millisecond)
 	if deliveredMessages(a, "[subagent") {

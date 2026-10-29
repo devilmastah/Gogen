@@ -473,7 +473,7 @@ func wsHandleClose(req *wsRequest) {
 		if label == "" {
 			label = target.agent.SessionID
 		}
-		s.registry.deliverToParent(parentID, fmt.Sprintf("[subagent %s] closed by the user — its session stays saved and can be reopened.", label))
+		s.registry.deliverToParent(parentID, steerq.Notice, fmt.Sprintf("[subagent %s] closed by the user — its session stays saved and can be reopened.", label))
 	}
 	s.registry.closeRuntime(target)
 }

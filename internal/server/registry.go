@@ -881,15 +881,20 @@ type sessionRegistry struct {
 	// once at construction; never reassigned.
 	evictHook func(sessionID string)
 
-	// parentDeliverMu guards parentDeliveries, the per-parent queue of
-	// system messages (background-subagent completion notices and captured
-	// send_message replies) for sessions whose runtime is not live. The spawner queues
-	// when the parent is evicted or closed while its children keep
-	// running; register() flushes the queue into the fresh runtime when
+	// parentDeliverMu guards parentDeliveries, the per-parent stash of
+	// messages (background-subagent completion notices and captured
+	// send_message replies) for sessions whose runtime is not live. The
+	// spawner stashes when the parent is evicted or closed while its children
+	// keep running; register() flushes the stash into the fresh runtime when
 	// the session is next loaded — "deliver once it is live again"
 	// (deliverToParent).
+	//
+	// Each stash is a steerq queue rather than a string list so the live
+	// queue's ordinal rules hold here too: at the cap the oldest NOTICE is
+	// evicted and a pending REPLY never is. The item kind orders eviction
+	// only — the flush injects everything as a one-way notice.
 	parentDeliverMu  sync.Mutex
-	parentDeliveries map[string][]string
+	parentDeliveries map[string]*steerq.Queue
 
 	// bgWorkHook reports whether a session id still owns background work
 	// that evicting its runtime would destroy. Agent.HasBackgroundWork
@@ -936,7 +941,7 @@ func newSessionRegistry(maxActive int) *sessionRegistry {
 	return &sessionRegistry{
 		agents:           make(map[string]*sessionRuntime),
 		maxActive:        maxActive,
-		parentDeliveries: make(map[string][]string),
+		parentDeliveries: make(map[string]*steerq.Queue),
 	}
 }
 

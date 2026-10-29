@@ -93,10 +93,10 @@ func (h *stubHost) Release(c *Child[*stubHandle], cancelledMidRun bool) {
 	}
 }
 
-func (h *stubHost) Deliver(parentID, text string) {
+func (h *stubHost) Deliver(event Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.delivered = append(h.delivered, parentID+": "+text)
+	h.delivered = append(h.delivered, event.ParentID+": "+event.ParentMessage())
 }
 
 func (h *stubHost) Started(c *Child[*stubHandle], job string) {

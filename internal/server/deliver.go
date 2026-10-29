@@ -35,16 +35,10 @@ func (rt *sessionRuntime) deliveriesLocked() *steerq.Queue {
 	return rt.pendingDeliver
 }
 
-// The per-session bounds (user cap, system cap) and the queue-item id
-// generator are internal/steerq's: they are queue policy, and the TUI must
-// apply exactly the same ones. The web-specific constants below are the ones
-// only this host has.
-
-// maxParentDeliveryQueue bounds the registry's offline-parent queue
-// (notices and replies for a session whose runtime is not live). Sized like
-// the per-runtime queue because a drop here is invisible — no client is
-// attached to toast it, and the parent may not be reopened for a long time.
-const maxParentDeliveryQueue = steerq.SystemCap
+// The per-session bounds (user cap, system cap), the queue-item id generator
+// and the offline-parent stash's bound are internal/steerq's: they are queue
+// policy, and the TUI applies the same ones. What is left here is this host's
+// own contract for client-supplied queue ids.
 
 // maxQueueIDLen bounds a client-supplied queue id: it is a correlation
 // token, never content, and the server-generated form is ~20 characters.
@@ -325,14 +319,21 @@ func (rt *sessionRuntime) enqueueSystem(text string, kind steerq.Kind) (ok, full
 
 // --- parent-scoped delivery (survives runtime eviction) ---
 
-// deliverToParent delivers a system message to a live parent session, or —
-// when the session's runtime is not live (orphan-evicted, closed) — queues
-// it in the registry so it is delivered when the session is next registered
-// (reopened from the store). Never blocks; at-most-once per queue entry.
-// Used by the continuable-subagent machinery, whose producers must not lose
-// a completion notice or reply to a parent that merely went idle with no
-// viewers.
-func (r *sessionRegistry) deliverToParent(parentID, text string) {
+// deliverToParent delivers a child-to-parent event's text to a live parent
+// session, or — when the session's runtime is not live (orphan-evicted,
+// closed) — stashes it in the registry so it is delivered when the session is
+// next registered (reopened from the store). Never blocks; at-most-once per
+// queue entry. Used by the continuable-subagent machinery, whose producers
+// must not lose a completion notice or a reply to a parent that merely went
+// idle with no viewers.
+//
+// kind orders the OFFLINE STASH only (see queueParentDelivery): a Reply is
+// never the eviction victim while the parent is away. The LIVE path injects
+// as a one-way Notice whatever the kind — the answer belongs to whoever asked
+// for it, and reply capture is armed per targeted delivery, never by a child
+// event arriving at its parent (which may itself be a child, and whose turn
+// output would then be forwarded one level too far).
+func (r *sessionRegistry) deliverToParent(parentID string, kind steerq.Kind, text string) {
 	if rt, ok := r.get(parentID); ok {
 		if rt.deliverToSession(text) {
 			return
@@ -340,28 +341,40 @@ func (r *sessionRegistry) deliverToParent(parentID, text string) {
 		// The runtime was evicted between the lookup and the queue append:
 		// fall through and queue for the next registration.
 	}
-	r.queueParentDelivery(parentID, text)
+	r.queueParentDelivery(parentID, kind, text)
 }
 
-// queueParentDelivery stashes a system message for a session whose runtime
-// is not live. Bounded like the per-runtime delivery queue: overflow drops
-// the OLDEST entry (freshness wins — a stale notice is worse than none).
+// queueParentDelivery stashes a message for a session whose runtime is not
+// live. The stash is a shared steerq queue, so it applies the same bound and
+// the same eviction preference as a live one: at the cap the OLDEST NOTICE is
+// evicted, a NOTICE arriving at an all-reply stash drops itself, and a REPLY
+// arriving there is refused — a message whose answer somebody is waiting on
+// must not evict another one. Overflow is silently unrecoverable either way
+// (the parent is not live, so there is no client to toast), which is why the
+// stash carries replies at all instead of a plain string list.
+//
+// The kind is carried for EVICTION PRIORITY ONLY: flushParentDeliveries
+// injects every stashed message as a one-way notice, because by then no turn
+// is waiting on an answer.
+//
 // Flushed by register() when the session is next loaded; cleared by
 // sessionDelete (a deleted session can never be reopened).
-func (r *sessionRegistry) queueParentDelivery(parentID, text string) {
+func (r *sessionRegistry) queueParentDelivery(parentID string, kind steerq.Kind, text string) {
 	if parentID == "" {
 		return
 	}
 	r.parentDeliverMu.Lock()
 	defer r.parentDeliverMu.Unlock()
 	q := r.parentDeliveries[parentID]
-	if len(q) >= maxParentDeliveryQueue {
-		q = append([]string(nil), q[1:]...) // drop the oldest entry
+	if q == nil {
+		// No User items are ever stashed: the user cap does not apply.
+		q = steerq.New(0, steerq.SystemCap)
+		r.parentDeliveries[parentID] = q
 	}
-	r.parentDeliveries[parentID] = append(q, text)
+	q.Append(steerq.Item{ID: steerq.NewID(), Text: text, Kind: kind})
 }
 
-// flushParentDeliveries delivers every queued message for id into rt (the
+// flushParentDeliveries delivers every stashed message for id into rt (the
 // freshly registered runtime of a session that was evicted/closed while its
 // background subagents kept running). No-op when nothing is queued. Must
 // NOT be called with r.mu held: deliverToSession can broadcast (bounded by
@@ -371,11 +384,16 @@ func (r *sessionRegistry) flushParentDeliveries(id string, rt *sessionRuntime) {
 		return
 	}
 	r.parentDeliverMu.Lock()
-	pending := r.parentDeliveries[id]
+	q := r.parentDeliveries[id]
 	delete(r.parentDeliveries, id)
 	r.parentDeliverMu.Unlock()
-	for _, text := range pending {
-		rt.deliverToSession(text)
+	if q == nil {
+		return
+	}
+	// Take zeroes the popped slots, so the drained messages' text is not kept
+	// reachable through the stash after it leaves the map.
+	for _, it := range q.Take(q.Len()) {
+		rt.deliverToSession(it.Text)
 	}
 }
 

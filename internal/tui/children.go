@@ -376,12 +376,17 @@ func (sp *tuiSubagentSpawner) Release(c *subagents.Child[*childHandle], cancelle
 	_ = sp.send(childReleaseMsg{handle: h, cancelledMidRun: cancelledMidRun})
 }
 
-// Deliver implements subagents.Host: queue one system message into the parent
+// Deliver implements subagents.Host: queue one child event into the parent
 // conversation. It names the parent by SESSION id; the Update thread resolves
 // the slot, so a focus switch between the producer and the handler cannot
 // re-attribute the notice.
-func (sp *tuiSubagentSpawner) Deliver(parentID, text string) {
-	_ = sp.send(deliveryRequestMsg{sid: parentID, text: text})
+//
+// The event is injected as a one-way notice whatever its kind: the TUI keeps
+// no offline stash (a delivery for a slot that is not live is dropped), and a
+// child's event never arms reply capture — that is armed per targeted
+// send_message delivery, on the child's own queue.
+func (sp *tuiSubagentSpawner) Deliver(event subagents.Event) {
+	_ = sp.send(deliveryRequestMsg{sid: event.ParentID, text: event.ParentMessage()})
 }
 
 // Started implements subagents.Host. The child's sidebar row comes from its

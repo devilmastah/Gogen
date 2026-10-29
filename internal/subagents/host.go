@@ -168,10 +168,13 @@ type Host[H any] interface {
 	// the sidebar renders it as done). The host also cascades to the child's
 	// own children and re-checks the parent for orphan eviction.
 	Release(c *Child[H], cancelledMidRun bool)
-	// Deliver queues one system message into the parent conversation (the
+	// Deliver routes one typed child event into the parent conversation (the
 	// host's delivery service; queued for the session's next registration
-	// when the parent is not live).
-	Deliver(parentID, text string)
+	// when the parent is not live). The EVENT crosses this seam, not a
+	// pre-flattened string: its Kind is what tells the host whether somebody
+	// is waiting on the text (EventReply), and that decides how a delivery
+	// which has to wait for the parent is ordered against the others.
+	Deliver(event Event)
 	// Started announces an ADMITTED child (its pane/sidebar row's attach
 	// target). Called after the caps pass, so a refused child is never
 	// announced — an announced-but-refused child would leave a phantom
