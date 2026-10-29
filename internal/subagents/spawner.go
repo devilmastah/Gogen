@@ -591,13 +591,31 @@ func (sp *Spawner[H]) WaitAgent(ctx context.Context, caller *agent.Agent, agentI
 	return status, nil
 }
 
-// SendMessage delivers text to a live child of caller as a new user message
-// (queued when the child is mid-turn). Implements
+// errNotRestorable reports that the store has no saved child the caller may
+// revive (unknown id, or another parent's session). SendMessage keeps its
+// original, more descriptive refusal in that case.
+var errNotRestorable = errors.New("subagent: no saved session to revive")
+
+// SendMessage delivers text to a child of caller as a new user message
+// (queued when the child is mid-turn). A child that is no longer live — its
+// retention window elapsed, it was evicted, or this process never spawned it
+// (a restart) — is REVIVED from its saved session first, so a conversation can
+// continue across restarts instead of ending at the first release. Implements
 // agent.ContinuableSubagentSpawner.
 func (sp *Spawner[H]) SendMessage(caller *agent.Agent, agentID, text string) error {
 	child, err := sp.ownedChild(caller, agentID, "send_message")
 	if err != nil {
-		return err
+		revived, reviveErr := sp.reviveChild(caller, agentID)
+		if reviveErr != nil {
+			if errors.Is(reviveErr, errNotRestorable) {
+				// Unknown id, or another parent's session: the ownership
+				// refusal above is the right answer, and it already points
+				// at the pull path.
+				return err
+			}
+			return reviveErr
+		}
+		child = revived
 	}
 	// The message itself is delivered through the child's delivery service
 	// (queued when the child is mid-turn); reply capture is armed by the
@@ -617,6 +635,68 @@ func (sp *Spawner[H]) SendMessage(caller *agent.Agent, agentID, text string) err
 		return fmt.Errorf("send_message: subagent %s is no longer live", agentID)
 	}
 	return nil
+}
+
+// reviveChild brings a saved child of caller back into the live registry as an
+// idle, continuable child, so the delivery that follows has somewhere to land
+// and the reply capture has a parent to report to.
+//
+// A revived child has NO main run — it is exactly an interrupted child that has
+// not been messaged yet — so its status is "idle" and its Done channel is
+// closed (WaitAgent must not park on a run that already happened in a previous
+// life). Its recorded outcome is left alone: the terminal state belongs to the
+// main run, which a follow-up turn does not rewrite. The retention timer is
+// armed so the revived runtime cannot linger; a delivery in flight re-arms it
+// through the usual Busy check.
+func (sp *Spawner[H]) reviveChild(caller *agent.Agent, agentID string) (*Child[H], error) {
+	if caller == nil || agentID == "" || sp == nil || sp.host == nil {
+		return nil, errNotRestorable
+	}
+	// A concurrent send_message (or a spawn) may have revived it already:
+	// the registry is the single source of truth. The ownership check is NOT
+	// optional here — ownedChild already refused this caller, so a live child
+	// with the id belongs to somebody else and must stay refused, exactly as
+	// if it had never been revived.
+	if c := sp.children.get(agentID); c != nil {
+		if c.ParentID != caller.SessionID {
+			return nil, errNotRestorable
+		}
+		return c, nil
+	}
+	pol := sp.host.Policy()
+	if sp.children.guardExceeded(caller.SessionID, pol.guardLimit()) {
+		return nil, fmt.Errorf("send_message: too many live subagents (%d); wait for them to finish or be released, then retry", pol.guardLimit())
+	}
+	nc, ok, err := sp.host.ReviveChild(caller, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("send_message: reopening subagent %s: %w", agentID, err)
+	}
+	if !ok {
+		return nil, errNotRestorable
+	}
+	if nc.Agent == nil {
+		return nil, fmt.Errorf("send_message: host returned no child agent for subagent %s", agentID)
+	}
+	child := &Child[H]{
+		ID: agentID,
+		// The store authorises the parent link; the caller is that parent.
+		ParentID: caller.SessionID,
+		Label:    nc.Label,
+		// Depth is not persisted (SessionSnapshot has no field for it), so
+		// it is reconstructed from the caller: one level below it. That is
+		// what the spawn contract would have set.
+		Depth:     caller.SubagentDepth() + 1,
+		CreatedAt: time.Now(),
+		Agent:     nc.Agent,
+		Handle:    nc.Handle,
+		done:      make(chan struct{}),
+		status:    "running",
+	}
+	child.MarkInterrupted() // no main run: idle and continuable
+	sp.children.register(child)
+	sp.host.ArmReplyCapture(child)
+	time.AfterFunc(pol.retain(), func() { sp.ReleaseChildIfQuiet(child) })
+	return child, nil
 }
 
 // InterruptAgent cancels a live child's in-flight turn (no-op when idle); the

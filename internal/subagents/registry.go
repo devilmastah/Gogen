@@ -131,6 +131,19 @@ func (r *registry[H]) liveCountLocked(parentID string) int {
 	return n
 }
 
+// guardExceeded reports whether parentID already holds guard NON-finished
+// children. It is the admission check for a REVIVED child (loaded from the
+// store for a send_message): unlike a spawn there is no in-flight child to
+// count itself, so a plain ">=" is the whole rule. guard <= 0 means unbounded.
+func (r *registry[H]) guardExceeded(parentID string, guard int) bool {
+	if r == nil || guard <= 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.liveCountLocked(parentID) >= guard
+}
+
 // acquireForeground atomically checks both spawn caps and, when allowed,
 // reserves a foreground slot for parentID: the user-facing limit against
 // active children (the new child counts itself via the increment, so >=

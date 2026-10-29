@@ -1883,3 +1883,79 @@ func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
 		t.Fatalf("another session's children leaked into list_agents: %q", foreign)
 	}
 }
+
+// TestSendMessageRevivesReleasedChild is the restart scenario in one test: the
+// child's runtime is gone (released — what a restart leaves behind), its
+// session is on disk, and a send_message must REOPEN it and deliver, so the
+// conversation continues instead of failing with "not live" forever. The reply
+// still comes back through the normal capture.
+func TestSendMessageRevivesReleasedChild(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		// The revived child is built from the store, so it gets a FRESH
+		// provider from the factory: key the answer on the prompt instead of
+		// on a call index, so the assertion proves the follow-up turn ran on
+		// the restored transcript.
+		p.OnStream = func(_ context.Context, msgs []llm.Message, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+			last := ""
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "user" {
+					last = msgs[i].Content
+					break
+				}
+			}
+			if strings.Contains(last, "please continue") {
+				return &llm.StreamResult{Content: "answer after revival"}, nil
+			}
+			return &llm.StreamResult{Content: "main job report"}, nil
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "revivable job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id).IsFinished() })
+
+	// Drop the runtime: the child is now exactly what a restart leaves — a
+	// saved session with a parent link and no live registry entry.
+	sp.ReleaseChild(sp.Get(id))
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id) == nil })
+	if err := sp.SendMessage(a, "not-a-child", "hi"); err == nil {
+		t.Fatal("an unknown id must still be refused")
+	}
+
+	if err := sp.SendMessage(a, id, "please continue"); err != nil {
+		t.Fatalf("send_message to a released child = %v, want the revived delivery", err)
+	}
+	// The revived child is live again, as an idle continuation of its saved
+	// session (same id, same parent).
+	revived := sp.Get(id)
+	if revived == nil {
+		t.Fatal("the released child must be revived into the live registry")
+	}
+	if revived.ParentID != a.SessionID {
+		t.Fatalf("revived child parent = %q, want %q", revived.ParentID, a.SessionID)
+	}
+	// The delivered turn runs on the SAVED transcript and its exact reply
+	// reaches the parent conversation.
+	waitFor(t, 10*time.Second, func() bool {
+		return deliveredMessages(a, "answer after revival")
+	})
+	// Continuity, not a fresh session: the revived agent carries the
+	// pre-release transcript plus the follow-up turn.
+	restored := revived.Agent.SnapshotMessages()
+	if len(restored) < 4 {
+		t.Fatalf("revived transcript = %d messages, want the saved turn plus the follow-up", len(restored))
+	}
+	if !strings.Contains(restored[0].Content, "subagent working on a task") {
+		t.Fatalf("revived transcript does not start with the saved job: %q", restored[0].Content)
+	}
+	// The follow-up turn lands in the child's own session, not in a clone.
+	if info := s.ws.Store.Info(s.ws.GetWorkingDir(), id); info == nil {
+		t.Fatal("the revived child's session must still be the same saved session")
+	}
+}

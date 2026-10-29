@@ -534,3 +534,54 @@ func TestNoticeOverflowNeverEvictsATargetedDelivery(t *testing.T) {
 		t.Fatal("the dropped notice was not reported")
 	}
 }
+
+// TestChildAdoptMsgGivesRevivedChildASlot pins the TUI half of reviving a saved
+// child for send_message: a targeted delivery only reaches a child that owns a
+// live slot, and a child whose session is ALREADY live (the user has it open as
+// a pane) is adopted rather than duplicated — two slots for one session id
+// would both persist to the same file.
+func TestChildAdoptMsgGivesRevivedChildASlot(t *testing.T) {
+	hh := newChildHarness(t, "revived reply")
+	child, _, c := hh.newChild(t, hh.m.agent, "revived reply", "subagent: saved job")
+
+	// The lifecycle builds the handle and binds the child (ArmReplyCapture)
+	// before asking for the slot.
+	handle := newChildHandle(child)
+	handle.mu.Lock()
+	handle.child = c
+	handle.mu.Unlock()
+
+	ack := make(chan error, 1)
+	_, _ = hh.m.handleChildAdoptMsg(childAdoptMsg{handle: handle, label: "subagent: saved job", ack: ack})
+	if err := <-ack; err != nil {
+		t.Fatalf("adopt refused: %v", err)
+	}
+	slot := handle.slotOf()
+	if slot == nil {
+		t.Fatal("an adopted child must own a slot")
+	}
+	if slot.id != child.SessionID || slot.parentID != hh.m.agent.SessionID {
+		t.Fatalf("slot = %q (parent %q), want the child's session under its parent", slot.id, slot.parentID)
+	}
+
+	// The delivery a revive exists for now lands on that slot.
+	slot.streaming = true // keep it queued so the assertion is deterministic
+	mack := make(chan childMessageAck, 1)
+	_, _ = hh.m.handleChildMessageMsg(childMessageMsg{handle: handle, text: "please continue", ack: mack})
+	if res := <-mack; !res.ok || res.full {
+		t.Fatalf("send_message to an adopted child = %+v, want queued", res)
+	}
+
+	// A second revive for a session that is already live reuses its slot.
+	before := len(hh.m.lives.sessions)
+	again := newChildHandle(child)
+	if _, _ = hh.m.handleChildAdoptMsg(childAdoptMsg{handle: again, label: "subagent: saved job", ack: make(chan error, 1)}); again.slotOf() == nil {
+		t.Fatal("the re-adopted handle must own the existing slot")
+	}
+	if got := len(hh.m.lives.sessions); got != before {
+		t.Fatalf("live slots = %d after re-adopting, want the unchanged %d (no duplicate)", got, before)
+	}
+	if again.slotOf() != slot {
+		t.Fatal("re-adopting must reuse the session's slot, not create one")
+	}
+}

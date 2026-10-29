@@ -248,6 +248,16 @@ type childSpawnMsg struct {
 	ready  chan error
 }
 
+// childAdoptMsg asks the Update thread to give a REVIVED child — one loaded
+// from the store because a send_message found it no longer live — a live slot,
+// WITHOUT starting a turn: the delivery that follows starts one. ack reports
+// admission.
+type childAdoptMsg struct {
+	handle *childHandle
+	label  string
+	ack    chan error
+}
+
 // childMessageMsg delivers a send_message into a child's queue (queued when the
 // child is mid-turn). ack reports (queued, full).
 type childMessageMsg struct {
@@ -399,6 +409,44 @@ func (sp *tuiSubagentSpawner) Finished(c *subagents.Child[*childHandle], report 
 	sp.addRecord(subagentRecord{label: c.Label, report: agent.TruncateSubagentReport(report), err: err})
 }
 
+// ReviveChild implements subagents.Host: reopen one of the caller's saved
+// nested sessions as a live slot so a send_message can reach it again — the
+// live slot set is process-local, the session is not, so without this a
+// subagent conversation ended for good at its first release or restart.
+//
+// The agent is loaded here, on the caller's goroutine (the spawn path builds
+// child agents off the Update thread too); only the SLOT is admitted on the
+// Update thread, through childAdoptMsg, because slots are Update-thread state.
+func (sp *tuiSubagentSpawner) ReviveChild(caller *agent.Agent, childID string) (subagents.NewChild[*childHandle], bool, error) {
+	if sp == nil || sp.ws == nil || sp.ws.Store == nil || caller == nil || childID == "" {
+		return subagents.NewChild[*childHandle]{}, false, nil
+	}
+	// Ownership from the store index first: it never loads a session the
+	// caller does not own (the same boundary PersistedResult uses).
+	info := sp.ws.Store.Info(sp.ws.GetWorkingDir(), childID)
+	if info == nil || info.ParentID != caller.SessionID {
+		return subagents.NewChild[*childHandle]{}, false, nil
+	}
+	snap, err := sp.ws.Store.LoadInWorkingDir(sp.ws.GetWorkingDir(), childID)
+	if err != nil {
+		return subagents.NewChild[*childHandle]{}, false, err
+	}
+	a := sp.ws.NewSessionAgent(&snap, childID)
+	h := newChildHandle(a)
+	label := info.Label
+	if l := a.SessionLabelSnapshot(); l != "" {
+		label = l
+	}
+	ack := make(chan error, 1)
+	if err := sp.send(childAdoptMsg{handle: h, label: label, ack: ack}); err != nil {
+		return subagents.NewChild[*childHandle]{}, false, err
+	}
+	if err := <-ack; err != nil {
+		return subagents.NewChild[*childHandle]{}, false, err
+	}
+	return subagents.NewChild[*childHandle]{Handle: h, Agent: a, Label: label}, true, nil
+}
+
 // PersistedChildren implements subagents.Host: the caller's saved nested
 // (subagent) sessions, newest first, for list_agents. The ParentID filter is
 // the same authorization boundary PersistedResult applies — a model must never
@@ -520,6 +568,45 @@ func (m *Model) handleChildSpawnMsg(msg childSpawnMsg) (tea.Model, tea.Cmd) {
 	cmd := m.startTurnOnWithResult(s, msg.text, childTurnResultSink(m.spawner, msg.handle, true))
 	msg.ready <- nil
 	return m, cmd
+}
+
+// handleChildAdoptMsg admits the slot a revived child needs. A child that is
+// ALREADY live as a session (the user has it open as a pane) is adopted rather
+// than duplicated: two slots for one session id would both persist to the same
+// file, and the older one's pending delta would be dropped by the newer
+// snapshot — the same rule spawnSavedSession states for resume.
+func (m *Model) handleChildAdoptMsg(msg childAdoptMsg) (tea.Model, tea.Cmd) {
+	ack := msg.ack
+	fail := func(err error) (tea.Model, tea.Cmd) {
+		if ack != nil {
+			ack <- err
+		}
+		return m, nil
+	}
+	if m.lives == nil || msg.handle == nil || msg.handle.agent == nil {
+		return fail(fmt.Errorf("subagent: no live session registry"))
+	}
+	// A release can overtake the revival (parent teardown, cap eviction):
+	// admitting a released child would leave a slot nothing ever removes.
+	if child := msg.handle.childOf(); child != nil && child.Released() {
+		return fail(subagents.ErrEvicted)
+	}
+	if i := m.lives.indexBySessionID(msg.handle.session); i >= 0 {
+		s := m.lives.sessions[i]
+		s.agent = msg.handle.agent
+		s.child = msg.handle
+		msg.handle.setSlot(s)
+		if ack != nil {
+			ack <- nil
+		}
+		return m, nil
+	}
+	s := m.lives.AddChild(msg.handle.agent, msg.label, msg.handle)
+	msg.handle.setSlot(s)
+	if ack != nil {
+		ack <- nil
+	}
+	return m, nil
 }
 
 // childTurnResultSink builds the onResult callback for one child turn: it

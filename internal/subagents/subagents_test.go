@@ -42,6 +42,17 @@ type stubHost struct {
 	// saved is the store-backed child list PersistedChildren reports
 	// (newest first, as a host returns it).
 	saved []PersistedChild
+	// revivable is the store's set of session ids ReviveChild may reopen,
+	// mapped to the label it reports. Absent = the store has no such child.
+	revivable map[string]string
+	// revived records the ids ReviveChild opened (a second revive of the same
+	// id would be a host bug).
+	revived []string
+	// revivableParent is the only caller ReviveChild serves: the store's
+	// ownership boundary, like the real hosts' ParentID check.
+	revivableParent string
+	// childMessages records targeted (send_message) deliveries.
+	childMessages []string
 }
 
 func newStubHost() *stubHost {
@@ -82,6 +93,9 @@ func (h *stubHost) RunTurn(ctx context.Context, c *Child[*stubHandle], prompt st
 func (h *stubHost) CancelTurn(c *Child[*stubHandle]) {}
 
 func (h *stubHost) DeliverChildMessage(c *Child[*stubHandle], text string) (ok, full bool) {
+	h.mu.Lock()
+	h.childMessages = append(h.childMessages, c.ID+": "+text)
+	h.mu.Unlock()
 	return true, false
 }
 
@@ -112,6 +126,23 @@ func (h *stubHost) Finished(c *Child[*stubHandle], report string, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.finished = append(h.finished, c.ID)
+}
+
+func (h *stubHost) ReviveChild(caller *agent.Agent, childID string) (NewChild[*stubHandle], bool, error) {
+	h.mu.Lock()
+	label, ok := h.revivable[childID]
+	if !ok || caller == nil || h.revivableParent != caller.SessionID {
+		h.mu.Unlock()
+		return NewChild[*stubHandle]{}, false, nil
+	}
+	handle := &stubHandle{}
+	child := testAgent("revived-"+childID, "mock-model")
+	child.SetSessionID(childID)
+	child.SetParentID(caller.SessionID)
+	h.handles[child.SessionID] = handle
+	h.revived = append(h.revived, childID)
+	h.mu.Unlock()
+	return NewChild[*stubHandle]{Handle: handle, Agent: child, Label: label}, true, nil
 }
 
 func (h *stubHost) PersistedChildren(caller *agent.Agent) []PersistedChild {
@@ -673,5 +704,172 @@ func TestListAgentsWithoutSavedChildren(t *testing.T) {
 	}
 	if out != "No live subagents." {
 		t.Fatalf("empty listing = %q, want the plain answer", out)
+	}
+}
+
+// TestSendMessageRevivesSavedChild pins the continuation half of the
+// survives-a-restart contract: a child the live registry no longer tracks (its
+// retention window elapsed, it was evicted, or this process never spawned it)
+// is reopened from its saved session and delivered to, instead of the send
+// failing forever with "not live".
+func TestSendMessageRevivesSavedChild(t *testing.T) {
+	host := newStubHost()
+	host.policy = Policy{Retain: time.Hour}
+	host.revivableParent = "parent"
+	host.revivable = map[string]string{"saved-child": "subagent: revived"}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+
+	if sp.Get("saved-child") != nil {
+		t.Fatal("precondition: the child must not be live")
+	}
+	if err := sp.SendMessage(parent, "saved-child", "follow-up question"); err != nil {
+		t.Fatalf("send_message to a saved child = %v, want the revived delivery", err)
+	}
+
+	host.mu.Lock()
+	revived, msgs := append([]string(nil), host.revived...), append([]string(nil), host.childMessages...)
+	host.mu.Unlock()
+	if len(revived) != 1 || revived[0] != "saved-child" {
+		t.Fatalf("revives = %v, want exactly saved-child", revived)
+	}
+	if len(msgs) != 1 || msgs[0] != "saved-child: follow-up question" {
+		t.Fatalf("deliveries = %v, want the message routed to the revived child", msgs)
+	}
+
+	child := sp.Get("saved-child")
+	if child == nil {
+		t.Fatal("the revived child must be registered")
+	}
+	if child.ParentID != "parent" || child.Label != "subagent: revived" || child.Depth != 1 {
+		t.Fatalf("revived child = %+v, want parent/label/depth from the store + caller", child)
+	}
+	// No main run: idle and continuable, so waiting must not park.
+	if got := child.StatusOf(host); got != "idle" {
+		t.Fatalf("revived status = %q, want idle", got)
+	}
+	select {
+	case <-child.Done():
+	case <-time.After(time.Second):
+		t.Fatal("a revived child has no main run; Done must already be closed")
+	}
+	res, err := sp.GetAgentResult(parent, "saved-child")
+	if err != nil || !strings.Contains(res, "interrupted") {
+		t.Fatalf("get_agent_result after revival = %q, %v; want the continuable-idle answer", res, err)
+	}
+	// Waking again must reuse the registered child (no second revive).
+	if err := sp.SendMessage(parent, "saved-child", "again"); err != nil {
+		t.Fatal(err)
+	}
+	host.mu.Lock()
+	n := len(host.revived)
+	host.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("revives = %d after a second delivery, want 1 (the child is live now)", n)
+	}
+}
+
+// TestSendMessageReviveIsOwnershipScoped pins the boundary: an id the store does
+// not hold FOR THIS PARENT is not revivable, and the original refusal (which
+// points at get_agent_result) is what the model sees.
+func TestSendMessageReviveIsOwnershipScoped(t *testing.T) {
+	host := newStubHost()
+	host.revivableParent = "someone-else"
+	host.revivable = map[string]string{"saved-child": "subagent: not yours"}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+
+	// A non-live id cannot be attributed to a parent, so ownedChild's answer is
+	// the liveness refusal (which also points at the pull path); what matters
+	// here is that the store boundary refused the revive.
+	err := sp.SendMessage(parent, "saved-child", "hi")
+	if err == nil || !strings.Contains(err.Error(), "is not live") {
+		t.Fatalf("send_message across parents = %v, want the refusal", err)
+	}
+	host.mu.Lock()
+	revived := len(host.revived)
+	host.mu.Unlock()
+	if revived != 0 {
+		t.Fatalf("revives = %d, want 0 for another parent's child", revived)
+	}
+	if sp.Get("saved-child") != nil {
+		t.Fatal("a refused revive must not register a child")
+	}
+
+	// The same boundary against a child that IS live but belongs to another
+	// parent: the revive shortcut must not hand it over (ownedChild's refusal
+	// already fired, so the registry lookup may not bypass it).
+	host2 := newStubHost()
+	host2.policy = Policy{Retain: time.Hour}
+	blocking := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	host2.run = func(ctx context.Context, _ *Child[*stubHandle], _ string) (string, error) {
+		entered <- struct{}{}
+		select {
+		case <-blocking:
+			return "report", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	sp2 := New[*stubHandle](host2)
+	owner := testAgent("owner", "m")
+	owner.SetSessionID("owner")
+	intruder := testAgent("intruder", "m")
+	intruder.SetSessionID("intruder")
+	liveID, err := sp2.SpawnBackground(context.Background(), owner, "owned job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	defer close(blocking)
+	if err := sp2.SendMessage(intruder, liveID, "hijack"); err == nil {
+		t.Fatal("another parent must not message a live child through the revive path")
+	}
+	host2.mu.Lock()
+	delivered := len(host2.childMessages)
+	host2.mu.Unlock()
+	if delivered != 0 {
+		t.Fatalf("deliveries to another parent's child = %d, want 0", delivered)
+	}
+}
+
+// TestSendMessageReviveHonoursTheLiveGuard pins the memory bound: reviving
+// loads a runtime, so it counts against the same non-finished guard the spawn
+// path uses, and the refusal is actionable.
+func TestSendMessageReviveHonoursTheLiveGuard(t *testing.T) {
+	host := newStubHost()
+	host.policy = Policy{Retain: time.Hour, MaxLiveGuard: 1}
+	host.revivableParent = "parent"
+	host.revivable = map[string]string{"saved-child": "subagent: saved"}
+	// One live non-finished child already fills the guard.
+	blocking := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	host.run = func(ctx context.Context, _ *Child[*stubHandle], _ string) (string, error) {
+		entered <- struct{}{}
+		select {
+		case <-blocking:
+			return "report", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	sp := New[*stubHandle](host)
+	parent := testAgent("parent", "m")
+	parent.SetSessionID("parent")
+	if _, err := sp.SpawnBackground(context.Background(), parent, "live job", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	defer close(blocking)
+
+	err := sp.SendMessage(parent, "saved-child", "hi")
+	if err == nil || !strings.Contains(err.Error(), "too many live subagents") {
+		t.Fatalf("revive past the guard = %v, want the guard refusal", err)
+	}
+	if sp.Get("saved-child") != nil {
+		t.Fatal("a refused revive must not register a child")
 	}
 }

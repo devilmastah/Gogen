@@ -206,6 +206,39 @@ func (sp *subagentSpawner) Finished(c *subagents.Child[*sessionRuntime], report 
 	})
 }
 
+// ReviveChild implements subagents.Host: reopen one of the caller's saved
+// nested sessions as a live runtime so a send_message can reach it again — the
+// live registry is process-local, the session is not, so without this a
+// subagent conversation ended for good at its first release or restart.
+//
+// The child's own runtime is loadOrCreateRuntime's job: it restores the parent
+// link, the nested flag (the active-session cap exemption) and the approval
+// routing, and dedupes against an already-registered runtime so a child the
+// user has open as a pane is adopted rather than duplicated. The runtime is
+// HELD like a spawned background child: an idle revived child must not be
+// orphan-evicted between the reopen and the delivered turn.
+func (sp *subagentSpawner) ReviveChild(caller *agent.Agent, childID string) (subagents.NewChild[*sessionRuntime], bool, error) {
+	if sp == nil || sp.s == nil || sp.s.ws == nil || sp.s.ws.Store == nil || caller == nil || childID == "" {
+		return subagents.NewChild[*sessionRuntime]{}, false, nil
+	}
+	// Ownership from the store index first: a cheap check that never opens a
+	// session the caller does not own (the same boundary PersistedResult uses).
+	info := sp.s.ws.Store.Info(sp.s.ws.GetWorkingDir(), childID)
+	if info == nil || info.ParentID != caller.SessionID {
+		return subagents.NewChild[*sessionRuntime]{}, false, nil
+	}
+	rt, err := sp.s.loadOrCreateRuntime(childID)
+	if err != nil {
+		return subagents.NewChild[*sessionRuntime]{}, false, err
+	}
+	rt.held.Store(true)
+	label := info.Label
+	if l := rt.agent.SessionLabelSnapshot(); l != "" {
+		label = l
+	}
+	return subagents.NewChild[*sessionRuntime]{Handle: rt, Agent: rt.agent, Label: label}, true, nil
+}
+
 // PersistedChildren implements subagents.Host: the caller's saved nested
 // (subagent) sessions, newest first, for list_agents. The ParentID filter is
 // the same authorization boundary PersistedResult applies — a model must never

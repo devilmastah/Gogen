@@ -316,11 +316,12 @@ func waitAgentToolDef() llm.Tool {
 // message when that turn finishes — the single return channel per run.
 func sendMessageToolDef() llm.Tool {
 	return toolDef("send_message",
-		"Send a message to a background subagent of this session (agent_id) — running, interrupted, or "+
-			"finished-but-retained; queued if it is mid-turn. Its reply is injected into this session "+
-			"when the turn finishes. Use to queue a follow-up, ask a finished one for more detail, or "+
-			"request a stop-and-report. This does not alter the already-running LLM request; use "+
-			"interrupt_agent first when the current turn must be stopped immediately.",
+		"Send a message to a child subagent of this session (agent_id) — running, interrupted, "+
+			"finished-but-retained, or saved (an inactive child is reopened from its saved session first, "+
+			"so a conversation can continue after a restart); queued if it is mid-turn. Its reply is "+
+			"injected into this session when the turn finishes. Use to queue a follow-up, ask a finished "+
+			"one for more detail, or request a stop-and-report. This does not alter the already-running "+
+			"LLM request; use interrupt_agent first when the current turn must be stopped immediately.",
 		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 			"message":  toolProp("string", "The message to deliver to the subagent"),

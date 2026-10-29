@@ -208,6 +208,15 @@ type Host[H any] interface {
 	// nested session belonging to another parent). ok=false when the store
 	// has no usable record.
 	PersistedResult(caller *agent.Agent, childID string) (string, bool)
+	// ReviveChild reopens one of the caller's SAVED nested sessions as a live
+	// runtime so a send_message can reach it again (after its retention
+	// window, an eviction, or a restart — the live registry is process-local,
+	// the session is not). It must keep the session's id, restore its parent
+	// link, and refuse (ok=false, no error) when the store has no such child
+	// OR it belongs to another parent: the caller-ownership check is the same
+	// boundary PersistedResult applies. Returning ok=false *and* an error is
+	// redundant; an error means "the store had it but could not open it".
+	ReviveChild(caller *agent.Agent, childID string) (nc NewChild[H], ok bool, err error)
 	// PersistedChildren returns the caller's SAVED nested (subagent)
 	// sessions, newest first — the children whose runtime is not live
 	// (released, evicted, or from a previous process). The lifecycle drops
