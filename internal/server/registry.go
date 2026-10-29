@@ -135,7 +135,8 @@ type sessionRuntime struct {
 	// queue, one drain path. The queue itself (item kinds, caps, eviction and
 	// batching policy, slot zeroing) is internal/steerq, shared with the TUI;
 	// it is NOT internally synchronized, so every access below is made under
-	// deliverMu. A delivered item's deliverSource travels in Item.Tag.
+	// deliverMu. The item kind (steerq.User / Notice / Reply) is the only
+	// per-delivery state this host records; see deliver.go.
 	deliverMu      sync.Mutex
 	pendingDeliver *steerq.Queue
 	deliverWorker  atomic.Bool
@@ -147,8 +148,8 @@ type sessionRuntime struct {
 	joinQueued func() bool
 
 	// deliverStartHook is invoked by the delivery worker immediately before
-	// it starts a delivered turn (see deliver.go) — for a send_message
-	// delivery ONLY (deliverFromChildMessage). It arms the child's per-run
+	// it starts a delivered turn (see deliver.go) — for a targeted
+	// send_message delivery ONLY (steerq.Reply). It arms the child's per-run
 	// reply capture exactly when that delivery starts, not when it was queued.
 	// Set once at child creation; never reassigned.
 	deliverStartHook func()
@@ -212,7 +213,7 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 		clients:        make(map[*wsConn]struct{}),
 		passive:        make(map[*wsConn]struct{}),
 		deliverNotify:  make(chan struct{}, 1),
-		pendingDeliver: steerq.New(maxUserQueueCap, maxSystemDeliveryQueue),
+		pendingDeliver: steerq.NewDefault(),
 		turnRelease:    make(chan struct{}),
 		joinQueued:     func() bool { return false },
 	}

@@ -7,10 +7,11 @@ import (
 // seedDeliveries replaces the runtime's delivery queue with items, so tests can
 // install queue contents directly instead of driving the enqueue paths (which
 // validate client ids, notify the worker, and broadcast).
-func seedDeliveries(rt *sessionRuntime, items ...deliverItem) {
-	q := steerq.New(maxUserQueueCap, maxSystemDeliveryQueue)
+func seedDeliveries(rt *sessionRuntime, items ...steerq.Item) {
+	q := steerq.NewDefault()
 	for _, it := range items {
-		q.ForceAppend(deliverItemFrom(it.ID, it.Text, it.Kind, it.Source, it.Images))
+		// Seed directly: the cap policy must not refuse fixtures.
+		q.ForceAppend(it)
 	}
 	rt.deliverMu.Lock()
 	rt.pendingDeliver = q

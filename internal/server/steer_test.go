@@ -238,7 +238,7 @@ func TestUserQueueCapRejects(t *testing.T) {
 	rt, _ := s.registry.get(a.SessionID)
 
 	startBlockedTurn(t, rt, stub, "block me")
-	for i := 0; i < maxUserQueueCap; i++ {
+	for i := 0; i < steerq.UserCap; i++ {
 		if !rt.enqueueUserTurn("", "steer-"+string(rune('a'+i)), nil) {
 			t.Fatalf("enqueue %d refused before cap", i)
 		}
@@ -246,17 +246,17 @@ func TestUserQueueCapRejects(t *testing.T) {
 	if rt.enqueueUserTurn("", "one too many", nil) {
 		t.Fatal("enqueue past the user cap must be refused")
 	}
-	if got := rt.countUser(); got != maxUserQueueCap {
-		t.Fatalf("countUser = %d, want %d", got, maxUserQueueCap)
+	if got := rt.countUser(); got != steerq.UserCap {
+		t.Fatalf("countUser = %d, want %d", got, steerq.UserCap)
 	}
 	rt.stream.cancelInFlight()
 	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
 	// Tear down cleanly: release every queued turn and wait for the LAST
 	// one's final flush so nothing races the TempDir teardown.
-	for i := 2; i <= maxUserQueueCap+1; i++ {
+	for i := 2; i <= steerq.UserCap+1; i++ {
 		stub.releaseN(i)
 	}
-	waitTurnsPersisted(t, store, dir, a.SessionID, maxUserQueueCap)
+	waitTurnsPersisted(t, store, dir, a.SessionID, steerq.UserCap)
 }
 
 // TestCancelClearsUserQueueKeepsSystem pins the interrupt semantics:
@@ -331,17 +331,17 @@ func TestRemoveQueuedItem(t *testing.T) {
 func TestSystemOverflowSparesUserItems(t *testing.T) {
 	rt := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
 	rt.deliverWorker.Store(true) // no worker goroutine: the queue stays put
-	for i := 0; i < maxUserQueueCap; i++ {
+	for i := 0; i < steerq.UserCap; i++ {
 		if !rt.enqueueUserTurn("", "user-"+string(rune('a'+i)), nil) {
 			t.Fatalf("user enqueue %d refused", i)
 		}
 	}
-	for i := 0; i < maxSystemDeliveryQueue+2; i++ {
+	for i := 0; i < steerq.SystemCap+2; i++ {
 		rt.deliverToSession("sys-" + string(rune('a'+i)))
 	}
 	// Every user item survives the system burst.
-	if got := rt.countUser(); got != maxUserQueueCap {
-		t.Fatalf("countUser = %d after system overflow, want %d (user items must not be dropped)", got, maxUserQueueCap)
+	if got := rt.countUser(); got != steerq.UserCap {
+		t.Fatalf("countUser = %d after system overflow, want %d (user items must not be dropped)", got, steerq.UserCap)
 	}
 	// System items are bounded at the cap.
 	sys := 0
@@ -350,8 +350,8 @@ func TestSystemOverflowSparesUserItems(t *testing.T) {
 			sys++
 		}
 	}
-	if sys != maxSystemDeliveryQueue {
-		t.Fatalf("queued system items = %d, want %d", sys, maxSystemDeliveryQueue)
+	if sys != steerq.SystemCap {
+		t.Fatalf("queued system items = %d, want %d", sys, steerq.SystemCap)
 	}
 }
 
@@ -513,7 +513,7 @@ func TestSteerQueueFullRevokesOptimisticBubble(t *testing.T) {
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
 
 	startBlockedTurn(t, rt, stub, "block me")
-	for i := 0; i < maxUserQueueCap; i++ {
+	for i := 0; i < steerq.UserCap; i++ {
 		if !rt.enqueueUserTurn("", "fill-"+string(rune('a'+i)), nil) {
 			t.Fatalf("enqueue %d refused before the cap", i)
 		}
@@ -540,8 +540,8 @@ func TestSteerQueueFullRevokesOptimisticBubble(t *testing.T) {
 		t.Fatalf("rejection queueId = %q, want the refused send's q-phantom", resp.QueueID)
 	}
 	qu := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "queue_update" })
-	if len(qu.Queue) != maxUserQueueCap {
-		t.Fatalf("queue_update queue = %d items, want the unchanged %d", len(qu.Queue), maxUserQueueCap)
+	if len(qu.Queue) != steerq.UserCap {
+		t.Fatalf("queue_update queue = %d items, want the unchanged %d", len(qu.Queue), steerq.UserCap)
 	}
 	for _, it := range qu.Queue {
 		if it.ID == "q-phantom" {
@@ -554,10 +554,10 @@ func TestSteerQueueFullRevokesOptimisticBubble(t *testing.T) {
 	// Drain the queue so the blocked turn's followers land before teardown.
 	rt.stream.cancelInFlight()
 	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "fill-a") >= 0 })
-	for i := 2; i <= maxUserQueueCap+1; i++ {
+	for i := 2; i <= steerq.UserCap+1; i++ {
 		stub.releaseN(i)
 	}
-	waitTurnsPersisted(t, store, dir, a.SessionID, maxUserQueueCap)
+	waitTurnsPersisted(t, store, dir, a.SessionID, steerq.UserCap)
 }
 
 // TestBusyRejectionEchoesQueueID pins that a command refused because another

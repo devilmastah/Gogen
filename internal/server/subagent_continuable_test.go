@@ -316,7 +316,7 @@ func TestSendMessageQueueFullRefuses(t *testing.T) {
 		active, _ := child.Handle.turnState()
 		return active
 	})
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
+	for i := 0; i < steerq.SystemCap; i++ {
 		if err := sp.SendMessage(a, id, fmt.Sprintf("queued-%d", i)); err != nil {
 			t.Fatalf("send %d refused before the cap: %v", i, err)
 		}
@@ -360,7 +360,7 @@ func TestSessionRuntimeQuiescentCoversDeliveryHandoff(t *testing.T) {
 	}
 
 	// A queued delivery alone is enough to hold the answer at "no".
-	seedDeliveries(rt, deliverItem{ID: newQueueItemID(), Text: "notice", Kind: deliverSystem, Source: deliverFromSystem})
+	seedDeliveries(rt, steerq.Item{ID: steerq.NewID(), Text: "notice", Kind: steerq.Notice})
 	if sessionRuntimeQuiescent(rt) {
 		t.Fatal("a runtime with a queued delivery must not read quiescent")
 	}

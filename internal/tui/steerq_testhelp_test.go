@@ -5,7 +5,7 @@ import "gogen/internal/steerq"
 // testQueue builds a steering queue already holding items, so tests can
 // install queue contents directly instead of driving the enqueue paths.
 func testQueue(items ...steerq.Item) *steerq.Queue {
-	q := steerq.New(maxSteerUserQueue, maxPendingDeliveries)
+	q := steerq.NewDefault()
 	for _, it := range items {
 		// Seed directly: the cap policy must not refuse fixtures.
 		q.ForceAppend(it)

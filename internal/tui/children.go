@@ -531,7 +531,7 @@ func (m *Model) handleChildMessageMsg(msg childMessageMsg) (tea.Model, tea.Cmd) 
 	// the shared queue refuses only when the system cap is already full of
 	// replies.
 	if outcome, evicted := s.queue().Append(steerq.Item{
-		ID: newSteerItemID(), Text: msg.text, Kind: steerq.Reply, Tag: h,
+		ID: steerq.NewID(), Text: msg.text, Kind: steerq.Reply, Tag: h,
 	}); outcome != steerq.Accepted {
 		msg.ack <- childMessageAck{ok: false, full: true}
 		return m, nil

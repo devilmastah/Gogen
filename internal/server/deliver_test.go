@@ -189,15 +189,15 @@ func TestDeliverQueueOverflow(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocking turn never entered the provider")
 	}
-	for i := 1; i <= maxSystemDeliveryQueue+1; i++ {
+	for i := 1; i <= steerq.SystemCap+1; i++ {
 		rt.deliverToSession(fmt.Sprintf("notice-%d", i))
 	}
 	// End the blocking turn: the worker wakes at turn end and drains the
 	// surviving run (2..cap+1 — notice-1 was dropped by the overflow) as
 	// ONE joined turn.
 	rt.stream.cancelInFlight()
-	want := make([]string, 0, maxSystemDeliveryQueue)
-	for i := 2; i <= maxSystemDeliveryQueue+1; i++ {
+	want := make([]string, 0, steerq.SystemCap)
+	for i := 2; i <= steerq.SystemCap+1; i++ {
 		want = append(want, fmt.Sprintf("notice-%d", i))
 	}
 	expected := strings.Join(want, "\n\n")
@@ -232,9 +232,9 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 		agent:         &agent.Agent{},
 		deliverNotify: make(chan struct{}, 1),
 	}
-	stale := make([]deliverItem, 0, maxSystemDeliveryQueue)
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
-		stale = append(stale, deliverItem{ID: newQueueItemID(), Text: "stale", Kind: deliverSystem})
+	stale := make([]steerq.Item, 0, steerq.SystemCap)
+	for i := 0; i < steerq.SystemCap; i++ {
+		stale = append(stale, steerq.Item{ID: steerq.NewID(), Text: "stale", Kind: steerq.Notice})
 	}
 	seedDeliveries(rt, stale...)
 	// No worker goroutine for this unit test: the queue stays at cap so the
@@ -265,8 +265,8 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 	if n > 0 {
 		last = q[n-1].Text
 	}
-	if n != maxSystemDeliveryQueue || last != "overflow notice" {
-		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last, maxSystemDeliveryQueue)
+	if n != steerq.SystemCap || last != "overflow notice" {
+		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last, steerq.SystemCap)
 	}
 }
 
@@ -492,7 +492,7 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 	rt.deliverWorker.Store(true) // no worker goroutine: the queue stays put
 
 	// Notice slots full: a targeted delivery evicts the oldest notice.
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
+	for i := 0; i < steerq.SystemCap; i++ {
 		rt.deliverToSession(fmt.Sprintf("notice-%d", i))
 	}
 	if ok, full := rt.deliverChildMessage("targeted-1"); !ok || full {
@@ -504,19 +504,19 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 			continue
 		}
 		nSys++
-		if it.Tag == deliverSource(deliverFromSystem) {
+		if it.Kind == steerq.Notice {
 			nNotice++
 		}
 	}
-	if nSys != maxSystemDeliveryQueue || nNotice != maxSystemDeliveryQueue-1 {
+	if nSys != steerq.SystemCap || nNotice != steerq.SystemCap-1 {
 		t.Fatalf("after targeted enqueue: system=%d notices=%d, want %d/%d (oldest notice evicted)",
-			nSys, nNotice, maxSystemDeliveryQueue, maxSystemDeliveryQueue-1)
+			nSys, nNotice, steerq.SystemCap, steerq.SystemCap-1)
 	}
 
 	// All-targeted full: the next targeted delivery is REFUSED...
 	rt2 := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
 	rt2.deliverWorker.Store(true)
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
+	for i := 0; i < steerq.SystemCap; i++ {
 		if ok, full := rt2.deliverChildMessage(fmt.Sprintf("targeted-%d", i)); !ok || full {
 			t.Fatalf("targeted enqueue %d refused before the cap (ok=%v full=%v)", i, ok, full)
 		}
@@ -538,7 +538,7 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 			nTargeted++
 		}
 	}
-	if n != maxSystemDeliveryQueue || nTargeted != maxSystemDeliveryQueue {
-		t.Fatalf("queue = %d items (%d targeted), want all %d targeted preserved", n, nTargeted, maxSystemDeliveryQueue)
+	if n != steerq.SystemCap || nTargeted != steerq.SystemCap {
+		t.Fatalf("queue = %d items (%d targeted), want all %d targeted preserved", n, nTargeted, steerq.SystemCap)
 	}
 }
