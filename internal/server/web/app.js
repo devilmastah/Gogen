@@ -1480,7 +1480,7 @@
             now.title = 'Stop at the next round and send the queue';
             now.addEventListener('click', (ev) => {
                 ev.stopPropagation();
-                sendQueuedNow(qid);
+                sendQueuedNow(qid, now);
             });
             el.appendChild(now);
             const rm = document.createElement('button');
@@ -1502,14 +1502,64 @@
         function refreshQueuedSendNow(pane) {
             const bubbles = pane && pane.queuedBubbles;
             if (!bubbles) return;
-            let last = null;
+            const buttons = [];
             for (const el of bubbles.values()) {
                 const btn = el.querySelector(':scope > .queue-send-btn');
                 if (!btn) continue;
                 btn.hidden = true;
-                last = btn;
+                buttons.push(btn);
+            }
+            const last = buttons[buttons.length - 1];
+            // A pending "Sending…" belongs to the button the user pressed. If
+            // a new item took that place, the old request is about an item that
+            // is no longer the queue's head: stop claiming it is sending rather
+            // than leave the spinner waiting forever behind the new one.
+            for (const btn of buttons) {
+                if (btn !== last) setSendNowPending(btn, false);
             }
             if (last) last.hidden = false;
+        }
+
+        // Send now has no success frame: the proof it worked is the
+        // queue_update that STARTS the message (its chip and this button leave
+        // with it). Until then the click would change nothing on screen while
+        // the turn finishes the round it is in — which can be minutes when that
+        // round is running a command. So the button says it is waiting, and the
+        // frames that prove otherwise take it back: a refusal ("queue" notice),
+        // the item starting, the item being removed, a newer item taking the
+        // button, or the timeout below (a lost frame must not leave a spinner
+        // spinning for the rest of the session).
+        const SEND_NOW_PENDING_MS = 120000;
+
+        function setSendNowPending(btn, pending) {
+            if (!btn) return;
+            if (btn._pendingTimer) {
+                clearTimeout(btn._pendingTimer);
+                btn._pendingTimer = null;
+            }
+            if (!btn.isConnected) return;
+            btn.classList.toggle('pending', pending);
+            // Disabled while pending, exactly like the sidebar's button: the
+            // yield is recorded once, so a second click has nothing to do.
+            btn.disabled = pending;
+            if (!pending) {
+                btn.textContent = 'Send now';
+                btn.removeAttribute('aria-busy');
+                return;
+            }
+            btn.textContent = 'Sending…';
+            btn.setAttribute('aria-busy', 'true');
+            btn._pendingTimer = setTimeout(() => setSendNowPending(btn, false), SEND_NOW_PENDING_MS);
+        }
+
+        /** Clear the pending state a refused send now must not keep. */
+        function clearSendNowPending(pane) {
+            const bubbles = pane && pane.queuedBubbles;
+            if (!bubbles) return;
+            for (const el of bubbles.values()) {
+                const btn = el.querySelector(':scope > .queue-send-btn');
+                if (btn && btn.classList.contains('pending')) setSendNowPending(btn, false);
+            }
         }
 
         /** Clear the queued mark (chip + ✕) — the item's turn has started. */
@@ -1529,10 +1579,13 @@
         // and then deliver the queue, in its order. qid is the bubble the
         // button is on: the server ignores the request once that item has
         // left the queue, so a late click cannot stop the turn it started.
-        function sendQueuedNow(qid) {
+        // btn (optional) shows the wait, since an accepted request produces no
+        // frame of its own.
+        function sendQueuedNow(qid, btn) {
             const pane = activePane();
             if (!ws || ws.readyState !== WebSocket.OPEN || !pane || !pane.id) return;
             ws.send(JSON.stringify({ type: 'queue_send_now', queueId: qid, sessionId: pane.id }));
+            setSendNowPending(btn, true);
         }
 
         /**
@@ -6321,6 +6374,9 @@
             // A refused mcp_save must drop its pending "Saving…" line: the
             // error itself is the toast above.
             if (data.kind === 'mcp') noteMCPOpFailed();
+            // A refused send now must stop the button claiming it is sending;
+            // the toast above is the reason it stopped.
+            if (data.kind === 'queue') clearSendNowPending(activePane());
         }
 
         function sendMessage() {

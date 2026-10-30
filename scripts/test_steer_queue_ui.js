@@ -121,6 +121,21 @@ async function main() {
   const yielded = ws.sent.filter((m) => m.type === 'queue_send_now').pop();
   check('Send now asks the server to yield this session', !!yielded && yielded.sessionId === 'A');
   check('Send now names the queued item', !!yielded && yielded.queueId === sent.queueId);
+  // An accepted request produces no frame of its own (the proof it worked is
+  // the queue_update that starts the item), so the button reports the wait.
+  check('Send now shows that it is waiting',
+    sendNow.classList.contains('pending') && sendNow.getAttribute('aria-busy') === 'true'
+      && sendNow.textContent === 'Sending\u2026' && sendNow.disabled);
+  // A refused request answers with a "queue" notice: the button must not keep
+  // claiming it is sending.
+  recv({ type: 'notice', sessionId: 'A', kind: 'queue', success: false, content: 'No turn is running.' });
+  check('a refused Send now takes the pending state back',
+    !sendNow.classList.contains('pending') && sendNow.getAttribute('aria-busy') === null
+      && sendNow.textContent === 'Send now' && !sendNow.disabled);
+  // Ask once more, so the drain below proves the indicator stops when the
+  // message actually runs.
+  sendNow.click();
+  check('Send now can be asked again after a refusal', sendNow.classList.contains('pending'));
   check('pane mirror carries the queued item', evalJs('activePane().queueItems.length') === 1);
 
   // 3. A user_acked must not stamp a still-queued bubble: with the local
@@ -143,6 +158,11 @@ async function main() {
   const steered = userBubbles().find((el) => el.textContent.includes('steered msg'));
   const plain = userBubbles().find((el) => el.textContent.includes('plain msg'));
   check('drained item is no longer marked queued', !!steered && !steered.classList.contains('queued'));
+  // The indicator's lifetime is exactly the wait: it leaves with the chip when
+  // the message starts, so nothing has to fire later to clear it.
+  check('the pending indicator is gone once the message starts',
+    !!steered && !steered.querySelector('.queue-send-btn')
+      && evalJs('document.querySelectorAll(".queue-send-btn.pending").length') === 0);
   check('drained item got the ack history index', !!steered && steered.dataset.histIdx === '1');
   check('still-queued bubble was NOT stamped', !!plain && plain.dataset.histIdx === undefined);
   check('still-queued bubble keeps its chip', !!plain && plain.classList.contains('queued'));
