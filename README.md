@@ -403,7 +403,8 @@ usually together with smart compact:
   and this layout cannot shrink it enough (for example, the request itself
   is most of the window), compaction uses the single summary instead, which
   summarizes the request with the rest. That happens when the estimate is
-  close to the limit. After the provider refused a request, deep dive
+  at or over the context window, and, in the emergency tier, when the total
+  is at or above the hard limit. After the provider refused a request, deep dive
   summarizes the request in that one pass: the provider's count is what did
   not fit, and the local estimate is usually still under the window. Below
   the limit, a large request stays verbatim.

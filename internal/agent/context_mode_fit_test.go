@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -275,8 +278,8 @@ func TestNormalTierOverHardLimitKeepsRequest(t *testing.T) {
 
 // TestEmergencyBelowHardLimitKeepsRequest pins the hard-limit gate on its
 // own. The tier is emergency, but the total stays under the hard limit, so
-// the request stays verbatim. Removing the hard-limit condition would
-// summarize it.
+// the request stays verbatim and no failure is recorded. The budget belongs
+// to the normal tier. Removing the hard-limit stop would arm the backoff.
 func TestEmergencyBelowHardLimitKeepsRequest(t *testing.T) {
 	a, ctxMgr, _ := newEmergencyTestAgent(t, false)
 	big := strings.Repeat("x", 100000)
@@ -289,5 +292,101 @@ func TestEmergencyBelowHardLimitKeepsRequest(t *testing.T) {
 	}
 	if total := a.compactionTokenTotal(); total < budget || total >= hard {
 		t.Fatalf("test setup: total %d left [budget %d, hard limit %d) before the fallback check", total, budget, hard)
+	}
+	if backoff, guard := compactState(a); !backoff.IsZero() || guard != 0 {
+		t.Fatalf("recorded a failure under the hard limit: backoff %v guard %d", backoff, guard)
+	}
+}
+
+// TestEmergencyFallbackSkipsSingleSummary pins that the emergency fallback
+// does not run when the history is already the single summary. The head is
+// the request, so there is no progress summary after it. Another pass would
+// fail the minimum-size guard and replace this loop's diagnostic.
+func TestEmergencyFallbackSkipsSingleSummary(t *testing.T) {
+	a, ctxMgr, provider := newEmergencyTestAgent(t, false)
+	a.SetDeepDive(true)
+	big := strings.Repeat("x", 120000)
+	a.appendMessage(llm.Message{Role: "user", Content: big})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("y", 8000)})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("z", 8000)})
+	_ = a.ContextStats(context.Background())
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	a.compactToFit(context.Background(), nil, cachedCounts(t, a), 0, true)
+	logged := buf.String()
+	if !strings.Contains(logged, "still over budget") {
+		t.Fatalf("log %q, want the loop's own failure", logged)
+	}
+	if strings.Contains(logged, "not enough history") {
+		t.Fatalf("the fallback replaced the diagnostic: %s", logged)
+	}
+	if !hasContent(a.Messages, big) {
+		t.Fatal("the head was summarized")
+	}
+	if total := a.compactionTokenTotal(); total < ctxMgr.HardLimit() {
+		t.Fatalf("test setup: total %d under the hard limit, so the fallback was not reached", total)
+	}
+	if n := atomic.LoadInt64(&provider.calls); n != 1 {
+		t.Fatalf("summarizer calls = %d, want the one layout pass", n)
+	}
+}
+
+// TestOverflowShrinkStillOverErrorMode pins the master-path change in
+// compact_last_resort=error: compaction shrank the history, the estimate is
+// still over the window, and the turn gets the actionable diagnostic
+// instead of a retry.
+func TestOverflowShrinkStillOverErrorMode(t *testing.T) {
+	a, ctxMgr, _ := newEmergencyTestAgent(t, false)
+	s := ctxMgr.SettingsSnapshot()
+	s.CompactLastResort = "error"
+	ctxMgr.UpdateSettings(s)
+	big := strings.Repeat("x", 300000)
+	a.appendMessage(llm.Message{Role: "user", Content: big})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("y", 8000)})
+	a.appendMessage(llm.Message{Role: "assistant", Content: "ok"})
+	_ = a.ContextStats(context.Background())
+
+	retry, err := a.handleOverflowError(context.Background(), nil, llm.ErrContextWindowExceeded)
+	if retry || err == nil || !strings.Contains(err.Error(), "shorten it or start a fresh session") {
+		t.Fatalf("retry = %v, err = %v; want the error-mode diagnostic", retry, err)
+	}
+	if !hasContent(a.Messages, big) {
+		t.Fatal("error mode condensed the head")
+	}
+}
+
+// TestPreflightFallbackSignalsCompacting pins that the second summarizer
+// pass tells the UI it is compacting, the same way the first pass does.
+func TestPreflightFallbackSignalsCompacting(t *testing.T) {
+	a, _, _ := newEmergencyTestAgent(t, false)
+	big := strings.Repeat("x", 300000)
+	seedDominantRequest(a, big, strings.Repeat("y", 8000))
+	var n atomic.Int32
+	h := &llm.StreamHandlers{OnCompacting: func() { n.Add(1) }}
+	if !a.runForcedSummarization(context.Background(), h, false) {
+		t.Fatal("expected the history to shrink")
+	}
+	if got := n.Load(); got != 2 {
+		t.Fatalf("OnCompacting fired %d times, want 2", got)
+	}
+}
+
+// TestLayoutKeptRequestRequiresProgressAfterLatestRequest pins the
+// predicate: a progress summary counts only when it follows the latest
+// request.
+func TestLayoutKeptRequestRequiresProgressAfterLatestRequest(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: contextmgr.ProgressSummaryPrefix + "old"},
+		{Role: "user", Content: "later"},
+	}
+	if layoutKeptRequest(msgs) {
+		t.Fatal("a progress summary before the latest request is not the layout")
+	}
+	msgs = append(msgs, llm.Message{Role: "assistant", Content: contextmgr.ProgressSummaryPrefix + "now"})
+	if !layoutKeptRequest(msgs) {
+		t.Fatal("a progress summary after the latest request is the layout")
 	}
 }

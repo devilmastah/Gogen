@@ -428,8 +428,9 @@ func (a *Agent) capToolResultsForTurn() bool {
 // provider already refused, and the local estimate is usually still under
 // the window, which is why pre-flight did not compact. Pre-flight passes
 // false. When that layout keeps the request verbatim and the rebuilt view
-// is still over the window, one more pass summarizes the request, and a
-// failure of that pass is recorded like this path's own failures. It
+// is still over the window, one more pass summarizes the request and fires
+// OnCompacting again. A failure of that pass is recorded like this path's
+// own failures. It
 // returns true when the history was strictly shrunk and republished.
 func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandlers, singleSummary bool) bool {
 	if h != nil && h.OnCompacting != nil {
@@ -450,7 +451,7 @@ func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandler
 		return false
 	}
 	if !singleSummary {
-		if err := a.summarizeKeptRequest(ctx); err != nil {
+		if err := a.summarizeKeptRequest(ctx, h); err != nil {
 			log.Printf("forced compaction: single-summary fallback failed: %v", err)
 			a.noteCompactFailure(err)
 			a.noteProgressFailure(&a.compactionGuards.emergency)
@@ -462,10 +463,11 @@ func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandler
 // summarizeKeptRequest is the pre-flight fit fallback. When the deep-dive
 // layout kept the request verbatim and the rebuilt view is still over the
 // window, one single-summary pass summarizes the request with the rest. A
-// result that is already the single summary (no progress summary) is left
-// alone: another pass would only re-summarize that summary. A summarizer
-// failure is returned for the caller to record.
-func (a *Agent) summarizeKeptRequest(ctx context.Context) error {
+// result that is already the single summary is left alone: another pass
+// would only re-summarize that summary. It fires h.OnCompacting again,
+// because this pass is a second summarizer call. A summarizer failure is
+// returned for the caller to record.
+func (a *Agent) summarizeKeptRequest(ctx context.Context, h *llm.StreamHandlers) error {
 	if !a.Context.DeepDive() {
 		return nil
 	}
@@ -473,15 +475,29 @@ func (a *Agent) summarizeKeptRequest(ctx context.Context) error {
 	if limit <= 0 || a.outgoingViewEstimate(a.rebuildView()) < limit || !layoutKeptRequest(a.Messages) {
 		return nil
 	}
+	if h != nil && h.OnCompacting != nil {
+		h.OnCompacting()
+	}
 	_, err := a.compactSingleSummary(ctx, true)
 	return err
 }
 
-// layoutKeptRequest reports whether a deep-dive compaction kept the current
-// request verbatim. That result carries a progress summary. The single
-// summary, used when the request is the head or sits in the tail, does not.
+// layoutKeptRequest reports whether a deep-dive compaction kept the latest
+// request verbatim. That result has a progress summary after the latest
+// request. A progress summary anywhere earlier is not that shape, and the
+// single summary, used when the request is the head or sits in the tail,
+// has none.
 func layoutKeptRequest(msgs []llm.Message) bool {
-	for _, m := range msgs {
+	req := -1
+	for i, m := range msgs {
+		if contextmgr.IsRequest(m) {
+			req = i
+		}
+	}
+	if req < 0 {
+		return false
+	}
+	for _, m := range msgs[req+1:] {
 		if strings.HasPrefix(m.Content, contextmgr.ProgressSummaryPrefix) {
 			return true
 		}
@@ -894,9 +910,18 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 		// pins become the next pass's input.
 		counts = a.publishCompaction(compacted, newPins)
 		pinned = newPins
-		// Re-measure: stop as soon as the post-compaction request fits.
+		// fits is this tier's goal. The normal tier stops at the budget.
+		// The emergency tier stops at the hard limit: the budget belongs
+		// to the normal tier, and a failure recorded here would arm the
+		// backoff and suppress that tier.
+		fits := func(total int) bool {
+			if budget <= 0 || total < budget {
+				return true
+			}
+			return emergency && total < a.Context.HardLimit()
+		}
 		total := a.compactionTokenTotal()
-		if budget <= 0 || total < budget {
+		if fits(total) {
 			return
 		}
 		if i == len(keeps)-1 {
@@ -904,7 +929,10 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 			// history and still leave a request that is most of the window
 			// verbatim. The emergency tier exists to get under the hard
 			// limit, so it summarizes the request too before giving up.
-			if emergency && a.Context.DeepDive() && total >= a.Context.HardLimit() {
+			// A history that is already the single summary is left to the
+			// failure below: another pass would only re-summarize it, and
+			// the minimum-size refusal would replace this loop's diagnostic.
+			if emergency && a.Context.DeepDive() && layoutKeptRequest(a.Messages) {
 				shrank, err := a.compactSingleSummary(ctx, false)
 				if err != nil {
 					a.noteCompactFailure(err)
@@ -912,13 +940,14 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 					return
 				}
 				if shrank {
-					if total = a.compactionTokenTotal(); total < budget {
+					total = a.compactionTokenTotal()
+					if fits(total) {
 						return
 					}
 				}
 			}
-			// Exhausted the shrinking-tail sequence and the request is
-			// still over budget: give up into the failure backoff so the
+			// Exhausted the shrinking-tail sequence and this tier's goal
+			// is still missed: give up into the failure backoff so the
 			// next turn does not immediately repeat the whole sequence.
 			a.noteCompactFailure(fmt.Errorf("still over budget after %d compaction passes (%d tokens, budget %d)", i+1, total, budget))
 			return

@@ -31,7 +31,20 @@ jobs:
       - name: Tidy
         run: go mod tidy -diff
       - name: Test
-        run: go test -race ./...
+        run: |
+          set -o pipefail
+          go test -race ./... 2>&1 | tee go-test.log
+      # A failing test names itself on stdout, but reading a job log needs
+      # repository admin: a pull request's author (or a fork) cannot see it.
+      # Re-emit the failure lines as annotations, which the checks API serves
+      # to anyone. The Windows job does the same.
+      - name: Report failing tests
+        if: failure()
+        run: |
+          test -f go-test.log || exit 0
+          grep -A2 -E '^--- FAIL' go-test.log | head -30 | while IFS= read -r line; do
+            echo "::error title=go test::$(printf '%s' "$line" | tr -d '\r')"
+          done
       # Debug-tagged sources (view-drift, profiling, WS stall knobs) only
       # compile under -tags debug, so this re-run is the sole CI signal that
       # they still build and pass. Keep it Linux-only: the normal Test step
