@@ -152,7 +152,7 @@ export function slashKeydown(e) {
     return false;
 }
 
-// ── Attachments (vision input + dropped text context) ──
+// ── Attachments (vision input + text context) ──
 // Image limits mirror the server's (internal/server/server.go
 // validateImageInputs). The attachment-count cap is shared across both
 // kinds; images additionally ride the payload's images array (max 4
@@ -193,7 +193,7 @@ function addImageAttachment(file) {
     reader.readAsDataURL(file);
 }
 
-// ── Text/code files (dropped only — the picker stays image-only) ──
+// ── Text/code files ──
 // Attached as context: read as UTF-8 and inlined into the outgoing
 // message content by composeMessageContent. The server's wire format
 // only carries image attachments separately, so text rides inside the
@@ -213,6 +213,17 @@ const TEXT_MIME_PREFIXES = [
     'application/x-yaml', 'application/yaml', 'application/toml',
     'application/x-sh', 'application/graphql',
 ];
+// MIME types that say nothing about the content. The OS reports these for
+// code files it has no association for (a Windows registry without a
+// Content Type, a network share, a mail client, a stripped-down file
+// manager), so they are treated exactly like an empty type and the
+// extension table decides — which is what the picker's accept hint
+// promises the user.
+const GENERIC_MIME_TYPES = new Set([
+    'application/octet-stream',
+    'application/unknown',
+    'binary/octet-stream',
+]);
 // Extensions accepted when the OS reports no MIME type. Includes
 // extension-less dotfiles and bare names ("Makefile", ".gitignore").
 const TEXT_EXTENSIONS = new Set([
@@ -238,8 +249,8 @@ function fileNameExtension(name) {
 }
 
 function isTextFile(file) {
-    const type = String(file.type || '');
-    if (type) {
+    const type = String(file.type || '').toLowerCase();
+    if (type && !GENERIC_MIME_TYPES.has(type)) {
         for (const prefix of TEXT_MIME_PREFIXES) {
             if (type.startsWith(prefix)) return true;
         }
@@ -359,38 +370,59 @@ function renderAttachmentPreview() {
     }
 }
 
+// The picker's accept hint, derived from the same tables the routing below
+// uses: images first (the dialog's default filter follows the first entry,
+// and a screenshot is still the common case), then every text/code MIME and
+// extension. It is a hint, not the contract — the routing decides, and
+// isTextFile also accepts a generic OS type by extension, so a code file the
+// OS mislabels as application/octet-stream is attached, not refused.
+// Extension-less names ("Makefile") match neither arm, so the dialog's "all
+// files" escape hatch (or a drop) still routes them correctly through
+// addFiles.
+imageUpload.accept = ['image/*']
+    .concat(TEXT_MIME_PREFIXES.map((t) => (t.endsWith('/') ? t + '*' : t)))
+    .concat([...TEXT_EXTENSIONS].map((ext) => '.' + ext))
+    .join(',');
+
 attachBtn.addEventListener('click', () => {
     imageUpload.click();
 });
 imageUpload.addEventListener('change', () => {
-    for (const file of imageUpload.files || []) {
-        addImageAttachment(file);
-    }
+    // Same router as a drop (addFiles): a pick that is not attachable is
+    // rejected with a toast instead of being dropped silently — the old
+    // image-only handler made picking a text document look like a broken
+    // upload (no chip, no error).
+    addFiles(imageUpload.files || []);
     imageUpload.value = '';
 });
-// Paste an image (or a file with an image MIME type) straight into
-// the composer; text pastes behave exactly as before.
+// Paste an image or a text/code file straight into the composer; text
+// pastes behave exactly as before (they arrive as kind === 'string').
+//
+// The paste is claimed only when at least one item will actually be
+// attached: a clipboard that carries both text and a refused file (a PDF
+// copied out of a mail client, an attachment from a file manager) must keep
+// its native text paste instead of turning into a rejection toast. Files
+// that share the paste with an attachable one still get their toast —
+// addFiles reports every item it cannot use.
 inputArea.addEventListener('paste', (e) => {
     const items = (e.clipboardData && e.clipboardData.items) || [];
-    let handled = false;
+    const files = [];
     for (const item of items) {
-        if (item.kind === 'file' && item.type && item.type.startsWith('image/')) {
-            const f = item.getAsFile();
-            if (f) {
-                addImageAttachment(f);
-                handled = true;
-            }
-        }
+        if (item.kind !== 'file') continue;
+        const f = item.getAsFile();
+        if (f) files.push(f);
     }
-    if (handled) e.preventDefault();
+    if (!files.some(isAttachable)) return;
+    e.preventDefault();
+    addFiles(files);
 });
 
 // ── Drag-and-drop attachments ──
 // Dropping files anywhere on the composer row (#input-area) attaches
-// them: images take the exact picker/paste path (same limits), text and
-// code files attach as context (see addTextAttachment). Only drags that
-// actually carry files are claimed — dragging a text selection onto the
-// textarea keeps the browser's native insert-on-drop.
+// them through the same addFiles router as the picker and paste, so all
+// three entry points share the limits and the rejections. Only drags
+// that actually carry files are claimed — dragging a text selection onto
+// the textarea keeps the browser's native insert-on-drop.
 
 // `types` includes the literal "Files" token whenever the drag carries
 // file system items (OS file manager, attachments from other apps).
@@ -403,7 +435,20 @@ function dragHasFiles(e) {
     return false;
 }
 
-function addDroppedFiles(files) {
+// isAttachable reports whether addFiles has a path for `file`. The per-kind
+// size caps are NOT part of it: those report their own toast, and a paste of
+// one oversized image is still the user asking to attach an image (claiming
+// it is what the pre-router handler did).
+function isAttachable(file) {
+    if (!file) return false;
+    if (file.type && file.type.startsWith('image/')) return true;
+    return isTextFile(file);
+}
+
+// One file list → the right attachment path, shared by the picker, the
+// paste handler and the drop zone so all three accept the same kinds and
+// report the same rejections.
+function addFiles(files) {
     for (const file of files) {
         if (!file) continue;
         if (file.type && file.type.startsWith('image/')) {
@@ -411,11 +456,21 @@ function addDroppedFiles(files) {
         } else if (isTextFile(file)) {
             addTextAttachment(file);
         } else {
-            deps.showToast(
-                `"${file.name}" was not attached — only images and text/code files are supported`,
-                'error');
+            deps.showToast(unsupportedAttachmentMessage(file), 'error');
         }
     }
+}
+
+// Why `file` cannot be attached. Audio gets its own wording: the wire
+// format carries images only (llm.Message.Images), text rides inlined in
+// the message body, and there is no audio part at any layer yet — so the
+// hint points at the workaround instead of implying a retry would help.
+function unsupportedAttachmentMessage(file) {
+    const name = file.name || 'file';
+    if (String(file.type || '').startsWith('audio/')) {
+        return `"${name}" was not attached — audio input is not supported yet (attach a transcript instead)`;
+    }
+    return `"${name}" was not attached — only images and text/code files are supported`;
 }
 
 // Overlay visibility via an enter/leave depth counter: the events bubble
@@ -450,7 +505,7 @@ composerEl.addEventListener('drop', (e) => {
     if (!dragHasFiles(e)) return; // text drops fall through to the textarea
     e.preventDefault();
     resetDragState();
-    addDroppedFiles(e.dataTransfer.files || []);
+    addFiles(e.dataTransfer.files || []);
 });
 
 // Safety net: a file drop that misses the composer must not trigger the

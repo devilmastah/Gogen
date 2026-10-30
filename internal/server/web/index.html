@@ -211,8 +211,11 @@
                             <span class="progress-label"></span>
                         </div>
                     </div>
-                    <button type="button" id="attach-btn" title="Attach image (or paste or drop files into the input)" aria-label="Attach image"><svg class="icon"><use href="#i-paperclip"></use></svg></button>
-                    <input type="file" id="image-upload" accept="image/*" multiple hidden>
+                    <button type="button" id="attach-btn" title="Attach images or text/code files (or paste or drop them into the input)" aria-label="Attach images or text/code files"><svg class="icon"><use href="#i-paperclip"></use></svg></button>
+                    <!-- Static accept is a fallback hint only: composer.js
+                         overwrites it from the routing tables (images +
+                         every text/code MIME and extension it attaches). -->
+                    <input type="file" id="image-upload" accept="image/*,text/*" multiple hidden>
                     <button id="send-btn" title="Send" aria-label="Send"><svg class="icon"><use href="#i-arrow-up"></use></svg></button>
                     <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
                     <!-- Drop-zone overlay (components/composer.js): shown
