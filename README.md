@@ -390,8 +390,14 @@ usually together with smart compact:
   later compaction in the same turn rewrites only the progress summary, so
   everything up to the request stays identical (and stays in the provider's
   prompt cache). Your next message becomes the new request, and the older
-  parts fold into the first summary. Job and subagent notices, and the image
-  messages `read_image` adds, do not count as a request. When your latest
+  parts fold into the first summary. The first compaction after a new
+  request therefore makes two summarizer calls, one after the other; the
+  second reuses the first one's cached history up to the request. Later
+  compactions in the same turn usually make one. When the work since the
+  request is still too small to summarize, compaction moves more of the
+  recent messages into it rather than counting the attempt as failed. Job
+  and subagent notices, and the image messages `read_image` adds, do not
+  count as a request. When your latest
   request is already among the recent messages, compaction summarizes
   everything before them as usual. When the conversation no longer fits
   and this layout cannot shrink it (for example, the request itself is most

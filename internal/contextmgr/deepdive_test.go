@@ -2,6 +2,7 @@ package contextmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -355,9 +356,9 @@ func TestSummaryPreserveListUnchanged(t *testing.T) {
 }
 
 // TestDeepDiveRefusalByCaller pins who falls back when the layout around the
-// request frees nothing: a normal compaction refuses and leaves the history
-// alone (the prefix up to the request stays), an emergency one uses the
-// single summary.
+// request frees nothing: a normal compaction returns the history unchanged
+// with no error (nothing failed, so the caller does not back off, and the
+// prefix up to the request stays), an emergency one uses the single summary.
 func TestDeepDiveRefusalByCaller(t *testing.T) {
 	msgs := []llm.Message{
 		{Role: "user", Content: "first"},
@@ -372,7 +373,7 @@ func TestDeepDiveRefusalByCaller(t *testing.T) {
 		emergency bool
 		want      string
 	}{
-		{"normal compaction refuses", false, ""},
+		{"normal compaction leaves the history unchanged", false, roles(msgs)},
 		{"emergency falls back to the single summary", true, "first | S1 | tail"},
 	}
 	for _, tt := range tests {
@@ -380,22 +381,34 @@ func TestDeepDiveRefusalByCaller(t *testing.T) {
 			p := &regionProvider{}
 			m := NewManager(p, Settings{CompactKeepRecentMessages: 1, ContextLimit: 1000000, CompactThreshold: 0.5, DeepDive: true})
 			out, _, err := m.Compact(context.Background(), msgs, CompactOptions{Emergency: tt.emergency})
-			if tt.want == "" {
-				if err == nil || !strings.Contains(err.Error(), "not enough history") {
-					t.Fatalf("err = %v, want the region refusal", err)
-				}
-				if len(p.requests) != 0 {
-					t.Fatalf("refusal made %d summarization calls", len(p.requests))
-				}
-				return
-			}
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("err = %v, want none", err)
 			}
 			if got := roles(out); got != tt.want {
 				t.Fatalf("layout:\n got %s\nwant %s", got, tt.want)
 			}
+			if !tt.emergency && len(p.requests) != 0 {
+				t.Fatalf("unchanged history made %d summarization calls", len(p.requests))
+			}
 		})
+	}
+}
+
+// TestDeepDiveNotSmallerStillRefuses pins the refusal that does back off: a
+// summary that came back no smaller spent a summarizer call, so the error
+// is returned as in the single-summary layout.
+func TestDeepDiveNotSmallerStillRefuses(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: SummaryPrefix + "earlier"},
+		{Role: "user", Content: "the request"},
+		{Role: "assistant", Content: "ok"},
+		{Role: "assistant", Content: "tail"},
+	}
+	m := NewManager(&regionProvider{}, Settings{CompactKeepRecentMessages: 1, ContextLimit: 1000000, CompactThreshold: 0.5, DeepDive: true})
+	m.minMiddleTokens = 0
+	if _, _, err := m.Compact(context.Background(), msgs, CompactOptions{}); !errors.Is(err, ErrSummaryNotSmaller) {
+		t.Fatalf("err = %v, want ErrSummaryNotSmaller", err)
 	}
 }
 
@@ -537,6 +550,30 @@ func TestNoteSummaryIndex(t *testing.T) {
 	}
 }
 
+// TestFirstUserIndexSkipsMachineMessages pins that the head kept verbatim
+// is the first user request, by the same rule as the deep-dive request.
+func TestFirstUserIndexSkipsMachineMessages(t *testing.T) {
+	tests := []struct {
+		name string
+		msgs []llm.Message
+		want int
+		ok   bool
+	}{
+		{"first message is the request", []llm.Message{{Role: "user", Content: "hi"}}, 0, true},
+		{"a notice before the request", []llm.Message{{Role: "user", Content: JobNoticePrefix + "bg-1 exited"}, {Role: "user", Content: "hi"}}, 1, true},
+		{"a legacy summary before the request", []llm.Message{{Role: "user", Content: SummaryPrefix + "x"}, {Role: "user", Content: "hi"}}, 1, true},
+		{"only machine messages", []llm.Message{{Role: "user", Content: ReadImagePrefix + "a.png"}}, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := firstUserIndex(tt.msgs)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("firstUserIndex = %d, %v, want %d, %v", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
 func TestDeepDiveFreeable(t *testing.T) {
 	s1 := llm.Message{Role: "assistant", Content: SummaryPrefix + "x"}
 	s2 := llm.Message{Role: "assistant", Content: ProgressSummaryPrefix + "x"}
@@ -564,7 +601,7 @@ func TestDeepDiveFreeable(t *testing.T) {
 			for i := range counts {
 				counts[i] = 10
 			}
-			if got := deepDiveFreeable(tt.msgs, counts, 0, len(tt.msgs)-1, tt.min); got != tt.want {
+			if got := NewManager(nil, DefaultSettings()).deepDiveFreeable(tt.msgs, counts, 0, len(tt.msgs)-1, tt.min); got != tt.want {
 				t.Fatalf("freeable = %d, want %d", got, tt.want)
 			}
 		})

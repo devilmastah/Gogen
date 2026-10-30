@@ -22,13 +22,14 @@ func NewPinManager() *PinManager {
 }
 
 // PinLastUser pins the most recent real user message so it survives
-// compaction. Compaction summaries are skipped (see
-// contextmgr.IsCompactionSummary): legacy sessions stored them as user-role
-// messages, and pinning one would preserve a recap instead of the actual
-// last user message.
+// compaction (see contextmgr.IsRequest). Compaction summaries are skipped:
+// legacy sessions stored them as user-role messages, and pinning one would
+// preserve a recap instead of the actual last user message. Machine
+// messages are skipped too: pinning a job notice or a read_image caption
+// would keep that (and its image) instead of the request.
 func (p *PinManager) PinLastUser(messages []llm.Message) {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && !contextmgr.IsCompactionSummary(messages[i].Content) {
+		if contextmgr.IsRequest(messages[i]) {
 			p.pinned[i] = struct{}{}
 			return
 		}

@@ -32,6 +32,36 @@ func TestPinLastUserSkipsCompactionSummaries(t *testing.T) {
 	}
 }
 
+// TestPinLastUserSkipsMachineMessages pins that context_pin_last pins the
+// request, not a message gogen wrote after it: a job notice (as the job's
+// producer formats it), a subagent notice, or a read_image caption, which
+// would otherwise keep its image through every compaction.
+func TestPinLastUserSkipsMachineMessages(t *testing.T) {
+	tests := []struct {
+		name  string
+		after llm.Message
+	}{
+		{"job notice", llm.Message{Role: "user", Content: jobExitSummary(&BackgroundJob{ID: "bg-1", Command: "go test ./..."})}},
+		{"subagent notice", llm.Message{Role: "user", Content: contextmgr.SubagentNoticePrefix + "scout] found it"}},
+		{"read_image caption", llm.Message{Role: "user", Content: contextmgr.ReadImagePrefix + "shot.png", Images: []llm.ImageInput{{DataURL: "data:image/png;base64,AAAA"}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewPinManager()
+			msgs := []llm.Message{
+				{Role: "user", Content: "first"},
+				{Role: "user", Content: "the request"},
+				{Role: "assistant", Content: "work"},
+				tt.after,
+			}
+			p.PinLastUser(msgs)
+			if !p.IsPinned(1) || len(p.PinnedIndices()) != 1 {
+				t.Fatalf("pins = %v, want only the request (index 1)", p.PinnedIndices())
+			}
+		})
+	}
+}
+
 // TestPinLastUserNoRealUserMessage pins the no-op case: when every user
 // message is a compaction summary, nothing is pinned.
 func TestPinLastUserNoRealUserMessage(t *testing.T) {

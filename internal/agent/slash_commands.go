@@ -26,6 +26,8 @@ var SlashCommands = []SlashCommand{
 	{Name: "/switch", Description: "Switch between live sessions (TUI)", Web: false, TUI: true},
 	{Name: "/fork", Description: "Fork a new session from the last assistant message (or fork <N> from message N)", Web: true, TUI: true},
 	{Name: "/compact", Description: "Compact conversation history", Web: false, TUI: true},
+	{Name: "/smartcompact", Description: "Smart compact on, off, or toggle", Web: false, TUI: true},
+	{Name: "/contextmode", Description: "Context mode: default or deep_dive", Web: false, TUI: true},
 	{Name: "/verbose", Description: "Toggle verbose tool output", Web: false, TUI: true},
 	{Name: "/think", Description: "Set thinking/reasoning level (off/low/medium/high) or show current level", Web: true, TUI: true},
 	{Name: "/save-config", Description: "Write config to .gogen/", Web: false, TUI: true},

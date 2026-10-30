@@ -559,7 +559,7 @@ func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed
 		case deepDive:
 			// The request and an untouched summary move with the split, so
 			// the freeable weight is not a running sum.
-			middle = deepDiveFreeable(messages, counts, headIdx, tailStart, m.minMiddleTokens)
+			middle = m.deepDiveFreeable(messages, counts, headIdx, tailStart, m.minMiddleTokens)
 		case prevTail < 0 || tailStart < prevTail:
 			// First step, or the tail moved EARLIER than last time (a pin/tool
 			// group): the running sum no longer describes this split.
@@ -898,8 +898,9 @@ type CompactOptions struct {
 // In deep dive (Settings.DeepDive), when the latest user request lies before
 // the tail, the middle is split around it instead: a session summary before
 // the request, the request verbatim, and a progress summary after it (see
-// compactAroundRequest). A forced compaction that would not drop a message
-// that way uses the single summary.
+// compactAroundRequest). A forced or emergency compaction that would not
+// drop a message that way uses the single summary; a normal one returns
+// the history unchanged.
 //
 // A deterministic executed-call roster is appended to the summary content:
 // one line per tool call in the summarized middle, carrying the call id, the
@@ -1127,8 +1128,10 @@ func IsCompactionSummary(content string) bool {
 }
 
 // Prefixes of the user-role messages gogen writes itself. Every producer
-// formats its message with one of these, and deep-dive compaction relies on
-// them to never keep such a message as the user's request.
+// formats its message with one of these, and IsRequest relies on them to
+// never take such a message for the user's request. A new kind of notice
+// needs its prefix here and in isMachineMessage, and a producer test that
+// IsRequest rejects it.
 const (
 	// JobNoticePrefix starts a background job's exit notice.
 	JobNoticePrefix = "[job] "
@@ -1156,16 +1159,18 @@ func isMachineMessage(content string) bool {
 // skipped), or -1.
 func latestRequestIndex(messages []llm.Message, from, to int) int {
 	for i := to - 1; i >= from; i-- {
-		if isRequest(messages[i]) {
+		if IsRequest(messages[i]) {
 			return i
 		}
 	}
 	return -1
 }
 
-// isRequest reports whether msg is a real user request: a user-role message
-// that is neither a compaction summary nor a machine message.
-func isRequest(msg llm.Message) bool {
+// IsRequest reports whether msg is a real user request: a user-role message
+// that is neither a compaction summary nor a machine message. It is the one
+// rule for "the user's message" in compaction (the head, the deep-dive
+// request) and in pinning (PinManager.PinLastUser).
+func IsRequest(msg llm.Message) bool {
 	return msg.Role == "user" && !IsCompactionSummary(msg.Content) && !isMachineMessage(msg.Content)
 }
 
@@ -1179,7 +1184,7 @@ func NoteSummaryIndex(messages []llm.Message, deepDive bool) int {
 		if IsCompactionSummary(messages[i].Content) {
 			return i
 		}
-		if deepDive && isRequest(messages[i]) {
+		if deepDive && IsRequest(messages[i]) {
 			return -1
 		}
 	}
@@ -1211,10 +1216,10 @@ func IsCondensedMessage(content string) bool {
 // compaction summaries — stored as assistant-role messages prefixed with
 // SummaryPrefix today, user-role in legacy sessions) and whether one exists.
 // ok is false when the conversation has no user message at all — callers
-// must not compact in that case.
+// must not compact in that case. Machine messages are skipped too (IsRequest).
 func firstUserIndex(messages []llm.Message) (int, bool) {
 	for i, msg := range messages {
-		if msg.Role == "user" && !IsCompactionSummary(msg.Content) {
+		if IsRequest(msg) {
 			return i, true
 		}
 	}

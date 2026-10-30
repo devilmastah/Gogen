@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -69,6 +70,9 @@ func TestReadImageAttachesImageAfterToolResult(t *testing.T) {
 	}
 	if !strings.Contains(msgs[2].Content, "[read_image] pic.png") {
 		t.Fatalf("caption = %q, want [read_image] prefix with relpath", msgs[2].Content)
+	}
+	if contextmgr.IsRequest(msgs[2]) {
+		t.Fatalf("the image message %q counts as a user request", msgs[2].Content)
 	}
 }
 

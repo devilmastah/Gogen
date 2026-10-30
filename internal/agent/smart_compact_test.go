@@ -134,6 +134,44 @@ func TestEmergencyDeepDiveFallsBack(t *testing.T) {
 	}
 }
 
+// TestDeepDiveSmallProgressRegionNoBackoff pins that a normal compaction in
+// deep dive whose regions around the request leave nothing to summarize at
+// the first keep is not a failure: it moves on to a smaller keep, which
+// puts the recent work in the progress region, and records no backoff.
+func TestDeepDiveSmallProgressRegionNoBackoff(t *testing.T) {
+	// The history really weighs over the budget (no provider baseline), so
+	// the re-measure after an unchanged pass still sees it over.
+	seed := func(last string) (*Agent, *contextmgr.Manager, *countingProvider) {
+		a, ctxMgr, provider := newEmergencyTestAgent(t, false)
+		a.SetDeepDive(true)
+		a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+		a.appendMessage(llm.Message{Role: "assistant", Content: contextmgr.SummaryPrefix + "earlier"})
+		a.appendMessage(llm.Message{Role: "user", Content: "the request"})
+		a.appendMessage(llm.Message{Role: "assistant", Content: contextmgr.ProgressSummaryPrefix + "so far"})
+		a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("step ", 800)})
+		a.appendMessage(llm.Message{Role: "assistant", Content: last})
+		_ = a.ContextStats(context.Background())
+		return a, ctxMgr, provider
+	}
+	probe, ctxMgr, _ := seed("ok")
+	budget, hard := ctxMgr.CompactBudget(), ctxMgr.HardLimit()
+	a, _, provider := seed(strings.Repeat(" pad", budget+300-probe.compactionTokenTotal()))
+	if total := a.compactionTokenTotal(); total < budget || total >= hard {
+		t.Fatalf("test setup: total %d not in [budget %d, hard limit %d)", total, budget, hard)
+	}
+
+	if !a.compactIfDue(context.Background(), nil) {
+		t.Fatalf("compaction did not shrink (%d summarizer calls)", provider.calls)
+	}
+	if got := len(a.Messages); got != 5 || a.Messages[2].Content != "the request" ||
+		!strings.HasPrefix(a.Messages[3].Content, contextmgr.ProgressSummaryPrefix) || !strings.HasPrefix(a.Messages[4].Content, " pad") {
+		t.Fatalf("layout after compaction: %d messages", got)
+	}
+	if backoff, guard := compactState(a); !backoff.IsZero() || guard != 0 {
+		t.Fatalf("recorded a failure: backoff %v guard %d", backoff, guard)
+	}
+}
+
 // TestSmartCompactDeepDiveKeepsPausedNote pins that the paused-call note is
 // not lost in deep dive when no progress summary can take it: the tool-call
 // message carries it, and the session summary before the request does not.

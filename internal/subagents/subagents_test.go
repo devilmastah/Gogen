@@ -11,6 +11,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/contextmgr"
+	"gogen/internal/llm"
 	"gogen/internal/llm/llmtest"
 )
 
@@ -449,6 +450,29 @@ func TestEventParentMessage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.in.ParentMessage(); !tc.want(got) {
 				t.Fatalf("ParentMessage() = %q", got)
+			}
+		})
+	}
+}
+
+// TestNoticesAreNotRequests pins the producer side of the machine-message
+// contract: every subagent notice a parent receives is told apart from a
+// user request, so compaction never keeps one as the request and
+// context_pin_last never pins one.
+func TestNoticesAreNotRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{"terminal notice", Notice("child-1", "finished (done). Use get_agent_result for the full result.")},
+		{"reply", Event{Kind: EventReply, Label: "scout", Text: "found it"}.ParentMessage()},
+		{"empty reply", Event{Kind: EventReply, Label: "scout"}.ParentMessage()},
+		{"failed reply", Event{Kind: EventReply, Label: "scout", Err: errors.New("boom")}.ParentMessage()},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if contextmgr.IsRequest(llm.Message{Role: "user", Content: tc.text}) {
+				t.Fatalf("%q counts as a user request", tc.text)
 			}
 		})
 	}
