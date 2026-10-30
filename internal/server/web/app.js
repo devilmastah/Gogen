@@ -6127,7 +6127,13 @@
                 // state it is actually in: continuable, not working.
                 const status = s.subagentStatus || '';
                 const attended = !!s.active || !!s.turnActive;
-                const interrupted = !attended && (status === 'running' || status === '');
+                // Three readings of one record: a terminal outcome, "never
+                // finished and nothing is running" (interrupted), and "never
+                // finished but still live here" (idle — the child is
+                // continuable, which is neither done nor interrupted).
+                const terminal = status === 'success' || status === 'failed';
+                const interrupted = !terminal && !attended;
+                const idle = !terminal && attended;
                 out.push({
                     id: s.id,
                     parentId: s.parentId,
@@ -6137,8 +6143,9 @@
                     label: (liveRec && liveRec.label) || s.label || s.id,
                     job: (liveRec && liveRec.job) || '',
                     running: !!s.turnActive,
-                    success: status !== 'failed' && !interrupted,
+                    success: status === 'success',
                     interrupted,
+                    idle,
                     active: !!s.active,
                     summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
                 });
@@ -6169,7 +6176,8 @@
             meta.className = 'session-row-meta';
             // A colored dot means the child is LIVE somewhere — responding,
             // open as a pane in this tab, or live-registered elsewhere —
-            // and its color carries the state: amber responding, red
+            // and its color carries the state: amber responding, blue idle
+            // (live, no terminal outcome yet — continuable, not done), red
             // failed, green done. A settled child that is neither open nor
             // live renders a muted TEXT status instead, so archived
             // outcomes do not read as active sessions. Summary text still
@@ -6189,6 +6197,14 @@
                 // nor done. Checked BEFORE the failed fallback, because an
                 // interrupted record is neither a success nor a failure.
                 stateLabel = 'interrupted';
+            } else if (rec.idle) {
+                // Live here (open as a pane, or attached elsewhere) with no
+                // terminal outcome yet: continuable, NOT done. Blue, like the
+                // flat rows' "open", and labelled the way the TUI labels the
+                // same state.
+                stateLabel = 'idle';
+                stateClass = 'blue';
+                stateDot = live;
             } else if (!rec.success) {
                 stateLabel = 'failed';
                 stateClass = 'red';

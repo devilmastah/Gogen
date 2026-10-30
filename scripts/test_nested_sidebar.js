@@ -164,10 +164,14 @@ async function main() {
   rows = nestedRows();
   check('restart child (no live events) renders from the payload', rows.length === 1 && rows[0].dataset.sessionId === 'E');
   const metaE = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
-  check('registered-but-idle restart child shows done (not failed)',
-    metaE.includes('done') && !metaE.includes('failed') && !metaE.includes('responding'));
-  check('live-registered done child shows the green done dot',
-    !!rows[0] && !!rows[0].querySelector('.session-state-dot.green'));
+  // The record carries no outcome (a legacy one, or one written before
+  // admission was stamped) and its runtime is live, so the state is "idle":
+  // continuable, never the red failed dot and never "responding" — and no
+  // longer "done", which claimed a terminal state nobody recorded.
+  check('registered-but-idle restart child shows idle (not failed, not done)',
+    metaE.includes('idle') && !metaE.includes('failed') && !metaE.includes('responding') && !metaE.includes('done'));
+  check('live-registered idle child shows the blue idle dot',
+    !!rows[0] && !!rows[0].querySelector('.session-state-dot.blue'));
 
   // 6b. The persisted outcome drives the fallback: a child that REALLY
   //     failed stays failed after a restart (subagentStatus is persisted
@@ -236,8 +240,12 @@ async function main() {
   check('legacy child (no recorded status) shows interrupted',
     metaJ.includes('interrupted') && !metaJ.includes('done'));
 
-  // A LIVE child between turns (status running, still active) is NOT
-  // interrupted: "running" only means interrupted once its runtime is gone.
+  // A LIVE child between turns (status running, still active) is neither
+  // interrupted nor done: its runtime exists, it reached no terminal state, so
+  // it reads "idle" (continuable) — the state the TUI labels the same way.
+  // Reading it as "done" told the user an unfinished child had finished, and
+  // made the label flip between "interrupted" and "done" depending on whether
+  // the child was open, which is the one thing this row must not do.
   recv({
     type: 'sessions',
     sessions: [
@@ -247,8 +255,9 @@ async function main() {
   });
   rows = nestedRows();
   const metaK = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
-  check('live child (status running, active) is not interrupted',
-    metaK.includes('done') && !metaK.includes('interrupted'));
+  check('live child (status running, active) reads idle, not done',
+    metaK.includes('idle') && !metaK.includes('done') && !metaK.includes('interrupted'));
+  check('idle child keeps its colored dot', !!rows[0] && !!rows[0].querySelector('.session-state-dot'));
 
   // 7. Cross-tab deletion: a child deleted elsewhere (session_removed
   //    broadcast) also stops rendering, and its open pane is replaced.
