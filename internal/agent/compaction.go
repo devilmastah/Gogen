@@ -316,6 +316,14 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// A compaction with nothing to summarize returns the history unchanged:
+	// in deep dive, when the regions around the current request are already
+	// summaries, and in either mode when there is no user message or a pin
+	// pulls the tail back to the head. Saying it compacted would be wrong,
+	// and publishing would drop the provider's token count for nothing.
+	if len(compacted) == len(a.Messages) && summaryBlob(compacted) == summaryBlob(a.Messages) {
+		return fmt.Errorf("nothing to compact: compaction left the history unchanged")
+	}
 	// Publish the compacted history together with its freshly computed token
 	// counts (cheap — compaction shrank the conversation) so the cached
 	// shouldCompactUsingCounts path stays valid on the next turn.

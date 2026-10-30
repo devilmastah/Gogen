@@ -400,8 +400,13 @@ usually together with smart compact:
   count as a request. When your latest
   request is already among the recent messages, compaction summarizes
   everything before them as usual. When the conversation no longer fits
-  and this layout cannot shrink it (for example, the request itself is most
-  of the window), compaction uses the single summary instead.
+  and this layout cannot shrink it enough (for example, the request itself
+  is most of the window), compaction uses the single summary instead, which
+  summarizes the request with the rest. That happens when the estimate is
+  close to the limit. After the provider refused a request, deep dive
+  summarizes the request in that one pass: the provider's count is what did
+  not fit, and the local estimate is usually still under the window. Below
+  the limit, a large request stays verbatim.
 - The system prompt says that history is compacted automatically, that notes
   worth keeping belong in the todo list (it survives compaction), and that
   the model should not stop or shorten its work because of context size. It

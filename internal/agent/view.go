@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -256,7 +257,7 @@ func (a *Agent) preflightForcedCompact(ctx context.Context, h *llm.StreamHandler
 	guarded := a.compactionGuards.emergency >= len(a.Messages)
 	a.statsMu.RUnlock()
 	if !guarded {
-		if a.runForcedSummarization(ctx, h) {
+		if a.runForcedSummarization(ctx, h, false) {
 			view = a.rebuildView()
 		}
 	}
@@ -422,43 +423,114 @@ func (a *Agent) capToolResultsForTurn() bool {
 // counts, pin remap, clear turn usage, reset save tracking) — the same
 // bookkeeping the auto-compaction path applies. It fires h.OnCompacting
 // before the summarization call so the UI can show compaction progress.
-// It returns true when the history was strictly shrunk and republished.
-func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandlers) bool {
+// singleSummary skips the deep-dive layout, so the current request is
+// summarized in this pass. Overflow recovery passes it in deep dive: the
+// provider already refused, and the local estimate is usually still under
+// the window, which is why pre-flight did not compact. Pre-flight passes
+// false. When that layout keeps the request verbatim and the rebuilt view
+// is still over the window, one more pass summarizes the request, and a
+// failure of that pass is recorded like this path's own failures. It
+// returns true when the history was strictly shrunk and republished.
+func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandlers, singleSummary bool) bool {
 	if h != nil && h.OnCompacting != nil {
 		h.OnCompacting()
 	}
-	var pinned map[int]struct{}
-	if a.PinManager != nil {
-		pinned = a.PinManager.PinnedSet()
-	}
-	a.statsMu.RLock()
-	counts := append([]int(nil), a.tokenCounts...)
-	a.statsMu.RUnlock()
-	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, contextmgr.CompactOptions{
-		ViewPrefix:   a.systemPromptPrefix(),
-		Counts:       counts,
-		Pinned:       pinned,
-		Keep:         contextmgr.NoTailKeep,
-		Forced:       true,
-		Tools:        a.llmTools(),
-		AllowedTools: a.AllowedToolNames(),
-	})
+	before := len(a.Messages)
+	shrunk, err := a.compactNoTail(ctx, contextmgr.CompactOptions{Forced: true, SingleSummary: singleSummary})
 	if err != nil {
 		a.noteCompactFailure(err)
 		a.noteProgressFailure(&a.compactionGuards.emergency)
 		return false
 	}
-	if len(compacted) >= len(a.Messages) {
+	if !shrunk {
 		// Strict-shrink requirement: abort a compaction that removed
 		// no message — it saves nothing and would not converge.
-		log.Printf("forced compaction aborted: no shrink (%d -> %d messages)", len(a.Messages), len(compacted))
+		log.Printf("forced compaction aborted: no shrink (%d -> %d messages)", before, len(a.Messages))
 		a.noteProgressFailure(&a.compactionGuards.emergency)
 		return false
 	}
-	// Publish the compacted history with the post-compaction bookkeeping
-	// shared with the auto-compaction path (compactToFit).
-	a.publishCompaction(compacted, newPins)
+	if !singleSummary {
+		if err := a.summarizeKeptRequest(ctx); err != nil {
+			log.Printf("forced compaction: single-summary fallback failed: %v", err)
+			a.noteCompactFailure(err)
+			a.noteProgressFailure(&a.compactionGuards.emergency)
+		}
+	}
 	return true
+}
+
+// summarizeKeptRequest is the pre-flight fit fallback. When the deep-dive
+// layout kept the request verbatim and the rebuilt view is still over the
+// window, one single-summary pass summarizes the request with the rest. A
+// result that is already the single summary (no progress summary) is left
+// alone: another pass would only re-summarize that summary. A summarizer
+// failure is returned for the caller to record.
+func (a *Agent) summarizeKeptRequest(ctx context.Context) error {
+	if !a.Context.DeepDive() {
+		return nil
+	}
+	limit := a.Context.ContextLimit()
+	if limit <= 0 || a.outgoingViewEstimate(a.rebuildView()) < limit || !layoutKeptRequest(a.Messages) {
+		return nil
+	}
+	_, err := a.compactSingleSummary(ctx, true)
+	return err
+}
+
+// layoutKeptRequest reports whether a deep-dive compaction kept the current
+// request verbatim. That result carries a progress summary. The single
+// summary, used when the request is the head or sits in the tail, does not.
+func layoutKeptRequest(msgs []llm.Message) bool {
+	for _, m := range msgs {
+		if strings.HasPrefix(m.Content, contextmgr.ProgressSummaryPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// compactNoTail runs one compaction with no preserved tail. The caller sets
+// Forced, Emergency and SingleSummary; the pins, counts, view prefix and
+// tools come from the live session, so every no-tail caller compacts the
+// same way. It publishes the result and reports true only when the history
+// strictly shrank. A summarizer failure is returned for the caller to record.
+func (a *Agent) compactNoTail(ctx context.Context, opts contextmgr.CompactOptions) (bool, error) {
+	if a.PinManager != nil {
+		opts.Pinned = a.PinManager.PinnedSet()
+	}
+	a.statsMu.RLock()
+	opts.Counts = append([]int(nil), a.tokenCounts...)
+	a.statsMu.RUnlock()
+	opts.ViewPrefix = a.systemPromptPrefix()
+	opts.Keep = contextmgr.NoTailKeep
+	opts.Tools = a.llmTools()
+	opts.AllowedTools = a.AllowedToolNames()
+	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, opts)
+	if err != nil {
+		return false, err
+	}
+	if len(compacted) >= len(a.Messages) {
+		return false, nil
+	}
+	a.publishCompaction(compacted, newPins)
+	return true, nil
+}
+
+// compactSingleSummary is deep dive's fit fallback: one compaction with the
+// single-summary layout and no tail, which summarizes the current request
+// with the rest. Pre-flight uses it when the layout around the request left
+// the view over the window. The emergency tier uses it when that layout left
+// the history at or above the hard limit. Overflow recovery summarizes the
+// request in its first pass instead, because the provider already refused.
+// forced selects the forced compaction; otherwise it runs as the emergency
+// tier. It publishes the result and reports true only when the history
+// strictly shrank. A summarizer failure is returned for the caller to record.
+func (a *Agent) compactSingleSummary(ctx context.Context, forced bool) (bool, error) {
+	return a.compactNoTail(ctx, contextmgr.CompactOptions{
+		Forced:        forced,
+		Emergency:     !forced,
+		SingleSummary: true,
+	})
 }
 
 // publishCompaction publishes a compacted history with the post-compaction
@@ -713,21 +785,36 @@ func (a *Agent) handleOverflowError(ctx context.Context, h *llm.StreamHandlers, 
 	// Stage 2: forced summarization (keep=0, minMiddleTokens bypassed,
 	// strict-shrink, post-success bookkeeping identical to the pre-flight
 	// path).
-	if a.runForcedSummarization(ctx, h) {
+	// In deep dive the request is summarized in this pass. The provider
+	// already refused, and the local estimate is usually still under the
+	// window, so a layout that kept the request verbatim would spend the
+	// retry on a request the provider has rejected.
+	compacted := a.runForcedSummarization(ctx, h, a.Context.DeepDive())
+	if ctx.Err() != nil {
+		// Cancelled during the forced pass: do not condense on the
+		// cancelled context, and do not spend the retry.
+		return false, ctx.Err()
+	}
+	view := a.rebuildView()
+	if compacted && a.outgoingViewEstimate(view) < a.Context.ContextLimit() {
 		a.overflowRetries.Add(1)
 		return true, nil
 	}
-	// Forced compaction could not shrink the history — the classic case is
-	// a fresh session whose single user message is the head (there is no
-	// middle to summarize). Phase 0e: last-resort condensation of the one
-	// message that cannot fit the window.
-	condensed, condErr := a.lastResortCondense(ctx, h, a.rebuildView())
+	// Forced compaction could not shrink the history, or shrank it and the
+	// estimate is still over the window: one message is too big to fit.
+	// The classic case is a fresh session whose single user message is the
+	// head (there is no middle to summarize); a huge head with history after
+	// it shrinks and still does not fit. The retry is spent only after
+	// Phase 0e: last-resort condensation of the one message that cannot fit
+	// the window. A retry would be refused again otherwise, and the next
+	// refusal is terminal before it reaches this stage.
+	condensed, condErr := a.lastResortCondense(ctx, h, view)
 	if condErr != nil {
 		// Error mode (compact_last_resort=error): the actionable diagnostic
 		// replaces the raw provider refusal.
 		return false, condErr
 	}
-	if condensed {
+	if condensed || compacted {
 		a.overflowRetries.Add(1)
 		return true, nil
 	}
@@ -813,6 +900,23 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 			return
 		}
 		if i == len(keeps)-1 {
+			// In deep dive the layout around the request can shrink the
+			// history and still leave a request that is most of the window
+			// verbatim. The emergency tier exists to get under the hard
+			// limit, so it summarizes the request too before giving up.
+			if emergency && a.Context.DeepDive() && total >= a.Context.HardLimit() {
+				shrank, err := a.compactSingleSummary(ctx, false)
+				if err != nil {
+					a.noteCompactFailure(err)
+					a.noteProgressFailure(&a.compactionGuards.emergency)
+					return
+				}
+				if shrank {
+					if total = a.compactionTokenTotal(); total < budget {
+						return
+					}
+				}
+			}
 			// Exhausted the shrinking-tail sequence and the request is
 			// still over budget: give up into the failure backoff so the
 			// next turn does not immediately repeat the whole sequence.

@@ -17,16 +17,24 @@ import (
 // prepareMessages attempted a compaction and force the failure paths. Note
 // one compaction attempt may make several provider calls (the manager falls
 // back to flattened-text summarization after a primary-path error), so
-// tests assert on "no new calls" / "new calls" deltas, not exact counts.
+// tests assert on "no new calls" / "new calls" deltas, not exact counts,
+// unless the summarized text is small enough for one call.
+// failAfter, when set, fails once calls reaches that count. cancel, when
+// set, cancels that context on the first call.
 type countingProvider struct {
-	limit int
-	fail  bool
-	calls int64
+	limit     int
+	fail      bool
+	failAfter int64
+	cancel    context.CancelFunc
+	calls     int64
 }
 
 func (p *countingProvider) GenerateResponse(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
-	atomic.AddInt64(&p.calls, 1)
-	if p.fail {
+	n := atomic.AddInt64(&p.calls, 1)
+	if p.cancel != nil {
+		p.cancel()
+	}
+	if p.fail || (p.failAfter > 0 && n >= p.failAfter) {
 		return llm.Response{}, errors.New("summarization unavailable")
 	}
 	return llm.Response{Content: "summary"}, nil

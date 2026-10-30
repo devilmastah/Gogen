@@ -102,14 +102,15 @@ Summarize everything after the first user message in the transcript above. The f
 
 // progressSummaryInstruction asks for the deep-dive progress summary: the
 // work after the current request. The request and everything before it are
-// on the wire verbatim (or already summarized), so only the work since is
+// on the wire as context (on the first compaction after a request, the part
+// before it is summarized in the same pass), so only the work since is
 // recapped. The cut is that request, not "the most recent user-role
 // message": job notices, subagent notices, and read_image captions in the
 // progress region are user-role but machine-written, and belong in the
 // recap of the work, not as a new cut point.
 const progressSummaryInstruction = summaryOpening + `
 
-Summarize the work done on the current request so far — the messages after that request in the transcript above. The current request and everything before it are preserved verbatim and excluded from this summary. Job notices, subagent notices, and read_image captions that appear after the request are part of the work to recap; they are not a new request and must not become the cut point.
+Summarize the work done on the current request so far — the messages after that request in the transcript above. The current request and everything before it are kept as context and excluded from this summary. Job notices, subagent notices, and read_image captions that appear after the request are part of the work to recap; they are not a new request and must not become the cut point.
 
 Preserve:
 ` + summaryWorkBullets + `
@@ -855,16 +856,29 @@ type CompactOptions struct {
 	// NoTailKeep (-1) means no preserved tail. Positive values are literal.
 	Keep int
 
-	// Forced bypasses the minMiddleTokens guard (emergency compaction).
-	// When forced and the last message is a tool result, the trailing tool
-	// group is preserved verbatim as the tail.
+	// Forced bypasses the minMiddleTokens guard: the forced compaction of
+	// the pre-flight check and the overflow recovery, which must shrink the
+	// history (the emergency tier is Emergency). When forced and the last
+	// message is a tool result, the trailing tool group is preserved
+	// verbatim as the tail.
 	Forced bool
 
 	// Emergency marks a compaction the conversation needs to fit the window
 	// (the emergency tier), without Forced's guard bypass. In deep dive,
 	// Forced and Emergency compactions fall back to the single summary when
 	// the layout around the request would refuse or not drop a message.
+	// When it drops messages and still does not fit, the caller asks for
+	// the single summary with SingleSummary, because only the caller
+	// measures the outgoing request.
 	Emergency bool
+
+	// SingleSummary skips the deep-dive layout for this compaction, so the
+	// current request is summarized with the rest. Overflow recovery asks
+	// for it up front, because the provider already refused a request the
+	// estimate may still call under the window. Pre-flight and the
+	// emergency tier ask for it when the layout around the request shrank
+	// the history but left it over the limit.
+	SingleSummary bool
 
 	// Pinned message indices to preserve in the tail.
 	Pinned map[int]struct{}
@@ -903,7 +917,8 @@ type CompactOptions struct {
 // the request, the request verbatim, and a progress summary after it (see
 // compactAroundRequest). A forced or emergency compaction that would not
 // drop a message that way uses the single summary; a normal one returns
-// the history unchanged.
+// the history unchanged. A forced or emergency caller whose result still
+// does not fit asks for the single summary with SingleSummary.
 //
 // A deterministic executed-call roster is appended to the summary content:
 // one line per tool call in the summarized middle, carrying the call id, the
@@ -958,15 +973,17 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 	if tailStart <= headIdx+1 {
 		return messages, copyIntSet(pinned), nil
 	}
-	if m.DeepDive() {
+	if m.DeepDive() && !opts.SingleSummary {
 		if reqIdx := deepDiveRequestIndex(messages, headIdx, tailStart); reqIdx >= 0 {
 			compact, pins, err := m.compactAroundRequest(ctx, messages, headIdx, reqIdx, tailStart, opts)
 			// A forced or emergency caller needs the history to shrink. Two
 			// summaries around a verbatim request can leave the count
 			// unchanged (a one-message region becomes one summary) or refuse
 			// both regions (the request itself is the bulk), so the
-			// single-summary layout is the fallback there. A summarizer
-			// failure is returned as it is.
+			// single-summary layout is the fallback there. A result that
+			// drops messages but still does not fit is the caller's to
+			// measure (SingleSummary). A summarizer failure is returned as
+			// it is.
 			var refused deepDiveRefusal
 			fallback := (forced || opts.Emergency) && (errors.As(err, &refused) || (err == nil && len(compact) >= len(messages)))
 			if !fallback {
@@ -1140,7 +1157,7 @@ const (
 	JobNoticePrefix = "[job] "
 	// SubagentNoticePrefix starts a subagent event delivered to its parent
 	// (a report, a missing reply, a close or delete by the user); the
-	// child's label and "]" follow.
+	// child's label (its id for the terminal notice) and "]" follow.
 	SubagentNoticePrefix = "[subagent "
 	// ReadImagePrefix starts the caption of the message that carries an
 	// image read_image attached.

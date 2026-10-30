@@ -105,11 +105,13 @@ func (e Event) ParentMessage() string {
 	}
 }
 
-// Notice is a subagent event as its parent reads it: "[subagent <label>]
-// <text>". Every subagent notice is built here, so compaction can tell it
-// from a user request by contextmgr.SubagentNoticePrefix.
-func Notice(label, text string) string {
-	return contextmgr.SubagentNoticePrefix + label + "] " + text
+// Notice is a subagent event as its parent reads it: "[subagent <name>]
+// <text>". name is the child's label, or its id for the terminal notice
+// (the id resolves duplicate or truncated labels; the text names the label).
+// Every subagent notice is built here, so compaction can tell it from a user
+// request by contextmgr.SubagentNoticePrefix.
+func Notice(name, text string) string {
+	return contextmgr.SubagentNoticePrefix + name + "] " + text
 }
 
 // DeliverEvent routes one typed child event to its parent through the host's

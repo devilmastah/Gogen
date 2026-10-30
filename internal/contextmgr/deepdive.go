@@ -158,8 +158,13 @@ func isOnlySummary(seg []llm.Message, prefix string) bool {
 // one summary of its kind, or under minTokens), free nothing.
 // A split where no region would be summarized or no message would be
 // dropped counts as freeing nothing, so the keep is lowered until the layout
-// around the request frees enough; only when no split does is the request
-// summarized, by compactPinned's fallback to the single summary. The caller
+// around the request frees enough. When no split does, the request is
+// summarized: by compactPinned's fallback to the single summary when the
+// layout refuses or drops nothing, or by the caller when it drops messages
+// and still does not fit. The emergency tier does that at the hard limit,
+// and pre-flight does it when the estimate is still over the window and the
+// request is still verbatim. Overflow recovery skips the layout and
+// summarizes the request in its one pass, because the provider refused. The caller
 // budgets one summary (EmergencySummaryAllowance); when both regions are
 // summarized, the second summary's allowance is charged here.
 func (m *Manager) deepDiveFreeable(messages []llm.Message, counts []int, headIdx, tailStart, minTokens int) int {
