@@ -432,6 +432,11 @@ func (sp *tuiSubagentSpawner) ReviveChild(caller *agent.Agent, childID string) (
 		return subagents.NewChild[*childHandle]{}, false, err
 	}
 	a := sp.ws.NewSessionAgent(&snap, childID)
+	if a == nil {
+		// No slot was admitted yet, so there is nothing to unwind: report the
+		// failure instead of handing the lifecycle a child it cannot use.
+		return subagents.NewChild[*childHandle]{}, false, fmt.Errorf("subagent: reopened session %s has no usable agent", childID)
+	}
 	h := newChildHandle(a)
 	label := info.Label
 	if l := a.SessionLabelSnapshot(); l != "" {
@@ -532,6 +537,9 @@ func (sp *tuiSubagentSpawner) Policy() subagents.Policy {
 	return subagents.Policy{
 		MaxFinished: maxRecordedSubagents,
 		Concurrent:  func(string) int { return limit },
+		// The child's system queue is the shared one (steerq.NewDefault), so
+		// the "queue is full" refusal quotes the bound that is enforced.
+		SystemQueueCap: steerq.SystemCap,
 	}
 }
 
@@ -586,8 +594,13 @@ func (m *Model) handleChildAdoptMsg(msg childAdoptMsg) (tea.Model, tea.Cmd) {
 	if m.lives == nil || msg.handle == nil || msg.handle.agent == nil {
 		return fail(fmt.Errorf("subagent: no live session registry"))
 	}
-	// A release can overtake the revival (parent teardown, cap eviction):
-	// admitting a released child would leave a slot nothing ever removes.
+	// A release can overtake the RE-adoption of a handle that already has a
+	// lifecycle record (the user opened the child as a pane, the record was
+	// released, and the delivery's adopt arrives after): admitting it would
+	// leave a slot nothing ever removes. A freshly revived handle has no record
+	// yet — reviveChild registers it after ReviveChild returns — so there the
+	// retention timer armed by the lifecycle is what unwinds an abandoned
+	// slot, not this check.
 	if child := msg.handle.childOf(); child != nil && child.Released() {
 		return fail(subagents.ErrEvicted)
 	}

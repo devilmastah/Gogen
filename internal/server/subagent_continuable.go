@@ -45,6 +45,12 @@ func (sp *subagentSpawner) NewChild(ctx context.Context, parent *agent.Agent, jo
 	if err != nil {
 		return subagents.NewChild[*sessionRuntime]{}, err
 	}
+	// Validate BEFORE the hold below: a held runtime with no usable agent is
+	// one the lifecycle cannot register (so nothing would ever release it) and
+	// orphan eviction would never collect.
+	if rt == nil || rt.agent == nil {
+		return subagents.NewChild[*sessionRuntime]{}, fmt.Errorf("subagent: host built no usable child runtime")
+	}
 	// Held: orphan eviction must never collect a continuable child while it
 	// is alive or awaiting release. Only the BACKGROUND path builds children
 	// through this method (the foreground Spawn/Fork call newChildRuntime
@@ -231,6 +237,11 @@ func (sp *subagentSpawner) ReviveChild(caller *agent.Agent, childID string) (sub
 	if err != nil {
 		return subagents.NewChild[*sessionRuntime]{}, false, err
 	}
+	// Same ordering as NewChild: the hold must not outlive a failure to hand
+	// the child back.
+	if rt == nil || rt.agent == nil {
+		return subagents.NewChild[*sessionRuntime]{}, false, fmt.Errorf("subagent: reopened session %s has no usable runtime", childID)
+	}
 	rt.held.Store(true)
 	label := info.Label
 	if l := rt.agent.SessionLabelSnapshot(); l != "" {
@@ -327,6 +338,10 @@ func (sp *subagentSpawner) Policy() subagents.Policy {
 		MaxFinished:  sp.maxFinished,
 		MaxLiveGuard: sp.maxLiveGuard,
 		Concurrent:   sp.concurrentLimit,
+		// The child's system queue is the shared one (steerq.NewDefault), so
+		// the "queue is full" refusal quotes the bound that is actually
+		// enforced instead of the package default that happens to match it.
+		SystemQueueCap: steerq.SystemCap,
 	}
 }
 
