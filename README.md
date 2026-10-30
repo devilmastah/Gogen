@@ -779,11 +779,13 @@ mode it is fixed to the project directory and the input is hidden.
   `board_review_prompt`; a ticket's own **Review agent** popover section
   overrides them.
 - With `subagent: on`, subagents appear as **nested rows** under their parent
-  session in the sidebar. A colored dot marks a live child — amber
-  **responding** while running, red **failed** on error, green **done** on
-  success — whether it is open as a pane here or live in another tab; a
-  settled child that is neither open nor live shows a muted text status
-  instead of a dot. Clicking a
+  session in the sidebar. A colored dot marks a child whose runtime is live in
+  the server — amber **responding** while a turn runs, blue **idle** between
+  turns (live and continuable: it reached no terminal outcome yet), red
+  **failed**, green **done** — whether or not anyone has the child open.
+  Once its runtime is gone the row shows a muted text status instead
+  (`success`, `failed`, or `interrupted` for a child that never reached a
+  terminal state). Clicking a
   nested row opens the child as a normal pane (live transcript, Cancel, ✕),
   which is the escape hatch for a subagent stuck in a loop. The Agent tab's
   **Default subagent model** picker and the **System prompt** / **Subagent

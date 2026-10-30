@@ -6187,21 +6187,23 @@
                 // process went away. That must NOT read as done — unfinished
                 // work used to render green "done" after a restart.
                 //
-                // The evidence is the payload's `active` flag, which means
-                // "open in a tab, or a turn is running" (sessionEntries/
-                // activeSet) — NOT "the runtime is registered". Folding in
-                // turnActive keeps a mid-turn child on "responding" and leaves
-                // an idle headless one reading as interrupted, which is the
-                // state it is actually in: continuable, not working.
+                // The evidence is the payload's `registered` flag: the
+                // runtime is live in the server process, viewed or not
+                // (sessionEntries/registeredSet). NOT `active`, which only
+                // means "open in a tab, or a turn is running" — keying on
+                // that made a live headless child read as interrupted and
+                // made the label flip when somebody opened its pane, which
+                // this row must not do: a child's state is the same however
+                // the list is being looked at, and it is the state the TUI
+                // (which keys on its live slot) already shows.
                 const status = s.subagentStatus || '';
-                const attended = !!s.active || !!s.turnActive;
                 // Three readings of one record: a terminal outcome, "never
-                // finished and nothing is running" (interrupted), and "never
-                // finished but still live here" (idle — the child is
+                // finished and its runtime is gone" (interrupted), and "never
+                // finished but still live in the server" (idle — the child is
                 // continuable, which is neither done nor interrupted).
                 const terminal = status === 'success' || status === 'failed';
-                const interrupted = !terminal && !attended;
-                const idle = !terminal && attended;
+                const interrupted = !terminal && !s.registered;
+                const idle = !terminal && !!s.registered;
                 out.push({
                     id: s.id,
                     parentId: s.parentId,
@@ -6215,6 +6217,7 @@
                     interrupted,
                     idle,
                     active: !!s.active,
+                    registered: !!s.registered,
                     summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
                 });
                 rendered.add(s.id);
@@ -6242,16 +6245,16 @@
             title.textContent = label;
             const meta = document.createElement('div');
             meta.className = 'session-row-meta';
-            // A colored dot means the child is LIVE somewhere — responding,
-            // open as a pane in this tab, or live-registered elsewhere —
-            // and its color carries the state: amber responding, blue idle
-            // (live, no terminal outcome yet — continuable, not done), red
-            // failed, green done. A settled child that is neither open nor
-            // live renders a muted TEXT status instead, so archived
-            // outcomes do not read as active sessions. Summary text still
-            // follows when one exists.
+            // A colored dot means the child is LIVE somewhere — open as a
+            // pane in this tab, or holding a runtime in the server
+            // (`registered`, watched or not) — and its color carries the
+            // state: amber responding, blue idle (live, no terminal outcome
+            // yet — continuable, not done), red failed, green done. A settled
+            // child with no runtime left renders a muted TEXT status instead,
+            // so archived outcomes do not read as active sessions. Summary
+            // text still follows when one exists.
             const frags = [];
-            const live = !!pane || !!rec.active;
+            const live = !!pane || !!rec.registered;
             let stateLabel = '';
             let stateClass = '';
             let stateDot = false;

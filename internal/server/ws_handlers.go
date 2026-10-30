@@ -175,7 +175,7 @@ func wsHandleListSessions(req *wsRequest) {
 		// the active pane — e.g. after another tab moved the global default.
 		_ = ws.writeJSON(WSMessage{
 			Type:     "sessions",
-			Sessions: sessionEntries(sessions, s.registry.activeSet(), s.registry.turnActiveSet()),
+			Sessions: sessionEntries(sessions, s.registry.activeSet(), s.registry.turnActiveSet(), s.registry.registeredSet()),
 		})
 	}()
 }

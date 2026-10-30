@@ -106,7 +106,7 @@ async function main() {
     type: 'sessions',
     sessions: [
       { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
-      { id: 'C', parentId: 'A', label: 'subagent: fix parser', messageCount: 1, active: true, updatedAt: '' },
+      { id: 'C', parentId: 'A', label: 'subagent: fix parser', messageCount: 1, active: true, registered: true, updatedAt: '' },
     ],
   });
   let rows = nestedRows();
@@ -152,13 +152,13 @@ async function main() {
 
   // 6. Restart scenario: a child with NO live events (subagent_started/
   //    finished are not replayed after a restart) renders from the payload
-  //    fallback. Registered-but-idle (active, no turn) must show done —
-  //    never the red failed dot.
+  //    fallback. Registered-but-idle (a live runtime, no turn) reads "idle"
+  //    — never the red failed dot, and never a green "done" nobody recorded.
   recv({
     type: 'sessions',
     sessions: [
       { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
-      { id: 'E', parentId: 'A', label: 'subagent: restarted', messageCount: 1, active: true, updatedAt: '' },
+      { id: 'E', parentId: 'A', label: 'subagent: restarted', messageCount: 1, registered: true, updatedAt: '' },
     ],
   });
   rows = nestedRows();
@@ -207,12 +207,11 @@ async function main() {
   check('settled closed child shows NO colored dot',
     !!rows[0] && !rows[0].querySelector('.session-state-dot'));
 
-  // 6d. A child that never reached a terminal state — interrupted
-  //     (interrupt_agent leaves it continuable) or killed with its process —
-  //     records status "running" (legacy records: ""). With no evidence of
-  //     current activity (the payload's active flag is "open in a tab or a turn
-  //     is running") both must read INTERRUPTED, never done: unfinished work
-  //     used to render a green "done" row after a restart.
+  // 6d. A child that never reached a terminal state — released after an
+  //     interrupt, or killed with its process — records status "running"
+  //     (legacy records: ""). With no runtime left (`registered` unset) both
+  //     must read INTERRUPTED, never done: unfinished work used to render a
+  //     green "done" row after a restart.
   recv({
     type: 'sessions',
     sessions: [
@@ -240,24 +239,27 @@ async function main() {
   check('legacy child (no recorded status) shows interrupted',
     metaJ.includes('interrupted') && !metaJ.includes('done'));
 
-  // A LIVE child between turns (status running, still active) is neither
+  // A LIVE child between turns (status running, runtime registered) is neither
   // interrupted nor done: its runtime exists, it reached no terminal state, so
   // it reads "idle" (continuable) — the state the TUI labels the same way.
   // Reading it as "done" told the user an unfinished child had finished, and
-  // made the label flip between "interrupted" and "done" depending on whether
-  // the child was open, which is the one thing this row must not do.
+  // keying it on "open in a tab / turn running" made the label flip between
+  // "interrupted" and "idle" depending on whether somebody had the child open,
+  // which is the one thing this row must not do: `registered` says the
+  // runtime is live whether or not anyone is looking.
   recv({
     type: 'sessions',
     sessions: [
       { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
-      { id: 'K', parentId: 'A', label: 'subagent: live idle', messageCount: 4, active: true, subagentStatus: 'running', updatedAt: '' },
+      { id: 'K', parentId: 'A', label: 'subagent: live idle', messageCount: 4, registered: true, subagentStatus: 'running', updatedAt: '' },
     ],
   });
   rows = nestedRows();
   const metaK = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
-  check('live child (status running, active) reads idle, not done',
+  check('live child (status running, registered) reads idle, not done',
     metaK.includes('idle') && !metaK.includes('done') && !metaK.includes('interrupted'));
-  check('idle child keeps its colored dot', !!rows[0] && !!rows[0].querySelector('.session-state-dot'));
+  check('idle headless child keeps its colored dot (nobody has to be looking)',
+    !!rows[0] && !!rows[0].querySelector('.session-state-dot.blue'));
 
   // 7. Cross-tab deletion: a child deleted elsewhere (session_removed
   //    broadcast) also stops rendering, and its open pane is replaced.
@@ -269,7 +271,7 @@ async function main() {
     type: 'sessions',
     sessions: [
       { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
-      { id: 'D', parentId: 'A', label: 'subagent: other job', messageCount: 1, active: true, turnActive: true, updatedAt: '' },
+      { id: 'D', parentId: 'A', label: 'subagent: other job', messageCount: 1, active: true, turnActive: true, registered: true, updatedAt: '' },
     ],
   });
   rows = nestedRows();
@@ -297,7 +299,7 @@ async function main() {
     type: 'sessions',
     sessions: [
       { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
-      { id: 'L', parentId: 'A', label: 'subagent: interrupted job', messageCount: 2, active: true, turnActive: true, subagentStatus: 'running', updatedAt: '' },
+      { id: 'L', parentId: 'A', label: 'subagent: interrupted job', messageCount: 2, active: true, turnActive: true, registered: true, subagentStatus: 'running', updatedAt: '' },
     ],
   });
   rows = nestedRows();
@@ -305,20 +307,40 @@ async function main() {
   check('started child mid-turn still shows responding', metaL1.includes('responding'));
 
   // The interrupt lands: no subagent_finished frame, but the runtime is no
-  // longer working — the payload says so.
+  // longer working — the payload says so. The runtime is STILL registered
+  // (an interrupted child stays continuable, held for its retention window),
+  // so the row settles on "idle", not on the archived "interrupted".
   recv({
     type: 'sessions',
     sessions: [
       { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
-      { id: 'L', parentId: 'A', label: '', messageCount: 2, active: false, turnActive: false, subagentStatus: 'running', updatedAt: '' },
+      { id: 'L', parentId: 'A', label: '', messageCount: 2, active: false, turnActive: false, registered: true, subagentStatus: 'running', updatedAt: '' },
     ],
   });
   rows = nestedRows();
   const metaL2 = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
   check('interrupted child stops showing responding WITHOUT a reload',
-    !metaL2.includes('responding') && metaL2.includes('interrupted'));
+    !metaL2.includes('responding') && metaL2.includes('idle') && !metaL2.includes('interrupted') && !metaL2.includes('done'));
   check('a listed child keeps the spawn label when the payload has none',
     !!rows[0] && (rows[0].querySelector('.session-row-title').textContent || '').includes('interrupted job'));
+
+  // The retention window ends and the runtime is released: the same record
+  // now has no runtime, so it reads "interrupted" (muted, no dot) — the
+  // archived state. Opening a pane would NOT change this: the label follows
+  // the runtime, not who is looking.
+  recv({
+    type: 'sessions',
+    sessions: [
+      { id: 'A', label: 'parent-session', messageCount: 2, updatedAt: '' },
+      { id: 'L', parentId: 'A', label: 'subagent: interrupted job', messageCount: 2, subagentStatus: 'running', updatedAt: '' },
+    ],
+  });
+  rows = nestedRows();
+  const metaL3 = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
+  check('released child settles on interrupted',
+    metaL3.includes('interrupted') && !metaL3.includes('idle') && !metaL3.includes('done'));
+  check('released child shows NO colored dot',
+    !!rows[0] && !rows[0].querySelector('.session-state-dot'));
 
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

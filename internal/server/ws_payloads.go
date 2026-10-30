@@ -9,7 +9,7 @@ import (
 	"gogen/internal/llm"
 )
 
-func sessionEntries(list []agent.SessionInfo, active, turnActive map[string]bool) []SessionEntry {
+func sessionEntries(list []agent.SessionInfo, active, turnActive, registered map[string]bool) []SessionEntry {
 	out := make([]SessionEntry, 0, len(list))
 	for _, s := range list {
 		out = append(out, SessionEntry{
@@ -21,6 +21,7 @@ func sessionEntries(list []agent.SessionInfo, active, turnActive map[string]bool
 			ParentID:        s.ParentID,
 			Active:          active[s.ID],
 			TurnActive:      turnActive[s.ID],
+			Registered:      registered[s.ID],
 			SubagentStatus:  s.SubagentStatus,
 			SubagentSummary: s.SubagentSummary,
 		})
@@ -53,6 +54,22 @@ func (r *sessionRegistry) activeSet() map[string]bool {
 		if active, _ := rt.turnState(); active {
 			out[id] = true
 		}
+	}
+	return out
+}
+
+// registeredSet returns the ids of every live runtime in this process,
+// regardless of viewers or turn state. The sessions payload uses it to let a
+// client tell a child whose runtime is live but nobody is watching (a
+// background subagent between turns, held for its retention window) from one
+// whose runtime is gone: the first is idle-but-continuable, the second never
+// finished. activeSet deliberately excludes the unattended case, so it cannot
+// answer that question. Ids are snapshotted under the registry lock.
+func (r *sessionRegistry) registeredSet() map[string]bool {
+	ids := r.activeIDs()
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
 	}
 	return out
 }
@@ -165,7 +182,7 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 	// session until it's done" symptom.
 	if err == nil && len(result.Sessions) > 0 {
 		resp.Type = "sessions"
-		resp.Sessions = sessionEntries(result.Sessions, s.registry.activeSet(), s.registry.turnActiveSet())
+		resp.Sessions = sessionEntries(result.Sessions, s.registry.activeSet(), s.registry.turnActiveSet(), s.registry.registeredSet())
 	}
 	cfg = agentConfigMsgBasic(a)
 	s.decorateConfig(&cfg)
