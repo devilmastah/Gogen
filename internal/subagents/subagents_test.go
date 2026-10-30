@@ -673,7 +673,7 @@ func TestListAgentsListsSavedChildren(t *testing.T) {
 		"saved one — inactive — success — 12 msgs — 3m ago",
 		"saved two — inactive — interrupted — 3 msgs — 2h ago",
 		"saved three — inactive — interrupted — 1 msgs — 2d ago",
-		"get_agent_result reads any child's report; send_message reaches active children only.",
+		"get_agent_result reads any child's report; send_message to an inactive one reopens its saved session.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("list_agents is missing %q: %q", want, out)

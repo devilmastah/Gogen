@@ -1012,10 +1012,10 @@ The agent has access to the following tools:
 | `board` | Project kanban board (when `board: on`): list/show/add/update/claim/move/block/comment/done/remove (update edits title/description/priority/context; remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
 | `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the bounded final report returns as the foreground tool result. Set `run_in_background=true` to return a child id immediately and receive a compact terminal event when it finishes. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
 | `subagent_fork` | Fork a child session seeded with a deep copy of this session's history and run one turn on it (when `subagent: on`) |
-| `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth, and each child's latest progress line (when `subagent: on`) |
+| `list_agents` | List this session's nested (subagent) sessions as one recency-ordered list — live children (with their latest progress line) and saved ones (with their recorded outcome and age), so a child stays discoverable after a restart (when `subagent: on`) |
 | `get_agent_result` | Get a background subagent's current status or authoritative final result by id; the persisted result remains available after the live child is released (when `subagent: on`) |
 | `wait_agent` | Wait up to `timeout_ms` (default 60000, max 600000) for a background subagent's main run to finish; timeout/cancellation leaves the child running (when `subagent: on`) |
-| `send_message` | Queue a message for a background subagent of this session — running, interrupted, or finished-but-retained. It runs after any current child turn; its exact reply is injected into this session when that turn finishes (when `subagent: on`) |
+| `send_message` | Send a message to a background subagent of this session — running, interrupted, finished-but-retained, or saved (an inactive child is reopened from its saved session first). It runs after any current child turn, or at the next round boundary with `steer=true`; its exact reply is injected into this session when that turn finishes (when `subagent: on`) |
 | `interrupt_agent` | Cancel the current main or follow-up turn of a live background subagent; an interrupted main run remains continuable (when `subagent: on`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |

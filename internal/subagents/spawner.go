@@ -425,7 +425,10 @@ func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 		b.WriteString("\n")
 	}
 	if active < len(rows) {
-		b.WriteString("get_agent_result reads any child's report; send_message reaches active children only.")
+		// send_message revives a saved child (it is the same tool, and the
+		// revival is transparent), so the footer must not claim the active
+		// rows are the only reachable ones — the model would stop trying.
+		b.WriteString("get_agent_result reads any child's report; send_message to an inactive one reopens its saved session.")
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
@@ -732,8 +735,11 @@ func (sp *Spawner[H]) reviveChild(caller *agent.Agent, agentID string) (*Child[H
 	child.MarkInterrupted() // no main run: idle and continuable
 	// Guaranteed to succeed: beginRevive owns the id until this returns. The
 	// check is kept so a future second registration path cannot silently
-	// displace this record.
+	// displace this record — and because a held runtime with no record is
+	// exactly what the Host contract forbids, the loser is torn down instead
+	// of leaked (the same unwind SpawnBackground's duplicate-id path does).
 	if !sp.children.register(child) {
+		sp.host.Release(child, false)
 		return nil, fmt.Errorf("send_message: subagent %s was registered while it was being reopened", agentID)
 	}
 	sp.host.ArmReplyCapture(child)

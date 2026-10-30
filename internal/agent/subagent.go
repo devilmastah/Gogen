@@ -291,8 +291,9 @@ func listAgentsToolDef() llm.Tool {
 			"inactive ones. Inactive children are saved sessions whose runtime is gone (released, or from "+
 			"before a restart) — they stay listed so they remain discoverable. Read-only. Use to resolve "+
 			"agent ids for get_agent_result/wait_agent/send_message/interrupt_agent, to check background "+
-			"status, or to see what a child is doing. send_message reaches active children only; "+
-			"get_agent_result reads any listed child's report.",
+			"status, or to see what a child is doing. send_message reaches any listed child — an "+
+			"inactive one is reopened from its saved session first; get_agent_result reads any listed "+
+			"child's report.",
 		toolSchema(map[string]any{}),
 	)
 }
