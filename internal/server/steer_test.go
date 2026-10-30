@@ -1,6 +1,8 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -226,6 +228,144 @@ func TestSendNowGating(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
 	stub.releaseN(3)
 	waitTurnsPersisted(t, store, dir, a.SessionID, 2)
+}
+
+// TestSendNowDeliversTheQueueHead pins what a recorded Send now actually
+// delivers when SEVERAL user messages wait: the yield stops the running turn
+// at its round boundary, and the queue then drains FIFO — the HEAD runs
+// first, which is usually NOT the item the control was on (its id only
+// proves the request still has something to deliver; both hosts put the
+// button on the newest bubble). The hosts' "Sending…" wait is taken back by
+// that first drain, so the head's turn is the observable proof the request
+// was consumed — and the rest of the queue must keep following, one turn
+// each.
+func TestSendNowDeliversTheQueueHead(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stub := newBlockingStub()
+	// Round 1 asks for a tool, so the turn reaches a round boundary: a yield
+	// is only honored BEFORE the next model call.
+	stub.firstTools = []llm.ToolCall{{
+		ID:   "call_read",
+		Name: "read_file",
+		Args: map[string]any{"path": "f.txt"},
+	}}
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	startBlockedTurn(t, rt, stub, "block me")
+	if !rt.enqueueUserTurn("q1", "steer-a", nil) {
+		t.Fatal("first steer enqueue refused")
+	}
+	if !rt.enqueueUserTurn("q2", "steer-b", nil) {
+		t.Fatal("second steer enqueue refused")
+	}
+	// The request names the NEWER item — the bubble that carries the control.
+	if got := rt.sendNow("q2"); got != steerq.SendNowRecorded {
+		t.Fatalf("sendNow(q2) = %v, want SendNowRecorded", got)
+	}
+	// Releasing the round in flight is enough for the head to start: the turn
+	// stops at the boundary (its tool call still runs) instead of starting
+	// another round, and the worker delivers the queue's head.
+	stub.releaseN(1)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
+	if userMsgIndex(a, "steer-b") >= 0 {
+		t.Fatal("FIFO violated: the newer item ran before the queue's head")
+	}
+	// The remaining item follows at the head turn's own end, so a Send now on
+	// a multi-item queue does not strand the rest.
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-b") >= 0 })
+	msgs := a.SnapshotMessages()
+	ia, ib := userMsgIndexIn(msgs, "steer-a"), userMsgIndexIn(msgs, "steer-b")
+	if ia < 0 || ib < 0 || !(ia < ib) {
+		t.Fatalf("delivery order violated: steer-a@%d, steer-b@%d", ia, ib)
+	}
+	if !hasAssistantBetween(msgs, ia, ib) {
+		t.Fatalf("no assistant reply between steer-a@%d and steer-b@%d, want one turn each", ia, ib)
+	}
+	stub.releaseN(3)
+	// Both delivered turns' closing flushes must land before TempDir teardown.
+	waitTurnsPersisted(t, store, dir, a.SessionID, 2)
+}
+
+// TestQueueSendNowDrainsTheWholeQueue pins the wire contract of the Send now
+// button: ONE press asks the running turn to stop at its round boundary, and
+// the WHOLE queue then drains FIFO — one turn per user message, each announced
+// by the queue_update the clients clean their chips up from (queueLeft names
+// the id that started; Content is the text that turn runs). The press names
+// the NEWEST item, so the frames also prove it is not a per-item send.
+func TestQueueSendNowDrainsTheWholeQueue(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stub := newBlockingStub()
+	// Round 1 asks for a tool, so the turn reaches a round boundary: a yield
+	// is only honored before the next model call.
+	stub.firstTools = []llm.ToolCall{{
+		ID:   "call_read",
+		Name: "read_file",
+		Args: map[string]any{"path": "f.txt"},
+	}}
+	s, a, store := newContinuationServer(t, stub, dir)
+	srv := startWSServer(t, s)
+	conn := dialWS(t, srv, "/ws")
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	// A turn blocking inside the provider, with three messages queued behind
+	// it — the ids are the clients' correlation tokens.
+	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "block me"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	stub.waitBlocked(1)
+	items := []struct{ id, text string }{
+		{"q-a", "steer-a"}, {"q-b", "steer-b"}, {"q-c", "steer-c"},
+	}
+	for _, it := range items {
+		if err := conn.WriteJSON(WSMessage{Type: "message", Content: it.text, QueueID: it.id}); err != nil {
+			t.Fatalf("queue %s: %v", it.id, err)
+		}
+	}
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "queue_update" && len(m.Queue) == len(items)
+	})
+
+	// One press, on the NEWEST item — where both hosts put the control.
+	if err := conn.WriteJSON(WSMessage{Type: "queue_send_now", QueueID: "q-c"}); err != nil {
+		t.Fatalf("send now: %v", err)
+	}
+	// Ending each blocked turn is what lets the worker start the next item,
+	// and it announces it first. Call 1 is the yielded round; the deliveries
+	// are calls 2..4.
+	for i, it := range items {
+		stub.releaseN(i + 1)
+		msg := readUntil(t, conn, 10*time.Second, func(m WSMessage) bool {
+			return m.Type == "queue_update" && len(m.QueueLeft) > 0
+		})
+		if len(msg.QueueLeft) != 1 || msg.QueueLeft[0] != it.id {
+			t.Fatalf("delivery %d: queueLeft = %v, want [%s] (FIFO from the head)", i, msg.QueueLeft, it.id)
+		}
+		if msg.Content != it.text {
+			t.Fatalf("delivery %d: started text = %q, want %q", i, msg.Content, it.text)
+		}
+		if want := len(items) - i - 1; len(msg.Queue) != want {
+			t.Fatalf("delivery %d: queue holds %d items, want %d left", i, len(msg.Queue), want)
+		}
+	}
+	stub.releaseN(4)
+	// The whole queue ran, in send order, one turn each.
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-c") >= 0 })
+	msgs := a.SnapshotMessages()
+	ia, ib, ic := userMsgIndexIn(msgs, "steer-a"), userMsgIndexIn(msgs, "steer-b"), userMsgIndexIn(msgs, "steer-c")
+	if ia < 0 || ib < 0 || ic < 0 || !(ia < ib && ib < ic) {
+		t.Fatalf("delivery order violated: steer-a@%d, steer-b@%d, steer-c@%d", ia, ib, ic)
+	}
+	waitTurnsPersisted(t, store, dir, a.SessionID, 3)
 }
 
 // TestUserQueueCapRejects pins the user-side overflow policy: user text is

@@ -10,7 +10,10 @@
 //     queued items from its mirror (background queue frames never touch the
 //     DOM);
 //   - a user_acked never stamps a still-queued bubble with its history index
-//     (resend/fork would then target a message that never ran).
+//     (resend/fork would then target a message that never ran);
+//   - Send now's "Sending…" wait ends when ANY queued run starts: with several
+//     items the drain starts the queue's head, not the bubble that carries the
+//     button, so the control must not stay disabled while the rest drains.
 //
 // Loads the real index.html + app.js into jsdom (imports stripped, editor/
 // marked/dompurify stubbed) with a controllable WebSocket stub.
@@ -288,6 +291,96 @@ async function main() {
   check('C: the joined bubble shows both texts',
     joined.length === 1 && joined[0].textContent.includes('C queued three'));
   check('C: the joined bubble is no longer queued', queuedBubbles().length === 0);
+
+  // 7. Send now with SEVERAL items queued. The button sits on the newest
+  //    bubble, but the yield starts the queue's HEAD — a different one — so
+  //    the "Sending…" wait must end when THAT run starts, not only when the
+  //    clicked item does. Left pending, the control stayed disabled until the
+  //    two-minute timeout, i.e. exactly while the rest of the queue drained.
+  send('C queued four');
+  const cq4 = lastSentMessage();
+  recv({ type: 'queue_update', sessionId: 'C', queue: [{ id: cq4.queueId, text: 'C queued four' }] });
+  send('C queued five');
+  const cq5 = lastSentMessage();
+  recv({
+    type: 'queue_update', sessionId: 'C',
+    queue: [{ id: cq4.queueId, text: 'C queued four' }, { id: cq5.queueId, text: 'C queued five' }],
+  });
+  send('C queued six');
+  const cq6 = lastSentMessage();
+  const three = [
+    { id: cq4.queueId, text: 'C queued four' },
+    { id: cq5.queueId, text: 'C queued five' },
+    { id: cq6.queueId, text: 'C queued six' },
+  ];
+  recv({ type: 'queue_update', sessionId: 'C', queue: three });
+  const queuedById = (id) => queuedBubbles().find((el) => el.dataset.queueId === id);
+  const sendNowOf = (id) => {
+    const el = queuedById(id);
+    return el && el.querySelector('.queue-send-btn');
+  };
+  // Every button access below is guarded: a bubble that exists WITHOUT its
+  // Send now button must fail these checks, not throw a TypeError that aborts
+  // the whole run before the report.
+  const sendNowBtns = three.map((it) => sendNowOf(it.id));
+  check('C: three queued, Send now only on the newest',
+    three.every((it) => !!queuedById(it.id)) && sendNowBtns.every((b) => !!b)
+      && sendNowBtns[0].hidden && sendNowBtns[1].hidden && !sendNowBtns[2].hidden);
+  if (sendNowBtns[2]) sendNowBtns[2].click();
+  check('C: the click names that item and shows the wait',
+    ws.sent.filter((m) => m.type === 'queue_send_now').pop().queueId === three[2].id
+      && !!sendNowBtns[2] && sendNowBtns[2].classList.contains('pending'));
+  // The yield lands: the queue drains FIFO from its HEAD, one item per turn.
+  // That first frame is the proof the request was consumed.
+  recv({
+    type: 'queue_update', sessionId: 'C', queue: three.slice(1),
+    queueLeft: [three[0].id], content: three[0].text,
+  });
+  const waitOn = sendNowOf(three[2].id);
+  check('C: a started run takes the Send now wait back',
+    !!waitOn && !waitOn.hidden && !waitOn.classList.contains('pending')
+      && waitOn.textContent === 'Send now' && !waitOn.disabled);
+  check('C: no Send now button is left claiming to send',
+    evalJs('document.querySelectorAll(".queue-send-btn.pending").length') === 0);
+  check('C: the head left the queue, the rest still chipped',
+    queuedBubbles().length === 2 && evalJs('queuedCount()') === 2);
+  // The control can be asked again while the rest of the queue drains. (jsdom
+  // dispatches a click on a disabled button too, so the enabled state checked
+  // above — not this click — is what pins the cleanup.)
+  if (waitOn) waitOn.click();
+  check('C: Send now can be asked again while the queue drains',
+    !!waitOn && waitOn.classList.contains('pending')
+      && ws.sent.filter((m) => m.type === 'queue_send_now').pop().queueId === three[2].id);
+  // The queue keeps draining FIFO to the last item.
+  recv({
+    type: 'queue_update', sessionId: 'C', queue: three.slice(2),
+    queueLeft: [three[1].id], content: three[1].text,
+  });
+  recv({ type: 'user_acked', sessionId: 'C', content: '4' });
+  check('C: the middle item started, one left', queuedBubbles().length === 1 && evalJs('queuedCount()') === 1);
+  recv({
+    type: 'queue_update', sessionId: 'C', queue: [],
+    queueLeft: [three[2].id], content: three[2].text,
+  });
+  recv({ type: 'user_acked', sessionId: 'C', content: '6' });
+  // Every queued UI element is gone: no chips, no Send now/✕ buttons, no
+  // pending wait, no correlation tags, and an empty mirror behind the
+  // input bar's "· N queued" count.
+  check('C: the whole queue ran and every queue element was cleaned up',
+    queuedBubbles().length === 0
+      && evalJs('document.querySelectorAll(".queued-chip").length') === 0
+      && evalJs('document.querySelectorAll(".queue-send-btn").length') === 0
+      && evalJs('document.querySelectorAll(".queue-send-btn.pending").length') === 0
+      && evalJs('document.querySelectorAll(".queue-remove-btn").length') === 0
+      && evalJs('document.querySelectorAll("#messages [data-queue-id]").length') === 0
+      && evalJs('queuedCount()') === 0
+      && evalJs('activePane().queuedBubbles ? activePane().queuedBubbles.size : 0') === 0);
+  const ran = ['C queued four', 'C queued five', 'C queued six'].map(
+    (t) => userBubbles().filter((el) => el.textContent.includes(t)).length);
+  check('C: each delivered message kept exactly one bubble, in send order',
+    ran.every((n) => n === 1)
+      && userBubbles().slice(-3).map((el) => el.textContent.trim().slice(0, 12)).join('|')
+        === ['C queued fou', 'C queued fiv', 'C queued six'].join('|'));
 
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

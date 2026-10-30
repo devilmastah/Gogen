@@ -1526,9 +1526,11 @@
         // the turn finishes the round it is in — which can be minutes when that
         // round is running a command. So the button says it is waiting, and the
         // frames that prove otherwise take it back: a refusal ("queue" notice),
-        // the item starting, the item being removed, a newer item taking the
-        // button, or the timeout below (a lost frame must not leave a spinner
-        // spinning for the rest of the session).
+        // ANY queued run starting (see applyQueueUpdate — with several items
+        // queued the drain starts the head, not the clicked bubble), the item
+        // being removed, a newer item taking the button, or the timeout below
+        // (a lost frame must not leave a spinner spinning for the rest of the
+        // session).
         const SEND_NOW_PENDING_MS = 120000;
 
         function setSendNowPending(btn, pending) {
@@ -5367,6 +5369,14 @@
             // queueLeft is in queue order, and content is the message the
             // started turn runs.
             joinStartedBubbles(left.map((id) => started.get(id)).filter(Boolean), data.content || '');
+            // A started run is the proof a Send now request was consumed: the
+            // wait belongs to the REQUEST, not to the bubble the button sat
+            // on. With several items queued the drain starts the queue's HEAD
+            // — usually a different bubble — so clearing only the started
+            // item's own mark left the last bubble's button "Sending…" and
+            // disabled until the timeout, hiding the control exactly while the
+            // rest of the queue drains.
+            if (left.length) clearSendNowPending(pane);
             if (dom) {
                 for (const it of items) {
                     if (bubbles.has(it.id)) continue;
