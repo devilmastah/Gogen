@@ -1805,6 +1805,10 @@ func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// IsFinished is published only AFTER the outcome is persisted (the spawner
+	// writes the snapshot before Finish), so this read needs no extra wait —
+	// and pinning it here is what catches a publish-before-persist regression:
+	// the read used to win the race on a slow runner and find "running".
 	waitFor(t, 5*time.Second, func() bool { return sp.Get(id).IsFinished() })
 	if info := s.ws.Store.Info(s.ws.GetWorkingDir(), id); info == nil || info.SubagentStatus != "success" {
 		t.Fatalf("saved child outcome = %+v, want success", info)

@@ -248,11 +248,18 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 			time.AfterFunc(sp.host.Policy().retain(), func() { sp.ReleaseChildIfQuiet(child) })
 			return
 		}
-		child.Finish(report, runErr)
-		// Persist the final outcome on the child's snapshot: the events are
-		// not replayed after a reload/restart, so the saved session is what
-		// get_agent_result and the host's UI fall back to.
+		// Persist the final outcome on the child's snapshot BEFORE publishing
+		// the terminal state: the events are not replayed after a reload or a
+		// restart, so the saved session is what get_agent_result and the
+		// host's UI fall back to. Publishing first (Finish, which closes Done
+		// and flips IsFinished) let a reader that woke on that signal — a
+		// waiter, the listing, a test — read the index while it still carried
+		// the admission stamp "running", so a finished child could be reported
+		// as interrupted. FinishSubagentOutcome writes synchronously (the
+		// snapshot and its index entry), so the terminal state is on disk by
+		// the time anything can observe that the run ended.
 		child.Agent.FinishSubagentOutcome(report, runErr)
+		child.Finish(report, runErr)
 		// Enforce the finished cap NOW: spawn-time enforcement misses fast
 		// jobs that finish after their siblings spawned.
 		sp.enforceCap(parent.SessionID)
