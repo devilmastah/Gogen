@@ -515,9 +515,12 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	//
 	// A full snapshot is written when there is none yet, when non-message
 	// metadata (label, mode, model, thinking level, oneshot, project profile,
-	// todos) changed — deltas do not carry those fields, so a quit before the
-	// next full save would silently drop the change — and otherwise at most
-	// every fullSaveInterval.
+	// todos, subagent outcome) changed — deltas do not carry those fields, so
+	// a quit before the next full save would silently drop the change. The
+	// outcome is one of them because the spawner persists a child's terminal
+	// status before it publishes the finish (see SpawnBackground), and that
+	// write must land in the snapshot and its index entry.
+	// Otherwise a full save happens at most every fullSaveInterval.
 	//
 	// The size trigger replaces the old "more than 5 new messages" rule: a
 	// delta REWRITES every message since the last full save, so a fixed
