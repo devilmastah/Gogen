@@ -101,12 +101,15 @@ Summarize everything after the first user message in the transcript above. The f
 ` + summaryClosing
 
 // progressSummaryInstruction asks for the deep-dive progress summary: the
-// work after the latest user request. The request and everything before it
-// are on the wire verbatim (or already summarized), so only the work since
-// is recapped.
+// work after the current request. The request and everything before it are
+// on the wire verbatim (or already summarized), so only the work since is
+// recapped. The cut is that request, not "the most recent user-role
+// message": job notices, subagent notices, and read_image captions in the
+// progress region are user-role but machine-written, and belong in the
+// recap of the work, not as a new cut point.
 const progressSummaryInstruction = summaryOpening + `
 
-Summarize everything after the most recent user message in the transcript above: the work done on that request so far. That user message and everything before it are preserved verbatim and excluded from this summary.
+Summarize the work done on the current request so far — the messages after that request in the transcript above. The current request and everything before it are preserved verbatim and excluded from this summary. Job notices, subagent notices, and read_image captions that appear after the request are part of the work to recap; they are not a new request and must not become the cut point.
 
 Preserve:
 ` + summaryWorkBullets + `

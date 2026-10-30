@@ -355,6 +355,25 @@ func TestSummaryPreserveListUnchanged(t *testing.T) {
 	}
 }
 
+// TestProgressSummaryInstructionCut pins that the progress summarizer is told
+// to cut at the current request, not at "the most recent user message". Job /
+// subagent / read_image notices in the progress region are user-role; a
+// literal "most recent user message" cut would drop the tool work before them.
+func TestProgressSummaryInstructionCut(t *testing.T) {
+	if strings.Contains(progressSummaryInstruction, "most recent user message") {
+		t.Fatal("progress instruction still cuts at the most recent user message")
+	}
+	for _, want := range []string{
+		"current request",
+		"Job notices, subagent notices, and read_image captions",
+		"must not become the cut point",
+	} {
+		if !strings.Contains(progressSummaryInstruction, want) {
+			t.Fatalf("progress instruction missing %q", want)
+		}
+	}
+}
+
 // TestDeepDiveRefusalByCaller pins who falls back when the layout around the
 // request frees nothing: a normal compaction returns the history unchanged
 // with no error (nothing failed, so the caller does not back off, and the
