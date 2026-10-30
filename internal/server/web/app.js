@@ -1570,7 +1570,12 @@
             const chip = el.querySelector(':scope > .queued-chip');
             if (chip) chip.remove();
             const now = el.querySelector(':scope > .queue-send-btn');
-            if (now) now.remove();
+            if (now) {
+                // Drop the pending timer with the button: otherwise it holds the
+                // detached element for its full 2-minute backstop.
+                if (now._pendingTimer) clearTimeout(now._pendingTimer);
+                now.remove();
+            }
             const rm = el.querySelector(':scope > .queue-remove-btn');
             if (rm) rm.remove();
         }
@@ -6375,8 +6380,12 @@
             // error itself is the toast above.
             if (data.kind === 'mcp') noteMCPOpFailed();
             // A refused send now must stop the button claiming it is sending;
-            // the toast above is the reason it stopped.
-            if (data.kind === 'queue') clearSendNowPending(activePane());
+            // the toast above is the reason it stopped. The notice names the
+            // session, so a pane switch between the click and the answer cannot
+            // leave the asking pane's spinner running.
+            if (data.kind === 'queue') {
+                clearSendNowPending(findPaneBySession(data.sessionId) || activePane());
+            }
         }
 
         function sendMessage() {

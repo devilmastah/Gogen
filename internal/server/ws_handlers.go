@@ -81,7 +81,9 @@ func wsHandleQueueSendNow(req *wsRequest) {
 		return
 	}
 	if res := target.sendNow(req.msg.QueueID); res != steerq.SendNowRecorded {
-		writeNoticeError(req.conn, "queue", res.Message())
+		// Session-tagged: the client clears the pending Send now of THAT pane,
+		// and the user may have switched panes while the answer was in flight.
+		writeNoticeErrorFor(req.conn, target.agent.SessionID, "queue", res.Message())
 	}
 }
 

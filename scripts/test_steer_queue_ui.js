@@ -126,8 +126,11 @@ async function main() {
   check('Send now shows that it is waiting',
     sendNow.classList.contains('pending') && sendNow.getAttribute('aria-busy') === 'true'
       && sendNow.textContent === 'Sending\u2026' && sendNow.disabled);
-  // A refused request answers with a "queue" notice: the button must not keep
-  // claiming it is sending.
+  // A refused request answers with a "queue" notice naming the session: the
+  // button must not keep claiming it is sending, and a notice for ANOTHER pane
+  // must not take this one's state back.
+  recv({ type: 'notice', sessionId: 'B', kind: 'queue', success: false, content: 'No turn is running.' });
+  check('a queue notice for another pane leaves this button pending', sendNow.classList.contains('pending'));
   recv({ type: 'notice', sessionId: 'A', kind: 'queue', success: false, content: 'No turn is running.' });
   check('a refused Send now takes the pending state back',
     !sendNow.classList.contains('pending') && sendNow.getAttribute('aria-busy') === null
@@ -146,6 +149,13 @@ async function main() {
   check('second send tagged', userBubbles().length === 3);
   recv({ type: 'queue_update', sessionId: 'A', queue: [{ id: sent.queueId, text: 'steered msg' }, { id: second.queueId, text: 'plain msg' }] });
   check('both sends queued', queuedBubbles().length === 2);
+  // A newer item takes the button: the older request is no longer about the
+  // queue's head, so its spinner must not keep running behind the new button.
+  const olderBtn = queuedBubbles()[0].querySelector('.queue-send-btn');
+  const newerBtn = queuedBubbles()[1].querySelector('.queue-send-btn');
+  check('a newer queued item takes the pending state over',
+    !!olderBtn && !!newerBtn && olderBtn.hidden && !olderBtn.classList.contains('pending')
+      && !newerBtn.hidden && !newerBtn.classList.contains('pending'));
   // Drop every local pending-ack entry (the state another tab's send would
   // leave behind): the ack below must then resolve through the DOM fallback,
   // which is the path the fix protects.
