@@ -51,6 +51,9 @@ type stubHost struct {
 	// revivableParent is the only caller ReviveChild serves: the store's
 	// ownership boundary, like the real hosts' ParentID check.
 	revivableParent string
+	// reviveDelay widens ReviveChild, so a test can put two revivals of one
+	// saved child in flight at the same time.
+	reviveDelay time.Duration
 	// childMessages records targeted (send_message) deliveries.
 	childMessages []string
 }
@@ -129,6 +132,14 @@ func (h *stubHost) Finished(c *Child[*stubHandle], report string, err error) {
 }
 
 func (h *stubHost) ReviveChild(caller *agent.Agent, childID string) (NewChild[*stubHandle], bool, error) {
+	h.mu.Lock()
+	delay := h.reviveDelay
+	h.mu.Unlock()
+	if delay > 0 {
+		// A real host opens a session here (store read + agent build), which
+		// is the window a second revival would slip through.
+		time.Sleep(delay)
+	}
 	h.mu.Lock()
 	label, ok := h.revivable[childID]
 	if !ok || caller == nil || h.revivableParent != caller.SessionID {

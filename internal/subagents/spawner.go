@@ -175,7 +175,14 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 		status:    "running",
 	}
 	child.SetRunCancel(runCancel)
-	sp.children.register(child)
+	if !sp.children.register(child) {
+		// Unreachable while ids come from sesspkg.NewID, and kept honest
+		// anyway: the registered record owns its host runtime, so this one
+		// (a held runtime nothing would ever release) must go.
+		runCancel()
+		sp.host.Release(child, false)
+		return "", fmt.Errorf("subagent: session id %s is already live", child.ID)
+	}
 	// Reply capture is armed once per background child; the host's delivery
 	// hooks arm it per targeted delivery (Child.BeginReply).
 	sp.host.ArmReplyCapture(child)
@@ -681,6 +688,18 @@ func (sp *Spawner[H]) reviveChild(caller *agent.Agent, agentID string) (*Child[H
 	if sp.children.guardExceeded(caller.SessionID, pol.guardLimit()) {
 		return nil, fmt.Errorf("send_message: too many live subagents (%d); wait for them to finish or be released, then retry", pol.guardLimit())
 	}
+	// Claim the id across the whole reopen. The lookup above and the register
+	// below are two critical sections, and between them the host opens a
+	// runtime: a second revival racing here would publish a second record over
+	// the first one's id (the web host dedupes the runtime by id, so both
+	// records would share it), and the displaced record's release would evict
+	// the child mid-turn. Unreachable through send_message today — the tool is
+	// never parallel-eligible — which is exactly why it must not be what keeps
+	// this correct.
+	if !sp.children.beginRevive(agentID) {
+		return nil, fmt.Errorf("send_message: subagent %s is being reopened; retry in a moment", agentID)
+	}
+	defer sp.children.endRevive(agentID)
 	nc, ok, err := sp.host.ReviveChild(caller, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("send_message: reopening subagent %s: %w", agentID, err)
@@ -689,6 +708,10 @@ func (sp *Spawner[H]) reviveChild(caller *agent.Agent, agentID string) (*Child[H
 		return nil, errNotRestorable
 	}
 	if nc.Agent == nil {
+		// Contract violation: a host must not open — let alone hold — a child
+		// runtime it cannot hand back (see Host.ReviveChild). Both hosts check
+		// their own runtime before they take the hold, so this reports the bug
+		// instead of pinning a runtime the lifecycle has no record of.
 		return nil, fmt.Errorf("send_message: host returned no child agent for subagent %s", agentID)
 	}
 	child := &Child[H]{
@@ -707,7 +730,12 @@ func (sp *Spawner[H]) reviveChild(caller *agent.Agent, agentID string) (*Child[H
 		status:    "running",
 	}
 	child.MarkInterrupted() // no main run: idle and continuable
-	sp.children.register(child)
+	// Guaranteed to succeed: beginRevive owns the id until this returns. The
+	// check is kept so a future second registration path cannot silently
+	// displace this record.
+	if !sp.children.register(child) {
+		return nil, fmt.Errorf("send_message: subagent %s was registered while it was being reopened", agentID)
+	}
 	sp.host.ArmReplyCapture(child)
 	time.AfterFunc(pol.retain(), func() { sp.ReleaseChildIfQuiet(child) })
 	return child, nil

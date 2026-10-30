@@ -161,7 +161,9 @@ type Host[H any] interface {
 	// runtime, and any approval routing. ctx is the spawning tool's context
 	// (used for model selection, which may dial the provider). It must NOT
 	// announce the child — Started runs only after the child is admitted by
-	// the caps.
+	// the caps. Agent is required: a host that cannot produce one returns an
+	// error, and must not keep (hold, register) a runtime it cannot hand
+	// back — the lifecycle has no record to release it by.
 	NewChild(ctx context.Context, parent *agent.Agent, job, model string, depth int) (NewChild[H], error)
 	// RunTurn runs one turn on the child and returns its final output. ctx
 	// survives the spawning tool call for background children (it is owned
@@ -216,6 +218,9 @@ type Host[H any] interface {
 	// OR it belongs to another parent: the caller-ownership check is the same
 	// boundary PersistedResult applies. Returning ok=false *and* an error is
 	// redundant; an error means "the store had it but could not open it".
+	// Agent is required here too: check the reopened runtime BEFORE taking
+	// the hold, and return an error rather than a child the lifecycle would
+	// have to drop (same contract as NewChild).
 	ReviveChild(caller *agent.Agent, childID string) (nc NewChild[H], ok bool, err error)
 	// PersistedChildren returns the caller's SAVED nested (subagent)
 	// sessions, newest first — the children whose runtime is not live
