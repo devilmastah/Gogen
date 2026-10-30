@@ -390,3 +390,179 @@ func TestLayoutKeptRequestRequiresProgressAfterLatestRequest(t *testing.T) {
 		t.Fatal("a progress summary after the latest request is the layout")
 	}
 }
+
+// seedEmptyProgressRequest builds a deep-dive history whose progress region
+// is empty. The work before the request is large enough to summarize, so
+// the layout shrinks and still leaves the request verbatim.
+func seedEmptyProgressRequest(a *Agent, request string) {
+	a.SetDeepDive(true)
+	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("y", 8000)})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("z", 8000)})
+	a.appendMessage(llm.Message{Role: "user", Content: request})
+	_ = a.ContextStats(context.Background())
+}
+
+// TestEmergencySmallMiddleReachesLastRequest pins that a minimum-size
+// refusal does not end the emergency sequence. The request is the last
+// message, so the first keep leaves it in the tail and the middle is too
+// small to summarize. The next keep includes the request.
+func TestEmergencySmallMiddleReachesLastRequest(t *testing.T) {
+	a, ctxMgr, provider := newEmergencyTestAgent(t, false)
+	a.SetDeepDive(true)
+	big := strings.Repeat("x", 150000)
+	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: "ok"})
+	a.appendMessage(llm.Message{Role: "user", Content: big})
+	_ = a.ContextStats(context.Background())
+	if total := a.compactionTokenTotal(); total < ctxMgr.HardLimit() {
+		t.Fatalf("test setup: total %d under the hard limit %d", total, ctxMgr.HardLimit())
+	}
+
+	a.compactToFit(context.Background(), nil, cachedCounts(t, a), 1, true)
+	if hasContent(a.Messages, big) {
+		t.Fatal("the last-message request is still verbatim")
+	}
+	if total := a.compactionTokenTotal(); total >= ctxMgr.HardLimit() {
+		t.Fatalf("total %d still at the hard limit %d", total, ctxMgr.HardLimit())
+	}
+	if backoff, guard := compactState(a); !backoff.IsZero() || guard != 0 {
+		t.Fatalf("a too-small middle was recorded as a failure: backoff %v guard %d", backoff, guard)
+	}
+	if n := atomic.LoadInt64(&provider.calls); n == 0 {
+		t.Fatal("summarizer calls = 0, want the keep that includes the request")
+	}
+}
+
+// TestNormalSmallMiddleTriesSmallerKeep pins the same minimum-size skip on
+// the normal tier. The first keep's middle is too small, and the next keep
+// summarizes what that keep had left in the tail. Recording the refusal
+// would back off with the history unchanged.
+func TestNormalSmallMiddleTriesSmallerKeep(t *testing.T) {
+	a, _, provider := newEmergencyTestAgent(t, false)
+	a.SetDeepDive(true)
+	tail := strings.Repeat("y", 8000)
+	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: "ok"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: tail})
+	_ = a.ContextStats(context.Background())
+
+	a.compactToFit(context.Background(), nil, cachedCounts(t, a), 1, false)
+	if hasContent(a.Messages, tail) {
+		t.Fatal("the smaller keep left the tail verbatim")
+	}
+	if backoff, _ := compactState(a); !backoff.IsZero() {
+		t.Fatalf("a too-small middle was recorded as a failure: backoff %v", backoff)
+	}
+	if n := atomic.LoadInt64(&provider.calls); n == 0 {
+		t.Fatal("summarizer calls = 0, want the smaller keep")
+	}
+}
+
+// TestEmergencySummarizerErrorStopsTheSequence pins that a summarizer
+// failure still ends the shrinking-tail sequence. The minimum-size skip
+// does not apply to it, so later keeps do not each call the provider.
+func TestEmergencySummarizerErrorStopsTheSequence(t *testing.T) {
+	a, _, provider := newEmergencyTestAgent(t, true)
+	a.SetDeepDive(true)
+	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("y", 8000)})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("z", 8000)})
+	a.appendMessage(llm.Message{Role: "user", Content: "tail"})
+	_ = a.ContextStats(context.Background())
+
+	a.compactToFit(context.Background(), nil, cachedCounts(t, a), 2, true)
+	if n := atomic.LoadInt64(&provider.calls); n != 2 {
+		t.Fatalf("summarizer calls = %d, want the one failed pass", n)
+	}
+	if _, guard := compactState(a); guard == 0 {
+		t.Fatal("the summarizer failure was not recorded")
+	}
+	if !hasContent(a.Messages, strings.Repeat("y", 8000)) {
+		t.Fatal("a later keep summarized the history after the failure")
+	}
+}
+
+// TestPreflightEmptyProgressSummarizesRequest pins the pre-flight fallback
+// when the progress region is empty. The layout summarizes what came
+// before the request and leaves the request last. The estimate is still
+// over the window, so the single summary runs.
+func TestPreflightEmptyProgressSummarizesRequest(t *testing.T) {
+	a, ctxMgr, provider := newEmergencyTestAgent(t, false)
+	big := strings.Repeat("x", 200000)
+	seedEmptyProgressRequest(a, big)
+	if est := a.outgoingViewEstimate(a.rebuildView()); est < ctxMgr.ContextLimit() {
+		t.Fatalf("test setup: estimate %d under the window", est)
+	}
+	var n atomic.Int32
+	h := &llm.StreamHandlers{OnCompacting: func() { n.Add(1) }}
+
+	if !a.runForcedSummarization(context.Background(), h, false) {
+		t.Fatal("expected the history to shrink")
+	}
+	if hasContent(a.Messages, big) {
+		t.Fatal("the request is still verbatim")
+	}
+	if calls := atomic.LoadInt64(&provider.calls); calls < 2 {
+		t.Fatalf("summarizer calls = %d, want the layout pass and the single summary", calls)
+	}
+	if got := n.Load(); got != 2 {
+		t.Fatalf("OnCompacting fired %d times, want 2", got)
+	}
+	if backoff, guard := compactState(a); !backoff.IsZero() || guard != 0 {
+		t.Fatalf("the fallback was recorded as a failure: backoff %v guard %d", backoff, guard)
+	}
+}
+
+// TestEmergencyEmptyProgressSummarizesRequest pins the same empty progress
+// region on the emergency tier. The layout shrinks the history and the
+// total stays at or above the hard limit, so the request is summarized.
+func TestEmergencyEmptyProgressSummarizesRequest(t *testing.T) {
+	a, ctxMgr, provider := newEmergencyTestAgent(t, false)
+	big := strings.Repeat("x", 200000)
+	seedEmptyProgressRequest(a, big)
+	if total := a.compactionTokenTotal(); total < ctxMgr.HardLimit() {
+		t.Fatalf("test setup: total %d under the hard limit %d", total, ctxMgr.HardLimit())
+	}
+
+	a.compactToFit(context.Background(), nil, cachedCounts(t, a), 0, true)
+	if hasContent(a.Messages, big) {
+		t.Fatal("the request is still verbatim")
+	}
+	if total := a.compactionTokenTotal(); total >= ctxMgr.HardLimit() {
+		t.Fatalf("total %d still at the hard limit %d", total, ctxMgr.HardLimit())
+	}
+	if backoff, guard := compactState(a); !backoff.IsZero() || guard != 0 {
+		t.Fatalf("recorded a failure after the request was summarized: backoff %v guard %d", backoff, guard)
+	}
+	if n := atomic.LoadInt64(&provider.calls); n < 2 {
+		t.Fatalf("summarizer calls = %d, want the layout pass and the single summary", n)
+	}
+}
+
+// TestLayoutKeptRequestIncludesEmptyProgress pins the empty progress
+// region: one session summary between the head and the request. Other
+// messages in that gap are a different history.
+func TestLayoutKeptRequestIncludesEmptyProgress(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: contextmgr.SummaryPrefix + "earlier"},
+		{Role: "user", Content: "the request"},
+	}
+	if !layoutKeptRequest(msgs) {
+		t.Fatal("an empty progress region keeps the request after the session summary")
+	}
+	withTail := append(append([]llm.Message{}, msgs...), llm.Message{Role: "assistant", Content: "tail"})
+	if !layoutKeptRequest(withTail) {
+		t.Fatal("a tail after that request is still the layout")
+	}
+	mixed := []llm.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: contextmgr.SummaryPrefix + "earlier"},
+		{Role: "assistant", Content: "more"},
+		{Role: "user", Content: "the request"},
+	}
+	if layoutKeptRequest(mixed) {
+		t.Fatal("other messages between the session summary and the request are a different history")
+	}
+}

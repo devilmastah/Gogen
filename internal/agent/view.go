@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -483,26 +484,32 @@ func (a *Agent) summarizeKeptRequest(ctx context.Context, h *llm.StreamHandlers)
 }
 
 // layoutKeptRequest reports whether a deep-dive compaction kept the latest
-// request verbatim. That result has a progress summary after the latest
-// request. A progress summary anywhere earlier is not that shape, and the
-// single summary, used when the request is the head or sits in the tail,
-// has none.
+// request verbatim. That result has a progress summary after the request
+// or, when the progress region was empty, one session summary between the
+// head and the request. A tail may follow the request.
 func layoutKeptRequest(msgs []llm.Message) bool {
-	req := -1
+	first, last := -1, -1
 	for i, m := range msgs {
 		if contextmgr.IsRequest(m) {
-			req = i
+			if first < 0 {
+				first = i
+			}
+			last = i
 		}
 	}
-	if req < 0 {
+	if last < 0 {
 		return false
 	}
-	for _, m := range msgs[req+1:] {
+	for _, m := range msgs[last+1:] {
 		if strings.HasPrefix(m.Content, contextmgr.ProgressSummaryPrefix) {
 			return true
 		}
 	}
-	return false
+	if last == first {
+		return false
+	}
+	between := msgs[first+1 : last]
+	return len(between) == 1 && strings.HasPrefix(between[0].Content, contextmgr.SummaryPrefix)
 }
 
 // compactNoTail runs one compaction with no preserved tail. The caller sets
@@ -866,7 +873,10 @@ func (a *Agent) overflowTerminalError(cause error) error {
 //
 // Giving up — a failed pass, or an exhausted sequence still over budget —
 // records a compact failure so the next turn's attempt is backed off
-// instead of immediately repeating the whole sequence.
+// instead of immediately repeating the whole sequence. A middle under the
+// minimum size is not that failure while a smaller keep remains: the next
+// keep takes in what this one left in the tail, including a request that
+// is the last message.
 func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, counts []int, keep int, emergency bool) {
 	// Shrinking-tail sequence: the chosen keep first, then keep/2, 1, 0.
 	// Duplicates are dropped so every retry preserves strictly fewer recent
@@ -895,7 +905,14 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 			AllowedTools: a.AllowedToolNames(),
 		})
 		if err != nil {
-			// A failing summarization call must not be retried on every turn.
+			// A middle under the minimum is the split's answer. The next
+			// keep puts more of the history into the middle. Recording it
+			// here would block that keep, and a request left in the tail
+			// would stay verbatim. A summarizer failure still stops the
+			// sequence: retrying it on every turn does not help.
+			if errors.Is(err, contextmgr.ErrNotEnoughHistory) && i < len(keeps)-1 {
+				continue
+			}
 			a.noteCompactFailure(err)
 			if emergency {
 				a.noteProgressFailure(&a.compactionGuards.emergency)

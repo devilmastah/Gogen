@@ -34,6 +34,11 @@ const maxSummarizeDepth = 8
 // same message) and identifies it to the UI.
 const CondensedMessagePrefix = "[Message condensed — the original was too large for the context window and was archived]\n"
 
+// ErrNotEnoughHistory is returned when the middle is below the minimum size
+// worth summarizing. It is the split's answer, not a summarizer failure: a
+// shrinking-tail retry includes more of the history in the next middle.
+var ErrNotEnoughHistory = errors.New("not enough history to compact")
+
 // ErrSummaryNotSmaller is returned by CompactPinned/CompactPinnedWithKeep when
 // the framed summary (SummaryPrefix + summary) is not strictly smaller than
 // the summarized middle. The compaction is refused without mutating history:
@@ -945,7 +950,9 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message, opts Comp
 }
 
 // compactPinned is the shared implementation of Compact. opts.Forced
-// bypasses the minMiddleTokens guard (emergency compaction).
+// bypasses the minMiddleTokens guard. Emergency compaction does not set
+// Forced, so a middle under that minimum returns ErrNotEnoughHistory and
+// the caller tries a smaller tail.
 func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, keep int, opts CompactOptions) ([]llm.Message, map[int]struct{}, error) {
 	viewPrefix, counts, pinned, forced := opts.ViewPrefix, opts.Counts, opts.Pinned, opts.Forced
 	if len(messages) <= keep+1 {
@@ -1030,7 +1037,7 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 		}
 	}
 	if !forced && middleTokens < m.minMiddleTokens {
-		return nil, nil, fmt.Errorf("not enough history to compact (%d messages in the middle)", len(middle))
+		return nil, nil, fmt.Errorf("%w (%d messages in the middle)", ErrNotEnoughHistory, len(middle))
 	}
 
 	// The summarization request carries the wire prefix (viewPrefix), the
