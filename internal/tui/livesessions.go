@@ -176,10 +176,10 @@ type liveSession struct {
 // Update-thread only (see steerQ).
 func (s *liveSession) queue() *steerq.Queue {
 	if s.steerQ == nil {
-		// maxSteerUserQueue / maxPendingDeliveries are this host's caps; the
-		// shared queue applies them (refuse user text, evict the oldest
-		// notice, never evict a targeted reply).
-		s.steerQ = steerq.New(maxSteerUserQueue, maxPendingDeliveries)
+		// NewDefault applies the shared bounds (steerq.UserCap /
+		// steerq.SystemCap): refuse user text at the cap, evict the oldest
+		// notice at the system cap, never evict a targeted reply.
+		s.steerQ = steerq.NewDefault()
 	}
 	return s.steerQ
 }

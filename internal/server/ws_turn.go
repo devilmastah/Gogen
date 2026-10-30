@@ -12,6 +12,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	"gogen/internal/steerq"
 	"gogen/internal/streamutil"
 )
 
@@ -120,7 +121,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 		// running" signal (otherwise the phantom queued chip would survive
 		// until some later unrelated queue frame).
 		_ = ws.writeJSON(WSMessage{Type: "response", QueueID: msg.QueueID, Content: fmt.Sprintf(
-			"Error: too many queued messages (limit %d) — wait for the current turn or stop it.", maxUserQueueCap)})
+			"Error: too many queued messages (limit %d) — wait for the current turn or stop it.", steerq.UserCap)})
 		rt.broadcastQueueState()
 		return
 	}

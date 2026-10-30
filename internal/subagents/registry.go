@@ -18,6 +18,14 @@ import (
 type registry[H any] struct {
 	mu       sync.Mutex
 	children map[string]*Child[H]
+	// reviving holds the ids whose host runtime is being reopened from the
+	// store right now. It closes the check-then-act in Spawner.reviveChild:
+	// two concurrent revivals of one saved child would build two Child
+	// records (and two host runtimes) for the same session id — the web host
+	// dedupes the runtime by id, so the two records would share one, and the
+	// loser's release would then tear down the runtime the winner is using.
+	// Guarded by mu.
+	reviving map[string]struct{}
 	// foreground counts in-flight foreground (Spawn/Fork) children per parent
 	// session id. Foreground children are not Child records, but they hold a
 	// slot of the concurrent limit for the whole turn; guarded by mu.
@@ -28,15 +36,57 @@ type registry[H any] struct {
 func newRegistry[H any]() *registry[H] {
 	return &registry[H]{
 		children:   make(map[string]*Child[H]),
+		reviving:   make(map[string]struct{}),
 		foreground: make(map[string]int),
 	}
 }
 
-// register publishes an admitted child.
-func (r *registry[H]) register(c *Child[H]) {
+// register publishes an admitted child, reporting false when the id is
+// already taken. A duplicate is refused rather than overwriting: the
+// registered record owns the host runtime, its armed reply capture and its
+// retention timer, so replacing it would strand all three (and the displaced
+// record's release would evict the runtime the newcomer is using). A caller
+// that gets false tears its own record down.
+func (r *registry[H]) register(c *Child[H]) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, ok := r.children[c.ID]; ok {
+		return false
+	}
 	r.children[c.ID] = c
+	return true
+}
+
+// beginRevive claims id for a revival in flight, so the lookup that decided
+// "not live, reopen it" and the register that publishes the reopened child
+// are one critical section. It refuses when the id is already registered
+// (somebody revived it, or the child was never released) or another revival
+// of it is in flight.
+func (r *registry[H]) beginRevive(id string) bool {
+	if r == nil {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.children[id]; ok {
+		return false
+	}
+	if _, ok := r.reviving[id]; ok {
+		return false
+	}
+	r.reviving[id] = struct{}{}
+	return true
+}
+
+// endRevive releases a claim taken by beginRevive, on every path: by then the
+// id is registered or nothing was published.
+func (r *registry[H]) endRevive(id string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.reviving, id)
 }
 
 // get resolves a live child by id (nil when unknown or already released).
@@ -129,6 +179,19 @@ func (r *registry[H]) liveCountLocked(parentID string) int {
 		}
 	}
 	return n
+}
+
+// guardExceeded reports whether parentID already holds guard NON-finished
+// children. It is the admission check for a REVIVED child (loaded from the
+// store for a send_message): unlike a spawn there is no in-flight child to
+// count itself, so a plain ">=" is the whole rule. guard <= 0 means unbounded.
+func (r *registry[H]) guardExceeded(parentID string, guard int) bool {
+	if r == nil || guard <= 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.liveCountLocked(parentID) >= guard
 }
 
 // acquireForeground atomically checks both spawn caps and, when allowed,

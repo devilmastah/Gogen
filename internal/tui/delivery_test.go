@@ -262,7 +262,7 @@ func TestDeliveryQueueOverflowDropsOldest(t *testing.T) {
 	s := m.focusedSession()
 	// One user item must survive the system overflow untouched.
 	s.queue().Append(userItem("u1", "user draft"))
-	for i := 1; i <= maxPendingDeliveries; i++ {
+	for i := 1; i <= steerq.SystemCap; i++ {
 		s.queue().Append(notice(fmt.Sprintf("n%d", i), fmt.Sprintf("notice-%d", i)))
 	}
 
@@ -288,8 +288,8 @@ func TestDeliveryQueueOverflowDropsOldest(t *testing.T) {
 			hasUser = true
 		}
 	}
-	if sys != maxPendingDeliveries {
-		t.Fatalf("queued system items = %d, want %d", sys, maxPendingDeliveries)
+	if sys != steerq.SystemCap {
+		t.Fatalf("queued system items = %d, want %d", sys, steerq.SystemCap)
 	}
 	if hasN1 {
 		t.Fatal("overflow must drop the OLDEST system delivery")
@@ -420,14 +420,14 @@ func TestUserQueueCapRefuses(t *testing.T) {
 	m := newQueueTestModel()
 	m.streaming = true
 	s := m.focusedSession()
-	for i := 0; i < maxSteerUserQueue; i++ {
+	for i := 0; i < steerq.UserCap; i++ {
 		s.queue().Append(userItem(fmt.Sprintf("u%d", i), fmt.Sprintf("msg-%d", i)))
 	}
 	m.textarea.SetValue("one too many")
 	model, _, _ := m.handleSubmitKey(keyPress("enter"))
 	m2 := model.(*Model)
-	if got := s.countUserSteer(); got != maxSteerUserQueue {
-		t.Fatalf("countUserSteer = %d, want %d", got, maxSteerUserQueue)
+	if got := s.countUserSteer(); got != steerq.UserCap {
+		t.Fatalf("countUserSteer = %d, want %d", got, steerq.UserCap)
 	}
 	if !strings.Contains(m2.statusMsg, "Too many queued messages") {
 		t.Fatalf("statusMsg = %q, want cap rejection", m2.statusMsg)

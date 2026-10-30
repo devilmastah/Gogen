@@ -199,9 +199,11 @@ type ContinuableSubagentSpawner interface {
 	// one foreground turn. job may be empty for the default continuation
 	// prompt. Returns the fork's final output.
 	Fork(ctx context.Context, parent *Agent, job string, depth int) (string, error)
-	// ListAgents lists the caller's registered children (id, label, status,
-	// depth, latest progress line). Finished children remain available only for
-	// their retention window; GetAgentResult resolves older persisted results.
+	// ListAgents lists the caller's children: the LIVE ones (id, label,
+	// status, depth, latest progress line) and the SAVED ones the registry no
+	// longer tracks (id, label, recorded outcome), so a child stays
+	// discoverable after its retention window or a restart. GetAgentResult
+	// reads any listed child's report.
 	ListAgents(caller *Agent) (string, error)
 	// GetAgentResult returns the authoritative current/final result for one
 	// of the caller's background children. It remains readable after the
@@ -220,6 +222,19 @@ type ContinuableSubagentSpawner interface {
 	// InterruptAgent cancels a live child's in-flight turn (no-op when
 	// idle). The child session stays alive.
 	InterruptAgent(caller *Agent, agentID string) error
+}
+
+// SubagentSteerer is the optional extension of ContinuableSubagentSpawner for
+// STEERING a busy child: the message is delivered like send_message, and the
+// child's running turn is asked to stop at its next round boundary so the
+// message runs immediately after the model call and tools that round already
+// started. A spawner that does not implement it still delivers the message — it
+// just waits for the child's turn to end, as send_message always did.
+type SubagentSteerer interface {
+	// Steer delivers text to a child of caller and, when the child is mid-turn
+	// (and not answering another targeted delivery), asks that turn to yield
+	// at its next round boundary.
+	Steer(caller *Agent, agentID, text string) error
 }
 
 // subagentToolDef is the LLM-facing schema for the subagent tool. Like the
@@ -270,10 +285,15 @@ func subagentForkToolDef() llm.Tool {
 // parent's conversation as turns, so the model checks deliberately.
 func listAgentsToolDef() llm.Tool {
 	return toolDef("list_agents",
-		"List this session's child subagents: id, label, status (running/idle/finished), depth, and each "+
-			"child's latest progress line. Read-only. Use to resolve agent ids for get_agent_result/"+
-			"wait_agent/send_message/interrupt_agent, to check background status, or to see what a child "+
-			"is doing. Finished children remain listed briefly.",
+		"List this session's child subagents as one list, most recent activity first: id, label, an "+
+			"active/inactive flag, status (active: running/idle/finished; inactive: success/failed/"+
+			"interrupted), depth and latest progress line for active children, message count and age for "+
+			"inactive ones. Inactive children are saved sessions whose runtime is gone (released, or from "+
+			"before a restart) — they stay listed so they remain discoverable. Read-only. Use to resolve "+
+			"agent ids for get_agent_result/wait_agent/send_message/interrupt_agent, to check background "+
+			"status, or to see what a child is doing. send_message reaches any listed child — an "+
+			"inactive one is reopened from its saved session first; get_agent_result reads any listed "+
+			"child's report.",
 		toolSchema(map[string]any{}),
 	)
 }
@@ -310,14 +330,20 @@ func waitAgentToolDef() llm.Tool {
 // message when that turn finishes — the single return channel per run.
 func sendMessageToolDef() llm.Tool {
 	return toolDef("send_message",
-		"Send a message to a background subagent of this session (agent_id) — running, interrupted, or "+
-			"finished-but-retained; queued if it is mid-turn. Its reply is injected into this session "+
-			"when the turn finishes. Use to queue a follow-up, ask a finished one for more detail, or "+
-			"request a stop-and-report. This does not alter the already-running LLM request; use "+
-			"interrupt_agent first when the current turn must be stopped immediately.",
+		"Send a message to a child subagent of this session (agent_id) — running, interrupted, "+
+			"finished-but-retained, or saved (an inactive child is reopened from its saved session first, "+
+			"so a conversation can continue after a restart); queued if it is mid-turn, or run at the "+
+			"next round boundary with steer=true. Its reply is injected into this session when the turn "+
+			"finishes. Use to queue a follow-up, ask a finished one for more detail, redirect a running "+
+			"one (steer), or request a stop-and-report. This does not alter the already-running "+
+			"LLM request; use interrupt_agent first when the current turn must be stopped immediately.",
 		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 			"message":  toolProp("string", "The message to deliver to the subagent"),
+			"steer": toolProp("boolean", "Redirect a child that is mid-turn: the message runs right after "+
+				"the tools its current round already started, instead of waiting for the whole turn to end. "+
+				"The in-flight model call and its tools finish, so no work is lost; only the next model call "+
+				"is skipped. A child answering another message is not cut (it replies first). Default false."),
 		}, "agent_id", "message"),
 	)
 }
@@ -464,6 +490,24 @@ func handleSendMessage(_ context.Context, a *Agent, args map[string]any) (string
 	if err != nil {
 		return "", err
 	}
+	steer, err := boolArg(args, "steer", false)
+	if err != nil {
+		return "", err
+	}
+	if steer {
+		if st, ok := cs.(SubagentSteerer); ok {
+			if err := st.Steer(a, agentID, message); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Message delivered to subagent %s (steering: it runs at the next round boundary if the child is mid-turn, otherwise after its current turn).", agentID), nil
+		}
+		// No steering in this mode: deliver anyway rather than refusing a
+		// message the caller already composed, and say what happened.
+		if err := cs.SendMessage(a, agentID, message); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Message delivered to subagent %s (steering is not supported in this mode; it runs after the current turn).", agentID), nil
+	}
 	if err := cs.SendMessage(a, agentID, message); err != nil {
 		return "", err
 	}
@@ -535,18 +579,19 @@ type subagentOutcome struct {
 	Summary string
 }
 
-// SetSubagentOutcome records the final outcome of a nested (subagent)
-// session. The spawner writes it at every terminal transition (natural
-// completion, cancellation, eviction) so the persisted snapshot carries the
-// truth across restarts; the sidebar reads it from the sessions payload
-// when the live subagent_started/finished events are gone. Empty status
-// means the child has not finished (or is not a subagent).
+// SetSubagentOutcome records the outcome of a nested (subagent) session. The
+// spawner writes "running" when the child is admitted and the terminal status
+// at every terminal transition (natural completion, cancellation, eviction),
+// so the persisted snapshot carries the truth across restarts; the sidebar
+// reads it from the sessions payload when the live subagent_started/finished
+// events are gone. "" means no outcome was ever recorded (not a subagent, or
+// a record written before admission was stamped).
 func (a *Agent) SetSubagentOutcome(status, summary string) {
 	a.subagentOutcome.Store(&subagentOutcome{Status: status, Summary: summary})
 }
 
-// SubagentOutcome returns the recorded final outcome: the status ("" /
-// "success" / "failed") and the summary text.
+// SubagentOutcome returns the recorded outcome: the status ("running" /
+// "success" / "failed" / "") and the summary text.
 func (a *Agent) SubagentOutcome() (string, string) {
 	v := a.subagentOutcome.Load()
 	if v == nil {

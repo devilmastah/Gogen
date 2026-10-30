@@ -1,6 +1,10 @@
 package server
 
-import "testing"
+import (
+	"testing"
+
+	"gogen/internal/steerq"
+)
 
 // TestRemoveDropsParentDeliveries pins the cleanup: the per-parent delivery
 // backlog is keyed by session id, and a removed session's undrained messages
@@ -12,15 +16,17 @@ func TestRemoveDropsParentDeliveries(t *testing.T) {
 	rt.agent.SessionID = "parent-1"
 	r.register("parent-1", rt)
 
+	stash := steerq.New(0, steerq.SystemCap)
+	stash.Append(steerq.Item{ID: steerq.NewID(), Text: "undrained notice", Kind: steerq.Notice})
 	r.parentDeliverMu.Lock()
-	r.parentDeliveries["parent-1"] = []string{"undrained notice"}
+	r.parentDeliveries["parent-1"] = stash
 	r.parentDeliverMu.Unlock()
 
 	r.remove("parent-1")
 
 	r.parentDeliverMu.Lock()
 	defer r.parentDeliverMu.Unlock()
-	if got := r.parentDeliveries["parent-1"]; len(got) != 0 {
+	if got := r.parentDeliveries["parent-1"]; got != nil {
 		t.Fatalf("parent deliveries survived removal: %#v", got)
 	}
 }

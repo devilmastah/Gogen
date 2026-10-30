@@ -256,6 +256,10 @@ func TestSidebarChildRowRendering(t *testing.T) {
 		{name: "idle", row: sidebarRow{depth: 1, live: true}, wantDot: true, state: "idle"},
 		{name: "settled done", row: sidebarRow{depth: 1, childStatus: "success"}, wantDot: false, state: "done"},
 		{name: "settled failed", row: sidebarRow{depth: 1, childStatus: "failed"}, wantDot: false, state: "failed"},
+		// A child whose runtime is gone and whose recorded outcome never
+		// reached a terminal state: interrupted, never done.
+		{name: "settled interrupted", row: sidebarRow{depth: 1, childStatus: "running"}, wantDot: false, state: "interrupted"},
+		{name: "settled legacy", row: sidebarRow{depth: 1}, wantDot: false, state: "interrupted"},
 	}
 	for _, tc := range states {
 		t.Run(tc.name, func(t *testing.T) {

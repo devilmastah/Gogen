@@ -248,6 +248,16 @@ type childSpawnMsg struct {
 	ready  chan error
 }
 
+// childAdoptMsg asks the Update thread to give a REVIVED child — one loaded
+// from the store because a send_message found it no longer live — a live slot,
+// WITHOUT starting a turn: the delivery that follows starts one. ack reports
+// admission.
+type childAdoptMsg struct {
+	handle *childHandle
+	label  string
+	ack    chan error
+}
+
 // childMessageMsg delivers a send_message into a child's queue (queued when the
 // child is mid-turn). ack reports (queued, full).
 type childMessageMsg struct {
@@ -376,12 +386,17 @@ func (sp *tuiSubagentSpawner) Release(c *subagents.Child[*childHandle], cancelle
 	_ = sp.send(childReleaseMsg{handle: h, cancelledMidRun: cancelledMidRun})
 }
 
-// Deliver implements subagents.Host: queue one system message into the parent
+// Deliver implements subagents.Host: queue one child event into the parent
 // conversation. It names the parent by SESSION id; the Update thread resolves
 // the slot, so a focus switch between the producer and the handler cannot
 // re-attribute the notice.
-func (sp *tuiSubagentSpawner) Deliver(parentID, text string) {
-	_ = sp.send(deliveryRequestMsg{sid: parentID, text: text})
+//
+// The event is injected as a one-way notice whatever its kind: the TUI keeps
+// no offline stash (a delivery for a slot that is not live is dropped), and a
+// child's event never arms reply capture — that is armed per targeted
+// send_message delivery, on the child's own queue.
+func (sp *tuiSubagentSpawner) Deliver(event subagents.Event) {
+	_ = sp.send(deliveryRequestMsg{sid: event.ParentID, text: event.ParentMessage()})
 }
 
 // Started implements subagents.Host. The child's sidebar row comes from its
@@ -392,6 +407,82 @@ func (sp *tuiSubagentSpawner) Started(*subagents.Child[*childHandle], string) {}
 // /subagents list (live status for running children comes from their slot).
 func (sp *tuiSubagentSpawner) Finished(c *subagents.Child[*childHandle], report string, err error) {
 	sp.addRecord(subagentRecord{label: c.Label, report: agent.TruncateSubagentReport(report), err: err})
+}
+
+// ReviveChild implements subagents.Host: reopen one of the caller's saved
+// nested sessions as a live slot so a send_message can reach it again — the
+// live slot set is process-local, the session is not, so without this a
+// subagent conversation ended for good at its first release or restart.
+//
+// The agent is loaded here, on the caller's goroutine (the spawn path builds
+// child agents off the Update thread too); only the SLOT is admitted on the
+// Update thread, through childAdoptMsg, because slots are Update-thread state.
+func (sp *tuiSubagentSpawner) ReviveChild(caller *agent.Agent, childID string) (subagents.NewChild[*childHandle], bool, error) {
+	if sp == nil || sp.ws == nil || sp.ws.Store == nil || caller == nil || childID == "" {
+		return subagents.NewChild[*childHandle]{}, false, nil
+	}
+	// Ownership from the store index first: it never loads a session the
+	// caller does not own (the same boundary PersistedResult uses).
+	info := sp.ws.Store.Info(sp.ws.GetWorkingDir(), childID)
+	if info == nil || info.ParentID != caller.SessionID {
+		return subagents.NewChild[*childHandle]{}, false, nil
+	}
+	snap, err := sp.ws.Store.LoadInWorkingDir(sp.ws.GetWorkingDir(), childID)
+	if err != nil {
+		return subagents.NewChild[*childHandle]{}, false, err
+	}
+	a := sp.ws.NewSessionAgent(&snap, childID)
+	if a == nil {
+		// No slot was admitted yet, so there is nothing to unwind: report the
+		// failure instead of handing the lifecycle a child it cannot use.
+		return subagents.NewChild[*childHandle]{}, false, fmt.Errorf("subagent: reopened session %s has no usable agent", childID)
+	}
+	h := newChildHandle(a)
+	label := info.Label
+	if l := a.SessionLabelSnapshot(); l != "" {
+		label = l
+	}
+	ack := make(chan error, 1)
+	if err := sp.send(childAdoptMsg{handle: h, label: label, ack: ack}); err != nil {
+		return subagents.NewChild[*childHandle]{}, false, err
+	}
+	if err := <-ack; err != nil {
+		return subagents.NewChild[*childHandle]{}, false, err
+	}
+	return subagents.NewChild[*childHandle]{Handle: h, Agent: a, Label: label}, true, nil
+}
+
+// PersistedChildren implements subagents.Host: the caller's saved nested
+// (subagent) sessions, newest first, for list_agents. The ParentID filter is
+// the same authorization boundary PersistedResult applies — a model must never
+// see another parent's children. Best effort: a store error yields no saved
+// section rather than failing the tool call.
+func (sp *tuiSubagentSpawner) PersistedChildren(caller *agent.Agent) []subagents.PersistedChild {
+	if sp.ws == nil || sp.ws.Store == nil || caller == nil {
+		return nil
+	}
+	list, err := sp.ws.Store.List(sp.ws.GetWorkingDir())
+	if err != nil {
+		return nil
+	}
+	var out []subagents.PersistedChild
+	for _, info := range list {
+		if info.ParentID == "" || info.ParentID != caller.SessionID {
+			continue
+		}
+		label := info.Label
+		if label == "" {
+			label = info.ID
+		}
+		out = append(out, subagents.PersistedChild{
+			ID:       info.ID,
+			Label:    label,
+			Status:   info.SubagentStatus,
+			Messages: info.MessageCount,
+			Updated:  info.UpdatedTime(),
+		})
+	}
+	return out
 }
 
 // PersistedResult implements subagents.Host: resolve a released child from the
@@ -446,6 +537,9 @@ func (sp *tuiSubagentSpawner) Policy() subagents.Policy {
 	return subagents.Policy{
 		MaxFinished: maxRecordedSubagents,
 		Concurrent:  func(string) int { return limit },
+		// The child's system queue is the shared one (steerq.NewDefault), so
+		// the "queue is full" refusal quotes the bound that is enforced.
+		SystemQueueCap: steerq.SystemCap,
 	}
 }
 
@@ -484,12 +578,61 @@ func (m *Model) handleChildSpawnMsg(msg childSpawnMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// handleChildAdoptMsg admits the slot a revived child needs. A child that is
+// ALREADY live as a session (the user has it open as a pane) is adopted rather
+// than duplicated: two slots for one session id would both persist to the same
+// file, and the older one's pending delta would be dropped by the newer
+// snapshot — the same rule spawnSavedSession states for resume.
+func (m *Model) handleChildAdoptMsg(msg childAdoptMsg) (tea.Model, tea.Cmd) {
+	ack := msg.ack
+	fail := func(err error) (tea.Model, tea.Cmd) {
+		if ack != nil {
+			ack <- err
+		}
+		return m, nil
+	}
+	if m.lives == nil || msg.handle == nil || msg.handle.agent == nil {
+		return fail(fmt.Errorf("subagent: no live session registry"))
+	}
+	// A release can overtake the RE-adoption of a handle that already has a
+	// lifecycle record (the user opened the child as a pane, the record was
+	// released, and the delivery's adopt arrives after): admitting it would
+	// leave a slot nothing ever removes. A freshly revived handle has no record
+	// yet — reviveChild registers it after ReviveChild returns — so there the
+	// retention timer armed by the lifecycle is what unwinds an abandoned
+	// slot, not this check.
+	if child := msg.handle.childOf(); child != nil && child.Released() {
+		return fail(subagents.ErrEvicted)
+	}
+	if i := m.lives.indexBySessionID(msg.handle.session); i >= 0 {
+		s := m.lives.sessions[i]
+		s.agent = msg.handle.agent
+		s.child = msg.handle
+		msg.handle.setSlot(s)
+		if ack != nil {
+			ack <- nil
+		}
+		return m, nil
+	}
+	s := m.lives.AddChild(msg.handle.agent, msg.label, msg.handle)
+	msg.handle.setSlot(s)
+	if ack != nil {
+		ack <- nil
+	}
+	return m, nil
+}
+
 // childTurnResultSink builds the onResult callback for one child turn: it
 // clears the handle's turn state and either resolves the main run
 // (deliverResult) or delivers the exact send_message reply to the parent.
 func childTurnResultSink(sp *tuiSubagentSpawner, h *childHandle, deliverResult bool) func(string, error) {
 	return func(out string, err error) {
 		h.turnDone()
+		if deliverResult && err == nil && h.agent != nil && h.agent.TurnYielded() {
+			// A steered run stopped at a round boundary: not a completion, and
+			// the queued message runs next (see subagents.ErrYielded).
+			err = subagents.ErrYielded
+		}
 		if deliverResult {
 			select {
 			case h.result <- childTurnResult{out: out, err: err}:
@@ -531,7 +674,7 @@ func (m *Model) handleChildMessageMsg(msg childMessageMsg) (tea.Model, tea.Cmd) 
 	// the shared queue refuses only when the system cap is already full of
 	// replies.
 	if outcome, evicted := s.queue().Append(steerq.Item{
-		ID: newSteerItemID(), Text: msg.text, Kind: steerq.Reply, Tag: h,
+		ID: steerq.NewID(), Text: msg.text, Kind: steerq.Reply, Tag: h,
 	}); outcome != steerq.Accepted {
 		msg.ack <- childMessageAck{ok: false, full: true}
 		return m, nil

@@ -101,10 +101,13 @@ type sidebarRow struct {
 	// it when the parent reorders.
 	parentID string
 	depth    int
-	// childStatus is the child's persisted outcome ("", "success", "failed")
-	// and childSummary its summary — the dot state for a live child, the
-	// muted text for a settled one. Read off the child agent (or the store
-	// index) at build time, so the renderer never touches host state.
+	// childStatus is the child's persisted outcome ("running", "success",
+	// "failed", or a legacy "") and childSummary its summary — the dot state
+	// for a live child, the muted text for a settled one. "running" with no
+	// live runtime means the child never reached a terminal state, so it
+	// renders as interrupted rather than done. Read off the child agent (or
+	// the store index) at build time, so the renderer never touches host
+	// state.
 	childStatus  string
 	childSummary string
 }
@@ -958,11 +961,17 @@ func (m *Model) sidebarMeta(r sidebarRow) string {
 	case r.depth > 0:
 		// A settled child (released, or restored from the store) renders a
 		// MUTED TEXT status instead of a dot, so an archived outcome never
-		// reads as an active session.
+		// reads as an active session. "running" (and a legacy "") means the
+		// child never reached a terminal state — interrupted, cancelled with
+		// its host, or its process went away — and must not read as done.
 		dot = false
-		state = "done"
-		if r.childStatus == "failed" {
+		switch r.childStatus {
+		case "failed":
 			state = "failed"
+		case "success":
+			state = "done"
+		default:
+			state = "interrupted"
 		}
 	case r.streaming:
 		dotStyle, state = ansiPromptOn, "responding"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -174,7 +175,14 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 		status:    "running",
 	}
 	child.SetRunCancel(runCancel)
-	sp.children.register(child)
+	if !sp.children.register(child) {
+		// Unreachable while ids come from sesspkg.NewID, and kept honest
+		// anyway: the registered record owns its host runtime, so this one
+		// (a held runtime nothing would ever release) must go.
+		runCancel()
+		sp.host.Release(child, false)
+		return "", fmt.Errorf("subagent: session id %s is already live", child.ID)
+	}
 	// Reply capture is armed once per background child; the host's delivery
 	// hooks arm it per targeted delivery (Child.BeginReply).
 	sp.host.ArmReplyCapture(child)
@@ -196,6 +204,16 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 	// only now, after the caps passed: a refused child is discarded without
 	// ever being announced.
 	sp.host.Started(child, job)
+	// Record the admission in the child's persisted outcome, BEFORE its first
+	// turn writes a snapshot. A child that is interrupted (interrupt_agent, a
+	// cancelled parent) or whose process goes away never reaches a terminal
+	// state, and an unstamped outcome ("") is indistinguishable from "was
+	// never admitted" — the host's UI then renders it as DONE. Marking it
+	// "running" makes such a child read as interrupted; the terminal paths
+	// overwrite it (FinishSubagentOutcome on completion, "failed"/"cancelled"
+	// on a cancelled release). In-memory only: the child's own persist writes
+	// it, so a refused spawn still leaves no session artifact.
+	child.Agent.SetSubagentOutcome("running", "")
 
 	sp.wg.Add(1)
 	go func() {
@@ -216,6 +234,16 @@ func (sp *Spawner[H]) SpawnBackground(ctx context.Context, parent *agent.Agent, 
 			// stays alive and continuable; no completion notice. Arm the
 			// retention timer so an idle interrupted child cannot linger in
 			// memory forever.
+			child.MarkInterrupted()
+			time.AfterFunc(sp.host.Policy().retain(), func() { sp.ReleaseChildIfQuiet(child) })
+			return
+		}
+		if errors.Is(runErr, ErrYielded) {
+			// STEERED: the run stopped at a round boundary with its work kept,
+			// so the queued message can run next. Same shape as an interrupt —
+			// continuable, no terminal event — and never a completion: recording
+			// one here would stamp an empty success and tell the parent the job
+			// finished.
 			child.MarkInterrupted()
 			time.AfterFunc(sp.host.Policy().retain(), func() { sp.ReleaseChildIfQuiet(child) })
 			return
@@ -317,8 +345,48 @@ func (sp *Spawner[H]) discardUnstartedChild(c *Child[H]) {
 	sp.host.Release(c, false)
 }
 
-// ListAgents lists the caller's live children (id, label, status, depth, and
-// latest progress line). Implements agent.ContinuableSubagentSpawner.
+// listAgentsRow is one child in the list_agents output, live or saved. The
+// two sources are merged into ONE list so the caller reads it in a single
+// order (most recent activity first) instead of two sections it has to
+// cross-reference.
+type listAgentsRow struct {
+	ID     string
+	Label  string
+	Active bool
+	// Status is the live status (running/idle/finished) for an active child,
+	// or the recorded outcome (success/failed/interrupted) for an inactive
+	// one.
+	Status string
+	// Depth is the live nesting depth (0 for a saved child: depth is not
+	// persisted — see SessionSnapshot).
+	Depth int
+	// Progress is the live one-line snippet of the newest assistant output.
+	Progress string
+	// Messages is the saved session's message count (inactive rows only).
+	Messages int
+	// Activity orders the listing, newest first: a running child is active
+	// NOW, a finished one ended when it finished, a saved one was last
+	// updated when the store says.
+	Activity time.Time
+}
+
+// ListAgents lists the caller's children as ONE list, most recent activity
+// first: the LIVE children (status, depth, latest progress line) and the SAVED
+// ones the live registry no longer tracks (recorded outcome, message count).
+// Every row carries an active/inactive flag, so the caller can tell at a
+// glance what send_message can reach — inactive rows are readable only through
+// get_agent_result.
+//
+// There is deliberately no cap here: the listing is a model-facing tool result,
+// and the executor already bounds tool results (spilling the full text when it
+// exceeds the configured limit). A cap would silently hide children the caller
+// cannot otherwise discover — which is the whole point of listing saved ones.
+//
+// The saved half is what makes a child survive a restart in the model's view:
+// the live registry is process-local, so after a restart (or once retention
+// released a child) nothing else would tell the caller that its children — and
+// their reports — still exist. Their ids are the handles get_agent_result
+// needs. Implements agent.ContinuableSubagentSpawner.
 func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 	if caller == nil {
 		return "", fmt.Errorf("list_agents: caller agent is nil")
@@ -326,18 +394,131 @@ func (sp *Spawner[H]) ListAgents(caller *agent.Agent) (string, error) {
 	if sp == nil || sp.children == nil {
 		return "", fmt.Errorf("list_agents: background subagents are not available in this mode")
 	}
-	children := sp.children.childrenOf(caller.SessionID)
-	if len(children) == 0 {
+	rows := sp.agentRows(caller)
+	if len(rows) == 0 {
 		return "No live subagents.", nil
 	}
-	var b strings.Builder
-	for _, c := range children {
-		fmt.Fprintf(&b, "%s — %s — %s (depth %d)\n", c.ID, c.Label, c.StatusOf(sp.host), c.Depth)
-		if line := c.LatestProgress(); line != "" {
-			fmt.Fprintf(&b, "  last: %s\n", line)
+	active := 0
+	for _, r := range rows {
+		if r.Active {
+			active++
 		}
 	}
+	var b strings.Builder
+	noun := "child subagents"
+	if len(rows) == 1 {
+		noun = "child subagent"
+	}
+	fmt.Fprintf(&b, "%d %s (%d active, %d inactive), most recent activity first:\n", len(rows), noun, active, len(rows)-active)
+	for _, r := range rows {
+		if r.Active {
+			fmt.Fprintf(&b, "%s — %s — active — %s (depth %d)\n", r.ID, r.Label, r.Status, r.Depth)
+			if r.Progress != "" {
+				fmt.Fprintf(&b, "  last: %s\n", r.Progress)
+			}
+			continue
+		}
+		fmt.Fprintf(&b, "%s — %s — inactive — %s — %d msgs", r.ID, r.Label, r.Status, r.Messages)
+		if age := shortAge(time.Since(r.Activity)); age != "" {
+			fmt.Fprintf(&b, " — %s ago", age)
+		}
+		b.WriteString("\n")
+	}
+	if active < len(rows) {
+		// send_message revives a saved child (it is the same tool, and the
+		// revival is transparent), so the footer must not claim the active
+		// rows are the only reachable ones — the model would stop trying.
+		b.WriteString("get_agent_result reads any child's report; send_message to an inactive one reopens its saved session.")
+	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// agentRows merges the live children and the caller's saved (non-live) ones
+// into one recency-ordered list. An id the registry still tracks is taken from
+// the registry only, so a child can never appear twice.
+func (sp *Spawner[H]) agentRows(caller *agent.Agent) []listAgentsRow {
+	children := sp.children.childrenOf(caller.SessionID)
+	now := time.Now()
+	rows := make([]listAgentsRow, 0, len(children))
+	liveIDs := make(map[string]struct{}, len(children))
+	for _, c := range children {
+		liveIDs[c.ID] = struct{}{}
+		row := listAgentsRow{
+			ID:       c.ID,
+			Label:    c.Label,
+			Active:   true,
+			Status:   c.StatusOf(sp.host),
+			Depth:    c.Depth,
+			Progress: c.LatestProgress(),
+			Activity: c.CreatedAt,
+		}
+		// Recency of a live child: a turn in flight is activity right now,
+		// a finished one ended when it finished, otherwise it was created
+		// when it was created.
+		if row.Status == "running" {
+			row.Activity = now
+		} else if fin := c.FinishedAt(); !fin.IsZero() {
+			row.Activity = fin
+		}
+		rows = append(rows, row)
+	}
+	if sp.host != nil {
+		for _, pc := range sp.host.PersistedChildren(caller) {
+			if pc.ID == "" {
+				continue
+			}
+			if _, ok := liveIDs[pc.ID]; ok {
+				continue
+			}
+			rows = append(rows, listAgentsRow{
+				ID:       pc.ID,
+				Label:    pc.Label,
+				Status:   persistedStatusLabel(pc.Status),
+				Messages: pc.Messages,
+				Activity: pc.Updated,
+			})
+		}
+	}
+	// Newest first; ties (and missing timestamps) break on the id so the
+	// listing is deterministic between calls.
+	sort.SliceStable(rows, func(i, j int) bool {
+		if !rows[i].Activity.Equal(rows[j].Activity) {
+			return rows[i].Activity.After(rows[j].Activity)
+		}
+		return rows[i].ID < rows[j].ID
+	})
+	return rows
+}
+
+// shortAge renders an update age for an inactive row ("3m", "2h", "4d"). Empty
+// for an unknown (zero) timestamp or an age under a minute, so the common
+// just-finished case stays clean.
+func shortAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return ""
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+// persistedStatusLabel renders a stored outcome for list_agents. "" and
+// "running" both mean the child never reached a terminal state — it was
+// interrupted, cancelled, or its process went away — so they read as
+// "interrupted"; nothing here may suggest that unfinished work completed.
+func persistedStatusLabel(status string) string {
+	switch status {
+	case "success":
+		return "success"
+	case "failed":
+		return "failed"
+	default:
+		return "interrupted"
+	}
 }
 
 // ownedChild resolves a live child and enforces direct-parent ownership.
@@ -434,13 +615,31 @@ func (sp *Spawner[H]) WaitAgent(ctx context.Context, caller *agent.Agent, agentI
 	return status, nil
 }
 
-// SendMessage delivers text to a live child of caller as a new user message
-// (queued when the child is mid-turn). Implements
+// errNotRestorable reports that the store has no saved child the caller may
+// revive (unknown id, or another parent's session). SendMessage keeps its
+// original, more descriptive refusal in that case.
+var errNotRestorable = errors.New("subagent: no saved session to revive")
+
+// SendMessage delivers text to a child of caller as a new user message
+// (queued when the child is mid-turn). A child that is no longer live — its
+// retention window elapsed, it was evicted, or this process never spawned it
+// (a restart) — is REVIVED from its saved session first, so a conversation can
+// continue across restarts instead of ending at the first release. Implements
 // agent.ContinuableSubagentSpawner.
 func (sp *Spawner[H]) SendMessage(caller *agent.Agent, agentID, text string) error {
 	child, err := sp.ownedChild(caller, agentID, "send_message")
 	if err != nil {
-		return err
+		revived, reviveErr := sp.reviveChild(caller, agentID)
+		if reviveErr != nil {
+			if errors.Is(reviveErr, errNotRestorable) {
+				// Unknown id, or another parent's session: the ownership
+				// refusal above is the right answer, and it already points
+				// at the pull path.
+				return err
+			}
+			return reviveErr
+		}
+		child = revived
 	}
 	// The message itself is delivered through the child's delivery service
 	// (queued when the child is mid-turn); reply capture is armed by the
@@ -460,6 +659,92 @@ func (sp *Spawner[H]) SendMessage(caller *agent.Agent, agentID, text string) err
 		return fmt.Errorf("send_message: subagent %s is no longer live", agentID)
 	}
 	return nil
+}
+
+// reviveChild brings a saved child of caller back into the live registry as an
+// idle, continuable child, so the delivery that follows has somewhere to land
+// and the reply capture has a parent to report to.
+//
+// A revived child has NO main run — it is exactly an interrupted child that has
+// not been messaged yet — so its status is "idle" and its Done channel is
+// closed (WaitAgent must not park on a run that already happened in a previous
+// life). Its recorded outcome is left alone: the terminal state belongs to the
+// main run, which a follow-up turn does not rewrite. The retention timer is
+// armed so the revived runtime cannot linger; a delivery in flight re-arms it
+// through the usual Busy check.
+func (sp *Spawner[H]) reviveChild(caller *agent.Agent, agentID string) (*Child[H], error) {
+	if caller == nil || agentID == "" || sp == nil || sp.host == nil {
+		return nil, errNotRestorable
+	}
+	// A concurrent send_message (or a spawn) may have revived it already:
+	// the registry is the single source of truth. The ownership check is NOT
+	// optional here — ownedChild already refused this caller, so a live child
+	// with the id belongs to somebody else and must stay refused, exactly as
+	// if it had never been revived.
+	if c := sp.children.get(agentID); c != nil {
+		if c.ParentID != caller.SessionID {
+			return nil, errNotRestorable
+		}
+		return c, nil
+	}
+	pol := sp.host.Policy()
+	if sp.children.guardExceeded(caller.SessionID, pol.guardLimit()) {
+		return nil, fmt.Errorf("send_message: too many live subagents (%d); wait for them to finish or be released, then retry", pol.guardLimit())
+	}
+	// Claim the id across the whole reopen. The lookup above and the register
+	// below are two critical sections, and between them the host opens a
+	// runtime: a second revival racing here would publish a second record over
+	// the first one's id (the web host dedupes the runtime by id, so both
+	// records would share it), and the displaced record's release would evict
+	// the child mid-turn. Unreachable through send_message today — the tool is
+	// never parallel-eligible — which is exactly why it must not be what keeps
+	// this correct.
+	if !sp.children.beginRevive(agentID) {
+		return nil, fmt.Errorf("send_message: subagent %s is being reopened; retry in a moment", agentID)
+	}
+	defer sp.children.endRevive(agentID)
+	nc, ok, err := sp.host.ReviveChild(caller, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("send_message: reopening subagent %s: %w", agentID, err)
+	}
+	if !ok {
+		return nil, errNotRestorable
+	}
+	if nc.Agent == nil {
+		// Contract violation: a host must not open — let alone hold — a child
+		// runtime it cannot hand back (see Host.ReviveChild). Both hosts check
+		// their own runtime before they take the hold, so this reports the bug
+		// instead of pinning a runtime the lifecycle has no record of.
+		return nil, fmt.Errorf("send_message: host returned no child agent for subagent %s", agentID)
+	}
+	child := &Child[H]{
+		ID: agentID,
+		// The store authorises the parent link; the caller is that parent.
+		ParentID: caller.SessionID,
+		Label:    nc.Label,
+		// Depth is not persisted (SessionSnapshot has no field for it), so
+		// it is reconstructed from the caller: one level below it. That is
+		// what the spawn contract would have set.
+		Depth:     caller.SubagentDepth() + 1,
+		CreatedAt: time.Now(),
+		Agent:     nc.Agent,
+		Handle:    nc.Handle,
+		done:      make(chan struct{}),
+		status:    "running",
+	}
+	child.MarkInterrupted() // no main run: idle and continuable
+	// Guaranteed to succeed: beginRevive owns the id until this returns. The
+	// check is kept so a future second registration path cannot silently
+	// displace this record — and because a held runtime with no record is
+	// exactly what the Host contract forbids, the loser is torn down instead
+	// of leaked (the same unwind SpawnBackground's duplicate-id path does).
+	if !sp.children.register(child) {
+		sp.host.Release(child, false)
+		return nil, fmt.Errorf("send_message: subagent %s was registered while it was being reopened", agentID)
+	}
+	sp.host.ArmReplyCapture(child)
+	time.AfterFunc(pol.retain(), func() { sp.ReleaseChildIfQuiet(child) })
+	return child, nil
 }
 
 // InterruptAgent cancels a live child's in-flight turn (no-op when idle); the
@@ -486,4 +771,56 @@ func spawnCapError(limit, guard int, guardHit bool) error {
 		return fmt.Errorf("subagent limit reached: too many live subagents (running or interrupted); wait for them to finish or be released")
 	}
 	return fmt.Errorf("subagent limit reached (%d concurrent): wait for running subagents to finish or interrupt_agent them", limit)
+}
+
+// ErrYielded reports that a child's turn stopped at a ROUND BOUNDARY because a
+// host asked it to (a steered send_message), not that its job finished. The
+// lifecycle treats it like an interrupt — the child stays continuable, no
+// terminal event is sent — except that the work done so far is kept (the turn
+// flushed itself) and the queued message runs as the next turn.
+var ErrYielded = errors.New("subagent: turn yielded to a queued message")
+
+// Steer delivers text to a child of caller like SendMessage, and additionally
+// asks the child's RUNNING turn to stop at its next round boundary so the
+// message runs immediately after the model call and tools that round already
+// started. That is the difference from SendMessage: a busy child is redirected
+// instead of finishing its turn first, without cancelling anything (the
+// in-flight model call and its tools complete; only the NEXT model call is
+// skipped), so no work is lost.
+//
+// A child that is answering another targeted delivery is never cut: the reply
+// capture is 1:1 with the call, and truncating that turn would hand the other
+// parent a bogus answer — the message then simply queues, exactly as
+// SendMessage would have left it. A child with no turn in flight is not
+// "steered" at all: the delivery starts its own turn.
+func (sp *Spawner[H]) Steer(caller *agent.Agent, agentID, text string) error {
+	if err := sp.SendMessage(caller, agentID, text); err != nil {
+		return err
+	}
+	child := sp.children.get(agentID)
+	if child == nil || child.Agent == nil {
+		return nil
+	}
+	// Read the GENERATION first, then the reply guard — the same order
+	// sendNow/CheckSendNow uses, and it matters: the delivery worker arms
+	// PendingReply BEFORE it starts the turn (deliverLoop's hook runs ahead of
+	// startTurnWithResult), so a turn observed here is a reply turn exactly
+	// when the guard read after it says so. Checking only before the read left
+	// a window where the child's MAIN turn ended and the queued reply turn
+	// started in between: the yield then landed on the reply turn, cutting the
+	// answer the other parent is waiting for down to "no reply".
+	turn := child.Agent.TurnGeneration()
+	if turn == 0 {
+		return nil // idle: the delivery starts its own turn
+	}
+	if child.PendingReply() {
+		// Answering another targeted delivery: the capture is 1:1 with that
+		// call, so this message waits for the turn to end (the same contract
+		// SendNow enforces for a turn that answers a parent).
+		return nil
+	}
+	// Best effort: a turn that ended between the read and this call simply
+	// makes RequestYieldFor a no-op (it compares generations).
+	child.Agent.RequestYieldFor(turn)
+	return nil
 }

@@ -82,7 +82,9 @@ func wsHandleQueueSendNow(req *wsRequest) {
 		return
 	}
 	if res := target.sendNow(req.msg.QueueID); res != steerq.SendNowRecorded {
-		writeNoticeError(req.conn, "queue", res.Message())
+		// Session-tagged: the client clears the pending Send now of THAT pane,
+		// and the user may have switched panes while the answer was in flight.
+		writeNoticeErrorFor(req.conn, target.agent.SessionID, "queue", res.Message())
 	}
 }
 
@@ -174,7 +176,7 @@ func wsHandleListSessions(req *wsRequest) {
 		// the active pane — e.g. after another tab moved the global default.
 		_ = ws.writeJSON(WSMessage{
 			Type:     "sessions",
-			Sessions: sessionEntries(sessions, s.registry.activeSet(), s.registry.turnActiveSet()),
+			Sessions: sessionEntries(sessions, s.registry.activeSet(), s.registry.turnActiveSet(), s.registry.registeredSet()),
 		})
 	}()
 }
@@ -474,7 +476,7 @@ func wsHandleClose(req *wsRequest) {
 		if label == "" {
 			label = target.agent.SessionID
 		}
-		s.registry.deliverToParent(parentID, subagents.Notice(label, "closed by the user — its session stays saved and can be reopened."))
+		s.registry.deliverToParent(parentID, steerq.Notice, subagents.Notice(label, "closed by the user — its session stays saved and can be reopened."))
 	}
 	s.registry.closeRuntime(target)
 }

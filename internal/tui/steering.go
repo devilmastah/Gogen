@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
-	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/debuglog"
@@ -28,27 +26,6 @@ import (
 // no turn lock), so it lives on the liveSession next to streaming/turnSeq —
 // the same home as the web server's per-runtime delivery queue it unifies
 // with — not in an agent domain group.
-
-var (
-	steerIDMu  sync.Mutex
-	steerIDSeq uint64
-	steerIDAdd = uint64(time.Now().UnixNano() & 0xffff)
-)
-
-// newSteerItemID generates a queue-item id ("q_<seed>_<seq>").
-func newSteerItemID() string {
-	steerIDMu.Lock()
-	steerIDSeq++
-	seq := steerIDSeq
-	steerIDMu.Unlock()
-	return fmt.Sprintf("q_%x_%x", steerIDAdd, seq)
-}
-
-// maxSteerUserQueue caps the user's queued steering messages per session.
-// Unlike system deliveries (bounded separately, drop-oldest), user text is
-// never silently dropped: overflow refuses the enqueue with a visible
-// status message.
-const maxSteerUserQueue = 20
 
 // countUserSteer counts queued user items. Update thread only.
 func (s *liveSession) countUserSteer() int {
@@ -102,8 +79,8 @@ func (s *liveSession) sendNow() steerq.SendNowResult {
 // boundary. Overflow refuses (never silently drops typed text).
 func (m *Model) enqueueSteer(text string) tea.Cmd {
 	s := m.turnSession()
-	if outcome, _ := s.queue().Append(steerq.Item{ID: newSteerItemID(), Text: text, Kind: steerq.User}); outcome != steerq.Accepted {
-		m.statusMsg = fmt.Sprintf("Too many queued messages (limit %d) — stop the turn or wait for it.", maxSteerUserQueue)
+	if outcome, _ := s.queue().Append(steerq.Item{ID: steerq.NewID(), Text: text, Kind: steerq.User}); outcome != steerq.Accepted {
+		m.statusMsg = fmt.Sprintf("Too many queued messages (limit %d) — stop the turn or wait for it.", steerq.UserCap)
 		return nil
 	}
 	m.statusMsg = fmt.Sprintf("Queued (%d) — runs after the current turn", s.countUserSteer())
@@ -134,7 +111,7 @@ func (m *Model) handleDeliveryRequestMsg(msg deliveryRequestMsg) (tea.Model, tea
 	// holds a targeted send_message delivery — whose reply the parent is
 	// waiting on — this notice is dropped instead, exactly like the web host's
 	// enqueueSystem.
-	outcome, evicted := s.queue().Append(steerq.Item{ID: newSteerItemID(), Text: msg.text, Kind: steerq.Notice})
+	outcome, evicted := s.queue().Append(steerq.Item{ID: steerq.NewID(), Text: msg.text, Kind: steerq.Notice})
 	switch {
 	case outcome == steerq.Dropped:
 		// Every system slot holds a targeted reply: this notice is dropped

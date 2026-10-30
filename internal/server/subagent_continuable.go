@@ -8,6 +8,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	sesspkg "gogen/internal/session"
+	"gogen/internal/steerq"
 	"gogen/internal/subagents"
 )
 
@@ -43,6 +44,12 @@ func (sp *subagentSpawner) NewChild(ctx context.Context, parent *agent.Agent, jo
 	rt, label, _, err := sp.newChildRuntime(ctx, parent, job, model, depth)
 	if err != nil {
 		return subagents.NewChild[*sessionRuntime]{}, err
+	}
+	// Validate BEFORE the hold below: a held runtime with no usable agent is
+	// one the lifecycle cannot register (so nothing would ever release it) and
+	// orphan eviction would never collect.
+	if rt == nil || rt.agent == nil {
+		return subagents.NewChild[*sessionRuntime]{}, fmt.Errorf("subagent: host built no usable child runtime")
 	}
 	// Held: orphan eviction must never collect a continuable child while it
 	// is alive or awaiting release. Only the BACKGROUND path builds children
@@ -148,15 +155,27 @@ func (sp *subagentSpawner) Release(c *subagents.Child[*sessionRuntime], cancelle
 	sp.recheckParent(c.ParentID)
 }
 
-// Deliver implements subagents.Host: route one system message to the parent
-// session, or queue it for the session's next registration when the parent is
+// Deliver implements subagents.Host: route one child event to the parent
+// session, or stash it for the session's next registration when the parent is
 // not live (orphan-evicted, closed). A producer must not lose a completion
-// notice to a parent that merely went idle with no viewers.
-func (sp *subagentSpawner) Deliver(parentID, text string) {
-	if sp == nil || sp.s == nil || sp.s.registry == nil || parentID == "" {
+// notice — or a reply somebody is waiting on — to a parent that merely went
+// idle with no viewers.
+func (sp *subagentSpawner) Deliver(event subagents.Event) {
+	if sp == nil || sp.s == nil || sp.s.registry == nil || event.ParentID == "" {
 		return
 	}
-	sp.s.registry.deliverToParent(parentID, text)
+	sp.s.registry.deliverToParent(event.ParentID, parentStashKind(event.Kind), event.ParentMessage())
+}
+
+// parentStashKind maps a child event onto the kind the offline-parent stash
+// orders by: a reply somebody asked for must never be the eviction victim
+// while the parent is away, while every other event is one-way news whose
+// staleness is worth less than that reply.
+func parentStashKind(k subagents.EventKind) steerq.Kind {
+	if k == subagents.EventReply {
+		return steerq.Reply
+	}
+	return steerq.Notice
 }
 
 // Started implements subagents.Host: announce an ADMITTED child — the sidebar
@@ -191,6 +210,79 @@ func (sp *subagentSpawner) Finished(c *subagents.Child[*sessionRuntime], report 
 		SubagentSuccess: err == nil,
 		SubagentSummary: truncateReport(report, err),
 	})
+}
+
+// ReviveChild implements subagents.Host: reopen one of the caller's saved
+// nested sessions as a live runtime so a send_message can reach it again — the
+// live registry is process-local, the session is not, so without this a
+// subagent conversation ended for good at its first release or restart.
+//
+// The child's own runtime is loadOrCreateRuntime's job: it restores the parent
+// link, the nested flag (the active-session cap exemption) and the approval
+// routing, and dedupes against an already-registered runtime so a child the
+// user has open as a pane is adopted rather than duplicated. The runtime is
+// HELD like a spawned background child: an idle revived child must not be
+// orphan-evicted between the reopen and the delivered turn.
+func (sp *subagentSpawner) ReviveChild(caller *agent.Agent, childID string) (subagents.NewChild[*sessionRuntime], bool, error) {
+	if sp == nil || sp.s == nil || sp.s.ws == nil || sp.s.ws.Store == nil || caller == nil || childID == "" {
+		return subagents.NewChild[*sessionRuntime]{}, false, nil
+	}
+	// Ownership from the store index first: a cheap check that never opens a
+	// session the caller does not own (the same boundary PersistedResult uses).
+	info := sp.s.ws.Store.Info(sp.s.ws.GetWorkingDir(), childID)
+	if info == nil || info.ParentID != caller.SessionID {
+		return subagents.NewChild[*sessionRuntime]{}, false, nil
+	}
+	rt, err := sp.s.loadOrCreateRuntime(childID)
+	if err != nil {
+		return subagents.NewChild[*sessionRuntime]{}, false, err
+	}
+	// Same ordering as NewChild: the hold must not outlive a failure to hand
+	// the child back.
+	if rt == nil || rt.agent == nil {
+		return subagents.NewChild[*sessionRuntime]{}, false, fmt.Errorf("subagent: reopened session %s has no usable runtime", childID)
+	}
+	rt.held.Store(true)
+	label := info.Label
+	if l := rt.agent.SessionLabelSnapshot(); l != "" {
+		label = l
+	}
+	return subagents.NewChild[*sessionRuntime]{Handle: rt, Agent: rt.agent, Label: label}, true, nil
+}
+
+// PersistedChildren implements subagents.Host: the caller's saved nested
+// (subagent) sessions, newest first, for list_agents. The ParentID filter is
+// the same authorization boundary PersistedResult applies — a model must never
+// see another parent's children. Best effort: a store error yields no saved
+// section rather than failing the tool call (the live listing is still
+// useful), and the store's own 1-second list cache keeps a repeated call
+// cheap.
+func (sp *subagentSpawner) PersistedChildren(caller *agent.Agent) []subagents.PersistedChild {
+	if sp == nil || sp.s == nil || sp.s.ws == nil || sp.s.ws.Store == nil || caller == nil {
+		return nil
+	}
+	list, err := sp.s.ws.Store.List(sp.s.ws.GetWorkingDir())
+	if err != nil {
+		return nil
+	}
+	var out []subagents.PersistedChild
+	for _, info := range list {
+		if info.ParentID == "" || info.ParentID != caller.SessionID {
+			continue
+		}
+		label := info.Label
+		if label == "" {
+			label = info.ID
+		}
+		out = append(out, subagents.PersistedChild{
+			ID:       info.ID,
+			Label:    label,
+			Status:   info.SubagentStatus,
+			Messages: info.MessageCount,
+			Updated:  info.UpdatedTime(),
+		})
+	}
+	return out
 }
 
 // PersistedResult implements subagents.Host: resolve a released child from the
@@ -246,6 +338,10 @@ func (sp *subagentSpawner) Policy() subagents.Policy {
 		MaxFinished:  sp.maxFinished,
 		MaxLiveGuard: sp.maxLiveGuard,
 		Concurrent:   sp.concurrentLimit,
+		// The child's system queue is the shared one (steerq.NewDefault), so
+		// the "queue is full" refusal quotes the bound that is actually
+		// enforced instead of the package default that happens to match it.
+		SystemQueueCap: steerq.SystemCap,
 	}
 }
 

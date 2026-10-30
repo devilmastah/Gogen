@@ -209,8 +209,8 @@ func TestChildMessageQueuesAndRefusesWhenFull(t *testing.T) {
 	// stale notice is worth less than a message whose reply the parent is
 	// waiting on), so a queue of plain notices still accepts it.
 	slot.steerQ = testQueue()
-	for i := 0; i < maxPendingDeliveries; i++ {
-		slot.queue().Append(notice(newSteerItemID(), "notice"))
+	for i := 0; i < steerq.SystemCap; i++ {
+		slot.queue().Append(notice(steerq.NewID(), "notice"))
 	}
 	ack = make(chan childMessageAck, 1)
 	_, _ = hh.m.handleChildMessageMsg(childMessageMsg{handle: handle, text: "again", ack: ack})
@@ -222,8 +222,8 @@ func TestChildMessageQueuesAndRefusesWhenFull(t *testing.T) {
 	// REFUSED (never silently dropped) so the model can retry: an answer
 	// someone is waiting on must not disappear.
 	slot.steerQ = testQueue()
-	for i := 0; i < maxPendingDeliveries; i++ {
-		slot.queue().Append(steerq.Item{ID: newSteerItemID(), Text: "targeted", Kind: steerq.Reply, Tag: handle})
+	for i := 0; i < steerq.SystemCap; i++ {
+		slot.queue().Append(steerq.Item{ID: steerq.NewID(), Text: "targeted", Kind: steerq.Reply, Tag: handle})
 	}
 	ack = make(chan childMessageAck, 1)
 	_, _ = hh.m.handleChildMessageMsg(childMessageMsg{handle: handle, text: "again", ack: ack})
@@ -243,7 +243,7 @@ func TestChildReplyReachesParent(t *testing.T) {
 	handle.setSlot(slot)
 
 	// A notice on the child must NOT produce a parent reply.
-	slot.queue().Append(notice(newSteerItemID(), "notice"))
+	slot.queue().Append(notice(steerq.NewID(), "notice"))
 	if cmd := hh.m.drainSessionQueue(slot); cmd == nil {
 		t.Fatal("notice drain returned no turn")
 	} else if msg := cmd(); msg != nil {
@@ -501,7 +501,7 @@ func TestNoticeOverflowNeverEvictsATargetedDelivery(t *testing.T) {
 	if _, _ = hh.m.handleChildMessageMsg(childMessageMsg{handle: handle, text: "please elaborate", ack: ack}); !(<-ack).ok {
 		t.Fatal("targeted delivery refused")
 	}
-	for i := 0; i < maxPendingDeliveries-1; i++ {
+	for i := 0; i < steerq.SystemCap-1; i++ {
 		_, _ = hh.m.handleMsg(deliveryRequestMsg{sid: child.SessionID, text: "notice"})
 	}
 	targetedBefore := countQueuedChildItems(slot.steerQ, handle)
@@ -522,15 +522,66 @@ func TestNoticeOverflowNeverEvictsATargetedDelivery(t *testing.T) {
 			slot.steerQ.Remove(it.ID, steerq.Notice)
 		}
 	}
-	for slot.steerQ.Len() < maxPendingDeliveries {
-		slot.queue().Append(steerq.Item{ID: newSteerItemID(), Text: "targeted", Kind: steerq.Reply, Tag: handle})
+	for slot.steerQ.Len() < steerq.SystemCap {
+		slot.queue().Append(steerq.Item{ID: steerq.NewID(), Text: "targeted", Kind: steerq.Reply, Tag: handle})
 	}
 	dropsBefore := hh.m.deliveryDrops
 	_, _ = hh.m.handleMsg(deliveryRequestMsg{sid: child.SessionID, text: "notice at a full targeted queue"})
-	if got := slot.steerQ.Len(); got != maxPendingDeliveries {
-		t.Fatalf("queue length = %d, want %d (no targeted delivery evicted)", got, maxPendingDeliveries)
+	if got := slot.steerQ.Len(); got != steerq.SystemCap {
+		t.Fatalf("queue length = %d, want %d (no targeted delivery evicted)", got, steerq.SystemCap)
 	}
 	if hh.m.deliveryDrops != dropsBefore+1 {
 		t.Fatal("the dropped notice was not reported")
+	}
+}
+
+// TestChildAdoptMsgGivesRevivedChildASlot pins the TUI half of reviving a saved
+// child for send_message: a targeted delivery only reaches a child that owns a
+// live slot, and a child whose session is ALREADY live (the user has it open as
+// a pane) is adopted rather than duplicated — two slots for one session id
+// would both persist to the same file.
+func TestChildAdoptMsgGivesRevivedChildASlot(t *testing.T) {
+	hh := newChildHarness(t, "revived reply")
+	child, _, c := hh.newChild(t, hh.m.agent, "revived reply", "subagent: saved job")
+
+	// The lifecycle builds the handle and binds the child (ArmReplyCapture)
+	// before asking for the slot.
+	handle := newChildHandle(child)
+	handle.mu.Lock()
+	handle.child = c
+	handle.mu.Unlock()
+
+	ack := make(chan error, 1)
+	_, _ = hh.m.handleChildAdoptMsg(childAdoptMsg{handle: handle, label: "subagent: saved job", ack: ack})
+	if err := <-ack; err != nil {
+		t.Fatalf("adopt refused: %v", err)
+	}
+	slot := handle.slotOf()
+	if slot == nil {
+		t.Fatal("an adopted child must own a slot")
+	}
+	if slot.id != child.SessionID || slot.parentID != hh.m.agent.SessionID {
+		t.Fatalf("slot = %q (parent %q), want the child's session under its parent", slot.id, slot.parentID)
+	}
+
+	// The delivery a revive exists for now lands on that slot.
+	slot.streaming = true // keep it queued so the assertion is deterministic
+	mack := make(chan childMessageAck, 1)
+	_, _ = hh.m.handleChildMessageMsg(childMessageMsg{handle: handle, text: "please continue", ack: mack})
+	if res := <-mack; !res.ok || res.full {
+		t.Fatalf("send_message to an adopted child = %+v, want queued", res)
+	}
+
+	// A second revive for a session that is already live reuses its slot.
+	before := len(hh.m.lives.sessions)
+	again := newChildHandle(child)
+	if _, _ = hh.m.handleChildAdoptMsg(childAdoptMsg{handle: again, label: "subagent: saved job", ack: make(chan error, 1)}); again.slotOf() == nil {
+		t.Fatal("the re-adopted handle must own the existing slot")
+	}
+	if got := len(hh.m.lives.sessions); got != before {
+		t.Fatalf("live slots = %d after re-adopting, want the unchanged %d (no duplicate)", got, before)
+	}
+	if again.slotOf() != slot {
+		t.Fatal("re-adopting must reuse the session's slot, not create one")
 	}
 }

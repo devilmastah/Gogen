@@ -1055,7 +1055,6 @@
             hideTocTooltip();
             rebuildToc();
             enableFollow();
-            msgIdxCounter = 0;
             // The transcript is gone: pending-ack entries point at
             // detached bubbles, and the re-attach re-derives every
             // histIdx from server history, so the tracking starts fresh.
@@ -1168,7 +1167,6 @@
                 sessionId: pane.id,
                 scrollTop: messagesDiv.scrollTop,
                 pinned: isPinned(),
-                msgIdxCounter,
                 historyToolCallArgs,
             };
             while (messagesDiv.firstChild) cache.container.appendChild(messagesDiv.firstChild);
@@ -1188,7 +1186,6 @@
             // Stray content (should not happen — the outgoing pane was moved
             // out or wiped) is dropped, not merged into the restored cache.
             messagesDiv.replaceChildren(...cache.container.childNodes);
-            msgIdxCounter = cache.msgIdxCounter;
             historyToolCallArgs = cache.historyToolCallArgs;
             // resetChatTranscriptState emptied the TOC rail after the cache
             // was captured; rebuild it from the restored DOM (same nodes, so
@@ -1483,7 +1480,7 @@
             now.title = 'Stop at the next round and send the queue';
             now.addEventListener('click', (ev) => {
                 ev.stopPropagation();
-                sendQueuedNow(qid);
+                sendQueuedNow(qid, now);
             });
             el.appendChild(now);
             const rm = document.createElement('button');
@@ -1505,14 +1502,66 @@
         function refreshQueuedSendNow(pane) {
             const bubbles = pane && pane.queuedBubbles;
             if (!bubbles) return;
-            let last = null;
+            const buttons = [];
             for (const el of bubbles.values()) {
                 const btn = el.querySelector(':scope > .queue-send-btn');
                 if (!btn) continue;
                 btn.hidden = true;
-                last = btn;
+                buttons.push(btn);
+            }
+            const last = buttons[buttons.length - 1];
+            // A pending "Sending…" belongs to the button the user pressed. If
+            // a new item took that place, the old request is about an item that
+            // is no longer the queue's head: stop claiming it is sending rather
+            // than leave the spinner waiting forever behind the new one.
+            for (const btn of buttons) {
+                if (btn !== last) setSendNowPending(btn, false);
             }
             if (last) last.hidden = false;
+        }
+
+        // Send now has no success frame: the proof it worked is the
+        // queue_update that STARTS the message (its chip and this button leave
+        // with it). Until then the click would change nothing on screen while
+        // the turn finishes the round it is in — which can be minutes when that
+        // round is running a command. So the button says it is waiting, and the
+        // frames that prove otherwise take it back: a refusal ("queue" notice),
+        // ANY queued run starting (see applyQueueUpdate — with several items
+        // queued the drain starts the head, not the clicked bubble), the item
+        // being removed, a newer item taking the button, or the timeout below
+        // (a lost frame must not leave a spinner spinning for the rest of the
+        // session).
+        const SEND_NOW_PENDING_MS = 120000;
+
+        function setSendNowPending(btn, pending) {
+            if (!btn) return;
+            if (btn._pendingTimer) {
+                clearTimeout(btn._pendingTimer);
+                btn._pendingTimer = null;
+            }
+            if (!btn.isConnected) return;
+            btn.classList.toggle('pending', pending);
+            // Disabled while pending, exactly like the sidebar's button: the
+            // yield is recorded once, so a second click has nothing to do.
+            btn.disabled = pending;
+            if (!pending) {
+                btn.textContent = 'Send now';
+                btn.removeAttribute('aria-busy');
+                return;
+            }
+            btn.textContent = 'Sending…';
+            btn.setAttribute('aria-busy', 'true');
+            btn._pendingTimer = setTimeout(() => setSendNowPending(btn, false), SEND_NOW_PENDING_MS);
+        }
+
+        /** Clear the pending state a refused send now must not keep. */
+        function clearSendNowPending(pane) {
+            const bubbles = pane && pane.queuedBubbles;
+            if (!bubbles) return;
+            for (const el of bubbles.values()) {
+                const btn = el.querySelector(':scope > .queue-send-btn');
+                if (btn && btn.classList.contains('pending')) setSendNowPending(btn, false);
+            }
         }
 
         /** Clear the queued mark (chip + ✕) — the item's turn has started. */
@@ -1523,7 +1572,12 @@
             const chip = el.querySelector(':scope > .queued-chip');
             if (chip) chip.remove();
             const now = el.querySelector(':scope > .queue-send-btn');
-            if (now) now.remove();
+            if (now) {
+                // Drop the pending timer with the button: otherwise it holds the
+                // detached element for its full 2-minute backstop.
+                if (now._pendingTimer) clearTimeout(now._pendingTimer);
+                now.remove();
+            }
             const rm = el.querySelector(':scope > .queue-remove-btn');
             if (rm) rm.remove();
         }
@@ -1532,10 +1586,13 @@
         // and then deliver the queue, in its order. qid is the bubble the
         // button is on: the server ignores the request once that item has
         // left the queue, so a late click cannot stop the turn it started.
-        function sendQueuedNow(qid) {
+        // btn (optional) shows the wait, since an accepted request produces no
+        // frame of its own.
+        function sendQueuedNow(qid, btn) {
             const pane = activePane();
             if (!ws || ws.readyState !== WebSocket.OPEN || !pane || !pane.id) return;
             ws.send(JSON.stringify({ type: 'queue_send_now', queueId: qid, sessionId: pane.id }));
+            setSendNowPending(btn, true);
         }
 
         /**
@@ -1731,9 +1788,6 @@
             if (REPLAY_IMMEDIATE_TYPES.has(data.type)) return true;
             return data.type === 'models' && !data.content;
         }
-        // Monotonic counter for message positions (used for forking)
-        let msgIdxCounter = 0;
-
         // Screen-reader live region: announces turn lifecycle without
         // reading the streaming transcript token-by-token.
         const srLive = document.getElementById('sr-live');
@@ -1906,7 +1960,7 @@
                 renderedHistIdx: -1,
                 // Offscreen transcript cache captured when this pane was
                 // switched away from while settled: { container, sessionId,
-                // scrollTop, pinned, msgIdxCounter, historyToolCallArgs }.
+                // scrollTop, pinned, historyToolCallArgs }.
                 // Focusing the pane restores the DOM directly (no server
                 // round-trip, no replay) and the attach re-verifies the
                 // fingerprint server-side; null = no cache.
@@ -2671,12 +2725,28 @@
         }
         // ==============================
 
+        /** The server-side message index a fork button sends for its bubble.
+         *  It is read at CLICK time, never captured when the button is
+         *  created: the server stamps a live bubble with hist_index when its
+         *  round is appended (handleHistIndex), which can land after the
+         *  button already exists.
+         *  -1 is the only safe fallback — the server reads it as "fork from
+         *  the last assistant message that produced output". Never fall back
+         *  to dataset.msgIdx: that is a page-local bubble counter, not a
+         *  server index, so forking at it silently truncates at the WRONG
+         *  message. */
+        function forkTargetIndex(msgDiv) {
+            const idx = parseInt(msgDiv.dataset.histIdx, 10);
+            return Number.isFinite(idx) && idx >= 0 ? idx : -1;
+        }
+
         /** Send a fork request.
-         *  For history-replayed messages the server-side message index is used.
-         *  For streaming messages (no histIdx) we pass -1 meaning "last assistant".
+         *  The target is the clicked bubble's server-side message index, or
+         *  -1 ("last assistant") when the bubble has none (see
+         *  forkTargetIndex).
          *  The fork opens a NEW pane with the fork's history; the
          *  source session is left untouched. */
-        function forkSession(msgIdx) {
+        function forkSession(messageIndex) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
@@ -2700,7 +2770,7 @@
             transitionToPane(pane);
             ensureEmptyState();
             pendingSessionResponse = true;
-            ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx, sessionId: srcId }));
+            ws.send(JSON.stringify({ type: 'session_fork', messageIndex, sessionId: srcId }));
         }
 
         function cancelActiveTurn() {
@@ -2979,8 +3049,6 @@
             removeEmptyState();
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${role}`;
-            const idx = msgIdxCounter++;
-            msgDiv.dataset.msgIdx = idx;
             if (histIdx !== undefined && histIdx >= 0) {
                 msgDiv.dataset.histIdx = histIdx;
             }
@@ -3027,12 +3095,7 @@
                 forkBtn.title = 'Fork session from this message';
                 forkBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    // Use the server-side history index when available (history replay),
-                    // otherwise fall back to the display index (streaming messages).
-                    const targetIdx = msgDiv.dataset.histIdx !== undefined
-                        ? parseInt(msgDiv.dataset.histIdx)
-                        : parseInt(msgDiv.dataset.msgIdx);
-                    forkSession(targetIdx);
+                    forkSession(forkTargetIndex(msgDiv));
                 });
                 msgDiv.appendChild(forkBtn);
             }
@@ -3414,21 +3477,21 @@
                 setMessageMarkdown(currentStreamDiv, currentStreamRaw || '');
                 currentStreamDiv.classList.remove('cursor');
                 addTimestampToMsg(currentStreamDiv, new Date());
-                // Assign a message index and fork button.
-                // Streaming messages use the server-side "last" target because
-                // the client's clock may not match the server's CreatedAt (which
-                // would cause the wrong message to be matched, or no match at all).
-                const idx = msgIdxCounter++;
-                currentStreamDiv.dataset.msgIdx = idx;
+                // The bubble is final: give it its fork button.
                 const forkBtn = document.createElement('button');
                 forkBtn.className = 'fork-btn';
                 forkBtn.innerHTML = icon('fork');
                 forkBtn.title = 'Fork session from this message';
+                // Read the bubble's own server index at click, like the
+                // history-replayed button does. A live bubble carries one as
+                // soon as its round is appended (hist_index), so a fork from
+                // an EARLIER live bubble truncates there — it must not fall
+                // back to "the last assistant message", which is what the
+                // hardcoded -1 did (silently forking at the newest turn).
+                const forkBubble = currentStreamDiv;
                 forkBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    // Streaming messages don't have a known server-side index,
-                    // so send -1 which the server treats as "last assistant".
-                    forkSession(-1);
+                    forkSession(forkTargetIndex(forkBubble));
                 });
                 currentStreamDiv.appendChild(forkBtn);
                 // The bubble is complete; allow the paint skip off-screen.
@@ -5306,6 +5369,14 @@
             // queueLeft is in queue order, and content is the message the
             // started turn runs.
             joinStartedBubbles(left.map((id) => started.get(id)).filter(Boolean), data.content || '');
+            // A started run is the proof a Send now request was consumed: the
+            // wait belongs to the REQUEST, not to the bubble the button sat
+            // on. With several items queued the drain starts the queue's HEAD
+            // — usually a different bubble — so clearing only the started
+            // item's own mark left the last bubble's button "Sending…" and
+            // disabled until the timeout, hiding the control exactly while the
+            // rest of the queue drains.
+            if (left.length) clearSendNowPending(pane);
             if (dom) {
                 for (const it of items) {
                     if (bubbles.has(it.id)) continue;
@@ -5380,6 +5451,15 @@
             // a FINISHED child is always persisted, so an absent record
             // that is not running and not open as a pane is stale. Running
             // children may not have hit their first save yet — keep them.
+            // NOTE: the record's `running` flag is deliberately NOT refreshed
+            // from the payload here. It is an optimistic spawn flag, and a
+            // released child's saved session STAYS in the payload, so absence
+            // is the only signal this prune may act on — and a running record
+            // must survive it (a child that has not saved yet is absent by
+            // definition). Rendering does not depend on the flag once the
+            // payload lists the child: collectNestedRows prefers the payload
+            // for any listed child, which is what stops an interrupted child
+            // from being pinned at "responding".
             const payloadIds = new Set((data.sessions || []).map((s) => s.id));
             for (const [id, rec] of nestedSessions) {
                 if (rec.running) continue;
@@ -6072,29 +6152,72 @@
             if (depth > 16) return []; // cycle guard (subagentMaxDepth max is 10)
             const out = [];
             const rendered = new Set();
+            // Live-event records (subagent_started) are OPTIMISTIC: running is
+            // true from the moment the child is announced, and the ONLY event
+            // that clears it is subagent_finished — which an interrupted child
+            // never sends (interrupt leaves it continuable). So once the
+            // sessions payload lists the child, the payload is server truth
+            // (turnActive + the recorded outcome) and the record must not
+            // shadow it, or an interrupted child stays pinned at "responding"
+            // until the page is reloaded. The record still supplies the job
+            // text, and is the whole row while the payload does not list the
+            // child yet (a spawn the in-flight list predates). Absent is NOT
+            // evidence: the list request may be older than the spawn.
+            const listed = new Set((getLastSessions() || []).map((s) => s.id));
             for (const rec of nestedSessions.values()) {
                 if (rec.parentId !== parentId) continue;
+                if (listed.has(rec.id)) continue;
                 out.push(rec);
                 rendered.add(rec.id);
             }
             for (const s of getLastSessions() || []) {
                 if (!s.parentId || s.parentId !== parentId) continue;
                 if (rendered.has(s.id)) continue;
+                const liveRec = nestedSessions.get(s.id);
                 // The payload carries the runtime's LIVE turn state
                 // (turnActive) and the child's PERSISTED outcome
                 // (subagentStatus/subagentSummary), so a registered-but-
                 // idle child (open as a pane, resumed after a restart) is
                 // never mistaken for running or failed, and a child that
-                // really failed stays failed. Status '' (not finished /
-                // legacy data) defaults to the green done state.
+                // really failed stays failed.
+                //
+                // A recorded "running" status (or a legacy "") with no
+                // evidence of current activity never reached a terminal state:
+                // the child was interrupted, cancelled with its host, or its
+                // process went away. That must NOT read as done — unfinished
+                // work used to render green "done" after a restart.
+                //
+                // The evidence is the payload's `registered` flag: the
+                // runtime is live in the server process, viewed or not
+                // (sessionEntries/registeredSet). NOT `active`, which only
+                // means "open in a tab, or a turn is running" — keying on
+                // that made a live headless child read as interrupted and
+                // made the label flip when somebody opened its pane, which
+                // this row must not do: a child's state is the same however
+                // the list is being looked at, and it is the state the TUI
+                // (which keys on its live slot) already shows.
+                const status = s.subagentStatus || '';
+                // Three readings of one record: a terminal outcome, "never
+                // finished and its runtime is gone" (interrupted), and "never
+                // finished but still live in the server" (idle — the child is
+                // continuable, which is neither done nor interrupted).
+                const terminal = status === 'success' || status === 'failed';
+                const interrupted = !terminal && !s.registered;
+                const idle = !terminal && !!s.registered;
                 out.push({
                     id: s.id,
                     parentId: s.parentId,
-                    label: s.label || s.id,
-                    job: '',
+                    // The spawn event carries the label the parent wrote; the
+                    // store's label can lag (or be empty before the first
+                    // save), so prefer the live one when there is one.
+                    label: (liveRec && liveRec.label) || s.label || s.id,
+                    job: (liveRec && liveRec.job) || '',
                     running: !!s.turnActive,
-                    success: s.subagentStatus !== 'failed',
+                    success: status === 'success',
+                    interrupted,
+                    idle,
                     active: !!s.active,
+                    registered: !!s.registered,
                     summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
                 });
                 rendered.add(s.id);
@@ -6122,15 +6245,16 @@
             title.textContent = label;
             const meta = document.createElement('div');
             meta.className = 'session-row-meta';
-            // A colored dot means the child is LIVE somewhere — responding,
-            // open as a pane in this tab, or live-registered elsewhere —
-            // and its color carries the state: amber responding, red
-            // failed, green done. A settled child that is neither open nor
-            // live renders a muted TEXT status instead, so archived
-            // outcomes do not read as active sessions. Summary text still
-            // follows when one exists.
+            // A colored dot means the child is LIVE somewhere — open as a
+            // pane in this tab, or holding a runtime in the server
+            // (`registered`, watched or not) — and its color carries the
+            // state: amber responding, blue idle (live, no terminal outcome
+            // yet — continuable, not done), red failed, green done. A settled
+            // child with no runtime left renders a muted TEXT status instead,
+            // so archived outcomes do not read as active sessions. Summary
+            // text still follows when one exists.
             const frags = [];
-            const live = !!pane || !!rec.active;
+            const live = !!pane || !!rec.registered;
             let stateLabel = '';
             let stateClass = '';
             let stateDot = false;
@@ -6138,6 +6262,20 @@
                 stateLabel = 'responding';
                 stateClass = 'amber';
                 stateDot = true;
+            } else if (rec.interrupted) {
+                // Settled without a terminal outcome (see collectNestedRows):
+                // muted text, not a colored dot — the child is neither live
+                // nor done. Checked BEFORE the failed fallback, because an
+                // interrupted record is neither a success nor a failure.
+                stateLabel = 'interrupted';
+            } else if (rec.idle) {
+                // Live here (open as a pane, or attached elsewhere) with no
+                // terminal outcome yet: continuable, NOT done. Blue, like the
+                // flat rows' "open", and labelled the way the TUI labels the
+                // same state.
+                stateLabel = 'idle';
+                stateClass = 'blue';
+                stateDot = live;
             } else if (!rec.success) {
                 stateLabel = 'failed';
                 stateClass = 'red';
@@ -6254,6 +6392,13 @@
             // A refused mcp_save must drop its pending "Saving…" line: the
             // error itself is the toast above.
             if (data.kind === 'mcp') noteMCPOpFailed();
+            // A refused send now must stop the button claiming it is sending;
+            // the toast above is the reason it stopped. The notice names the
+            // session, so a pane switch between the click and the answer cannot
+            // leave the asking pane's spinner running.
+            if (data.kind === 'queue') {
+                clearSendNowPending(findPaneBySession(data.sessionId) || activePane());
+            }
         }
 
         function sendMessage() {

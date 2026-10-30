@@ -29,13 +29,6 @@ const (
 	FocusSidebar // sessions panel (tab from viewport; web-parity mouse clicks land here too)
 )
 
-// maxPendingDeliveries caps queued system deliveries (job notices,
-// subagent reports), mirroring the web delivery queue (32): overflow drops
-// the OLDEST delivery — a stale job notice is worse than none — and the
-// queue drains as ONE batched turn, so the cap bounds the notice backstop
-// rather than the number of drained turns.
-const maxPendingDeliveries = 32
-
 // ModalKind identifies the active modal overlay.
 type ModalKind int
 

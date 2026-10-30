@@ -3375,6 +3375,25 @@
         .queued-chip { user-select: none; }
         .queue-send-btn { cursor: pointer; }
         .queue-send-btn:hover { background: var(--bg-elevated); }
+        /* A pressed Send now waits for the running turn to finish its round:
+           it says so, instead of looking like a dead button. */
+        .queue-send-btn.pending {
+            color: var(--fg-muted);
+            border-color: var(--border);
+            cursor: progress;
+        }
+        .queue-send-btn.pending::before {
+            content: '';
+            display: inline-block;
+            width: 0.62em;
+            height: 0.62em;
+            margin-right: 0.42em;
+            border: 1.5px solid currentColor;
+            border-right-color: transparent;
+            border-radius: 50%;
+            vertical-align: -0.05em;
+            animation: input-spin 0.8s linear infinite;
+        }
         .queue-remove-btn {
             display: none;
             position: absolute;
@@ -3724,6 +3743,9 @@
             #conn-indicator.reconnecting { animation: none; }
             .progress-spinner { animation: none; }
             .waiting-spinner { animation: none; }
+            /* The pending Send now keeps its dot (a static ring still reads
+               as "working") and drops the rotation. */
+            .queue-send-btn.pending::before { animation: none; border-right-color: currentColor; opacity: 0.6; }
             .cursor::after { animation: none; }
             .toast { animation: none; }
             #toc-rail { transition: none; }

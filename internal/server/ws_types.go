@@ -51,13 +51,24 @@ type SessionEntry struct {
 	// when rendering nested (subagent) rows after a reload, when the live
 	// subagent_started/finished events are gone.
 	TurnActive bool `json:"turnActive,omitempty"`
+	// Registered marks sessions whose runtime is live in THIS process,
+	// viewed or not. Active and TurnActive are subsets of it (a runtime
+	// with a viewer or a running turn is necessarily registered). The
+	// client uses it to tell a live child that nobody is viewing — a
+	// background subagent between turns, held for its retention window —
+	// from one whose runtime is gone: the first is idle but continuable,
+	// the second never finished. Without it the label depended on whether
+	// somebody happened to have the child open.
+	Registered bool `json:"registered,omitempty"`
 	// ParentID is non-empty for nested (subagent) sessions; the client
 	// renders them as indented rows under their parent.
 	ParentID string `json:"parentId,omitempty"`
-	// SubagentStatus is the persisted final outcome of a nested (subagent)
-	// session: "" (unknown / not finished), "success", or "failed". The
-	// sidebar uses it when the live subagent_started/finished events are
-	// gone (reload / restart), so a failed child stays failed.
+	// SubagentStatus is the persisted outcome of a nested (subagent)
+	// session: "running" (admitted, no terminal state recorded), "success",
+	// "failed", or "" (not a subagent / legacy record). The sidebar uses it
+	// when the live subagent_started/finished events are gone (reload /
+	// restart), so a failed child stays failed and a child that never
+	// finished reads as interrupted rather than done.
 	SubagentStatus string `json:"subagentStatus,omitempty"`
 	// SubagentSummary is the report/error summary written alongside
 	// SubagentStatus.

@@ -35,10 +35,12 @@ type SessionSnapshot struct {
 	// are excluded from the flat saved list, cascade-deleted with their
 	// parent, and capped per parent (D2).
 	ParentID string
-	// SubagentStatus records the final outcome of a nested (subagent)
-	// session: "" (unknown / not finished), "success", or "failed".
-	// Persisted so the sidebar can render the true outcome after a
-	// reload/restart, when the subagent_started/finished events are gone.
+	// SubagentStatus records the outcome of a nested (subagent) session:
+	// "running" (admitted, no terminal state recorded yet), "success",
+	// "failed", or "" (not a subagent, or a record written before admission
+	// was stamped). Persisted so the sidebar can render the true outcome
+	// after a reload/restart, when the subagent_started/finished events are
+	// gone; "running" with no live runtime means the child was interrupted.
 	SubagentStatus string
 	// SubagentSummary is the report/error summary written alongside
 	// SubagentStatus.
@@ -47,8 +49,10 @@ type SessionSnapshot struct {
 
 // SessionInfo describes a saved session entry.
 type SessionInfo struct {
-	ID           string
-	Oneshot      bool
+	ID      string
+	Oneshot bool
+	// UpdatedAt is the entry's update time, formatted RFC3339Nano (see
+	// UpdatedTime for the time.Time form).
 	UpdatedAt    string
 	MessageCount int
 	Label        string
@@ -56,12 +60,27 @@ type SessionInfo struct {
 	// renders them under their parent and the flat saved-session list
 	// excludes them.
 	ParentID string
-	// SubagentStatus is the persisted final outcome of a nested (subagent)
-	// session: "" (unknown / not finished), "success", or "failed".
+	// SubagentStatus is the persisted outcome of a nested (subagent)
+	// session: "running" (no terminal state recorded), "success", "failed",
+	// or "" (not a subagent / legacy record).
 	SubagentStatus string
 	// SubagentSummary is the report/error summary written alongside
 	// SubagentStatus.
 	SubagentSummary string
+}
+
+// UpdatedTime parses UpdatedAt (the RFC3339Nano form the store writes),
+// returning the zero time when it is absent or malformed — callers sort by it
+// and must tolerate a missing timestamp rather than dropping the entry.
+func (s SessionInfo) UpdatedTime() time.Time {
+	if s.UpdatedAt == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, s.UpdatedAt)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // TodoItem represents a single task.

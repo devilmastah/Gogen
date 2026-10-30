@@ -113,12 +113,15 @@ func Notice(label, text string) string {
 }
 
 // DeliverEvent routes one typed child event to its parent through the host's
-// delivery service, stamping the identity the host needs for routing.
+// delivery service, stamping the identity the host needs for routing and
+// carrying the Kind: the host decides both how the text renders
+// (Event.ParentMessage) and how a delivery that must wait for the parent is
+// ordered (EventReply is never the eviction victim).
 func (c *Child[H]) DeliverEvent(host Host[H], event Event) {
 	event.ChildID = c.ID
 	event.ParentID = c.ParentID
 	event.Label = c.Label
-	host.Deliver(event.ParentID, event.ParentMessage())
+	host.Deliver(event)
 }
 
 // Finish records the main-run outcome and closes Done.

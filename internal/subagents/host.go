@@ -119,6 +119,26 @@ func (p Policy) systemQueueCap() int {
 	return DefaultSystemQueueCap
 }
 
+// PersistedChild is one SAVED nested (subagent) session of a caller, as the
+// host's store records it: the view of a child whose runtime is gone —
+// released after finishing, evicted, or left behind by a previous process.
+//
+// Status is the recorded outcome: "success", "failed", or "running" for a
+// child that was mid-run and never reached a terminal state (interrupted, or
+// its process went away). Legacy records may carry "". The report itself is
+// NOT here on purpose: it can be tens of KiB, and get_agent_result already
+// pulls it one child at a time.
+type PersistedChild struct {
+	ID       string
+	Label    string
+	Status   string
+	Messages int
+	// Updated is the session's last-update time, which orders the listing
+	// (newest first). Zero when the store could not supply one; such an
+	// entry sinks to the end instead of being dropped.
+	Updated time.Time
+}
+
 // NewChild is what a host returns from Host.NewChild: its own runtime handle,
 // the child agent, and the label derived from the job.
 type NewChild[H any] struct {
@@ -141,7 +161,9 @@ type Host[H any] interface {
 	// runtime, and any approval routing. ctx is the spawning tool's context
 	// (used for model selection, which may dial the provider). It must NOT
 	// announce the child — Started runs only after the child is admitted by
-	// the caps.
+	// the caps. Agent is required: a host that cannot produce one returns an
+	// error, and must not keep (hold, register) a runtime it cannot hand
+	// back — the lifecycle has no record to release it by.
 	NewChild(ctx context.Context, parent *agent.Agent, job, model string, depth int) (NewChild[H], error)
 	// RunTurn runs one turn on the child and returns its final output. ctx
 	// survives the spawning tool call for background children (it is owned
@@ -168,10 +190,13 @@ type Host[H any] interface {
 	// the sidebar renders it as done). The host also cascades to the child's
 	// own children and re-checks the parent for orphan eviction.
 	Release(c *Child[H], cancelledMidRun bool)
-	// Deliver queues one system message into the parent conversation (the
+	// Deliver routes one typed child event into the parent conversation (the
 	// host's delivery service; queued for the session's next registration
-	// when the parent is not live).
-	Deliver(parentID, text string)
+	// when the parent is not live). The EVENT crosses this seam, not a
+	// pre-flattened string: its Kind is what tells the host whether somebody
+	// is waiting on the text (EventReply), and that decides how a delivery
+	// which has to wait for the parent is ordered against the others.
+	Deliver(event Event)
 	// Started announces an ADMITTED child (its pane/sidebar row's attach
 	// target). Called after the caps pass, so a refused child is never
 	// announced — an announced-but-refused child would leave a phantom
@@ -185,6 +210,25 @@ type Host[H any] interface {
 	// nested session belonging to another parent). ok=false when the store
 	// has no usable record.
 	PersistedResult(caller *agent.Agent, childID string) (string, bool)
+	// ReviveChild reopens one of the caller's SAVED nested sessions as a live
+	// runtime so a send_message can reach it again (after its retention
+	// window, an eviction, or a restart — the live registry is process-local,
+	// the session is not). It must keep the session's id, restore its parent
+	// link, and refuse (ok=false, no error) when the store has no such child
+	// OR it belongs to another parent: the caller-ownership check is the same
+	// boundary PersistedResult applies. Returning ok=false *and* an error is
+	// redundant; an error means "the store had it but could not open it".
+	// Agent is required here too: check the reopened runtime BEFORE taking
+	// the hold, and return an error rather than a child the lifecycle would
+	// have to drop (same contract as NewChild).
+	ReviveChild(caller *agent.Agent, childID string) (nc NewChild[H], ok bool, err error)
+	// PersistedChildren returns the caller's SAVED nested (subagent)
+	// sessions, newest first — the children whose runtime is not live
+	// (released, evicted, or from a previous process). The lifecycle drops
+	// any id it still tracks live, so a child is never listed twice, and it
+	// never sees another parent's children: the ownership boundary is the
+	// same one PersistedResult applies. nil when the host has no store.
+	PersistedChildren(caller *agent.Agent) []PersistedChild
 	// TurnActive reports whether the child is mid-turn on a follow-up
 	// delivery (the status reads "running" until it ends).
 	TurnActive(c *Child[H]) bool

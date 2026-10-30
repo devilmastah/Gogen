@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -316,7 +317,7 @@ func TestSendMessageQueueFullRefuses(t *testing.T) {
 		active, _ := child.Handle.turnState()
 		return active
 	})
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
+	for i := 0; i < steerq.SystemCap; i++ {
 		if err := sp.SendMessage(a, id, fmt.Sprintf("queued-%d", i)); err != nil {
 			t.Fatalf("send %d refused before the cap: %v", i, err)
 		}
@@ -360,7 +361,7 @@ func TestSessionRuntimeQuiescentCoversDeliveryHandoff(t *testing.T) {
 	}
 
 	// A queued delivery alone is enough to hold the answer at "no".
-	seedDeliveries(rt, deliverItem{ID: newQueueItemID(), Text: "notice", Kind: deliverSystem, Source: deliverFromSystem})
+	seedDeliveries(rt, steerq.Item{ID: steerq.NewID(), Text: "notice", Kind: steerq.Notice})
 	if sessionRuntimeQuiescent(rt) {
 		t.Fatal("a runtime with a queued delivery must not read quiescent")
 	}
@@ -1527,7 +1528,7 @@ func TestBackgroundSpawnCompletionQueuedUntilParentLive(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		s.registry.parentDeliverMu.Lock()
 		defer s.registry.parentDeliverMu.Unlock()
-		return len(s.registry.parentDeliveries[a.SessionID]) == 1
+		return s.registry.parentDeliveries[a.SessionID].Len() == 1
 	})
 	time.Sleep(200 * time.Millisecond)
 	if deliveredMessages(a, "[subagent") {
@@ -1781,5 +1782,271 @@ func TestEvictedChildWithArmedCaptureReleases(t *testing.T) {
 	sp.ReleaseChildIfQuiet(child)
 	if sp.Get(id) != nil {
 		t.Fatal("an evicted child must be released, not pinned by the armed capture")
+	}
+}
+
+// TestListAgentsListsSavedChildAfterRelease is the web host's half of the
+// restart-surviving listing: once a child's runtime is gone (released after
+// finishing, evicted, or a previous process), list_agents still reports it —
+// with the outcome its saved session records — because the live registry alone
+// answered "No live subagents." and left the parent with no way to find the
+// child again. The ParentID filter is the same authorization boundary
+// get_agent_result applies.
+func TestListAgentsListsSavedChildAfterRelease(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "saved child report"}}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "restart survivor", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id).IsFinished() })
+	if info := s.ws.Store.Info(s.ws.GetWorkingDir(), id); info == nil || info.SubagentStatus != "success" {
+		t.Fatalf("saved child outcome = %+v, want success", info)
+	}
+
+	// Release the runtime: the child is no longer in the live registry.
+	sp.ReleaseChild(sp.Get(id))
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id) == nil })
+
+	out, err := sp.ListAgents(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "1 child subagent (0 active, 1 inactive)") {
+		t.Fatalf("a released child must still be listed, flagged inactive: %q", out)
+	}
+	if !strings.Contains(out, id) {
+		t.Fatalf("the saved child's id must be listed (it is the get_agent_result handle): %q", out)
+	}
+	if !strings.Contains(out, "— inactive — success — ") {
+		t.Fatalf("the saved child's recorded outcome must be listed: %q", out)
+	}
+
+	// A child interrupted and released without a terminal outcome is NOT
+	// reported as completed.
+	blocking := make(chan struct{})
+	s2, a2 := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		var once sync.Once
+		p.OnStream = func(ctx context.Context, _ []llm.Message, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+			once.Do(func() { close(blocking) })
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return p
+	})
+	sp2 := continuableSpawner(t, s2)
+	keepParentPaneAttached(t, s2)
+	id2, err := sp2.SpawnBackground(context.Background(), a2, "interrupted job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocking:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child turn never entered the provider")
+	}
+	if err := sp2.InterruptAgent(a2, id2); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp2.Get(id2).StatusOf(sp2) == "idle" })
+	// Force the interrupted child's runtime out (the retention timer would
+	// otherwise keep it live for its window).
+	sp2.ReleaseChild(sp2.Get(id2))
+	waitFor(t, 5*time.Second, func() bool { return sp2.Get(id2) == nil })
+	out2, err := sp2.ListAgents(a2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out2, id2) || !strings.Contains(out2, "— inactive — interrupted — ") {
+		t.Fatalf("an interrupted child must read as inactive+interrupted, not done: %q", out2)
+	}
+	if strings.Contains(out2, "— success") {
+		t.Fatalf("an interrupted child must not read as success: %q", out2)
+	}
+
+	// The store query is scoped by ParentID: another session must not see
+	// these children, exactly like get_agent_result's ownership check.
+	other := &agent.Agent{}
+	other.SetSessionID("someone-else")
+	foreign, err := sp.ListAgents(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(foreign, id) || strings.Contains(foreign, id2) {
+		t.Fatalf("another session's children leaked into list_agents: %q", foreign)
+	}
+}
+
+// TestSendMessageRevivesReleasedChild is the restart scenario in one test: the
+// child's runtime is gone (released — what a restart leaves behind), its
+// session is on disk, and a send_message must REOPEN it and deliver, so the
+// conversation continues instead of failing with "not live" forever. The reply
+// still comes back through the normal capture.
+func TestSendMessageRevivesReleasedChild(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		// The revived child is built from the store, so it gets a FRESH
+		// provider from the factory: key the answer on the prompt instead of
+		// on a call index, so the assertion proves the follow-up turn ran on
+		// the restored transcript.
+		p.OnStream = func(_ context.Context, msgs []llm.Message, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+			last := ""
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "user" {
+					last = msgs[i].Content
+					break
+				}
+			}
+			if strings.Contains(last, "please continue") {
+				return &llm.StreamResult{Content: "answer after revival"}, nil
+			}
+			return &llm.StreamResult{Content: "main job report"}, nil
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "revivable job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id).IsFinished() })
+
+	// Drop the runtime: the child is now exactly what a restart leaves — a
+	// saved session with a parent link and no live registry entry.
+	sp.ReleaseChild(sp.Get(id))
+	waitFor(t, 5*time.Second, func() bool { return sp.Get(id) == nil })
+	if err := sp.SendMessage(a, "not-a-child", "hi"); err == nil {
+		t.Fatal("an unknown id must still be refused")
+	}
+
+	if err := sp.SendMessage(a, id, "please continue"); err != nil {
+		t.Fatalf("send_message to a released child = %v, want the revived delivery", err)
+	}
+	// The revived child is live again, as an idle continuation of its saved
+	// session (same id, same parent).
+	revived := sp.Get(id)
+	if revived == nil {
+		t.Fatal("the released child must be revived into the live registry")
+	}
+	if revived.ParentID != a.SessionID {
+		t.Fatalf("revived child parent = %q, want %q", revived.ParentID, a.SessionID)
+	}
+	// The delivered turn runs on the SAVED transcript and its exact reply
+	// reaches the parent conversation.
+	waitFor(t, 10*time.Second, func() bool {
+		return deliveredMessages(a, "answer after revival")
+	})
+	// Continuity, not a fresh session: the revived agent carries the
+	// pre-release transcript plus the follow-up turn.
+	restored := revived.Agent.SnapshotMessages()
+	if len(restored) < 4 {
+		t.Fatalf("revived transcript = %d messages, want the saved turn plus the follow-up", len(restored))
+	}
+	if !strings.Contains(restored[0].Content, "subagent working on a task") {
+		t.Fatalf("revived transcript does not start with the saved job: %q", restored[0].Content)
+	}
+	// The follow-up turn lands in the child's own session, not in a clone.
+	if info := s.ws.Store.Info(s.ws.GetWorkingDir(), id); info == nil {
+		t.Fatal("the revived child's session must still be the same saved session")
+	}
+}
+
+// TestSteerRedirectsABusyChild is the end-to-end steering contract: a child in a
+// multi-round turn is redirected at its next round boundary — the round's tool
+// work is kept, the queued message runs right after it, the parent gets that
+// turn's reply, and the run is NOT reported as finished (a yield is not a
+// completion).
+func TestSteerRedirectsABusyChild(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	steered := atomic.Bool{}
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.OnStream = func(ctx context.Context, msgs []llm.Message, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+			last := ""
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "user" {
+					last = msgs[i].Content
+					break
+				}
+			}
+			switch {
+			case strings.Contains(last, "change of plan"):
+				return &llm.StreamResult{Content: "redirected as asked"}, nil
+			case steered.Load():
+				// A later round (the yield must prevent this from running
+				// before the steer message's own turn).
+				return &llm.StreamResult{Content: "should not run"}, nil
+			default:
+				// Round 1: block so the steer lands mid-turn, then ask for a
+				// tool. Its result must survive the yield.
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				<-release
+				return &llm.StreamResult{
+					ToolCalls: []llm.ToolCall{{ID: "t1", Name: "list_files", Args: map[string]any{"path": "."}}},
+				}, nil
+			}
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	keepParentPaneAttached(t, s)
+
+	id, err := sp.SpawnBackground(context.Background(), a, "long job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child turn never entered the provider")
+	}
+	// The parent steers while the child is mid-turn.
+	if err := sp.Steer(a, id, "change of plan"); err != nil {
+		t.Fatalf("steer = %v", err)
+	}
+	steered.Store(true)
+	close(release)
+
+	// The child's turn stops at the round boundary, the steer message runs as
+	// its own turn, and THAT turn's reply reaches the parent.
+	waitFor(t, 10*time.Second, func() bool { return deliveredMessages(a, "redirected as asked") })
+	time.Sleep(300 * time.Millisecond)
+	// The steer turn produced a real answer: the reply capture must not have
+	// been cut short into the no-reply fallback.
+	if deliveredMessages(a, "no reply") {
+		t.Fatal("the steered reply turn must deliver its answer, not the no-reply fallback")
+	}
+	if deliveredMessages(a, "should not run") {
+		t.Fatal("the yielded turn must not have run another round")
+	}
+	if deliveredMessages(a, "(finished)") {
+		t.Fatal("a steered run must not be reported as finished")
+	}
+	child := sp.Get(id)
+	if child == nil {
+		t.Fatal("the steered child must stay registered (continuable), not be released as finished")
+	}
+	// The round's work is kept: the tool result is in the child's transcript.
+	sawTool := false
+	for _, m := range child.Agent.SnapshotMessages() {
+		if m.Role == "tool" {
+			sawTool = true
+		}
+	}
+	if !sawTool {
+		t.Fatal("the yielded round must keep its tool result")
 	}
 }

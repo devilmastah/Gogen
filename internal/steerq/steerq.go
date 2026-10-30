@@ -12,6 +12,10 @@
 // own drain machinery, because that part is genuinely transport-specific (a
 // goroutine worker over a WebSocket vs a tea.Cmd on the Update thread).
 //
+// The values the hosts must agree on live here too: NewDefault applies the
+// bounds both use (UserCap, SystemCap), and NewID generates the correlation
+// ids for the items a host creates itself.
+//
 // Queue is NOT goroutine-safe by design: the web host guards its queue with the
 // runtime's deliverMu (its drain, eviction and orphan-check paths take that lock
 // explicitly, and their lock ordering with the turn lock is part of the
@@ -24,6 +28,7 @@ import (
 	"strings"
 
 	"gogen/internal/llm"
+	"gogen/internal/randhex"
 )
 
 // Kind classifies a queued item. It decides both presentation and policy.
@@ -62,10 +67,36 @@ type Item struct {
 	Kind Kind
 	// Images carries user-attached images (User items only; nil otherwise).
 	Images []llm.ImageInput
-	// Tag is the host's per-item payload — the web host stores the delivery
-	// source, the TUI the child handle of a targeted delivery. Opaque here.
+	// Tag is the host's per-item payload — the TUI stores the child handle of
+	// a targeted delivery. Opaque here.
 	Tag any
 }
+
+// NewID returns a fresh queue-item id ("q_<hex>"), unique within the process.
+// A host uses it for the items it generates itself (machine deliveries, and a
+// user message whose client-supplied correlation id was missing or unusable);
+// an item that carries a client's own id keeps it, because that id is what the
+// client reconciles its optimistic bubble against.
+func NewID() string { return randhex.ID(8, "q_") }
+
+// The per-session bounds both hosts use (see NewDefault). They are queue
+// policy, not host policy: the eviction, batching and refusal rules below key
+// on them, so a host picking its own number would silently change the contract
+// it just inherited.
+const (
+	// UserCap bounds queued User items. Deliberately low: each item may carry
+	// up to MaxImagesPerMessage images (each capped at a multi-MB data URL)
+	// and drains as its own turn, so the count doubles as a memory/backlog
+	// bound. Reaching it REFUSES the enqueue — user text is never silently
+	// dropped.
+	UserCap = 20
+	// SystemCap bounds Notice+Reply items. Sized to hold one full cohort of
+	// finished children (the default subagent cap) plus replies. Terminal
+	// events are compact and authoritative reports are pulled separately, so
+	// the cap bounds the notice backstop — and a run of notices drains as ONE
+	// turn, so it does not bound the number of drained turns either.
+	SystemCap = 32
+)
 
 // Queue is one session's FIFO. The zero value is not usable; call New.
 type Queue struct {
@@ -78,10 +109,15 @@ type Queue struct {
 }
 
 // New returns an empty queue with the given caps. A non-positive cap is
-// treated as unbounded for that kind (tests and hosts that do not bound).
+// treated as unbounded for that kind (tests, and a queue that intentionally
+// carries only one kind).
 func New(maxUser, maxSystem int) *Queue {
 	return &Queue{maxUser: maxUser, maxSystem: maxSystem}
 }
+
+// NewDefault returns an empty queue bounded by UserCap and SystemCap: the
+// bounds every host uses. New is for callers that need their own.
+func NewDefault() *Queue { return New(UserCap, SystemCap) }
 
 // Len reports how many items are queued.
 func (q *Queue) Len() int {

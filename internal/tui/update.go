@@ -183,6 +183,8 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// targeted deliveries, releases) and parks on the returned channel.
 	case childSpawnMsg:
 		return m.handleChildSpawnMsg(msg)
+	case childAdoptMsg:
+		return m.handleChildAdoptMsg(msg)
 	case childMessageMsg:
 		return m.handleChildMessageMsg(msg)
 	case childReleaseMsg:

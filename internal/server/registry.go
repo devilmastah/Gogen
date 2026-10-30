@@ -135,7 +135,8 @@ type sessionRuntime struct {
 	// queue, one drain path. The queue itself (item kinds, caps, eviction and
 	// batching policy, slot zeroing) is internal/steerq, shared with the TUI;
 	// it is NOT internally synchronized, so every access below is made under
-	// deliverMu. A delivered item's deliverSource travels in Item.Tag.
+	// deliverMu. The item kind (steerq.User / Notice / Reply) is the only
+	// per-delivery state this host records; see deliver.go.
 	deliverMu      sync.Mutex
 	pendingDeliver *steerq.Queue
 	deliverWorker  atomic.Bool
@@ -147,8 +148,8 @@ type sessionRuntime struct {
 	joinQueued func() bool
 
 	// deliverStartHook is invoked by the delivery worker immediately before
-	// it starts a delivered turn (see deliver.go) — for a send_message
-	// delivery ONLY (deliverFromChildMessage). It arms the child's per-run
+	// it starts a delivered turn (see deliver.go) — for a targeted
+	// send_message delivery ONLY (steerq.Reply). It arms the child's per-run
 	// reply capture exactly when that delivery starts, not when it was queued.
 	// Set once at child creation; never reassigned.
 	deliverStartHook func()
@@ -212,7 +213,7 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 		clients:        make(map[*wsConn]struct{}),
 		passive:        make(map[*wsConn]struct{}),
 		deliverNotify:  make(chan struct{}, 1),
-		pendingDeliver: steerq.New(maxUserQueueCap, maxSystemDeliveryQueue),
+		pendingDeliver: steerq.NewDefault(),
 		turnRelease:    make(chan struct{}),
 		joinQueued:     func() bool { return false },
 	}
@@ -880,15 +881,20 @@ type sessionRegistry struct {
 	// once at construction; never reassigned.
 	evictHook func(sessionID string)
 
-	// parentDeliverMu guards parentDeliveries, the per-parent queue of
-	// system messages (background-subagent completion notices and captured
-	// send_message replies) for sessions whose runtime is not live. The spawner queues
-	// when the parent is evicted or closed while its children keep
-	// running; register() flushes the queue into the fresh runtime when
+	// parentDeliverMu guards parentDeliveries, the per-parent stash of
+	// messages (background-subagent completion notices and captured
+	// send_message replies) for sessions whose runtime is not live. The
+	// spawner stashes when the parent is evicted or closed while its children
+	// keep running; register() flushes the stash into the fresh runtime when
 	// the session is next loaded — "deliver once it is live again"
 	// (deliverToParent).
+	//
+	// Each stash is a steerq queue rather than a string list so the live
+	// queue's ordinal rules hold here too: at the cap the oldest NOTICE is
+	// evicted and a pending REPLY never is. The item kind orders eviction
+	// only — the flush injects everything as a one-way notice.
 	parentDeliverMu  sync.Mutex
-	parentDeliveries map[string][]string
+	parentDeliveries map[string]*steerq.Queue
 
 	// bgWorkHook reports whether a session id still owns background work
 	// that evicting its runtime would destroy. Agent.HasBackgroundWork
@@ -935,7 +941,7 @@ func newSessionRegistry(maxActive int) *sessionRegistry {
 	return &sessionRegistry{
 		agents:           make(map[string]*sessionRuntime),
 		maxActive:        maxActive,
-		parentDeliveries: make(map[string][]string),
+		parentDeliveries: make(map[string]*steerq.Queue),
 	}
 }
 

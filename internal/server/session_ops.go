@@ -14,6 +14,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/llm"
 	"gogen/internal/session"
+	"gogen/internal/steerq"
 	"gogen/internal/subagents"
 )
 
@@ -588,7 +589,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		if notifyLabel == "" {
 			notifyLabel = id
 		}
-		s.registry.deliverToParent(notifyParentID, subagents.Notice(notifyLabel, "deleted by the user — its transcript is gone."))
+		s.registry.deliverToParent(notifyParentID, steerq.Notice, subagents.Notice(notifyLabel, "deleted by the user — its transcript is gone."))
 	}
 	// The file is gone, so the session can never be reopened: drop any
 	// queued deliveries for it (subagent completions/reports) instead of

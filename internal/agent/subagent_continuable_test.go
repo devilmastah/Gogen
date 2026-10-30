@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // fakeContinuableSpawner is a fakeSpawner that also implements
@@ -216,5 +217,79 @@ func TestContinuableToolExecution(t *testing.T) {
 		if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: name, Args: map[string]any{}}); err == nil {
 			t.Fatalf("%s must fail in plan mode", name)
 		}
+	}
+}
+
+// steerFakeSpawner is a continuable spawner that also supports steering, so the
+// send_message tool's steer branch can be observed. The embedded fake stays the
+// plain (non-steering) one for the fallback case.
+type steerFakeSpawner struct {
+	*fakeContinuableSpawner
+	steers []string
+	sends  []string
+}
+
+func (f *steerFakeSpawner) SendMessage(caller *Agent, agentID, text string) error {
+	f.sends = append(f.sends, agentID+": "+text)
+	return nil
+}
+
+func (f *steerFakeSpawner) Steer(caller *Agent, agentID, text string) error {
+	f.steers = append(f.steers, agentID+": "+text)
+	return nil
+}
+
+// TestSendMessageSteerFlag pins the tool surface: send_message stays the one
+// tool (no new name), and steer=true routes to the spawner's Steer — falling
+// back to plain delivery, with the outcome said out loud, when the mode cannot
+// steer.
+func TestSendMessageSteerFlag(t *testing.T) {
+	newAgentWith := func(sp SubagentSpawner) *Agent {
+		a := NewAgent(llmtest.NewMockProvider(), NewExecutor(t.TempDir()), nil)
+		a.SetSubagentsEnabled(true)
+		a.SetSubagentSpawner(sp)
+		return a
+	}
+
+	steering := &steerFakeSpawner{fakeContinuableSpawner: &fakeContinuableSpawner{}}
+	a := newAgentWith(steering)
+	out, err := handleSendMessage(context.Background(), a, map[string]any{
+		"agent_id": "child-1", "message": "do Y instead", "steer": true,
+	})
+	if err != nil {
+		t.Fatalf("steer send_message = %v", err)
+	}
+	if len(steering.steers) != 1 || steering.steers[0] != "child-1: do Y instead" {
+		t.Fatalf("steers = %v, want the steering path", steering.steers)
+	}
+	if len(steering.sends) != 0 {
+		t.Fatalf("plain sends = %v, want none when steering is supported", steering.sends)
+	}
+	if !strings.Contains(out, "steering:") {
+		t.Fatalf("tool result = %q, want the steering outcome", out)
+	}
+
+	// Default (no flag) remains a plain delivery through the same tool.
+	steering.steers, steering.sends = nil, nil
+	if _, err := handleSendMessage(context.Background(), a, map[string]any{
+		"agent_id": "child-1", "message": "queue after the turn",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(steering.sends) != 1 || len(steering.steers) != 0 {
+		t.Fatalf("default send = %v/%v, want a plain delivery", steering.sends, steering.steers)
+	}
+
+	// A spawner without steering still delivers, and says the message waits.
+	plain := &fakeContinuableSpawner{}
+	b := newAgentWith(plain)
+	out, err = handleSendMessage(context.Background(), b, map[string]any{
+		"agent_id": "child-1", "message": "hi", "steer": true,
+	})
+	if err != nil {
+		t.Fatalf("fallback send_message = %v", err)
+	}
+	if !strings.Contains(out, "not supported in this mode") || !strings.Contains(out, "after the current turn") {
+		t.Fatalf("fallback result = %q, want it to explain the fallback", out)
 	}
 }

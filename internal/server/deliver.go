@@ -1,65 +1,28 @@
 package server
 
 import (
-	"fmt"
-	"sync"
-	"time"
-
 	"gogen/internal/llm"
 	"gogen/internal/steerq"
 )
 
-// deliverKind distinguishes the two producers sharing one FIFO queue per
-// runtime: system-generated messages (job notices, scheduled reminders,
-// compact subagent terminal events, exact send_message replies) and user
-// steering messages (typed into a busy session — rendered as the user's own
-// message). One queue, one drain path; kind changes presentation and policy.
-type deliverKind int
-
-const (
-	deliverSystem deliverKind = iota
-	deliverUser
-)
-
-// deliverSource records WHY a SYSTEM item was enqueued. Only a direct
-// send_message delivery (deliverFromChildMessage) arms the receiving
-// session's delivery-start hook — the continuable-subagent reply capture.
-// Every other machine message (job notices, completion notices,
-// queued-parent deliveries) must NOT be mistaken for a message
-// whose answer belongs to the parent: a child's reaction to an unrelated
-// notice would otherwise be injected into ITS parent as an unsolicited
-// "reply" (and another parent turn).
-type deliverSource uint8
-
-const (
-	// deliverFromSystem is every machine-generated delivery except a
-	// direct send_message: job completion notices, scheduled reminders,
-	// subagent completion notices, and notices flushed from the
-	// registry's per-parent queue. Never arms the start hook. Zero value.
-	deliverFromSystem deliverSource = iota
-	// deliverFromChildMessage is a send_message delivery into a child's
-	// runtime: the delivered turn's exact returned output is the reply
-	// the parent asked for, so this source arms the start hook and
-	// per-invocation result callback (subagents.Child.OnTurnResult).
-	deliverFromChildMessage
-)
-
-// deliverItem is one queued turn waiting for the session to go idle.
-type deliverItem struct {
-	// ID is the queue-item identity the client correlates its queued
-	// bubble against (queue_update reconciliation). Client-provided for
-	// user items (queueId on the inbound message frame); generated for
-	// system items.
-	ID   string
-	Text string
-	Kind deliverKind
-	// Source is why a SYSTEM item was enqueued (deliverFromSystem /
-	// deliverFromChildMessage); meaningless for user items. Only
-	// deliverFromChildMessage arms the delivery-start hook.
-	Source deliverSource
-	// Images carries user-attached images (nil for system items).
-	Images []llm.ImageInput
-}
+// The per-runtime delivery queue stores internal/steerq items, so the kinds
+// here are steerq's, and each one names a producer on this host:
+//
+//   - steerq.User: text the user typed into a busy session (rendered as the
+//     user's own message).
+//   - steerq.Notice: every machine-generated one-way message — job notices,
+//     scheduled reminders, compact subagent terminal events, and notices
+//     flushed from the registry's per-parent queue.
+//   - steerq.Reply: a TARGETED delivery — a parent's send_message into a
+//     child's runtime, whose exact turn output is the answer the parent
+//     asked for.
+//
+// Only a Reply arms the receiving session's delivery-start hook (the
+// continuable-subagent reply capture, see deliverLoop). Every other machine
+// message must NOT be mistaken for a message whose answer belongs to the
+// parent: a child's reaction to an unrelated notice would otherwise be
+// injected into ITS parent as an unsolicited "reply" (and another parent
+// turn).
 
 // deliveriesLocked returns the runtime's delivery queue, creating it on first
 // use (a hand-built runtime — tests, a nested child without the full
@@ -67,93 +30,15 @@ type deliverItem struct {
 // internally synchronized, and this assigns the field.
 func (rt *sessionRuntime) deliveriesLocked() *steerq.Queue {
 	if rt.pendingDeliver == nil {
-		rt.pendingDeliver = steerq.New(maxUserQueueCap, maxSystemDeliveryQueue)
+		rt.pendingDeliver = steerq.NewDefault()
 	}
 	return rt.pendingDeliver
 }
 
-// steerqKind maps this host's (kind, source) pair onto the shared queue's
-// kind, which is what the caps, eviction preference and batching rule key on:
-// a user message is its own kind, a targeted send_message delivery is a Reply
-// (never evicted, never batched), and every other machine message is a
-// Notice (batchable, evictable oldest-first).
-func steerqKind(k deliverKind, src deliverSource) steerq.Kind {
-	if k == deliverUser {
-		return steerq.User
-	}
-	if src == deliverFromChildMessage {
-		return steerq.Reply
-	}
-	return steerq.Notice
-}
-
-// deliverItemFrom builds the queue item for a delivery; the deliverSource
-// travels in Tag because only a targeted delivery arms the delivery-start
-// hook (see deliverLoop).
-func deliverItemFrom(id, text string, k deliverKind, src deliverSource, images []llm.ImageInput) steerq.Item {
-	return steerq.Item{ID: id, Text: text, Kind: steerqKind(k, src), Images: images, Tag: src}
-}
-
-// itemSource reads back the deliverSource stored by deliverItemFrom.
-func itemSource(it steerq.Item) deliverSource {
-	src, _ := it.Tag.(deliverSource)
-	return src
-}
-
-// itemFromSteerq is the read-side view of a queued item, so the drain code
-// keeps speaking this host's vocabulary.
-func itemFromSteerq(it steerq.Item) deliverItem {
-	return deliverItem{ID: it.ID, Text: it.Text, Kind: mapDeliverKind(it.Kind), Source: itemSource(it), Images: it.Images}
-}
-
-// mapDeliverKind is the inverse of steerqKind for the fields the drain reads
-// (a targeted delivery is a system item with deliverFromChildMessage).
-func mapDeliverKind(k steerq.Kind) deliverKind {
-	if k == steerq.User {
-		return deliverUser
-	}
-	return deliverSystem
-}
-
-// maxSystemDeliveryQueue bounds pending SYSTEM message deliveries per
-// runtime. NOTICE-style deliveries (job notices and compact subagent
-// terminal events) may be dropped oldest-first, while exact targeted
-// send_message replies are never silently dropped. User items are a separate
-// kind and are never dropped by system overflow.
-//
-// Sized to hold one full cohort of finished children (the default cap is 32)
-// plus replies. Terminal events are compact and authoritative reports are
-// pulled separately, so this queue no longer carries a 64 KiB report per
-// completion.
-const maxSystemDeliveryQueue = 32
-
-// maxParentDeliveryQueue bounds the registry's offline-parent queue
-// (notices and replies for a session whose runtime is not live). Sized like
-// the per-runtime queue because a drop here is invisible — no client is
-// attached to toast it, and the parent may not be reopened for a long time.
-const maxParentDeliveryQueue = 32
-
-// maxUserQueueCap bounds USER steering messages per runtime. Unlike system
-// deliveries, user text is never silently dropped: overflow REJECTS the new
-// message at submit time with a visible error. Kept low deliberately: each
-// item may carry up to 4 images (5MB data URL cap each) and drains as its
-// own turn, so the count doubles as a memory/backlog bound.
-const maxUserQueueCap = 20
-
-var (
-	queueIDMu  sync.Mutex
-	queueIDSeq uint64
-	queueIDAdd = uint64(time.Now().UnixNano() & 0xffff)
-)
-
-// newQueueItemID generates a unique queue-item id ("q_<seed>_<seq>").
-func newQueueItemID() string {
-	queueIDMu.Lock()
-	queueIDSeq++
-	seq := queueIDSeq
-	queueIDMu.Unlock()
-	return fmt.Sprintf("q_%x_%x", queueIDAdd, seq)
-}
+// The per-session bounds (user cap, system cap), the queue-item id generator
+// and the offline-parent stash's bound are internal/steerq's: they are queue
+// policy, and the TUI applies the same ones. What is left here is this host's
+// own contract for client-supplied queue ids.
 
 // maxQueueIDLen bounds a client-supplied queue id: it is a correlation
 // token, never content, and the server-generated form is ~20 characters.
@@ -198,7 +83,7 @@ func (rt *sessionRuntime) enqueueUserTurn(id, content string, images []llm.Image
 		return false
 	}
 	rt.deliverMu.Lock()
-	if rt.countUser() >= maxUserQueueCap {
+	if rt.countUser() >= steerq.UserCap {
 		rt.deliverMu.Unlock()
 		return false
 	}
@@ -210,11 +95,11 @@ func (rt *sessionRuntime) enqueueUserTurn(id, content string, images []llm.Image
 	// (The client's own ids carry a per-tab nonce, so a duplicate only ever
 	// arrives from a hand-built frame.)
 	if !validQueueID(id) || rt.queueIDInUseLocked(id) {
-		id = newQueueItemID()
+		id = steerq.NewID()
 	}
 	// The user cap was checked above under the same lock, so Accepted is the
 	// only outcome here.
-	rt.deliveriesLocked().Append(deliverItemFrom(id, content, deliverUser, deliverFromSystem, images))
+	rt.deliveriesLocked().Append(steerq.Item{ID: id, Text: content, Kind: steerq.User, Images: images})
 	if !rt.deliverWorker.Swap(true) {
 		go rt.deliverLoop()
 	}
@@ -337,8 +222,8 @@ func (rt *sessionRuntime) dropDeliveredLocked(n int) {
 // completion notices) call this from arbitrary goroutines; the worker owns
 // all interaction with
 // the turn machinery, so the "Messages are owned by the turn goroutine"
-// invariant holds by construction. The item's source is deliverFromSystem:
-// it never arms the delivery-start hook (see deliverChildMessage).
+// invariant holds by construction. The item's kind is steerq.Notice: it
+// never arms the delivery-start hook (see deliverChildMessage).
 //
 // Delivery is at-most-once: the item is popped BEFORE the turn starts, so a
 // crash between pop and start loses one message rather than duplicating one.
@@ -354,40 +239,41 @@ func (rt *sessionRuntime) dropDeliveredLocked(n int) {
 // enqueueSystem). Only false may be re-routed to deliverToParent; a true
 // result has already been resolved either way.
 func (rt *sessionRuntime) deliverToSession(text string) bool {
-	accepted, _ := rt.enqueueSystem(text, deliverFromSystem)
+	accepted, _ := rt.enqueueSystem(text, steerq.Notice)
 	return accepted
 }
 
 // deliverChildMessage delivers a parent's send_message into a child's
-// runtime. It is deliverToSession with the deliverFromChildMessage source:
-// the delivered turn's final assistant message is the reply the parent
-// asked for, so starting it arms the child's delivery-start hook (the
-// reply capture). This is the ONLY producer allowed to arm that capture —
-// see deliverSource.
+// runtime. It is deliverToSession with the steerq.Reply kind: the delivered
+// turn's final assistant message is the reply the parent asked for, so
+// starting it arms the child's delivery-start hook (the reply capture). This
+// is the ONLY producer that enqueues a Reply — see the kind notes at the top
+// of this file.
 //
 // ok=false means nothing was queued: full=true reports a queue holding only
 // targeted deliveries, so the caller can tell the model to wait and retry
 // instead of dropping a message whose reply is pending.
 func (rt *sessionRuntime) deliverChildMessage(text string) (ok, full bool) {
-	return rt.enqueueSystem(text, deliverFromChildMessage)
+	return rt.enqueueSystem(text, steerq.Reply)
 }
 
 // enqueueSystem is the shared system-delivery enqueue used by
-// deliverToSession (source = deliverFromSystem) and deliverChildMessage
-// (source = deliverFromChildMessage).
+// deliverToSession (kind = steerq.Notice) and deliverChildMessage
+// (kind = steerq.Reply); kind must be one of those two. A USER steering
+// message never comes through here — enqueueUserTurn owns User items and
+// their separate cap.
 //
-// Per-source overflow policy (the per-kind caps never touch user items):
-//   - a NOTICE (deliverFromSystem) first evicts the OLDEST queued notice
-//     (freshness wins — a stale job notice is worse than none). If every
-//     slot holds a targeted delivery, the notice itself is dropped instead:
-//     a message whose reply the parent is waiting on must not be evicted by
-//     a notice.
-//   - a TARGETED delivery (deliverFromChildMessage) first evicts the oldest
-//     notice to make room; when every slot holds a targeted delivery the
-//     enqueue is REFUSED (ok=false, full=true) rather than silently
-//     discarding a message — the caller turns that into a visible tool
-//     error the model can retry.
-func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) (ok, full bool) {
+// Per-kind overflow policy (the per-kind caps never touch user items):
+//   - a NOTICE first evicts the OLDEST queued notice (freshness wins — a
+//     stale job notice is worse than none). If every slot holds a targeted
+//     delivery, the notice itself is dropped instead: a message whose reply
+//     the parent is waiting on must not be evicted by a notice.
+//   - a TARGETED delivery (Reply) first evicts the oldest notice to make
+//     room; when every slot holds a targeted delivery the enqueue is
+//     REFUSED (ok=false, full=true) rather than silently discarding a
+//     message — the caller turns that into a visible tool error the model
+//     can retry.
+func (rt *sessionRuntime) enqueueSystem(text string, kind steerq.Kind) (ok, full bool) {
 	if rt == nil || rt.evicted.Load() {
 		return false, false
 	}
@@ -398,7 +284,7 @@ func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) (ok, ful
 	// reports an actionable error instead of dropping a message whose answer
 	// is pending) and a new notice is DROPPED (a full reply queue must not
 	// lose its replies).
-	outcome, evicted := rt.deliveriesLocked().Append(deliverItemFrom(newQueueItemID(), text, deliverSystem, src, nil))
+	outcome, evicted := rt.deliveriesLocked().Append(steerq.Item{ID: steerq.NewID(), Text: text, Kind: kind})
 	var dropped bool
 	switch {
 	case outcome == steerq.Refused:
@@ -433,14 +319,21 @@ func (rt *sessionRuntime) enqueueSystem(text string, src deliverSource) (ok, ful
 
 // --- parent-scoped delivery (survives runtime eviction) ---
 
-// deliverToParent delivers a system message to a live parent session, or —
-// when the session's runtime is not live (orphan-evicted, closed) — queues
-// it in the registry so it is delivered when the session is next registered
-// (reopened from the store). Never blocks; at-most-once per queue entry.
-// Used by the continuable-subagent machinery, whose producers must not lose
-// a completion notice or reply to a parent that merely went idle with no
-// viewers.
-func (r *sessionRegistry) deliverToParent(parentID, text string) {
+// deliverToParent delivers a child-to-parent event's text to a live parent
+// session, or — when the session's runtime is not live (orphan-evicted,
+// closed) — stashes it in the registry so it is delivered when the session is
+// next registered (reopened from the store). Never blocks; at-most-once per
+// queue entry. Used by the continuable-subagent machinery, whose producers
+// must not lose a completion notice or a reply to a parent that merely went
+// idle with no viewers.
+//
+// kind orders the OFFLINE STASH only (see queueParentDelivery): a Reply is
+// never the eviction victim while the parent is away. The LIVE path injects
+// as a one-way Notice whatever the kind — the answer belongs to whoever asked
+// for it, and reply capture is armed per targeted delivery, never by a child
+// event arriving at its parent (which may itself be a child, and whose turn
+// output would then be forwarded one level too far).
+func (r *sessionRegistry) deliverToParent(parentID string, kind steerq.Kind, text string) {
 	if rt, ok := r.get(parentID); ok {
 		if rt.deliverToSession(text) {
 			return
@@ -448,28 +341,40 @@ func (r *sessionRegistry) deliverToParent(parentID, text string) {
 		// The runtime was evicted between the lookup and the queue append:
 		// fall through and queue for the next registration.
 	}
-	r.queueParentDelivery(parentID, text)
+	r.queueParentDelivery(parentID, kind, text)
 }
 
-// queueParentDelivery stashes a system message for a session whose runtime
-// is not live. Bounded like the per-runtime delivery queue: overflow drops
-// the OLDEST entry (freshness wins — a stale notice is worse than none).
+// queueParentDelivery stashes a message for a session whose runtime is not
+// live. The stash is a shared steerq queue, so it applies the same bound and
+// the same eviction preference as a live one: at the cap the OLDEST NOTICE is
+// evicted, a NOTICE arriving at an all-reply stash drops itself, and a REPLY
+// arriving there is refused — a message whose answer somebody is waiting on
+// must not evict another one. Overflow is silently unrecoverable either way
+// (the parent is not live, so there is no client to toast), which is why the
+// stash carries replies at all instead of a plain string list.
+//
+// The kind is carried for EVICTION PRIORITY ONLY: flushParentDeliveries
+// injects every stashed message as a one-way notice, because by then no turn
+// is waiting on an answer.
+//
 // Flushed by register() when the session is next loaded; cleared by
 // sessionDelete (a deleted session can never be reopened).
-func (r *sessionRegistry) queueParentDelivery(parentID, text string) {
+func (r *sessionRegistry) queueParentDelivery(parentID string, kind steerq.Kind, text string) {
 	if parentID == "" {
 		return
 	}
 	r.parentDeliverMu.Lock()
 	defer r.parentDeliverMu.Unlock()
 	q := r.parentDeliveries[parentID]
-	if len(q) >= maxParentDeliveryQueue {
-		q = append([]string(nil), q[1:]...) // drop the oldest entry
+	if q == nil {
+		// No User items are ever stashed: the user cap does not apply.
+		q = steerq.New(0, steerq.SystemCap)
+		r.parentDeliveries[parentID] = q
 	}
-	r.parentDeliveries[parentID] = append(q, text)
+	q.Append(steerq.Item{ID: steerq.NewID(), Text: text, Kind: kind})
 }
 
-// flushParentDeliveries delivers every queued message for id into rt (the
+// flushParentDeliveries delivers every stashed message for id into rt (the
 // freshly registered runtime of a session that was evicted/closed while its
 // background subagents kept running). No-op when nothing is queued. Must
 // NOT be called with r.mu held: deliverToSession can broadcast (bounded by
@@ -479,11 +384,16 @@ func (r *sessionRegistry) flushParentDeliveries(id string, rt *sessionRuntime) {
 		return
 	}
 	r.parentDeliverMu.Lock()
-	pending := r.parentDeliveries[id]
+	q := r.parentDeliveries[id]
 	delete(r.parentDeliveries, id)
 	r.parentDeliverMu.Unlock()
-	for _, text := range pending {
-		rt.deliverToSession(text)
+	if q == nil {
+		return
+	}
+	// Take zeroes the popped slots, so the drained messages' text is not kept
+	// reachable through the stash after it leaves the map.
+	for _, it := range q.Take(q.Len()) {
+		rt.deliverToSession(it.Text)
 	}
 }
 
@@ -530,8 +440,7 @@ func (rt *sessionRuntime) deliverLoop() {
 		// actually starting. Popping first opened a handoff window (queue
 		// empty, turnMu still free) where the just-ended turn's orphan
 		// re-check could evict the runtime and drop the item.
-		head, _ := rt.pendingDeliver.Peek()
-		item := itemFromSteerq(head)
+		item, _ := rt.pendingDeliver.Peek()
 		rt.deliverMu.Unlock()
 
 		if rt.evicted.Load() {
@@ -571,9 +480,9 @@ func (rt *sessionRuntime) deliverLoop() {
 		// lock to startTurn (its goroutine defers the unlock). The
 		// delivery-start hook (if any) fires immediately before, so
 		// consumers can arm per-delivery state exactly when the delivered
-		// turn begins — SYSTEM items only: the hook arms send_message
-		// reply capture, which must not treat a user steering message as
-		// a system delivery.
+		// turn begins — Reply items only: the hook arms send_message
+		// reply capture, which must not treat a user steering message or a
+		// one-way notice as a targeted delivery.
 		//
 		// Re-verify the head under the lock before popping: the queue can
 		// shift between the peek above and this pop (an overflow drop or an
@@ -600,7 +509,7 @@ func (rt *sessionRuntime) deliverLoop() {
 		// dropDeliveredLocked zeroes the popped slots (so their text/images
 		// are no longer retained by the backing array). batch is a COPY, and
 		// steerq.Join builds a new string, so both stay valid after the clear.
-		item = itemFromSteerq(batch[0])
+		item = batch[0]
 		text, images := steerq.Join(batch)
 		rt.dropDeliveredLocked(len(batch))
 		rt.deliverMu.Unlock()
@@ -614,7 +523,7 @@ func (rt *sessionRuntime) deliverLoop() {
 		// A batch is a single kind, and SYSTEM deliveries are not on the
 		// wire queue (queueItems sends user items only), so their pops
 		// change nothing client-visible — no frame.
-		if item.Kind == deliverUser {
+		if item.Kind == steerq.User {
 			left := make([]string, 0, len(batch))
 			for _, it := range batch {
 				left = append(left, it.ID)
@@ -622,12 +531,12 @@ func (rt *sessionRuntime) deliverLoop() {
 			rt.broadcastQueueStarted(text, left)
 		}
 		// The delivery-start hook arms per-delivery state exactly when the
-		// delivered turn begins — and ONLY for a send_message delivery
-		// (deliverFromChildMessage). The callback receives that exact turn's
+		// delivered turn begins — and ONLY for a targeted send_message
+		// delivery (steerq.Reply). The callback receives that exact turn's
 		// output/error, so a child's reaction to any other machine message
 		// can never be injected into its parent as a reply.
 		var onResult func(string, error)
-		if item.Kind == deliverSystem && item.Source == deliverFromChildMessage {
+		if item.Kind == steerq.Reply {
 			if rt.deliverStartHook != nil {
 				rt.deliverStartHook()
 			}

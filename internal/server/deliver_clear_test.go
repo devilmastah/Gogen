@@ -3,6 +3,8 @@ package server
 import (
 	"strings"
 	"testing"
+
+	"gogen/internal/steerq"
 )
 
 // TestPoppedQueueItemsAreCleared pins the server side of M3: dropping a
@@ -13,8 +15,8 @@ func TestPoppedQueueItemsAreCleared(t *testing.T) {
 	rt := newTestRuntime(t)
 	big := strings.Repeat("x", 1<<20)
 	seedDeliveries(rt,
-		deliverItem{ID: "q1", Kind: deliverUser, Text: big},
-		deliverItem{ID: "q2", Kind: deliverUser, Text: "second"},
+		steerq.Item{ID: "q1", Kind: steerq.User, Text: big},
+		steerq.Item{ID: "q2", Kind: steerq.User, Text: "second"},
 	)
 	rt.deliverMu.Lock()
 	rt.dropDeliveredLocked(1)

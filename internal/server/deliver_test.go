@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -189,15 +190,15 @@ func TestDeliverQueueOverflow(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocking turn never entered the provider")
 	}
-	for i := 1; i <= maxSystemDeliveryQueue+1; i++ {
+	for i := 1; i <= steerq.SystemCap+1; i++ {
 		rt.deliverToSession(fmt.Sprintf("notice-%d", i))
 	}
 	// End the blocking turn: the worker wakes at turn end and drains the
 	// surviving run (2..cap+1 — notice-1 was dropped by the overflow) as
 	// ONE joined turn.
 	rt.stream.cancelInFlight()
-	want := make([]string, 0, maxSystemDeliveryQueue)
-	for i := 2; i <= maxSystemDeliveryQueue+1; i++ {
+	want := make([]string, 0, steerq.SystemCap)
+	for i := 2; i <= steerq.SystemCap+1; i++ {
 		want = append(want, fmt.Sprintf("notice-%d", i))
 	}
 	expected := strings.Join(want, "\n\n")
@@ -232,9 +233,9 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 		agent:         &agent.Agent{},
 		deliverNotify: make(chan struct{}, 1),
 	}
-	stale := make([]deliverItem, 0, maxSystemDeliveryQueue)
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
-		stale = append(stale, deliverItem{ID: newQueueItemID(), Text: "stale", Kind: deliverSystem})
+	stale := make([]steerq.Item, 0, steerq.SystemCap)
+	for i := 0; i < steerq.SystemCap; i++ {
+		stale = append(stale, steerq.Item{ID: steerq.NewID(), Text: "stale", Kind: steerq.Notice})
 	}
 	seedDeliveries(rt, stale...)
 	// No worker goroutine for this unit test: the queue stays at cap so the
@@ -265,8 +266,8 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 	if n > 0 {
 		last = q[n-1].Text
 	}
-	if n != maxSystemDeliveryQueue || last != "overflow notice" {
-		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last, maxSystemDeliveryQueue)
+	if n != steerq.SystemCap || last != "overflow notice" {
+		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last, steerq.SystemCap)
 	}
 }
 
@@ -337,13 +338,13 @@ func TestDeliverToParentQueuesUntilRegistered(t *testing.T) {
 	// Evict the parent (idle, no viewers) and deliver to it: the message
 	// must be queued, not dropped.
 	s.registry.evictRuntime(parentRt)
-	s.registry.deliverToParent(a.SessionID, "delayed notice")
+	s.registry.deliverToParent(a.SessionID, steerq.Notice, "delayed notice")
 	time.Sleep(200 * time.Millisecond)
 	if deliveredMessages(a, "delayed notice") {
 		t.Fatal("message must not deliver while the runtime is not live")
 	}
 	s.registry.parentDeliverMu.Lock()
-	queued := len(s.registry.parentDeliveries[a.SessionID])
+	queued := s.registry.parentDeliveries[a.SessionID].Len()
 	s.registry.parentDeliverMu.Unlock()
 	if queued != 1 {
 		t.Fatalf("queued = %d, want 1", queued)
@@ -356,10 +357,112 @@ func TestDeliverToParentQueuesUntilRegistered(t *testing.T) {
 	})
 	// The queue is drained by the flush.
 	s.registry.parentDeliverMu.Lock()
-	queued = len(s.registry.parentDeliveries[a.SessionID])
+	queued = s.registry.parentDeliveries[a.SessionID].Len()
 	s.registry.parentDeliverMu.Unlock()
 	if queued != 0 {
 		t.Fatalf("queued after flush = %d, want 0", queued)
+	}
+}
+
+// stashTexts snapshots an offline parent stash for assertions.
+func stashTexts(t *testing.T, r *sessionRegistry, id string) []string {
+	t.Helper()
+	r.parentDeliverMu.Lock()
+	defer r.parentDeliverMu.Unlock()
+	var out []string
+	if q := r.parentDeliveries[id]; q != nil {
+		for _, it := range q.Items() {
+			out = append(out, it.Text)
+		}
+	}
+	return out
+}
+
+// TestParentStashProtectsReplies pins the offline stash's eviction order: the
+// stash is a shared steerq queue, so it applies the preference a live runtime
+// applies — at the cap the OLDEST NOTICE is evicted, and a pending REPLY never
+// is. It used to be a plain string list that dropped whichever entry was
+// oldest, so a burst of completion notices could silently discard the answer
+// to a send_message the parent was still waiting for.
+func TestParentStashProtectsReplies(t *testing.T) {
+	const reply = "reply-somebody-waits-for"
+
+	r := newSessionRegistry(4)
+	r.deliverToParent("parent-1", steerq.Reply, reply)
+	for i := 0; i < steerq.SystemCap-1; i++ {
+		r.deliverToParent("parent-1", steerq.Notice, fmt.Sprintf("notice-%d", i))
+	}
+	if got := len(stashTexts(t, r, "parent-1")); got != steerq.SystemCap {
+		t.Fatalf("stash = %d entries, want the cap %d", got, steerq.SystemCap)
+	}
+
+	// One notice past the cap: freshness wins over the oldest notice.
+	r.deliverToParent("parent-1", steerq.Notice, "notice-last")
+	texts := stashTexts(t, r, "parent-1")
+	if len(texts) != steerq.SystemCap {
+		t.Fatalf("stash = %d entries after overflow, want %d", len(texts), steerq.SystemCap)
+	}
+	if tail := texts[len(texts)-1]; tail != "notice-last" {
+		t.Fatalf("tail of the stash = %q, want the arriving notice", tail)
+	}
+	if slices.Contains(texts, "notice-0") {
+		t.Fatal("the oldest notice must be the eviction victim")
+	}
+	if !slices.Contains(texts, reply) {
+		t.Fatal("the pending reply was evicted by a notice burst")
+	}
+
+	// With every slot holding a reply, an arriving notice drops ITSELF...
+	allReplies := newSessionRegistry(4)
+	for i := 0; i < steerq.SystemCap; i++ {
+		allReplies.deliverToParent("parent-2", steerq.Reply, fmt.Sprintf("reply-%d", i))
+	}
+	allReplies.deliverToParent("parent-2", steerq.Notice, "notice-at-full")
+	replies := stashTexts(t, allReplies, "parent-2")
+	if len(replies) != steerq.SystemCap {
+		t.Fatalf("all-reply stash = %d entries, want %d", len(replies), steerq.SystemCap)
+	}
+	if slices.Contains(replies, "notice-at-full") {
+		t.Fatal("a notice must not survive an all-reply stash at the cap")
+	}
+	// ...and so does a reply arriving there (nothing can be made room for).
+	allReplies.deliverToParent("parent-2", steerq.Reply, "one-too-many")
+	if got := len(stashTexts(t, allReplies, "parent-2")); got != steerq.SystemCap {
+		t.Fatalf("all-reply stash = %d entries after a refused reply, want %d", got, steerq.SystemCap)
+	}
+}
+
+// TestParentStashFlushInjectsAsNotice pins the flush contract: a stash item's
+// kind orders eviction ONLY, so a flushed reply enters the parent's queue as a
+// one-way notice. Enqueuing it as a Reply would arm the delivery-start hook
+// when the parent is itself a continuable child, and that child's turn output
+// would then be forwarded one level too far up the tree.
+func TestParentStashFlushInjectsAsNotice(t *testing.T) {
+	r := newSessionRegistry(4)
+	r.deliverToParent("parent-1", steerq.Reply, "reply")
+	r.deliverToParent("parent-1", steerq.Notice, "notice")
+
+	rt := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
+	rt.deliverWorker.Store(true) // no worker goroutine: the queue stays put
+	r.flushParentDeliveries("parent-1", rt)
+
+	items := queuedItems(rt)
+	if len(items) != 2 {
+		t.Fatalf("flushed items = %d, want 2", len(items))
+	}
+	for _, it := range items {
+		if it.Kind != steerq.Notice {
+			t.Fatalf("flushed item %q has kind %v, want Notice", it.Text, it.Kind)
+		}
+	}
+	if items[0].Text != "reply" || items[1].Text != "notice" {
+		t.Fatalf("flush order = [%q %q], want the stash order", items[0].Text, items[1].Text)
+	}
+	r.parentDeliverMu.Lock()
+	left := r.parentDeliveries["parent-1"]
+	r.parentDeliverMu.Unlock()
+	if left != nil {
+		t.Fatalf("stash survived the flush: %#v", left)
 	}
 }
 
@@ -492,7 +595,7 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 	rt.deliverWorker.Store(true) // no worker goroutine: the queue stays put
 
 	// Notice slots full: a targeted delivery evicts the oldest notice.
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
+	for i := 0; i < steerq.SystemCap; i++ {
 		rt.deliverToSession(fmt.Sprintf("notice-%d", i))
 	}
 	if ok, full := rt.deliverChildMessage("targeted-1"); !ok || full {
@@ -504,19 +607,19 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 			continue
 		}
 		nSys++
-		if it.Tag == deliverSource(deliverFromSystem) {
+		if it.Kind == steerq.Notice {
 			nNotice++
 		}
 	}
-	if nSys != maxSystemDeliveryQueue || nNotice != maxSystemDeliveryQueue-1 {
+	if nSys != steerq.SystemCap || nNotice != steerq.SystemCap-1 {
 		t.Fatalf("after targeted enqueue: system=%d notices=%d, want %d/%d (oldest notice evicted)",
-			nSys, nNotice, maxSystemDeliveryQueue, maxSystemDeliveryQueue-1)
+			nSys, nNotice, steerq.SystemCap, steerq.SystemCap-1)
 	}
 
 	// All-targeted full: the next targeted delivery is REFUSED...
 	rt2 := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
 	rt2.deliverWorker.Store(true)
-	for i := 0; i < maxSystemDeliveryQueue; i++ {
+	for i := 0; i < steerq.SystemCap; i++ {
 		if ok, full := rt2.deliverChildMessage(fmt.Sprintf("targeted-%d", i)); !ok || full {
 			t.Fatalf("targeted enqueue %d refused before the cap (ok=%v full=%v)", i, ok, full)
 		}
@@ -538,7 +641,7 @@ func TestTargetedDeliveryOverflowPolicy(t *testing.T) {
 			nTargeted++
 		}
 	}
-	if n != maxSystemDeliveryQueue || nTargeted != maxSystemDeliveryQueue {
-		t.Fatalf("queue = %d items (%d targeted), want all %d targeted preserved", n, nTargeted, maxSystemDeliveryQueue)
+	if n != steerq.SystemCap || nTargeted != steerq.SystemCap {
+		t.Fatalf("queue = %d items (%d targeted), want all %d targeted preserved", n, nTargeted, steerq.SystemCap)
 	}
 }

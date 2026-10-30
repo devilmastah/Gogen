@@ -248,7 +248,17 @@ function nestedRowSig(rec) {
         isCurrent,
         rec.running ? 1 : 0,
         rec.success ? 1 : 0,
+        // A nested row's "interrupted" and "idle" states are neither failed nor
+        // done, so each needs its own signature bit: without them a status
+        // change from interrupted (or idle) to failed — the same success=0,
+        // running=0, active=0 — would leave the stale label in place.
+        rec.interrupted ? 1 : 0,
+        rec.idle ? 1 : 0,
         rec.active ? 1 : 0,
+        // "Registered" (the runtime is live in the server) decides whether the
+        // row renders a colored dot at all, so a child released by its
+        // retention timer — same running/success/active bits — must flip it.
+        rec.registered ? 1 : 0,
         rec.label,
         (rec.summary || '').slice(0, 80),
         rec.job || '',
