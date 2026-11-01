@@ -3,6 +3,7 @@ package agent
 import (
 	"reflect"
 
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -94,6 +95,13 @@ type SessionAgentOptions struct {
 	// bash_persistent). Used only when FeatureFlags is nil — the web path
 	// reads the shared store's live flag instead.
 	TerminalEnabled bool
+	// CodeIndex is the shared vector store for the working folder. Nil
+	// until a host installs one. CodeIndexEnabled is the live flag used
+	// only when FeatureFlags is nil. CodeIndexConfig reads the live config
+	// at each search.
+	CodeIndex        *codeindex.Index
+	CodeIndexEnabled bool
+	CodeIndexConfig  func() config.Config
 	// MCPConfigured reports that MCP is enabled with at least one server in
 	// the session's config (config.MCPActive), and MCPNested selects the
 	// gateway exposure mode (config.MCPNested). Both are CONFIG answers taken
@@ -152,7 +160,10 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 		a.SetSubagentMaxConcurrent(opts.SubagentMaxConcurrent)
 		a.SetSkillsEnabled(opts.SkillsEnabled && opts.SkillsManager != nil)
 		a.SetTerminalEnabled(opts.TerminalEnabled)
+		a.SetCodeIndexEnabled(opts.CodeIndexEnabled)
 	}
+	a.SetCodeIndex(opts.CodeIndex)
+	a.SetCodeIndexConfig(opts.CodeIndexConfig)
 	a.SetBoardManager(opts.BoardManager)
 	a.SetSkillsManager(opts.SkillsManager)
 	a.SetSubagentSpawner(opts.SubagentSpawner)

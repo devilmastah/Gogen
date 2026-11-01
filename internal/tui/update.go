@@ -10,6 +10,23 @@ import (
 	"charm.land/bubbletea/v2"
 )
 
+// codeIndexProgressMsg is the shared index snapshot, already rendered as one
+// sentence. Walking updates the status bar only. Embedding and writing mark
+// the rebuild busy. Idle after that busy stretch appends the finished line
+// when there is no error. A search that only scans an up-to-date index does
+// not append a line. Idle with an error leaves that sentence on the status
+// bar. /reindex still reports the error through codeIndexDoneMsg. A watch
+// refresh has no done message, so the status bar is the report.
+type codeIndexProgressMsg struct {
+	line  string
+	phase string
+	err   string
+}
+
+type codeIndexDoneMsg struct {
+	err error
+}
+
 func (m *Model) Init() tea.Cmd {
 	// The sidebar tick loop runs for the whole program lifetime (a no-op
 	// while the panel is hidden) so toggling can never fork a second loop.
@@ -85,6 +102,35 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case modelChangedMsg:
 		return m.handleModelChangedMsg()
+
+	case codeIndexProgressMsg:
+		switch msg.phase {
+		case "embedding", "writing":
+			m.codeIndexBusy = true
+			m.statusMsg = msg.line
+			return m, nil
+		case "walking":
+			m.statusMsg = msg.line
+			return m, nil
+		}
+		if m.codeIndexBusy && msg.err == "" {
+			m.appendChatLine(SystemStyle.Render(msg.line))
+		}
+		m.codeIndexBusy = false
+		if msg.err != "" {
+			m.statusMsg = msg.line
+			return m, nil
+		}
+		m.statusMsg = ""
+		return m, nil
+
+	case codeIndexDoneMsg:
+		if msg.err != nil {
+			m.codeIndexBusy = false
+			m.statusMsg = ""
+			m.appendChatLine(SystemStyle.Render(msg.err.Error()))
+		}
+		return m, nil
 
 	case spinner.TickMsg:
 		return m.handleSpinnerTick(msg)

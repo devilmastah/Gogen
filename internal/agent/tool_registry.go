@@ -121,6 +121,15 @@ func (a *Agent) featureTools() []featureTool {
 			featureTool{Name: "bash_persistent", Definition: bashPersistentToolDef(), Handler: handleBashPersistent},
 		)
 	}
+	if a.CodeIndexEnabled() && codeIndexProviderSet(a.codeIndexCfg()) {
+		// Plan mode may search. The only writes are under .gogen/index.
+		out = append(out, featureTool{
+			Name:        "search_meaning",
+			Definition:  searchMeaningToolDef(),
+			Handler:     handleSearchMeaning,
+			PlanAllowed: true,
+		})
+	}
 	if a.mcpGatewayEnabled() {
 		// Nested MCP (mcp_tool_mode: nested): three fixed tools. Act-mode
 		// only, matching the plan-mode gate on inlined MCP tools (isMCPTool).

@@ -369,6 +369,18 @@ type WSMessage struct {
 	// Same contract as Board/Subagent.
 	Skills   string `json:"skills,omitempty"`
 	Terminal string `json:"terminal,omitempty"`
+	// CodeIndex is the live search_meaning flag ("on"/"off"). Same contract
+	// as Skills. CodeIndexLine is the current progress sentence.
+	// CodeIndexPhase is idle, walking, embedding, or writing. The chat
+	// spinner uses it and stays hidden while idle.
+	CodeIndex      string `json:"codeIndex,omitempty"`
+	CodeIndexLine  string `json:"codeIndexLine,omitempty"`
+	CodeIndexPhase string `json:"codeIndexPhase,omitempty"`
+	// CodeIndexSeq orders the line. A host applies a line only when this
+	// is newer than the sequence it already showed. A config frame can
+	// be built while a refresh is running and reach the socket after the
+	// idle progress.
+	CodeIndexSeq uint64 `json:"codeIndexSeq,omitempty"`
 	// SubagentMaxDepth is the live subagent nesting-depth limit (0 = not
 	// provided in client→server messages; the server normalizes <= 0 to the
 	// config default when seeding agents).
@@ -457,7 +469,21 @@ type WSMessage struct {
 	// (client→server inside ConfigFields; server→client current value in
 	// config pushes). "" = auto-detect.
 	TestCommand string `json:"testCommand,omitempty"`
-	LintCommand string `json:"lintCommand,omitempty"`
+	// Code index runtime settings. Overlap is a pointer so an explicit 0
+	// is sent (omitempty drops a plain 0).
+	CodeIndexProvider     string `json:"codeIndexProvider,omitempty"`
+	CodeIndexModel        string `json:"codeIndexModel,omitempty"`
+	CodeIndexChunkLines   int    `json:"codeIndexChunkLines,omitempty"`
+	CodeIndexChunkOverlap *int   `json:"codeIndexChunkOverlap,omitempty"`
+	// CodeIndexWatch is "on" or "off". Empty and unknown are on; the server
+	// projects the effective value so the settings select is never blank.
+	CodeIndexWatch string `json:"codeIndexWatch,omitempty"`
+	// CodeIndexRerank is "on" or "off". Empty and unknown are off; the
+	// server projects the effective value so the settings select is never blank.
+	CodeIndexRerank         string `json:"codeIndexRerank,omitempty"`
+	CodeIndexRerankProvider string `json:"codeIndexRerankProvider,omitempty"`
+	CodeIndexRerankModel    string `json:"codeIndexRerankModel,omitempty"`
+	LintCommand             string `json:"lintCommand,omitempty"`
 	// MCPToolMode is the MCP tool-exposure mode ("nested" = the single
 	// `mcp` gateway tool, "inline" = one definition per server tool).
 	// Client→server inside ConfigFields; server→client carries the

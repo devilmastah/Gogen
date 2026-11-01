@@ -28,6 +28,24 @@ type Definition struct {
 	Name string
 }
 
+// Span is one function, method, or type. Lines are 1-based and inclusive.
+// Class, struct, enum, trait, and interface nodes are reported as types.
+type Span struct {
+	Start int
+	End   int
+	Kind  string
+}
+
+// SymbolSpans returns function, method, and type ranges for a supported file.
+// Tree-sitter off returns ErrDisabled. A file type with no definition query,
+// and a binary built without tree-sitter, return ErrUnsupported.
+func SymbolSpans(path string, content []byte) ([]Span, error) {
+	if err := guardEnabled(); err != nil {
+		return nil, err
+	}
+	return symbolSpans(path, content)
+}
+
 // ListDefinitions returns structural definitions for a supported source file.
 func ListDefinitions(path string, content []byte) ([]Definition, error) {
 	if err := guardEnabled(); err != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -99,6 +100,17 @@ func newAgent(cfg *config.Config, isGlobalMode bool, restoreSession bool) (*agen
 	// feature tools gated through featureTools(), toggled live from the web
 	// settings modal.
 	a.SetTerminalEnabled(cfg.TerminalEnabled())
+	// Code index: off until the user turns it on. Open does not create
+	// .gogen/index. The first search_meaning or /reindex is what writes it.
+	a.SetCodeIndexEnabled(cfg.CodeIndexEnabled())
+	a.SetCodeIndex(codeindex.Open(cfg.WorkingDir))
+	a.SetCodeIndexConfig(func() config.Config {
+		if cfg == nil {
+			return config.Config{}
+		}
+		return *cfg
+	})
+	a.SyncCodeIndexWatch()
 	// Workspace instructions (AGENTS.md/CLAUDE.md): merged below the
 	// project guidelines at view-build time from the CURRENT working dir
 	// (agent.EffectiveGuidelines), so /dir and web workspace changes

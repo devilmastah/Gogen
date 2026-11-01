@@ -100,6 +100,13 @@ func (s *Server) handleWSWorkingDir(ws *wsConn, ctx context.Context, pane **sess
 // them; they keep the pre-change directory until their turn finishes and the
 // change is re-issued.
 func (s *Server) applyWorkingDirToAll(absDir string) (skipped []string) {
+	// Move the shared index before any session turn lock. SetWorkingDir
+	// waits out a refresh, and that wait must not sit under a session's
+	// turn lock. A later per-session SetWorkingDir sees the same folder
+	// and returns.
+	if ix := s.ws.CodeIndex(); ix != nil {
+		ix.SetWorkingDir(absDir)
+	}
 	ids := s.registry.activeIDs()
 	slices.Sort(ids)
 	// A working-dir change relocates every session's persisted state into the

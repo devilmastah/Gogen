@@ -53,6 +53,7 @@ export var SETTINGS_TABS = [
     { id: 'tools', label: 'Tools' },
     { id: 'web', label: 'Web' },
     { id: 'status-display', label: 'Status display' },
+    { id: 'embeddings', label: 'Embeddings' },
     { id: 'context', label: 'Context' },
     { id: 'security', label: 'Security' },
     { id: 'sessions', label: 'Sessions' },
@@ -129,6 +130,18 @@ export var SETTINGS_SCHEMA = [
     { id: 'status-display-host-input', tab: 'status-display', type: 'text', label: 'Status display host', ariaLabel: 'Status display host', storage: 'server', channel: 'runtime', field: 'statusDisplayHost', rowId: 'status-display-host-row', note: 'mDNS name, IP, or base URL of the display. The default assumes the firmware advertises statusscreen.local; use the IP if .local does not resolve.' },
     { id: 'status-display-token-input', tab: 'status-display', type: 'password', label: 'Status display token', ariaLabel: 'Status display token', storage: 'server', channel: 'runtime', field: 'statusDisplayToken', rowId: 'status-display-token-row', placeholder: 'Token', note: 'Only needed when the display has a shared secret set (GET /token?set=… on the device).' },
     { id: 'status-display-source-input', tab: 'status-display', type: 'text', label: 'Status display row name', ariaLabel: 'Status display row name', storage: 'server', channel: 'runtime', field: 'statusDisplaySource', rowId: 'status-display-source-row', note: 'Empty = auto: gogen-<project folder>, so instances in different projects get their own row. Set it explicitly when two instances share a project folder (e.g. gogen-tui / gogen-web).' },
+
+    // ── Embeddings (server runtime; optional code index) ──────────────
+    { id: 'code-index-select', tab: 'embeddings', type: 'select', label: 'Code index (search by meaning)', storage: 'server', channel: 'feature', featureKey: 'codeIndex', options: [['off', 'Off'], ['on', 'On']], button: { id: 'code-index-reindex', label: 'Reindex' }, progressId: 'code-index-progress', note: 'Off by default. When on, and an embedding provider is chosen, search_meaning indexes this folder into .gogen/index. Nothing is sent until that tool runs, or you reindex. Leave the provider unset and the tool stays off.' },
+    { id: 'code-index-provider-input', tab: 'embeddings', type: 'select', label: 'Embedding provider', storage: 'server', channel: 'runtime', field: 'codeIndexProvider', options: [['', 'Not set']], note: 'Not set leaves the code index off. Any other choice is a name from the Providers tab.' },
+    { id: 'code-index-model-input', tab: 'embeddings', type: 'select', label: 'Embedding model', storage: 'server', channel: 'runtime', field: 'codeIndexModel', options: [['', 'Choose a model']], note: 'Choose a model uses that provider\'s own model. An empty model is an error when the provider has none. The chat model is not sent on its own.' },
+    { id: 'code-index-chunk-input', tab: 'embeddings', type: 'number', label: 'Chunk lines', storage: 'server', channel: 'runtime', field: 'codeIndexChunkLines', min: 10, max: 200, step: 1 },
+    { id: 'code-index-overlap-input', tab: 'embeddings', type: 'number', label: 'Chunk overlap', storage: 'server', channel: 'runtime', field: 'codeIndexChunkOverlap', min: 0, step: 1 },
+    { id: 'code-index-watch-select', tab: 'embeddings', type: 'select', label: 'Watch for changes', storage: 'server', channel: 'runtime', field: 'codeIndexWatch', options: [['on', 'On'], ['off', 'Off']], note: 'On unless set to off. Once an index exists, a changed file is refreshed after a second of quiet. This does not build the first index. Nothing runs while the code index is off or the embedding provider is not set.' },
+    { tab: 'embeddings', type: 'separator' },
+    { id: 'code-index-rerank-select', tab: 'embeddings', type: 'select', label: 'Rerank results', storage: 'server', channel: 'runtime', field: 'codeIndexRerank', options: [['off', 'Off'], ['on', 'On']], note: 'Off by default. When on, a search sends the closest 24 chunks to the rerank provider below and uses that order. A failure keeps the cosine order.' },
+    { id: 'code-index-rerank-provider-input', tab: 'embeddings', type: 'select', label: 'Rerank provider', storage: 'server', channel: 'runtime', field: 'codeIndexRerankProvider', options: [['', 'Embedding provider']], note: 'Embedding provider uses the same server as the embedding model. Any other choice is a name from the Providers tab.' },
+    { id: 'code-index-rerank-model-input', tab: 'embeddings', type: 'select', label: 'Rerank model', storage: 'server', channel: 'runtime', field: 'codeIndexRerankModel', options: [['', 'Choose a model']], note: 'With a named provider, Choose a model uses that provider\'s own model. With Embedding provider, pick a model: the embedding model is not sent.' },
 
     // ── Context (server runtime) ───────────────────────────────────────
     { id: 'context-limit-input', tab: 'context', type: 'number', label: 'Context limit (0 = auto)', storage: 'server', channel: 'runtime', field: 'contextLimit', prop: 'contextLimitConfig', min: 0, step: 1000 },

@@ -190,6 +190,15 @@ var settings = []setting{
 	{key: "agent_instructions", env: "GOGEN_AGENT_INSTRUCTIONS", cfg: "AgentInstructions", file: "AgentInstructions", writer: "AgentInstructions", kind: kString, omitDefault: true},
 	{key: "skills", env: "GOGEN_SKILLS", cfg: "Skills", file: "Skills", writer: "Skills", kind: kString, omitDefault: true},
 	{key: "terminal", env: "GOGEN_TERMINAL", cfg: "Terminal", file: "Terminal", writer: "Terminal", kind: kString, omitDefault: true},
+	{key: "code_index", env: "GOGEN_CODE_INDEX", cfg: "CodeIndex", file: "CodeIndex", writer: "CodeIndex", kind: kString, omitDefault: true},
+	{key: "code_index_provider", env: "GOGEN_CODE_INDEX_PROVIDER", cfg: "CodeIndexProvider", file: "CodeIndexProvider", writer: "CodeIndexProvider", kind: kString, omitDefault: true},
+	{key: "code_index_model", env: "GOGEN_CODE_INDEX_MODEL", cfg: "CodeIndexModel", file: "CodeIndexModel", writer: "CodeIndexModel", kind: kString, omitDefault: true},
+	{key: "code_index_chunk_lines", env: "GOGEN_CODE_INDEX_CHUNK_LINES", cfg: "CodeIndexChunkLines", file: "CodeIndexChunkLines", writer: "CodeIndexChunkLines", kind: kInt, omitDefault: true},
+	{key: "code_index_chunk_overlap", env: "GOGEN_CODE_INDEX_CHUNK_OVERLAP", cfg: "CodeIndexChunkOverlap", file: "CodeIndexChunkOverlap", writer: "CodeIndexChunkOverlap", kind: kIntPtr, omitDefault: true},
+	{key: "code_index_watch", env: "GOGEN_CODE_INDEX_WATCH", cfg: "CodeIndexWatch", file: "CodeIndexWatch", writer: "CodeIndexWatch", kind: kString, writeSpecial: true},
+	{key: "code_index_rerank", env: "GOGEN_CODE_INDEX_RERANK", cfg: "CodeIndexRerank", file: "CodeIndexRerank", writer: "CodeIndexRerank", kind: kString, writeSpecial: true},
+	{key: "code_index_rerank_provider", env: "GOGEN_CODE_INDEX_RERANK_PROVIDER", cfg: "CodeIndexRerankProvider", file: "CodeIndexRerankProvider", writer: "CodeIndexRerankProvider", kind: kString, omitDefault: true},
+	{key: "code_index_rerank_model", env: "GOGEN_CODE_INDEX_RERANK_MODEL", cfg: "CodeIndexRerankModel", file: "CodeIndexRerankModel", writer: "CodeIndexRerankModel", kind: kString, omitDefault: true},
 	{key: "job_notices", env: "GOGEN_JOB_NOTICES", cfg: "JobNotices", file: "JobNotices", writer: "JobNotices", kind: kString, omitDefault: true},
 	{key: "join_queued", env: "GOGEN_JOIN_QUEUED", cfg: "JoinQueued", file: "JoinQueued", writer: "JoinQueued", kind: kString, omitDefault: true},
 	{key: "automations", env: "GOGEN_AUTOMATIONS", cfg: "Automations", file: "Automations", writer: "Automations", kind: kString, omitDefault: true},
@@ -339,6 +348,13 @@ func writeSettings(out *configYAML, cfg, def *config.Config, includeSecrets bool
 			panic("projectfile: setting " + s.key + " names a missing writer field")
 		}
 		if s.omitDefault && reflect.DeepEqual(src.Interface(), dv.Field(cfgFieldIndex[s.cfg]).Interface()) {
+			continue
+		}
+		// An int written as *int keeps an explicit 0. yaml omitempty drops a
+		// plain 0, which would turn a saved overlap of 0 back into the default.
+		if dst.Kind() == reflect.Pointer && dst.Type().Elem().Kind() == reflect.Int && src.Kind() == reflect.Int {
+			n := int(src.Int())
+			dst.Set(reflect.ValueOf(&n))
 			continue
 		}
 		dst.Set(src)

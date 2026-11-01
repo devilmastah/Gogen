@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/skills"
 )
@@ -27,8 +28,9 @@ type FeatureFlags struct {
 	// skill tool; the terminal + bash_persistent tools). They live in the
 	// shared store like the board/subagent flags, so the settings-modal
 	// toggle reaches every session with no sweep.
-	skillsEnabled   atomic.Bool
-	terminalEnabled atomic.Bool
+	skillsEnabled    atomic.Bool
+	terminalEnabled  atomic.Bool
+	codeIndexEnabled atomic.Bool
 
 	// gen is the store's monotonic change counter, bumped by every setter.
 	// It is a component of the wire-overhead cache key (see overheadKey): a
@@ -140,6 +142,18 @@ func (f *FeatureFlags) SkillsEnabled() bool {
 // store.
 func (f *FeatureFlags) SetSkillsEnabled(on bool) {
 	f.skillsEnabled.Store(on)
+	f.gen.Add(1)
+}
+
+// CodeIndexEnabled reports whether search_meaning is active. Opt-in: the
+// config seed and the settings toggle write it.
+func (f *FeatureFlags) CodeIndexEnabled() bool {
+	return f.codeIndexEnabled.Load()
+}
+
+// SetCodeIndexEnabled toggles search_meaning for every agent reading this store.
+func (f *FeatureFlags) SetCodeIndexEnabled(on bool) {
+	f.codeIndexEnabled.Store(on)
 	f.gen.Add(1)
 }
 
@@ -370,6 +384,20 @@ type featureWiring struct {
 	// feature is off.
 	jobNoticeHookMu sync.RWMutex
 	jobNoticeHook   func(summary string)
+
+	// codeIndex is the shared vector store for the working folder. It is not
+	// a field grown onto Agent: the workspace owns one pointer and every
+	// session reads it. Its mutex is its own lock. The progress callback
+	// runs on the index's progress goroutine, after that lock is released,
+	// and must not call Search, SearchRerank, Rebuild, or take the agent
+	// turn lock. codeIndexConfig reads the live config at call time.
+	// codeIndexEmbedder is a test double; production posts to the provider.
+	// codeIndexReranker is a test double; production posts to the provider
+	// when code_index_rerank is on, and is not called while it is off.
+	codeIndex         atomic.Pointer[codeindex.Index]
+	codeIndexConfig   atomic.Value // codeIndexConfig
+	codeIndexEmbedder atomic.Value // codeIndexEmbedder
+	codeIndexReranker atomic.Value // codeIndexReranker
 
 	// toolGen counts model-facing tool-set reconfigurations that the SHARED
 	// FeatureFlags generation does not capture: the MCP registry, the board/

@@ -297,6 +297,33 @@ func TestEffectiveConfigOverlaysLiveValues(t *testing.T) {
 	}
 }
 
+func TestCodeIndexConfigUsesLiveProviders(t *testing.T) {
+	ws := &Workspace{}
+	ws.SetRuntimeConfig(config.Config{
+		OpenAIURL:         "http://chat/v1",
+		OpenAIKey:         "chat-key",
+		CodeIndexProvider: "embed",
+		OpenAIProviders: []config.OpenAIProviderConfig{{
+			Name: "stale", BaseURL: "http://old/v1", APIKey: "old",
+		}},
+	})
+	ws.SetOpenAIProviders([]config.OpenAIProviderConfig{{
+		Name: "embed", BaseURL: "http://embed/v1", APIKey: "sk", Model: "bge",
+	}})
+	got := ws.codeIndexConfig()
+	if got.OpenAIURL != "http://chat/v1" || got.OpenAIKey != "chat-key" || got.CodeIndexProvider != "embed" {
+		t.Fatalf("overlay = url %q key %q provider %q", got.OpenAIURL, got.OpenAIKey, got.CodeIndexProvider)
+	}
+	if len(got.OpenAIProviders) != 1 || got.OpenAIProviders[0].Name != "embed" || got.OpenAIProviders[0].BaseURL != "http://embed/v1" || got.OpenAIProviders[0].APIKey != "sk" || got.OpenAIProviders[0].Model != "bge" {
+		t.Fatalf("providers = %+v", got.OpenAIProviders)
+	}
+	got.OpenAIProviders[0].APIKey = "changed"
+	live := ws.GetOpenAIProviders()
+	if len(live) != 1 || live[0].APIKey != "sk" {
+		t.Fatalf("live providers = %+v", live)
+	}
+}
+
 func TestValidHTTPURL(t *testing.T) {
 	cases := []struct {
 		in   string

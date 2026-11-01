@@ -138,23 +138,35 @@ type configYAML struct {
 	AgentInstructions         string  `yaml:"agent_instructions,omitempty"`
 	Skills                    string  `yaml:"skills,omitempty"`
 	Terminal                  string  `yaml:"terminal,omitempty"`
-	JobNotices                string  `yaml:"job_notices,omitempty"`
-	JoinQueued                string  `yaml:"join_queued,omitempty"`
-	Automations               string  `yaml:"automations,omitempty"`
-	StatusDisplay             string  `yaml:"status_display,omitempty"`
-	StatusDisplayHost         string  `yaml:"status_display_host,omitempty"`
-	StatusDisplayToken        string  `yaml:"status_display_token,omitempty"`
-	StatusDisplaySource       string  `yaml:"status_display_source,omitempty"`
-	OutputSpill               string  `yaml:"output_spill,omitempty"`
-	SessionMaxCount           int     `yaml:"session_max_count,omitempty"`
-	SessionMaxAgeDays         int     `yaml:"session_max_age_days,omitempty"`
-	WebMaxActiveSessions      int     `yaml:"web_max_active_sessions,omitempty"`
-	WebApprovalHoldSecs       int     `yaml:"web_approval_hold_secs,omitempty"`
-	WebBind                   string  `yaml:"web_bind,omitempty"`
-	WebAllowedOrigins         string  `yaml:"web_allowed_origins,omitempty"`
-	WebAuthToken              string  `yaml:"web_auth_token,omitempty"`
-	WebTLSCertFile            string  `yaml:"web_tls_cert_file,omitempty"`
-	WebTLSKeyFile             string  `yaml:"web_tls_key_file,omitempty"`
+	CodeIndex                 string  `yaml:"code_index,omitempty"`
+	CodeIndexProvider         string  `yaml:"code_index_provider,omitempty"`
+	CodeIndexModel            string  `yaml:"code_index_model,omitempty"`
+	CodeIndexChunkLines       int     `yaml:"code_index_chunk_lines,omitempty"`
+	// A pointer so an explicit 0 survives omitempty. Nil is the omitted default.
+	CodeIndexChunkOverlap *int `yaml:"code_index_chunk_overlap,omitempty"`
+	// Written only for an explicit off. On, empty, and unknown are omitted.
+	CodeIndexWatch string `yaml:"code_index_watch,omitempty"`
+	// Written only while rerank is on. Off, empty, and unknown are omitted.
+	CodeIndexRerank         string `yaml:"code_index_rerank,omitempty"`
+	CodeIndexRerankProvider string `yaml:"code_index_rerank_provider,omitempty"`
+	CodeIndexRerankModel    string `yaml:"code_index_rerank_model,omitempty"`
+	JobNotices              string `yaml:"job_notices,omitempty"`
+	JoinQueued              string `yaml:"join_queued,omitempty"`
+	Automations             string `yaml:"automations,omitempty"`
+	StatusDisplay           string `yaml:"status_display,omitempty"`
+	StatusDisplayHost       string `yaml:"status_display_host,omitempty"`
+	StatusDisplayToken      string `yaml:"status_display_token,omitempty"`
+	StatusDisplaySource     string `yaml:"status_display_source,omitempty"`
+	OutputSpill             string `yaml:"output_spill,omitempty"`
+	SessionMaxCount         int    `yaml:"session_max_count,omitempty"`
+	SessionMaxAgeDays       int    `yaml:"session_max_age_days,omitempty"`
+	WebMaxActiveSessions    int    `yaml:"web_max_active_sessions,omitempty"`
+	WebApprovalHoldSecs     int    `yaml:"web_approval_hold_secs,omitempty"`
+	WebBind                 string `yaml:"web_bind,omitempty"`
+	WebAllowedOrigins       string `yaml:"web_allowed_origins,omitempty"`
+	WebAuthToken            string `yaml:"web_auth_token,omitempty"`
+	WebTLSCertFile          string `yaml:"web_tls_cert_file,omitempty"`
+	WebTLSKeyFile           string `yaml:"web_tls_key_file,omitempty"`
 	// The web content group (fetch/search) is read from the file and settable
 	// from the settings modal, and used to be MISSING here: a save rewrote the
 	// config without those keys, silently erasing the user's choices (and the
@@ -185,14 +197,28 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 	// fields by name and never reorders — so existing config files keep their
 	// layout.
 	out := configYAML{}
-	writeSettings(&out, cfg, &def, opts.IncludeSecrets)
+	// A settings save stores the normalized chunk window, so a value outside
+	// the bounds is treated as the default instead of being written back raw.
+	normalized := *cfg
+	normalized.CodeIndexChunkLines, normalized.CodeIndexChunkOverlap = normalized.CodeIndexChunk()
+	writeSettings(&out, &normalized, &def, opts.IncludeSecrets)
+	if !normalized.CodeIndexWatchEnabled() {
+		out.CodeIndexWatch = "off"
+	}
+	if normalized.CodeIndexRerankEnabled() {
+		out.CodeIndexRerank = "on"
+	}
 	// openai_api_key, web_auth_token, status_display_token and
 	// web_search_api_key are all written by the loop above via their
 	// `secret` flag: persisted only with --save-config-secrets (a forced
 	// provider/modal save sets it), never echoed by a plain save.
-	// The two list settings (and preserve_reasoning below) are the rows the
-	// settings table marks writeSpecial: their persistence needs more than a
-	// value copy, so they are handled here rather than by the generic loop.
+	// code_index_watch is on unless it is an explicit off, and a saved file
+	// omits on, empty, and unknown. code_index_rerank is off unless it is
+	// an explicit on, and a saved file omits off, empty, and unknown. The
+	// two list settings (and preserve_reasoning below) are the other rows
+	// the settings table marks writeSpecial: their persistence needs more
+	// than a value copy, so they are handled here rather than by the
+	// generic loop.
 	out.OpenAIProviders = cfg.OpenAIProviders
 	if !opts.IncludeSecrets && len(cfg.OpenAIProviders) > 0 {
 		// Copy without api_key so provider keys are never persisted without

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"gogen/internal/agent"
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/server"
 
@@ -155,6 +156,15 @@ func (t *TUI) Run(ctx context.Context) {
 
 	m.program = p
 	t.program.Store(p)
+	if a := t.agent; a != nil {
+		if ix := a.CodeIndex(); ix != nil {
+			ix.SetProgress(func(prog codeindex.Progress) {
+				if pr := t.program.Load(); pr != nil {
+					pr.Send(codeIndexProgressMsg{line: prog.Line(), phase: string(prog.Phase), err: prog.Error})
+				}
+			})
+		}
+	}
 	// The lifecycle reaches the Update thread through the program: install the
 	// sender now that it exists (before the event loop starts, so no turn can
 	// observe a half-wired spawner).

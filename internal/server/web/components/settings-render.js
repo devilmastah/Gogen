@@ -80,7 +80,14 @@ function buildControl(entry) {
 }
 
 // Builds one `.setting-row` (label + control + optional button/note/reset).
+// A separator is the line between the watch row and the rerank group.
 function buildRow(entry) {
+    if (entry.type === 'separator') {
+        const rule = document.createElement('div');
+        rule.className = 'settings-separator';
+        rule.setAttribute('role', 'separator');
+        return rule;
+    }
     const row = document.createElement('div');
     row.className = 'setting-row';
     if (entry.rowId) row.id = entry.rowId;
@@ -103,6 +110,13 @@ function buildRow(entry) {
         const p = document.createElement('p');
         p.className = 'settings-note';
         p.textContent = entry.note;
+        inner.appendChild(p);
+    }
+    if (entry.progressId) {
+        const p = document.createElement('p');
+        p.className = 'settings-note';
+        p.id = entry.progressId;
+        p.textContent = 'Not indexed';
         inner.appendChild(p);
     }
     if (entry.resetToDefault) {

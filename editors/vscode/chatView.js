@@ -437,7 +437,7 @@ function chatHtml(webview) {
     transform: translateY(1px);
     opacity: 0.7;
   }
-  #mode, #ctx, #think, #cancel, #send { flex-shrink: 0; }
+  #mode, #ctx, #index-spin, #think, #cancel, #send { flex-shrink: 0; }
   #model { min-width: 0; }
   #rate {
     flex: 1;
@@ -461,6 +461,17 @@ function chatHtml(webview) {
     border-radius: 50%;
     background: conic-gradient(var(--ring, var(--vscode-textLink-foreground)) var(--pct, 0%), color-mix(in srgb, var(--vscode-foreground) 16%, transparent) 0);
   }
+  #index-spin {
+    width: 13px;
+    height: 13px;
+    box-sizing: border-box;
+    border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--vscode-foreground) 16%, transparent);
+    border-top-color: var(--vscode-textLink-foreground);
+    animation: index-spin 0.8s linear infinite;
+  }
+  #index-spin[hidden] { display: none; }
+  @keyframes index-spin { to { transform: rotate(360deg); } }
   #ctx[data-tone="warning"] { color: var(--vscode-editorWarning-foreground); --ring: var(--vscode-editorWarning-foreground); }
   #ctx[data-tone="danger"] { color: var(--vscode-errorForeground); --ring: var(--vscode-errorForeground); }
   #cancel[hidden], #think[hidden] { display: none; }
@@ -575,6 +586,9 @@ function chatHtml(webview) {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
   }
+  @media (prefers-reduced-motion: reduce) {
+    #index-spin { animation: none; }
+  }
 </style>
 </head>
 <body>
@@ -618,6 +632,7 @@ function chatHtml(webview) {
       <button id="mode" class="pill" type="button" disabled><span id="mode-label">Act</span></button>
       <button id="model" class="pill" type="button" disabled title="Choose a model"><span id="model-label">Choose a model</span></button>
       <span id="rate"></span>
+      <span id="index-spin" hidden title="Updating the code index"></span>
       <span id="ctx" title="Context usage"><i id="ring"></i><span id="ctx-label">—</span></span>
       <button id="think" class="icon" type="button" disabled hidden title="Thinking level">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8.1 1.8a5.7 5.7 0 1 0 6.1 7.2A4.5 4.5 0 0 1 8.1 1.8z"/></svg>
@@ -677,7 +692,14 @@ const thinkBtn = document.getElementById("think");
 const thinkLabel = document.getElementById("think-label");
 const cancelBtn = document.getElementById("cancel");
 const rateEl = document.getElementById("rate");
+const indexSpin = document.getElementById("index-spin");
 const ctxEl = document.getElementById("ctx");
+
+function setIndexSpin(phase, line) {
+  const updating = phase === "walking" || phase === "embedding" || phase === "writing";
+  indexSpin.hidden = !updating;
+  indexSpin.title = updating && line ? line : "Updating the code index";
+}
 const ctxLabel = document.getElementById("ctx-label");
 const ring = document.getElementById("ring");
 const nearEl = document.getElementById("near");
@@ -1126,6 +1148,9 @@ window.addEventListener("message", (event) => {
     setModel(msg.modelLabel, msg.model);
     if (msg.type === "models" && Array.isArray(msg.models)) catalog = msg.models;
     if (msg.type === "config") {
+      if (typeof msg.codeIndexPhase === "string") {
+        setIndexSpin(msg.codeIndexPhase, msg.codeIndexLine || "");
+      }
       setupKnown = true;
       if (Array.isArray(msg.providers)) setupProviders = msg.providers;
       setupModel = msg.model || "";
@@ -1197,6 +1222,17 @@ window.addEventListener("message", (event) => {
     }
     box.answer.textContent += msg.text;
     log.scrollTop = log.scrollHeight;
+    return;
+  }
+  if (msg.type === "codeIndex") {
+    setIndexSpin(msg.phase, msg.line);
+    if (live && live.tool) {
+      const head = live.tool.querySelector(".tool-head");
+      const body = live.tool.querySelector(".tool-body");
+      if (head && body && head.textContent === "search_meaning" && msg.line) {
+        body.textContent = msg.line;
+      }
+    }
     return;
   }
   if (msg.type === "tool") {

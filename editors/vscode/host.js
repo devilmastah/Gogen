@@ -5,6 +5,7 @@ const { Sidecar } = require("./sidecar");
 const { resolveBinary } = require("./binary");
 const { EditorBridge } = require("./editorBridge");
 const { queueIdOk } = require("./queueId");
+const { withCodeIndexLine, acceptCodeIndexSeq } = require("./codeIndexView");
 const {
   projectConfRels,
   templateSources,
@@ -94,6 +95,9 @@ class GogenHost {
     if (this.lastContext) {
       fn(this.contextView(this.lastContext));
     }
+    if (this.lastCodeIndex) {
+      fn({ type: "codeIndex", phase: this.lastCodeIndex.phase, line: this.lastCodeIndex.line });
+    }
     fn({ type: "turn", active: !!this.turnActive, tokensPerSec: this.tokensPerSec || 0 });
     return () => this.listeners.delete(fn);
   }
@@ -104,10 +108,10 @@ class GogenHost {
     if (!this.lastConfig) {
       return null;
     }
-    return Object.assign({}, this.lastConfig, {
+    return withCodeIndexLine(Object.assign({}, this.lastConfig, {
       type: "config",
       modelLabel: this.currentModelLabel(),
-    });
+    }), this.lastCodeIndex);
   }
 
   modelsView() {
@@ -343,11 +347,17 @@ class GogenHost {
         this.setTurn(true);
         this.emit({ type: "userAcked" });
         break;
+      case "code_index_progress":
+        this.noteCodeIndex(msg.codeIndexPhase || "", msg.codeIndexLine || "", msg.codeIndexSeq);
+        break;
       case "config":
         if (Array.isArray(msg.providers)) {
           this.providers = msg.providers;
         }
         this.lastConfig = msg;
+        if (typeof msg.codeIndexPhase === "string") {
+          this.noteCodeIndex(msg.codeIndexPhase, msg.codeIndexLine || "", msg.codeIndexSeq);
+        }
         this.model = msg.model || "";
         this.modelProvider = msg.modelProvider || "";
         this.emit(this.configView());
@@ -459,6 +469,16 @@ class GogenHost {
       totalCachedTokens: msg.totalCachedTokens || 0,
       totalTurns: msg.totalTurns || 0,
     };
+  }
+
+  // noteCodeIndex remembers the latest index snapshot and tells the chat.
+  // The spinner is shown only while a refresh is running. A frame whose
+  // sequence is older than the one already shown is ignored.
+  noteCodeIndex(phase, line, seq) {
+    const prev = this.lastCodeIndex && this.lastCodeIndex.seq;
+    if (!acceptCodeIndexSeq(prev, seq)) return;
+    this.lastCodeIndex = { phase: phase || "", line: line || "", seq: Number(seq) || 0 };
+    this.emit({ type: "codeIndex", phase: this.lastCodeIndex.phase, line: this.lastCodeIndex.line });
   }
 
   setTurn(active) {
@@ -618,6 +638,11 @@ class GogenHost {
   // a config message with the flag fields and no configFields list.
   sendFeature(fields) {
     this.sidecar.sendRaw(Object.assign({ type: "config" }, fields));
+  }
+
+  reindexCode() {
+    if (!this.sidecar) return;
+    this.sidecar.sendRaw({ type: "reindex_code" });
   }
 
   // sendRuntime writes one runtime setting. configFields names it so an

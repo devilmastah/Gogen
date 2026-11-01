@@ -33,6 +33,9 @@ func (a *Agent) SetWorkingDir(dir string) {
 		// root is unchanged).
 		sm.SetWorkingDir(dir)
 	}
+	if ix := a.CodeIndex(); ix != nil {
+		ix.SetWorkingDir(dir)
+	}
 	if a.instructionsEnabled.Load() {
 		// Re-render the AGENTS.md/CLAUDE.md section for the new dir: the
 		// project guidelines body is unchanged, but the workspace

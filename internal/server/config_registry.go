@@ -1016,6 +1016,115 @@ func buildConfigFields() map[string]fieldSpec {
 		add(f)
 	}
 
+	// --- code index (embedding provider, model, chunk window) ----------------
+	{
+		f := strSpec("codeIndexProvider",
+			func(r *config.Config) *string { return &r.CodeIndexProvider },
+			func(m *WSMessage) *string { return &m.CodeIndexProvider })
+		f.normalize = func(v any) (any, string) { return strings.TrimSpace(v.(string)), "" }
+		// Empty stops the watch and drops search_meaning. A name starts the
+		// watch again when the feature and the watch switch allow it.
+		f.applyLive = func(s *Server, r *config.Config) { s.ws.SyncCodeIndexWatch() }
+		f.sample = "embed"
+		add(f)
+	}
+	{
+		f := strSpec("codeIndexModel",
+			func(r *config.Config) *string { return &r.CodeIndexModel },
+			func(m *WSMessage) *string { return &m.CodeIndexModel })
+		f.normalize = func(v any) (any, string) { return strings.TrimSpace(v.(string)), "" }
+		f.sample = "bge"
+		add(f)
+	}
+	{
+		f := intSpec("codeIndexChunkLines",
+			func(r *config.Config) *int { return &r.CodeIndexChunkLines },
+			func(m *WSMessage) *int { return &m.CodeIndexChunkLines })
+		f.set = func(r *config.Config, v any) {
+			r.CodeIndexChunkLines = v.(int)
+			r.CodeIndexChunkLines, r.CodeIndexChunkOverlap = config.NormalizeCodeIndexChunk(r.CodeIndexChunkLines, r.CodeIndexChunkOverlap)
+		}
+		f.sample = 32
+		add(f)
+	}
+	add(fieldSpec{
+		name: "codeIndexChunkOverlap",
+		get:  func(r *config.Config) any { return r.CodeIndexChunkOverlap },
+		set: func(r *config.Config, v any) {
+			r.CodeIndexChunkOverlap = v.(int)
+			r.CodeIndexChunkLines, r.CodeIndexChunkOverlap = config.NormalizeCodeIndexChunk(r.CodeIndexChunkLines, r.CodeIndexChunkOverlap)
+		},
+		fromMsg: func(m *WSMessage) any {
+			if m.CodeIndexChunkOverlap == nil {
+				return 0
+			}
+			return *m.CodeIndexChunkOverlap
+		},
+		project: func(r *config.Config, m *WSMessage) {
+			n := r.CodeIndexChunkOverlap
+			m.CodeIndexChunkOverlap = &n
+		},
+		msgGet: func(m *WSMessage) any {
+			if m.CodeIndexChunkOverlap == nil {
+				return 0
+			}
+			return *m.CodeIndexChunkOverlap
+		},
+		sample: 4,
+	})
+	add(fieldSpec{
+		name: "codeIndexWatch",
+		get: func(r *config.Config) any {
+			if r.CodeIndexWatchEnabled() {
+				return "on"
+			}
+			return "off"
+		},
+		set:       func(r *config.Config, v any) { r.CodeIndexWatch = v.(string) },
+		fromMsg:   func(m *WSMessage) any { return m.CodeIndexWatch },
+		normalize: onOffNormalize("codeIndexWatch"),
+		project: func(r *config.Config, m *WSMessage) {
+			m.CodeIndexWatch = "off"
+			if r.CodeIndexWatchEnabled() {
+				m.CodeIndexWatch = "on"
+			}
+		},
+		msgGet:    func(m *WSMessage) any { return m.CodeIndexWatch },
+		applyLive: func(s *Server, r *config.Config) { s.ws.SyncCodeIndexWatch() },
+		sample:    "off",
+	})
+	add(fieldSpec{
+		name:      "codeIndexRerank",
+		get:       func(r *config.Config) any { return r.CodeIndexRerank },
+		set:       func(r *config.Config, v any) { r.CodeIndexRerank = v.(string) },
+		fromMsg:   func(m *WSMessage) any { return m.CodeIndexRerank },
+		normalize: onOffNormalize("codeIndexRerank"),
+		project: func(r *config.Config, m *WSMessage) {
+			m.CodeIndexRerank = "off"
+			if r.CodeIndexRerankEnabled() {
+				m.CodeIndexRerank = "on"
+			}
+		},
+		msgGet: func(m *WSMessage) any { return m.CodeIndexRerank },
+		sample: "on",
+	})
+	{
+		f := strSpec("codeIndexRerankProvider",
+			func(r *config.Config) *string { return &r.CodeIndexRerankProvider },
+			func(m *WSMessage) *string { return &m.CodeIndexRerankProvider })
+		f.normalize = func(v any) (any, string) { return strings.TrimSpace(v.(string)), "" }
+		f.sample = "rerank"
+		add(f)
+	}
+	{
+		f := strSpec("codeIndexRerankModel",
+			func(r *config.Config) *string { return &r.CodeIndexRerankModel },
+			func(m *WSMessage) *string { return &m.CodeIndexRerankModel })
+		f.normalize = func(v any) (any, string) { return strings.TrimSpace(v.(string)), "" }
+		f.sample = "qwen3-reranker"
+		add(f)
+	}
+
 	// --- project profile (test / lint commands) ------------------------------
 	// Both override the auto-detection (DetectProjectProfile) for the
 	// project; they are per-session agent state, so applyLive sweeps every

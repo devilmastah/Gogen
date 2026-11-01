@@ -1,11 +1,15 @@
 package server
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	llmtest "gogen/internal/llm/llmtest"
@@ -138,6 +142,109 @@ func TestApplyWorkingDirToAllSkipsBusySession(t *testing.T) {
 
 // TestWorkingDirSkipMessage reports the busy sessions by id so the client can
 // see which panes did not move.
+type blockEmbed struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockEmbed) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	select {
+	case <-b.started:
+	default:
+		close(b.started)
+	}
+	<-b.release
+	return nil, context.Canceled
+}
+
+func TestWorkspaceSetWorkingDirDoesNotWaitOnIndex(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirA, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ix := codeindex.Open(dirA)
+	emb := &blockEmbed{started: make(chan struct{}), release: make(chan struct{})}
+	go ix.Rebuild(context.Background(), emb, codeindex.Identity{Model: "m", ChunkLines: 40, ChunkOverlap: 5})
+	select {
+	case <-emb.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rebuild did not start")
+	}
+	ws := &Workspace{WorkingDir: dirA, codeIndex: ix}
+	done := make(chan struct{})
+	go func() {
+		ws.SetWorkingDir(dirB)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SetWorkingDir waited on the index")
+	}
+	close(emb.release)
+	if got := ix.Dir(); got != dirA {
+		t.Fatalf("index folder = %q, want %q", got, dirA)
+	}
+	if got := ws.GetWorkingDir(); got != dirB {
+		t.Fatalf("workspace folder = %q, want %q", got, dirB)
+	}
+}
+
+func TestApplyWorkingDirMovesIndexBeforeTurnLock(t *testing.T) {
+	dirOld := t.TempDir()
+	dirNew := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirOld, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, a, _ := newLifecycleServer(t)
+	ix := codeindex.Open(dirOld)
+	s.ws.codeIndex = ix
+	a.SetCodeIndex(ix)
+	a.SetWorkingDir(dirOld)
+	emb := &blockEmbed{started: make(chan struct{}), release: make(chan struct{})}
+	go ix.Rebuild(context.Background(), emb, codeindex.Identity{Model: "m", ChunkLines: 40, ChunkOverlap: 5})
+	select {
+	case <-emb.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rebuild did not start")
+	}
+	rt := s.registry.first()
+	if rt == nil {
+		t.Fatal("no session")
+	}
+	done := make(chan struct{})
+	go func() {
+		s.applyWorkingDirToAll(dirNew)
+		close(done)
+	}()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case <-done:
+			t.Fatal("sweep finished while the rebuild held the index")
+		default:
+		}
+		if !rt.turnMu.TryLock() {
+			t.Fatal("turn lock held while the index rebuild was still running")
+		}
+		rt.turnMu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+	close(emb.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep did not finish")
+	}
+	if got := ix.Dir(); got != dirNew {
+		t.Fatalf("index folder = %q, want %q", got, dirNew)
+	}
+	if got := a.WorkingDir; got != dirNew {
+		t.Fatalf("session folder = %q, want %q", got, dirNew)
+	}
+}
+
 func TestWorkingDirSkipMessage(t *testing.T) {
 	msg := workingDirSkipMessage("/work", []string{"sess-1", "sess-2"})
 	if !strings.Contains(msg, "/work") || !strings.Contains(msg, "2 session(s)") ||

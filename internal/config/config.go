@@ -374,6 +374,40 @@ type Config struct {
 	// Live: the web settings modal exposes it as a feature toggle (shared
 	// flag store, no restart).
 	Terminal string
+	// CodeIndex enables search_meaning ("on"/"off"; default off). Off
+	// registers no tool, walks nothing, and does not create .gogen/index.
+	CodeIndex string
+	// CodeIndexProvider names the embedding provider. Empty leaves the code
+	// index off: search_meaning is not registered, the watch does not run,
+	// and nothing is embedded or written. A set value is an openai_providers
+	// name, or "default" for the legacy endpoint.
+	CodeIndexProvider string
+	// CodeIndexModel is the embedding model. When it is empty and the named
+	// provider has its own model, that model is used. An empty model with no
+	// provider model is an error. The chat model is not sent on its own.
+	CodeIndexModel string
+	// CodeIndexChunkLines and CodeIndexChunkOverlap are the line window.
+	// Defaults are 40 and 5. NormalizeCodeIndexChunk is the one bounds check.
+	CodeIndexChunkLines   int
+	CodeIndexChunkOverlap int
+	// CodeIndexWatch refreshes an existing index after a file change.
+	// Empty or unknown is on. The only value that stops the watch is an
+	// explicit off. The watch runs only while CodeIndex is on and an
+	// embedding provider is set, and it does not build the first index.
+	CodeIndexWatch string
+	// CodeIndexRerank asks a rerank model to reorder the closest chunks
+	// ("on"/"off"; default off). Off keeps the cosine order and does not
+	// call the rerank endpoint. A failure keeps the cosine order.
+	CodeIndexRerank string
+	// CodeIndexRerankProvider names the rerank provider. Empty uses the
+	// embedding provider's base URL and key. A set value is an
+	// openai_providers name, or "default" for the legacy endpoint.
+	CodeIndexRerankProvider string
+	// CodeIndexRerankModel is the model sent on the rerank request. When
+	// it is empty and a named rerank provider has its own model, that
+	// model is used. Otherwise an empty model is an error: the embedding
+	// model and the chat model are not sent.
+	CodeIndexRerankModel string
 	// JobNotices enables background-job completion notices ("on"/"off";
 	// default off): when a background shell job finishes naturally, a
 	// summary is injected into the session as a user message and a turn
@@ -467,6 +501,9 @@ func Defaults() Config {
 		AgentInstructions:         "off",
 		Skills:                    "off",
 		Terminal:                  "off",
+		CodeIndex:                 "off",
+		CodeIndexChunkLines:       40,
+		CodeIndexChunkOverlap:     5,
 		JobNotices:                "off",
 		JoinQueued:                "off",
 		Automations:               "off",
@@ -640,6 +677,54 @@ func (c *Config) SkillsEnabled() bool {
 // enabled.
 func (c *Config) TerminalEnabled() bool {
 	return c != nil && configOn(c.Terminal)
+}
+
+// CodeIndexEnabled reports whether search_meaning is active. Off registers
+// no tool and does not walk the tree.
+func (c *Config) CodeIndexEnabled() bool {
+	return c != nil && configOn(c.CodeIndex)
+}
+
+// CodeIndexWatchEnabled reports whether an existing index is refreshed
+// after a file change. Empty and unknown are on. An explicit off is the
+// only value that stops the watch.
+func (c *Config) CodeIndexWatchEnabled() bool {
+	if c == nil {
+		return true
+	}
+	return !configOff(c.CodeIndexWatch)
+}
+
+// CodeIndexRerankEnabled reports whether a search reranks the closest
+// chunks. Off keeps the cosine order.
+func (c *Config) CodeIndexRerankEnabled() bool {
+	return c != nil && configOn(c.CodeIndexRerank)
+}
+
+// NormalizeCodeIndexChunk is the one bounds check for the code index window.
+// Lines outside 10–200 become 40. An overlap below 0, or not smaller than
+// the chunk, becomes 5 when that still fits, and 0 when it does not. An
+// overlap of 0 is kept.
+func NormalizeCodeIndexChunk(lines, overlap int) (int, int) {
+	if lines < 10 || lines > 200 {
+		lines = 40
+	}
+	if overlap < 0 || overlap >= lines {
+		if 5 < lines {
+			overlap = 5
+		} else {
+			overlap = 0
+		}
+	}
+	return lines, overlap
+}
+
+// CodeIndexChunk returns the normalized chunk size and overlap.
+func (c *Config) CodeIndexChunk() (lines, overlap int) {
+	if c == nil {
+		return NormalizeCodeIndexChunk(0, 0)
+	}
+	return NormalizeCodeIndexChunk(c.CodeIndexChunkLines, c.CodeIndexChunkOverlap)
 }
 
 // JobNoticesEnabled reports whether background-job completion notices are

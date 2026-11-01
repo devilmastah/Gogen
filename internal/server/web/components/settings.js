@@ -157,6 +157,16 @@ for (const f of FEATURE_SELECTS) {
     if (!el) continue;
     el.addEventListener('change', () => sendFeatureConfig({ [f.featureKey]: el.value }));
 }
+const codeIndexReindex = document.getElementById('code-index-reindex');
+if (codeIndexReindex) {
+    codeIndexReindex.hidden = true;
+    codeIndexReindex.addEventListener('click', () => {
+        const ws = deps.getWs();
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const pane = deps.getPane();
+        ws.send(JSON.stringify({ type: 'reindex_code', sessionId: pane ? pane.id || '' : '' }));
+    });
+}
 // Numeric feature rows are wired generically too, and their clamp bounds
 // come from the control's own min/max — which the renderer took from the
 // schema. A second copy of "10" / "32" here used to be the only
@@ -191,6 +201,36 @@ for (const f of FEATURE_NUMBERS) {
 // data.subagentMaxDepth), so every tab stays in sync without
 // localStorage. Toggling board off while the board pane is the
 // active view falls back to chat; the board data is untouched.
+// codeIndexSeen is the newest index sequence this page has shown.
+// A config frame can carry an older snapshot than the progress frame
+// that already arrived. The same rule is acceptCodeIndexSeq in the
+// sidebar host.
+let codeIndexSeen = 0;
+
+// applyCodeIndexFrame paints the settings line and the toolbar spinner
+// when seq is newer than the line already shown. It returns false when
+// the frame is older.
+export function applyCodeIndexFrame(seq, phase, line) {
+    const n = Number(seq) || 0;
+    if (!n) {
+        if (codeIndexSeen !== 0) return false;
+    } else if (n <= codeIndexSeen) {
+        return false;
+    } else {
+        codeIndexSeen = n;
+    }
+    const text = line || '';
+    const note = document.getElementById('code-index-progress');
+    if (note && text) note.textContent = text;
+    const spin = document.getElementById('tb-index-spin');
+    if (spin) {
+        const updating = phase === 'walking' || phase === 'embedding' || phase === 'writing';
+        spin.hidden = !updating;
+        spin.title = updating && text ? text : 'Updating the code index';
+    }
+    return true;
+}
+
 export function applyFeatureSettings(data) {
     const boardOn = data.board === 'on';
     const subagentOn = data.subagent === 'on';
@@ -203,6 +243,11 @@ export function applyFeatureSettings(data) {
         const el = document.getElementById(f.id);
         const v = data[f.featureKey];
         if (el && typeof v === 'string' && el.value !== v) el.value = v;
+    }
+    const reindex = document.getElementById('code-index-reindex');
+    if (reindex) reindex.hidden = data.codeIndex !== 'on';
+    if (typeof data.codeIndexPhase === 'string' || typeof data.codeIndexLine === 'string') {
+        applyCodeIndexFrame(data.codeIndexSeq, data.codeIndexPhase || '', data.codeIndexLine || '');
     }
     const boardTab = document.getElementById('board-tab');
     const wasVisible = boardTab && !boardTab.hidden;
@@ -270,7 +315,7 @@ export function applyFeatureSettings(data) {
     // list at once (toolbar, subagent picker, board picker), so asking
     // twice for the subagent and the review-agent picker was a duplicated
     // round-trip that also re-rendered the toolbar list twice.
-    if (needsModels && (subagentOn || reviewAgentRowsVisible)) {
+    if (needsModels && (subagentOn || reviewAgentRowsVisible || document.getElementById('code-index-model-input'))) {
         // Just enabled while the modal is open: fetch the catalog so the
         // picker is not stuck on "No models loaded".
         ws.send(JSON.stringify({ type: 'list_models' }));
@@ -320,6 +365,8 @@ function wireRuntimeControl(ctrl) {
     // edit (see holdsDraft).
     trackDraft(el);
     el.addEventListener('change', () => {
+        if (ctrl.field === 'codeIndexProvider') refreshEmbeddingModels();
+        if (ctrl.field === 'codeIndexRerankProvider') refreshRerankModels();
         let value = el.value;
         if (el.type === 'number') {
             // Fractional fields (e.g. #compact-threshold-input, step="0.05")
@@ -348,6 +395,104 @@ for (const b of PROMPT_RESET_BUTTONS) {
     el.addEventListener('click', () => sendRuntimeConfig({ [b.field]: { prop: b.field, value: '' } }));
 }
 
+// The last provider list and the session's chat provider, so a models
+// reply can refill the embedding model dropdown without a config push.
+let embeddingProviders = [];
+let embeddingChatProvider = 'default';
+
+function fillSelect(select, options, current) {
+    select.replaceChildren();
+    for (const [value, text] of options) {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = text;
+        select.appendChild(opt);
+    }
+    select.value = current;
+}
+
+// fillCodeIndexProviders lists the configured provider names. The blank
+// choice leaves the code index off. A saved name that is no longer in the
+// list stays visible so the push does not silently switch the selection.
+function fillCodeIndexProviders(select, providers, current, blankLabel) {
+    const names = [];
+    const seen = new Set();
+    for (const p of providers || []) {
+        const name = p && p.name;
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        const url = p.baseUrl ? ' — ' + p.baseUrl : '';
+        names.push([name, name + url]);
+    }
+    if (current && !seen.has(current)) names.push([current, current]);
+    fillSelect(select, [['', blankLabel || 'Not set']].concat(names), current);
+}
+
+// fillCodeIndexModels lists the models that belong to the chosen provider.
+// A named provider's blank choice means that provider's own model. An empty
+// provider lists no models, because the code index is off.
+function fillCodeIndexModels(select, providers, models, providerName, chatProvider, current, blankOverride) {
+    if (!providerName) {
+        const blank = blankOverride || 'Choose a model';
+        const options = [['', blank]];
+        if (current) options.push([current, current]);
+        fillSelect(select, options, current || '');
+        return;
+    }
+    const owner = providerName;
+    const provider = (providers || []).find((p) => p && p.name === providerName);
+    const saved = provider && provider.model ? provider.model : '';
+    let blank = saved ? "Provider's model (" + saved + ')' : 'Choose a model';
+    if (blankOverride) blank = blankOverride;
+    const ids = [];
+    const seen = new Set();
+    for (const m of models || []) {
+        if (!m || !m.id) continue;
+        if ((m.provider || 'default') !== owner) continue;
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        ids.push(m.id);
+    }
+    const options = [['', blank]].concat(ids.map((id) => [id, id]));
+    if (current && !seen.has(current)) options.push([current, current]);
+    fillSelect(select, options, current);
+}
+
+// fillRerankModels lists models for the rerank dropdown. A named rerank
+// provider can leave the model blank and use its own. Embedding provider
+// has no such default: the embedding model is not a rerank model.
+function fillRerankModels(select, providers, models, rerankProvider, embedProvider, chatProvider, current) {
+    if (rerankProvider) {
+        fillCodeIndexModels(select, providers, models, rerankProvider, chatProvider, current);
+        return;
+    }
+    fillCodeIndexModels(select, providers, models, embedProvider || '', chatProvider, current, 'Choose a model');
+}
+
+function refreshRerankModels() {
+    const select = document.getElementById('code-index-rerank-model-input');
+    const rerankProvider = document.getElementById('code-index-rerank-provider-input');
+    const embedProvider = document.getElementById('code-index-provider-input');
+    if (!select || select.tagName !== 'SELECT') return;
+    const current = select.value || '';
+    if (holdsDraft(select, current)) return;
+    fillRerankModels(select, embeddingProviders, deps.getModels(), rerankProvider ? rerankProvider.value : '', embedProvider ? embedProvider.value : '', embeddingChatProvider, current);
+}
+
+// refreshEmbeddingModels refills the model dropdown after the catalog
+// arrives. A config push is not required.
+export function refreshEmbeddingModels() {
+    const select = document.getElementById('code-index-model-input');
+    const provider = document.getElementById('code-index-provider-input');
+    if (select && select.tagName === 'SELECT') {
+        const current = select.value || '';
+        if (!holdsDraft(select, current)) {
+            fillCodeIndexModels(select, embeddingProviders, deps.getModels(), provider ? provider.value : '', embeddingChatProvider, current);
+        }
+    }
+    refreshRerankModels();
+}
+
 // Applies the runtime-config values from the server push to the
 // controls, updates the secret placeholders, and renders the
 // restart banner. Values not present in the push are left as-is.
@@ -356,6 +501,40 @@ export function applyRuntimeSettings(data) {
         const el = document.getElementById(ctrl.id);
         if (!el) continue;
         const v = data[ctrl.prop || ctrl.field];
+        // An empty provider is omitted from the push. The dropdown's blank
+        // choice is that empty value, so a missing field means the code index is off.
+        if (ctrl.field === 'codeIndexProvider' && el.tagName === 'SELECT') {
+            const current = typeof v === 'string' ? v : '';
+            if (Array.isArray(data.providers)) embeddingProviders = data.providers;
+            if (typeof data.modelProvider === 'string' && data.modelProvider) embeddingChatProvider = data.modelProvider;
+            if (holdsDraft(el, current)) continue;
+            fillCodeIndexProviders(el, embeddingProviders, current);
+            continue;
+        }
+        if (ctrl.field === 'codeIndexModel' && el.tagName === 'SELECT') {
+            const current = typeof v === 'string' ? v : '';
+            if (holdsDraft(el, current)) continue;
+            const providerEl = document.getElementById('code-index-provider-input');
+            const providerName = providerEl ? providerEl.value : (typeof data.codeIndexProvider === 'string' ? data.codeIndexProvider : '');
+            fillCodeIndexModels(el, embeddingProviders, deps.getModels(), providerName, embeddingChatProvider, current);
+            continue;
+        }
+        if (ctrl.field === 'codeIndexRerankProvider' && el.tagName === 'SELECT') {
+            const current = typeof v === 'string' ? v : '';
+            if (holdsDraft(el, current)) continue;
+            fillCodeIndexProviders(el, embeddingProviders, current, 'Embedding provider');
+            continue;
+        }
+        if (ctrl.field === 'codeIndexRerankModel' && el.tagName === 'SELECT') {
+            const current = typeof v === 'string' ? v : '';
+            if (holdsDraft(el, current)) continue;
+            const rerankEl = document.getElementById('code-index-rerank-provider-input');
+            const embedEl = document.getElementById('code-index-provider-input');
+            const rerankName = rerankEl ? rerankEl.value : (typeof data.codeIndexRerankProvider === 'string' ? data.codeIndexRerankProvider : '');
+            const embedName = embedEl ? embedEl.value : (typeof data.codeIndexProvider === 'string' ? data.codeIndexProvider : '');
+            fillRerankModels(el, embeddingProviders, deps.getModels(), rerankName, embedName, embeddingChatProvider, current);
+            continue;
+        }
         if (v === undefined) continue;
         // Do not overwrite an in-progress edit (see holdsDraft).
         if (holdsDraft(el, v)) continue;

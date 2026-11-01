@@ -47,6 +47,13 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	msg.Subagent = onOff(a.SubagentsEnabled())
 	msg.Skills = onOff(a.SkillsEnabled())
 	msg.Terminal = onOff(a.TerminalEnabled())
+	msg.CodeIndex = onOff(a.CodeIndexEnabled())
+	if ix := a.CodeIndex(); ix != nil {
+		snap := ix.Snapshot()
+		msg.CodeIndexLine = snap.Line()
+		msg.CodeIndexPhase = string(snap.Phase)
+		msg.CodeIndexSeq = snap.Seq
+	}
 	msg.ReviewAgent = onOff(a.ReviewAgentEnabled())
 	msg.Automations = onOff(a.AutomationsEnabled())
 	msg.SubagentMaxDepth = a.SubagentMaxDepth()
@@ -265,7 +272,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	if msg.WorkingDir != "" {
 		s.handleWSWorkingDir(ws, ctx, pane, msg)
 	}
-	if msg.Board != "" || msg.Subagent != "" || msg.Skills != "" || msg.Terminal != "" || msg.ReviewAgent != "" || msg.Automations != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
+	if msg.Board != "" || msg.Subagent != "" || msg.Skills != "" || msg.Terminal != "" || msg.CodeIndex != "" || msg.ReviewAgent != "" || msg.Automations != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
 		s.handleWSFeatureFlags(ws, msg)
 	}
 	if len(msg.ConfigFields) > 0 {
@@ -312,6 +319,16 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 			return
 		}
 		skillsSet = true
+	}
+	var codeIndex, codeIndexSet bool
+	if msg.CodeIndex != "" {
+		var ok bool
+		codeIndex, ok = onoff.Parse(msg.CodeIndex)
+		if !ok {
+			writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid codeIndex value %q (want on or off)", msg.CodeIndex))
+			return
+		}
+		codeIndexSet = true
 	}
 	var terminal, terminalSet bool
 	if msg.Terminal != "" {
@@ -364,6 +381,10 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 	}
 	if terminalSet {
 		s.ws.SetTerminalEnabled(terminal)
+	}
+	if codeIndexSet {
+		s.ws.SetCodeIndexEnabled(codeIndex)
+		s.ws.SyncCodeIndexWatch()
 	}
 	if reviewAgentSet {
 		s.ws.SetReviewAgentEnabled(reviewAgent)
@@ -460,6 +481,7 @@ func (s *Server) effectiveConfig() *config.Config {
 	out.Subagent = onOff(s.ws.GetSubagentEnabled())
 	out.Skills = onOff(s.ws.GetSkillsEnabled())
 	out.Terminal = onOff(s.ws.GetTerminalEnabled())
+	out.CodeIndex = onOff(s.ws.GetCodeIndexEnabled())
 	out.ReviewAgent = onOff(s.ws.GetReviewAgentEnabled())
 	out.Automations = onOff(s.ws.GetAutomationsEnabled())
 	out.SubagentMaxDepth = s.ws.GetSubagentMaxDepth()

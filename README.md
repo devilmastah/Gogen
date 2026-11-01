@@ -19,6 +19,23 @@ It's built to be handed real work:
 - **Knows your project** — project guidelines, `AGENTS.md`/`CLAUDE.md`
   instructions, skills, and auto-detected test/lint commands shape how it
   works in your repo
+- **Search by meaning** — optional and off until you turn `code_index` on
+  and choose an embedding provider. It indexes the working folder into
+  `.gogen/index` with that provider's model (a separate server is fine) and
+  adds a `search_meaning` tool. Leave the provider unset and the tool stays
+  off.
+  Nothing is sent until that tool runs, or you reindex from settings or `/reindex`.
+  Once an index exists, a changed file is refreshed after a second of quiet
+  unless `code_index_watch` is off. That watch does not build the first index.
+  With tree-sitter on, a chunk is a function, method, or type, and a longer
+  one is split on the chunk setting. With tree-sitter off, or a build without
+  it, the split is lines. `code_index_rerank` is off. Turn it on and a search
+  asks the rerank model to reorder the closest 24 chunks. An empty rerank
+  provider uses the embedding provider. The embedding model is not sent as
+  the reranker. A failure keeps the cosine order. At 20,000 stored chunks,
+  a search may use an in-memory lookup built from the saved vectors. That
+  lookup is rebuilt after the index changes. Fewer than 20,000 stays an
+  exact comparison.
 - **Extensible** — connect MCP servers for extra tools, spawn subagents for
   parallel work, and track tickets on a project kanban board
 
@@ -155,6 +172,7 @@ While in the TUI:
 | `compact` or `/compact` | Manually compact conversation history |
 | `/smartcompact` | Smart compact for a long tool loop: `on`, `off`, or bare to toggle. Applies to this run; `/save-config` stores it. Default off |
 | `/contextmode` | Context mode: `default` or `deep_dive` (see deep dive below); bare shows the current mode. Applies to this run; `/save-config` stores it |
+| `/reindex` | Rebuild the code index. With `code_index` off, it says so and writes nothing |
 | `/models` | List available models |
 | `/models <name>` | Switch to a different model |
 | `/plan` | Enable plan mode (read-only) |
@@ -235,6 +253,15 @@ status_display_token: ""                 # only if the display has a shared secr
 status_display_source: ""                # display row name; empty = auto (gogen-<project folder>)
 skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
 terminal: off      # persistent terminal tool (open/send/read/signal/list/close actions) + bash_persistent
+code_index: off    # search_meaning: embed this folder into .gogen/index
+code_index_provider: ""  # empty leaves the code index off; a name is from the Providers tab
+code_index_model: ""     # empty uses that provider's own model
+code_index_chunk_lines: 40
+code_index_chunk_overlap: 5
+code_index_watch: on     # on unless set to off; does not build the first index
+code_index_rerank: off
+code_index_rerank_provider: ""  # empty = the embedding provider
+code_index_rerank_model: ""     # required when the rerank provider is the embedding provider
 agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
 web_bind: 0.0.0.0:8080  # web listen address (applies on next start; also GOGEN_WEB_BIND / --host)
 # Configurable prompt templates ("" = the built-in default):
@@ -259,6 +286,7 @@ setting:
 | `compact_keep_recent_messages` | keep nothing recent: only the first user message survives compaction, everything after it is summarized |
 | `max_tool_result_bytes` | no truncation cap on tool output |
 | `compact_reserve_tokens` | reserve no tokens for new messages after compaction |
+| `code_index_chunk_overlap` | chunks do not overlap |
 
 Negative values are invalid for these settings and fall back to defaults
 (`session_max_age_days` is the exception — a negative value keeps sessions
@@ -655,6 +683,15 @@ the server process):
 | `GOGEN_SKILLS` | off | Set to `on` to enable the skill tool (`skill` list/read over `.gogen/skills` + `~/.config/gogen/skills`); live-toggleable from the web settings modal (Tools) |
 | `GOGEN_TERMINAL` | off | Set to `on` to enable the persistent-terminal feature tools: `terminal` (actions `open`/`send`/`read`/`signal`/`list`/`close` over session-scoped PTY sessions) and `bash_persistent` (a per-session shell whose cwd/env persist across calls; it bypasses the fresh-process model of `execute_command`). The command guard applies to `bash_persistent`; the PTY `send` action writes raw stdin, so the guard does not apply to it. Live-toggleable from the web settings modal (Tools) |
 | `GOGEN_AGENT_INSTRUCTIONS` | off | Set to `on` to load `AGENTS.md` / `CLAUDE.md` workspace instruction files (below the project guidelines); live-toggleable from the web settings modal (Agent) |
+| `GOGEN_CODE_INDEX` | off | Set to `on` to index the working folder. `search_meaning` is registered only when an embedding provider is also set |
+| `GOGEN_CODE_INDEX_PROVIDER` | *(empty)* | Embedding provider. Empty leaves the code index off |
+| `GOGEN_CODE_INDEX_MODEL` | *(empty)* | Embedding model. Empty uses the chosen provider's own model. An empty model with no provider model is an error, and the chat model is not sent on its own |
+| `GOGEN_CODE_INDEX_CHUNK_LINES` | `40` | Lines in one chunk, from 10 to 200 |
+| `GOGEN_CODE_INDEX_CHUNK_OVERLAP` | `5` | Lines shared by neighboring chunks. `0` is kept |
+| `GOGEN_CODE_INDEX_WATCH` | on | Refresh a changed file after a second of quiet once an index exists. An explicit `off` is the only value that stops it. The watch does not build the first index |
+| `GOGEN_CODE_INDEX_RERANK` | off | Set to `on` to ask the rerank model to reorder the closest 24 chunks. A failure keeps the cosine order |
+| `GOGEN_CODE_INDEX_RERANK_PROVIDER` | *(empty)* | Rerank provider. Empty uses the embedding provider's base URL and key |
+| `GOGEN_CODE_INDEX_RERANK_MODEL` | *(empty)* | Rerank model. Empty uses a named rerank provider's own model. Otherwise it is an error, and the embedding model is not sent |
 | `GOGEN_STATUS_DISPLAY` | `auto` | Status-screen gate: `off`, `auto` (probe for the screen at startup and enable reporting when it answers), `on` (report without probing), or `browser` (the web UI sends; web mode only) — see [Status display](#status-display-lan-status-screen); live-toggleable from the web settings modal |
 | `GOGEN_STATUS_DISPLAY_HOST` | `statusscreen.local` | Display host: mDNS name, IP, or base URL |
 | `GOGEN_STATUS_DISPLAY_TOKEN` | *(empty)* | Shared secret for the display's mutating endpoints (sent as `X-Status-Token`) |
@@ -1110,6 +1147,7 @@ The agent has access to the following tools:
 | `patch_file` | Apply surgical unified diff(s) (preferred; `dry_run`, `fuzzy`) |
 | `show_diff` | Show git diff (working tree or path) |
 | `search_code` | Regex/literal search across the codebase (optional `context_lines`) |
+| `search_meaning` | Search this folder by meaning when `code_index` is on and an embedding provider is set. `query` is required. `path` is an optional subdirectory. Plan mode allows it. Building the index sends file text to the embedding provider |
 | `find_symbol` | Locate a symbol: `kind=def` (definition) or `refs` (references) |
 | `git` | Git history/status/diff: `action=log`, `status`, `show` (read-only; plan mode) |
 | `git_commit` | Commit (requires staged files) |

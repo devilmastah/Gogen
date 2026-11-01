@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/llm"
 	"gogen/internal/mcp"
@@ -286,6 +287,19 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	a.SetFeatureFlags(ws.FeatureFlags())
 	a.SetBoardManager(ws.GetBoardManager())
 	a.SetSkillsManager(ws.skillsManager)
+	a.SetCodeIndex(ws.CodeIndex())
+	a.SetCodeIndexConfig(ws.codeIndexConfig)
+	ws.SetCodeIndexWatchSync(a.SyncCodeIndexWatch)
+	a.SyncCodeIndexWatch()
+	if ix := ws.CodeIndex(); ix != nil {
+		ix.SetProgress(func(p codeindex.Progress) {
+			// The callback already runs off the index lock, on one goroutine.
+			// Broadcasting here keeps snapshots in the order they were delivered.
+			line := p.Line()
+			phase := string(p.Phase)
+			s.registry.broadcastAll(WSMessage{Type: "code_index_progress", CodeIndexLine: line, CodeIndexPhase: phase, CodeIndexSeq: p.Seq})
+		})
+	}
 	// The subagent spawner needs the registry, so it is installed after the
 	// server is constructed; NewSessionAgent seeds it on every later session.
 	// The spawner is the host half of the shared continuable-subagent

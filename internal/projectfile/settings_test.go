@@ -134,7 +134,12 @@ func TestSettingsTypesAgree(t *testing.T) {
 			continue
 		}
 		if cf.Type != wf.Type {
-			t.Errorf("%s: config field type %s != writer field type %s", s.key, cf.Type, wf.Type)
+			// code_index_chunk_overlap is an int in config and a *int in the
+			// saved file so an explicit 0 round-trips (see writeSettings).
+			intPtr := cf.Type.Kind() == reflect.Int && wf.Type.Kind() == reflect.Pointer && wf.Type.Elem().Kind() == reflect.Int
+			if !intPtr {
+				t.Errorf("%s: config field type %s != writer field type %s", s.key, cf.Type, wf.Type)
+			}
 		}
 		if got := strings.Split(wf.Tag.Get("yaml"), ",")[0]; got != s.key {
 			t.Errorf("%s: written to yaml key %q, want %q", s.key, got, s.key)
@@ -313,6 +318,15 @@ func distinctValue(t *testing.T, cfg config.Config, s setting, mode int) string 
 	cur := reflect.ValueOf(cfg).FieldByName(s.cfg)
 	switch s.kind {
 	case kString:
+		// code_index_watch omits every value except an explicit off, so the
+		// generic round trip has to use that one persisted spelling.
+		if s.key == "code_index_watch" {
+			return "off"
+		}
+		// code_index_rerank omits every value except an explicit on.
+		if s.key == "code_index_rerank" {
+			return "on"
+		}
 		v := "test-" + s.key
 		if v == cur.String() {
 			v += "-2"

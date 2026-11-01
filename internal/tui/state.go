@@ -366,6 +366,7 @@ type Model struct {
 	// live textarea height instead would make a once-shrunk band permanent.
 	preferredInputLines int
 	statusMsg           string // transient message (e.g. "Copied N chars")
+	codeIndexBusy       bool   // embedding or writing has started for this rebuild
 }
 
 // NewModel creates a new TUI model. Returns a pointer: Model contains a

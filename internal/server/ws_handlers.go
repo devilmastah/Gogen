@@ -36,6 +36,7 @@ var wsHandlers = map[string]wsHandlerEntry{
 	"set_mode":           {handle: wsHandleSetMode},
 	"set_thinking_level": {handle: wsHandleSetThinkingLevel},
 	"config":             {handle: wsHandleConfig},
+	"reindex_code":       {handle: wsHandleReindexCode},
 	"cancel":             {handle: wsHandleCancel},
 	"board_op":           {handle: wsHandleBoardOp},
 	"provider_save":      {handle: wsHandleProviderSave},

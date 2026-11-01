@@ -1258,6 +1258,7 @@ func (m *Model) renderHelpModal() string {
 			{"/queue", "Queued messages (send now, per-item cancel)"},
 			{"/verbose", "Toggle verbose output"},
 			{"/save-config", "Write config to .gogen/"},
+			{"/reindex", "Rebuild the code index"},
 			{"dir <path>", "Change working dir"},
 			{"/exit", "Quit GoGen"},
 		}},

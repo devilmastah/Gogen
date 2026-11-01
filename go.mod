@@ -12,6 +12,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.9
 	github.com/creack/pty v1.1.24
 	github.com/ericchiang/css v1.4.0
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/gortexhq/tree-sitter-dockerfile v0.1.0
 	github.com/makiuchi-d/gozxing v0.1.1

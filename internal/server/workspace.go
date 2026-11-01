@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/llm"
 	"gogen/internal/modelinfo"
@@ -80,6 +81,16 @@ type Workspace struct {
 	// whether the skill tool is EXPOSED is the live flag in the shared
 	// feature-flag store, so a settings toggle applies without a sweep.
 	skillsManager *skills.Manager
+
+	// codeIndex is the shared vector store for this working folder. Set
+	// once, before the server accepts connections. Open does not create
+	// the directory. A session's SetWorkingDir re-points it once that
+	// session has changed folder. The pointer stays. The read loop does
+	// not take the index lock.
+	codeIndex *codeindex.Index
+	// codeIndexWatchSync starts or stops the shared index watch. Set once
+	// from the initial agent, which reads the live runtime config.
+	codeIndexWatchSync atomic.Value // codeIndexWatchSyncFunc
 
 	// Live host settings that change no tool are plain atomics here: the
 	// settings handler writes them while session creation and the delivery
@@ -192,9 +203,10 @@ func (ws *Workspace) GetWorkingDir() string {
 }
 
 // SetWorkingDir updates the workspace-wide working directory.
-// Thread-safe. Does NOT touch the shared executor or any session agent —
-// handleWSConfig applies the change to every session agent (under each
-// session's turn lock) via applyWorkingDirToAll.
+// Thread-safe. Does NOT touch the shared executor, the code index, or any
+// session agent — handleWSConfig applies the change to every session agent
+// (under each session's turn lock) via applyWorkingDirToAll, and that is
+// what re-points the index.
 func (ws *Workspace) SetWorkingDir(dir string) {
 	if ws == nil {
 		return
@@ -331,6 +343,56 @@ func (ws *Workspace) SetSubagentEnabled(on bool) {
 // additionally gated on the workspace having a skills manager).
 func (ws *Workspace) GetSkillsEnabled() bool {
 	return ws.flags().SkillsEnabled()
+}
+
+// GetCodeIndexEnabled returns the live code index flag.
+func (ws *Workspace) GetCodeIndexEnabled() bool {
+	return ws.flags().CodeIndexEnabled()
+}
+
+// SetCodeIndexEnabled updates the live code index flag.
+func (ws *Workspace) SetCodeIndexEnabled(on bool) {
+	ws.flags().SetCodeIndexEnabled(on)
+}
+
+// codeIndexWatchSyncFunc is the initial agent's watch start/stop.
+type codeIndexWatchSyncFunc func()
+
+// SetCodeIndexWatchSync installs the function that starts or stops the
+// shared index watch. A nil func clears it.
+func (ws *Workspace) SetCodeIndexWatchSync(fn func()) {
+	if ws == nil {
+		return
+	}
+	if fn == nil {
+		ws.codeIndexWatchSync.Store(codeIndexWatchSyncFunc(nil))
+		return
+	}
+	ws.codeIndexWatchSync.Store(codeIndexWatchSyncFunc(fn))
+}
+
+// SyncCodeIndexWatch runs the installed watch start/stop. A host calls it
+// when code_index or code_index_watch changes.
+func (ws *Workspace) SyncCodeIndexWatch() {
+	if ws == nil {
+		return
+	}
+	v := ws.codeIndexWatchSync.Load()
+	if v == nil {
+		return
+	}
+	fn := v.(codeIndexWatchSyncFunc)
+	if fn != nil {
+		fn()
+	}
+}
+
+// CodeIndex returns the shared index for this working folder.
+func (ws *Workspace) CodeIndex() *codeindex.Index {
+	if ws == nil {
+		return nil
+	}
+	return ws.codeIndex
 }
 
 // SetSkillsEnabled updates the live skills feature flag (shared store, see
@@ -541,6 +603,15 @@ func (ws *Workspace) providerProfiles() []llm.ProviderProfile {
 	return llm.ProviderProfiles(r.OpenAIKey, r.OpenAIModel, r.OpenAIURL, ws.GetOpenAIProviders())
 }
 
+// codeIndexConfig is the config a search and the watch read. The runtime
+// overlay's provider list is the copy from startup. provider_save and
+// provider_delete write the live list, which is the list chat already uses.
+func (ws *Workspace) codeIndexConfig() config.Config {
+	cfg := ws.GetRuntimeConfig()
+	cfg.OpenAIProviders = ws.GetOpenAIProviders()
+	return cfg
+}
+
 // subagentDepthFrom resolves the effective nesting-depth default for a
 // possibly-nil config (NewServer tolerates nil configs in tests).
 func subagentDepthFrom(cfg *config.Config) int {
@@ -620,6 +691,8 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		SubagentSpawner:      ws.SubagentSpawner,
 		SkillsEnabled:        ws.GetSkillsEnabled(),
 		TerminalEnabled:      ws.GetTerminalEnabled(),
+		CodeIndex:            ws.codeIndex,
+		CodeIndexConfig:      ws.codeIndexConfig,
 	}
 	if ws.Store != nil {
 		// Assigned conditionally on purpose: ws.Store is a concrete
@@ -690,6 +763,12 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		ws.flags().SetAutomationsEnabled(cfg.AutomationsEnabled())
 		ws.flags().SetSkillsEnabled(cfg.SkillsEnabled())
 		ws.flags().SetTerminalEnabled(cfg.TerminalEnabled())
+		ws.flags().SetCodeIndexEnabled(cfg.CodeIndexEnabled())
+	}
+	if ix := a.CodeIndex(); ix != nil {
+		ws.codeIndex = ix
+	} else if ws.WorkingDir != "" {
+		ws.codeIndex = codeindex.Open(ws.WorkingDir)
 	}
 	if cfg != nil && cfg.BoardEnabled() {
 		// The workspace owns the single board manager; session agents are

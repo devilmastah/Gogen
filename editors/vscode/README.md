@@ -44,9 +44,9 @@ If the board is switched off, the tab says so and can turn it on. With the revie
 
 ## Settings
 
-**GoGen: Settings** edits the settings gogen stores for this folder. The pages are Agent, Subagents, Automations, Tools, Context, Security, Sessions, Providers, MCP, and Server.
+**GoGen: Settings** edits the settings gogen stores for this folder. The pages are Agent, Subagents, Automations, Tools, Embeddings, Context, Security, Sessions, Providers, MCP, and Server.
 
-That includes the endpoint and model, the project board, subagents, scheduled automations, web fetch and search, tree-sitter, context and compaction, the command guard, delete approval, and saved-session limits. A blank secret leaves the stored secret in place. MCP and the server options apply the next time gogen starts.
+That includes the endpoint and model, the code index, the project board, subagents, scheduled automations, web fetch and search, tree-sitter, context and compaction, the command guard, delete approval, and saved-session limits. A blank secret leaves the stored secret in place. MCP and the server options apply the next time gogen starts.
 
 Optional features stay off until you turn them on. The command guard still blocks what it is set to block, and a delete still asks unless delete approval is off.
 

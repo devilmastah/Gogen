@@ -96,6 +96,15 @@ type FileConfig struct {
 	AgentInstructions         string                `yaml:"agent_instructions"`
 	Skills                    string                `yaml:"skills"`
 	Terminal                  string                `yaml:"terminal"`
+	CodeIndex                 string                `yaml:"code_index"`
+	CodeIndexProvider         string                `yaml:"code_index_provider"`
+	CodeIndexModel            string                `yaml:"code_index_model"`
+	CodeIndexChunkLines       int                   `yaml:"code_index_chunk_lines"`
+	CodeIndexChunkOverlap     *int                  `yaml:"code_index_chunk_overlap"`
+	CodeIndexWatch            string                `yaml:"code_index_watch"`
+	CodeIndexRerank           string                `yaml:"code_index_rerank"`
+	CodeIndexRerankProvider   string                `yaml:"code_index_rerank_provider"`
+	CodeIndexRerankModel      string                `yaml:"code_index_rerank_model"`
 	JobNotices                string                `yaml:"job_notices"`
 	JoinQueued                string                `yaml:"join_queued"`
 	Automations               string                `yaml:"automations"`

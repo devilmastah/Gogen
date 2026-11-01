@@ -73,6 +73,7 @@ var tuiCommands = []tuiCommand{
 	// Thinking command: mirror HandleThinkingCommand's accepted forms.
 	{match: commandWithArgs("think"), run: cmdThinking},
 	{match: exactAny("context", "/context"), run: cmdContext},
+	{match: exactAny("reindex", "/reindex"), run: cmdReindex},
 	// Session commands: reuse the agent's pure parser, mirroring its cases.
 	{match: func(input, trimmed string) bool {
 		cmd, _ := agent.ParseSessionCommand(input)
@@ -340,6 +341,18 @@ func cmdThinking(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	m.appendChatLine(SystemStyle.Render(out))
 	m.checkPersistError()
 	return true, false, nil
+}
+
+func cmdReindex(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	if m.agent == nil || !m.agent.CodeIndexEnabled() {
+		m.appendChatLine(SystemStyle.Render("code index is off"))
+		return true, false, nil
+	}
+	a := m.agent
+	return true, false, func() tea.Msg {
+		err := a.ReindexCode(context.Background())
+		return codeIndexDoneMsg{err: err}
+	}
 }
 
 func cmdContext(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {

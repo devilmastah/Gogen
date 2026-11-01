@@ -588,7 +588,12 @@
 
         /* Model picker popover */
         .tb-group { position: relative; }
-        #tb-context-group { margin-left: auto; }
+        #tb-context-group {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
         .tb-popover {
             display: none;
             position: absolute;
@@ -740,6 +745,18 @@
         .tb-context-badge[data-tone="warning"] .ctx-ring { --ctx-color: var(--amber); }
         .tb-context-badge[data-tone="danger"] { color: var(--error); }
         .tb-context-badge[data-tone="danger"] .ctx-ring { --ctx-color: var(--error); }
+        .tb-index-spin {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            box-sizing: border-box;
+            border-radius: 50%;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            flex-shrink: 0;
+            animation: input-spin 0.8s linear infinite;
+        }
+        .tb-index-spin[hidden] { display: none; }
 
         /* Command mode indicator */
         /* Command mode lights up the wrap (the textarea has no border). */
@@ -2969,6 +2986,10 @@
             justify-content: space-between;
             margin-bottom: 14px;
         }
+        #settings-dialog .settings-separator {
+            border-top: 1px solid var(--border);
+            margin: 4px 0 16px;
+        }
         #settings-dialog .settings-group:last-child .setting-row:last-child { margin-bottom: 0; }
         #settings-dialog select {
             font-family: var(--mono);
@@ -3741,7 +3762,7 @@
             /* Loops/entrances: connection pulse, input spinner, stream
                cursor blink, toast slide-in; TOC fades become instant. */
             #conn-indicator.reconnecting { animation: none; }
-            .progress-spinner { animation: none; }
+            .progress-spinner, .tb-index-spin { animation: none; }
             .waiting-spinner { animation: none; }
             /* The pending Send now keeps its dot (a static ring still reads
                as "working") and drops the rotation. */

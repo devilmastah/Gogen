@@ -112,6 +112,7 @@ test-vscode:
 	node scripts/test_vscode_editor_bridge.js
 	node scripts/test_vscode_queue_id.js
 	node scripts/test_vscode_pending_sends.js
+	node scripts/test_vscode_code_index_view.js
 
 # Runs the hand-maintained web UI regression tests (scripts/test_*.js):
 # jsdom harnesses that load the REAL index.html + app.js +

@@ -9,6 +9,7 @@ const TABS = [
   { id: "project", label: "Project" },
   { id: "automations", label: "Automations" },
   { id: "tools", label: "Tools" },
+  { id: "embeddings", label: "Embeddings" },
   { id: "context", label: "Context" },
   { id: "security", label: "Security" },
   { id: "sessions", label: "Sessions" },
@@ -55,6 +56,17 @@ const FIELDS = [
   { tab: "tools", kind: "runtime", field: "webSearchApiKey", label: "Search API key", control: "password", secret: "webSearchApiKeySet", placeholder: "API key" },
   { tab: "tools", kind: "runtime", field: "treesitter", label: "Tree-sitter", options: ON_OFF },
   { tab: "tools", kind: "runtime", field: "treesitterLangs", label: "Tree-sitter languages (comma-separated)" },
+  { tab: "embeddings", kind: "feature", key: "codeIndex", label: "Code index (search by meaning)", options: ON_OFF, note: "Off by default. When on, and an embedding provider is chosen, search_meaning indexes this folder into .gogen/index. Nothing is sent until that tool runs, or you reindex. Leave the provider unset and the tool stays off." },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexProvider", label: "Embedding provider", providers: true, modelField: "codeIndexModel", options: [["", "Not set"]], note: "Not set leaves the code index off. Any other choice is a name from the Providers tab." },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexModel", label: "Embedding model", models: true, options: [["", "Choose a model"]], note: "Choose a model uses that provider's own model. An empty model is an error when the provider has none. The chat model is not sent on its own." },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexChunkLines", label: "Chunk lines", control: "number", min: 10, max: 200, step: 1 },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexChunkOverlap", label: "Chunk overlap", control: "number", min: 0, step: 1 },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexWatch", label: "Watch for changes", options: ON_OFF, note: "On unless set to off. Once an index exists, a changed file is refreshed after a second of quiet. This does not build the first index. Nothing runs while the code index is off or the embedding provider is not set." },
+  { tab: "embeddings", kind: "separator" },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexRerank", label: "Rerank results", options: ON_OFF, note: "Off by default. When on, a search sends the closest 24 chunks to the rerank provider below and uses that order. A failure keeps the cosine order." },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexRerankProvider", label: "Rerank provider", providers: true, blank: "Embedding provider", modelField: "codeIndexRerankModel", options: [["", "Embedding provider"]], note: "Embedding provider uses the same server as the embedding model. Any other choice is a name from the Providers tab." },
+  { tab: "embeddings", kind: "runtime", field: "codeIndexRerankModel", label: "Rerank model", models: true, modelSource: "codeIndexRerankProvider", embedFallback: true, options: [["", "Choose a model"]], note: "With a named provider, Choose a model uses that provider's own model. With Embedding provider, pick a model: the embedding model is not sent." },
+  { tab: "embeddings", kind: "button", id: "code-index-reindex", label: "Reindex" },
   { tab: "tools", kind: "feature", key: "skills", label: "Skills (skill tool)", options: ON_OFF, note: "Exposes the skill tool: list/read over .gogen/skills and ~/.config/gogen/skills. Applies live." },
   { tab: "tools", kind: "feature", key: "terminal", label: "Persistent terminal tools", options: ON_OFF, note: "Exposes the agent-facing terminal tool and bash_persistent (a per-session shell whose cwd/env persist across calls)." },
   { tab: "tools", kind: "runtime", field: "statusDisplay", label: "Status display (LAN status screen)", options: [["off", "Off"], ["auto", "Auto (probe at startup)"], ["on", "On"], ["browser", "Browser (web UI fallback)"]], note: "Pushes live turn status to an ESP32 status screen. Auto probes and enables reporting when the screen answers. Browser uses this web UI to post the rows when the server cannot reach the display." },
@@ -112,7 +124,7 @@ function openSettings(host) {
     if (!panel || !event) {
       return;
     }
-    if (event.type === "config" || event.type === "models" || event.type === "providerTest" || event.type === "mcpTest" || event.type === "notice") {
+    if (event.type === "config" || event.type === "models" || event.type === "providerTest" || event.type === "mcpTest" || event.type === "notice" || event.type === "codeIndex") {
       panel.webview.postMessage(event);
     }
   };
@@ -142,6 +154,10 @@ function onMessage(host, msg, send) {
   try {
     if (msg.type === "feature") {
       host.sendFeature(msg.fields || {});
+      return;
+    }
+    if (msg.type === "reindex") {
+      host.reindexCode();
       return;
     }
     if (msg.type === "runtime") {
@@ -253,6 +269,7 @@ function settingsHtml(webview) {
   .panel { display: none; max-width: 640px; }
   .panel.active { display: block; }
   .row { margin: 0 0 14px; }
+  .sep { border-top: 1px solid var(--vscode-panel-border); margin: 4px 0 16px; }
   label { display: block; margin-bottom: 4px; font-size: 13px; }
   input, select, textarea { width: 100%; box-sizing: border-box; font: inherit; color: inherit; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); padding: 6px 8px; }
   textarea { resize: vertical; }
@@ -337,8 +354,33 @@ function build() {
   }
   for (const field of SCHEMA.fields) {
     const panel = document.getElementById("tab-" + field.tab);
+    if (field.kind === "separator") {
+      const rule = document.createElement("div");
+      rule.className = "sep";
+      rule.setAttribute("role", "separator");
+      panel.appendChild(rule);
+      continue;
+    }
     const row = document.createElement("div");
     row.className = "row";
+    if (field.kind === "button") {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "quiet";
+      b.id = field.id;
+      b.textContent = field.label;
+      b.hidden = true;
+      b.addEventListener("click", () => vscodeApi.postMessage({ type: "reindex" }));
+      row.appendChild(b);
+      const progress = document.createElement("p");
+      progress.id = "code-index-progress";
+      progress.className = "note";
+      progress.textContent = "Not indexed";
+      row.appendChild(progress);
+      controls.set(field.id, { field, row, el: b });
+      panel.appendChild(row);
+      continue;
+    }
     const label = document.createElement("label");
     label.textContent = field.label;
     row.appendChild(label);
@@ -435,6 +477,16 @@ function onChange(field, el) {
     vscodeApi.postMessage({ type: "feature", fields });
     return;
   }
+  if (field.providers) {
+    const model = controls.get(field.modelField || "codeIndexModel");
+    if (model && model.el && document.activeElement !== model.el) {
+      paintModel(model.field, model.el);
+    }
+    if (field.field === "codeIndexProvider") {
+      const rerank = controls.get("codeIndexRerankModel");
+      if (rerank && rerank.el && document.activeElement !== rerank.el) paintModel(rerank.field, rerank.el);
+    }
+  }
   let value = el.value;
   if (el.type === "number") {
     const step = parseFloat(el.step || "1");
@@ -452,6 +504,88 @@ function showTab(id) {
   for (const panel of document.querySelectorAll(".panel")) {
     panel.classList.toggle("active", panel.id === "tab-" + id);
   }
+}
+
+function fillSelect(select, options, current) {
+  select.replaceChildren();
+  for (const [value, text] of options) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = text;
+    select.appendChild(opt);
+  }
+  select.value = current;
+}
+
+// fillCodeIndexProviders lists the configured provider names. The blank
+// choice leaves the code index off. A saved name that is no longer in the
+// list stays visible so the push does not silently switch the selection.
+function fillCodeIndexProviders(select, providers, current, blankLabel) {
+  const names = [];
+  const seen = new Set();
+  for (const p of providers || []) {
+    const name = p && p.name;
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const url = p.baseUrl ? " — " + p.baseUrl : "";
+    names.push([name, name + url]);
+  }
+  if (current && !seen.has(current)) names.push([current, current]);
+  fillSelect(select, [["", blankLabel || "Not set"]].concat(names), current);
+}
+
+// fillCodeIndexModels lists the models that belong to the chosen provider.
+// A named provider's blank choice means that provider's own model. An empty
+// provider lists no models, because the code index is off.
+function fillCodeIndexModels(select, providers, catalog, providerName, chatProvider, current, blankOverride) {
+  if (!providerName) {
+    const blank = blankOverride || "Choose a model";
+    const options = [["", blank]];
+    if (current) options.push([current, current]);
+    fillSelect(select, options, current || "");
+    return;
+  }
+  const owner = providerName;
+  const provider = (providers || []).find((p) => p && p.name === providerName);
+  const saved = provider && provider.model ? provider.model : "";
+  let blank = saved ? "Provider's model (" + saved + ")" : "Choose a model";
+  if (blankOverride) blank = blankOverride;
+  const ids = [];
+  const seen = new Set();
+  for (const m of catalog || []) {
+    if (!m || !m.id) continue;
+    if ((m.provider || "default") !== owner) continue;
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    ids.push(m.id);
+  }
+  const options = [["", blank]].concat(ids.map((id) => [id, id]));
+  if (current && !seen.has(current)) options.push([current, current]);
+  fillSelect(select, options, current);
+}
+
+function fillRerankModels(select, providers, catalog, rerankProvider, embedProvider, chatProvider, current) {
+  if (rerankProvider) {
+    fillCodeIndexModels(select, providers, catalog, rerankProvider, chatProvider, current);
+    return;
+  }
+  fillCodeIndexModels(select, providers, catalog, embedProvider || "", chatProvider, current, "Choose a model");
+}
+
+function selectedValue(fieldName) {
+  const entry = controls.get(fieldName);
+  if (entry && entry.el) return entry.el.value || "";
+  return typeof cfg[fieldName] === "string" ? cfg[fieldName] : "";
+}
+
+function paintModel(field, el, current) {
+  if (current === undefined) current = el.value;
+  const chat = cfg.modelProvider || "default";
+  if (field.embedFallback) {
+    fillRerankModels(el, cfg.providers, models, selectedValue("codeIndexRerankProvider"), selectedValue("codeIndexProvider"), chat, current);
+    return;
+  }
+  fillCodeIndexModels(el, cfg.providers, models, selectedValue(field.modelSource || "codeIndexProvider"), chat, current);
 }
 
 function applyConfig() {
@@ -479,12 +613,24 @@ function applyConfig() {
       continue;
     }
     const prop = entry.field.prop || entry.field.field || entry.field.key;
+    if (entry.field.providers && el.tagName === "SELECT") {
+      fillCodeIndexProviders(el, cfg.providers, typeof cfg[prop] === "string" ? cfg[prop] : "", entry.field.blank);
+      continue;
+    }
+    if (entry.field.models && el.tagName === "SELECT") {
+      paintModel(entry.field, el, typeof cfg[prop] === "string" ? cfg[prop] : "");
+      continue;
+    }
     const value = cfg[prop];
     if (value === undefined || value === null) continue;
     if (String(el.value) !== String(value)) el.value = String(value);
   }
   renderProviders();
   renderMcp();
+  const reindex = document.getElementById("code-index-reindex");
+  if (reindex) reindex.hidden = cfg.codeIndex !== "on";
+  const codeLine = document.getElementById("code-index-progress");
+  if (codeLine && cfg.codeIndexLine) codeLine.textContent = cfg.codeIndexLine;
   const path = document.getElementById("configPath");
   if (path) path.textContent = cfg.configFilePath || "this folder's gogen config";
 }
@@ -713,6 +859,10 @@ window.addEventListener("message", (event) => {
   if (msg.type === "config") {
     cfg = msg;
     applyConfig();
+    return;
+  }
+  if (msg.type === "codeIndex") {
+    setNote("code-index-progress", msg.line || "");
     return;
   }
   if (msg.type === "models") {
