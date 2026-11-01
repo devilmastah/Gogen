@@ -220,7 +220,14 @@ func safeChunkPath(p string) bool {
 	if filepath.IsAbs(p) {
 		return false
 	}
-	c := path.Clean(filepath.ToSlash(p))
+	// A stored path is relative. A backslash separates names on Windows, so
+	// it counts as a separator here too. "..\x" then climbs out on every
+	// system, including one where a backslash is otherwise just a character.
+	slashed := strings.ReplaceAll(filepath.ToSlash(p), `\`, "/")
+	if path.IsAbs(slashed) {
+		return false
+	}
+	c := path.Clean(slashed)
 	return c != "." && c != ".." && !strings.HasPrefix(c, "../")
 }
 

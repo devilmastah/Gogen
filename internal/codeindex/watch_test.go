@@ -197,20 +197,20 @@ func TestWatchDoesNotFollowOutsideLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	addCreatedDir(w, dir, link)
-	writeTree(t, filepath.Join(link, "a.go"), "package a\n")
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		select {
-		case ev := <-w.Events:
-			if strings.Contains(filepath.Clean(ev.Name), filepath.Clean(link)) {
-				t.Fatalf("watched through an outside link: %s", ev.Name)
-			}
-		case err := <-w.Errors:
-			t.Fatal(err)
-		default:
-			time.Sleep(20 * time.Millisecond)
+	for _, watched := range w.WatchList() {
+		cleaned := filepath.Clean(watched)
+		if cleaned == filepath.Clean(link) || cleaned == filepath.Clean(outside) || eventInside(link, watched) || eventInside(outside, watched) {
+			t.Fatalf("watching %s", watched)
 		}
 	}
+}
+
+func eventInside(root, name string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(name))
+	if err != nil || rel == "." {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func TestWatchNoIndexYet(t *testing.T) {
