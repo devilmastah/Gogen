@@ -537,7 +537,7 @@ function fillCodeIndexProviders(select, providers, current, blankLabel) {
 // fillCodeIndexModels lists the models that belong to the chosen provider.
 // A named provider's blank choice means that provider's own model. An empty
 // provider lists no models, because the code index is off.
-function fillCodeIndexModels(select, providers, catalog, providerName, chatProvider, current, blankOverride) {
+function fillCodeIndexModels(select, providers, catalog, providerName, current, blankOverride) {
   if (!providerName) {
     const blank = blankOverride || "Choose a model";
     const options = [["", blank]];
@@ -547,7 +547,9 @@ function fillCodeIndexModels(select, providers, catalog, providerName, chatProvi
   }
   const owner = providerName;
   const provider = (providers || []).find((p) => p && p.name === providerName);
-  const saved = provider && provider.model ? provider.model : "";
+  // The default profile's model is the chat model, which is not an
+  // embedding model. Leave it blank so the user must choose one.
+  const saved = provider && provider.name !== "default" && provider.model ? provider.model : "";
   let blank = saved ? "Provider's model (" + saved + ")" : "Choose a model";
   if (blankOverride) blank = blankOverride;
   const ids = [];
@@ -564,12 +566,12 @@ function fillCodeIndexModels(select, providers, catalog, providerName, chatProvi
   fillSelect(select, options, current);
 }
 
-function fillRerankModels(select, providers, catalog, rerankProvider, embedProvider, chatProvider, current) {
+function fillRerankModels(select, providers, catalog, rerankProvider, embedProvider, current) {
   if (rerankProvider) {
-    fillCodeIndexModels(select, providers, catalog, rerankProvider, chatProvider, current);
+    fillCodeIndexModels(select, providers, catalog, rerankProvider, current);
     return;
   }
-  fillCodeIndexModels(select, providers, catalog, embedProvider || "", chatProvider, current, "Choose a model");
+  fillCodeIndexModels(select, providers, catalog, embedProvider || "", current, "Choose a model");
 }
 
 function selectedValue(fieldName) {
@@ -580,12 +582,11 @@ function selectedValue(fieldName) {
 
 function paintModel(field, el, current) {
   if (current === undefined) current = el.value;
-  const chat = cfg.modelProvider || "default";
   if (field.embedFallback) {
-    fillRerankModels(el, cfg.providers, models, selectedValue("codeIndexRerankProvider"), selectedValue("codeIndexProvider"), chat, current);
+    fillRerankModels(el, cfg.providers, models, selectedValue("codeIndexRerankProvider"), selectedValue("codeIndexProvider"), current);
     return;
   }
-  fillCodeIndexModels(el, cfg.providers, models, selectedValue(field.modelSource || "codeIndexProvider"), chat, current);
+  fillCodeIndexModels(el, cfg.providers, models, selectedValue(field.modelSource || "codeIndexProvider"), current);
 }
 
 function applyConfig() {

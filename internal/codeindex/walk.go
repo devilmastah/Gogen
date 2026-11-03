@@ -2,8 +2,6 @@ package codeindex
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -26,10 +24,15 @@ func skipDir(name string) bool {
 func skipFile(name string) bool {
 	lower := strings.ToLower(name)
 	switch lower {
-	case ".env", "id_rsa", "gogen.conf", "credentials.json", "secrets.json":
+	case ".env", ".git-credentials", ".netrc", ".npmrc", ".pgpass", ".pypirc",
+		"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+		"gogen.conf", "credentials", "credentials.json", "secrets", "secrets.json":
 		return true
 	}
 	if strings.HasPrefix(lower, ".env.") {
+		return true
+	}
+	if strings.HasSuffix(lower, ".tfstate") || strings.HasSuffix(lower, ".tfstate.backup") {
 		return true
 	}
 	ext := ""
@@ -37,32 +40,44 @@ func skipFile(name string) bool {
 		ext = lower[i+1:]
 	}
 	switch ext {
-	case "pem", "key", "png", "jpg", "jpeg", "gif", "webp", "pdf", "zip", "gz",
+	case "pem", "key", "p12", "pfx", "keystore", "jks", "ppk", "kdbx", "ovpn",
+		"png", "jpg", "jpeg", "gif", "webp", "pdf", "zip", "gz",
 		"exe", "dll", "so", "dylib", "wasm", "mp4", "mp3", "ico", "woff", "woff2":
 		return true
 	}
 	return false
 }
 
-// fileRec is one file the walk decided to index.
+// fileRec is one file the walk decided to index. Chunk hashes are computed
+// per chunk, so the walk does not hash the file itself.
 type fileRec struct {
 	Rel  string
-	Abs  string
-	Hash string
 	Text string
 }
 
 // walkFiles lists the indexable files under root. A path outside root is not
 // followed. Symlinks are skipped. sub, when set, limits the walk to that
 // relative directory.
-func walkFiles(root, sub string) ([]fileRec, error) {
+func walkFiles(root string) ([]fileRec, error) {
 	root = filepath.Clean(root)
-	start := root
-	if sub != "" {
-		start = filepath.Join(root, filepath.FromSlash(sub))
+	if root == "" {
+		root = "."
 	}
+	// A working directory can itself be a symlink. Walk the resolved path so
+	// WalkDir sees a directory, not a link it refuses to follow.
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	// WalkDir does not follow symlinks, and the entry check below skips a
+	// symlinked file or directory, so a walked path is below a real
+	// directory. The Root makes the read itself safe against a swap.
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
 	var out []fileRec
-	err := filepath.WalkDir(start, func(path string, d os.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -70,14 +85,8 @@ func walkFiles(root, sub string) ([]fileRec, error) {
 			return err
 		}
 		name := d.Name()
-		if outsideLink(root, path) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
 		if d.IsDir() {
-			if path != start && skipDir(name) {
+			if path != root && skipDir(name) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -96,14 +105,7 @@ func walkFiles(root, sub string) ([]fileRec, error) {
 		if !safeChunkPath(rel) {
 			return nil
 		}
-		info, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		if info.Size() > MaxFileBytes {
-			return nil
-		}
-		rec, ok := readIndexable(path, rel)
+		rec, ok := readIndexable(r, rel)
 		if ok {
 			out = append(out, rec)
 		}
@@ -112,8 +114,13 @@ func walkFiles(root, sub string) ([]fileRec, error) {
 	return out, err
 }
 
-func readIndexable(path, rel string) (fileRec, bool) {
-	f, err := os.Open(path)
+func readIndexable(r *os.Root, rel string) (fileRec, bool) {
+	name := filepath.FromSlash(rel)
+	info, err := r.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > MaxFileBytes {
+		return fileRec{}, false
+	}
+	f, err := r.Open(name)
 	if err != nil {
 		return fileRec{}, false
 	}
@@ -127,23 +134,18 @@ func readIndexable(path, rel string) (fileRec, bool) {
 	if bytes.IndexByte(probe, 0) >= 0 {
 		return fileRec{}, false
 	}
-	rest, err := io.ReadAll(f)
-	if err != nil {
+	rest, err := io.ReadAll(io.LimitReader(f, int64(MaxFileBytes)+1-int64(n)))
+	if err != nil || int64(n)+int64(len(rest)) > MaxFileBytes {
 		return fileRec{}, false
 	}
 	body := append(probe, rest...)
-	sum := sha256.Sum256(body)
-	return fileRec{
-		Rel:  rel,
-		Abs:  path,
-		Hash: hex.EncodeToString(sum[:]),
-		Text: string(body),
-	}, true
+	return fileRec{Rel: rel, Text: string(body)}, true
 }
 
-// outsideLink reports whether an existing component between root and target
-// is a link whose target leaves root. A Windows junction is not a symlink
-// to EvalSymlinks, and Readlink still returns its target.
+// outsideLink reports whether target, or any component between root and
+// target, resolves to a location outside root. EvalSymlinks follows a whole
+// chain, so a link to a link that leaves root is caught too. A target that
+// does not exist is not an escape; callers handle a missing path as absent.
 func outsideLink(root, target string) bool {
 	root = filepath.Clean(root)
 	target = filepath.Clean(target)
@@ -157,6 +159,23 @@ func outsideLink(root, target string) bool {
 	if rel == "." {
 		return false
 	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err == nil {
+		resolvedTarget, terr := filepath.EvalSymlinks(target)
+		if terr != nil {
+			// A watch event can name a file that is already gone. Resolve
+			// the parent so a link in the path is still checked.
+			if parent, perr := filepath.EvalSymlinks(filepath.Dir(target)); perr == nil {
+				resolvedTarget = filepath.Join(parent, filepath.Base(target))
+				terr = nil
+			}
+		}
+		if terr == nil && !within(resolvedRoot, resolvedTarget) {
+			return true
+		}
+	}
+	// EvalSymlinks does not resolve every reparse point (a Windows junction,
+	// for example), so also inspect each component the target path names.
 	cur := root
 	for _, part := range strings.Split(rel, string(filepath.Separator)) {
 		if part == "" {

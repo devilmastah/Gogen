@@ -50,6 +50,20 @@ func (a *Agent) CodeIndex() *codeindex.Index {
 	return a.codeIndex.Load()
 }
 
+// CodeIndexConfig returns the live config reader installed on this agent, or
+// nil. A host uses it to give a child agent the same reader.
+func (a *Agent) CodeIndexConfig() func() config.Config {
+	v := a.codeIndexConfig.Load()
+	if v == nil {
+		return nil
+	}
+	fn := v.(codeIndexConfig)
+	if fn == nil {
+		return nil
+	}
+	return fn
+}
+
 // SetCodeIndexConfig installs the live config read at each search. The web
 // host passes the runtime overlay with the live provider list. A nil func
 // reads nothing.
@@ -107,7 +121,9 @@ func codeIndexProviderSet(cfg config.Config) bool {
 // codeIndexTarget resolves the embedding endpoint. The API key is returned
 // beside the identity and is never written into the index. An empty
 // code_index_provider is an error. A named provider with an empty model
-// uses that provider's own model. The chat model is not sent on its own.
+// uses that provider's own model. The default profile has no separate
+// embedding model, so it requires an explicit code_index_model; the chat
+// model is not sent on its own.
 func codeIndexTarget(cfg config.Config) (codeindex.Identity, string, error) {
 	lines, overlap := cfg.CodeIndexChunk()
 	name := strings.TrimSpace(cfg.CodeIndexProvider)
@@ -133,7 +149,11 @@ func codeIndexTarget(cfg config.Config) (codeindex.Identity, string, error) {
 
 func lookupEmbeddingProvider(cfg config.Config, name string) (base, key, model string, ok bool) {
 	if name == llm.DefaultProfileName {
-		return cfg.OpenAIURL, cfg.OpenAIKey, cfg.OpenAIModel, true
+		// The default profile is the chat profile. OpenAI model is the chat
+		// model, not an embedding or rerank model, so it is not used as the
+		// provider's own model. The caller must set an explicit model; the
+		// chat model is never sent on its own.
+		return cfg.OpenAIURL, cfg.OpenAIKey, "", true
 	}
 	for _, p := range cfg.OpenAIProviders {
 		if p.Name == name {
@@ -273,8 +293,9 @@ func codeIndexRerankOn(cfg config.Config) bool {
 
 // codeIndexRerankTarget resolves the rerank request. An empty provider uses
 // the embedding provider's base URL and key. An empty model uses a named
-// rerank provider's own model. The embedding model and the chat model are
-// not sent.
+// rerank provider's own model. The default profile has no separate rerank
+// model, so it also requires an explicit rerank model. The embedding model
+// and the chat model are not sent.
 func codeIndexRerankTarget(cfg config.Config) (base, key, model string, err error) {
 	explicit := strings.TrimSpace(cfg.CodeIndexRerankProvider)
 	model = strings.TrimSpace(cfg.CodeIndexRerankModel)

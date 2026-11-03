@@ -18,8 +18,8 @@ func TestChunkNoCGOUsesLineRule(t *testing.T) {
 	t.Cleanup(func() { treesitter.Configure(true, "") })
 
 	text := twoLongFuncs()
-	got := ChunkSource("a.go", text, "h", 40, 5)
-	want := ChunkText("a.go", text, "h", 40, 5)
+	got := ChunkSource("a.go", text, 40, 5)
+	want := ChunkText("a.go", text, 40, 5)
 	if len(got) != len(want) {
 		t.Fatalf("chunks = %d, want %d (the line window)", len(got), len(want))
 	}

@@ -105,7 +105,7 @@ func TestApproxFollowsFileChange(t *testing.T) {
 		t.Fatal("lookup was not built")
 	}
 	first := ix.approx
-	out, err = ix.Search(context.Background(), emb, id, "q", "")
+	_, err = ix.Search(context.Background(), emb, id, "q", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,8 +116,11 @@ func TestApproxFollowsFileChange(t *testing.T) {
 		t.Fatalf("unchanged file embeds = %d", emb.countContaining("ccc-stay"))
 	}
 	opened := Open(dir)
+	if _, err := opened.Search(context.Background(), emb, id, "q", ""); err != nil {
+		t.Fatal(err)
+	}
 	if opened.approx == nil {
-		t.Fatal("Open did not build the lookup")
+		t.Fatal("the first search did not build the lookup")
 	}
 
 	writeTree(t, filepath.Join(dir, "a.go"), "aaa-far\n")
@@ -149,6 +152,9 @@ func TestApproxFollowsFileChange(t *testing.T) {
 		t.Fatal("switching folders kept the lookup")
 	}
 	ix.SetWorkingDir(dir)
+	if _, err := ix.Search(context.Background(), emb, id, "q", ""); err != nil {
+		t.Fatal(err)
+	}
 	if ix.approx == nil || ix.approx == rebuilt {
 		t.Fatal("returning to the folder did not rebuild the lookup")
 	}

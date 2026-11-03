@@ -6,12 +6,30 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
+)
+
+// Index file limits. They are far above a normal index and keep a corrupt,
+// crafted, or swapped file from exhausting memory or blocking a read.
+const (
+	// maxMetaBytes caps meta.json.
+	maxMetaBytes = 1 << 20
+	// maxChunksFileBytes caps chunks.json.
+	maxChunksFileBytes = 256 << 20
+	// maxVectorsFileBytes caps vectors.bin (1 GiB).
+	maxVectorsFileBytes = 1 << 30
+	// maxChunks caps the chunk count so the size product stays in int64.
+	maxChunks = 2_000_000
+	// maxDimension caps one vector. Embedding models are far below this.
+	maxDimension = 65536
 )
 
 // metaFile is .gogen/index/meta.json. It does not record the API key.
@@ -51,9 +69,14 @@ type diskChunk struct {
 }
 
 type stored struct {
-	Meta    metaFile
-	Chunks  []diskChunk
+	Meta   metaFile
+	Chunks []diskChunk
+	// Vectors is indexed in the same order as Chunks.
 	Vectors [][]float32
+	// Gen names the on-disk generation (the chunk file plus the vector
+	// file). It is empty for a legacy index that still uses chunks.json
+	// and vectors.bin, which cannot be cached safely by name.
+	Gen string
 }
 
 func indexPaths(root string) (meta, chunks, vectors string) {
@@ -62,37 +85,75 @@ func indexPaths(root string) (meta, chunks, vectors string) {
 		filepath.Join(root, "vectors.bin")
 }
 
-func loadStored(root string) (stored, bool) {
+// loadMeta reads and validates meta.json only. It is what Open uses to
+// show the stored counts without reading the vector generation.
+func loadMeta(root string) (metaFile, bool) {
 	// A root reached through a link that leaves the working directory is
-	// not this folder's index. Reading it would show the other folder's
-	// counts as if they belonged here.
+	// not this folder's index.
 	if indexEscapes(root) {
-		return stored{}, false
+		return metaFile{}, false
 	}
 	// A missing meta.json stays missing. Putting meta.json.bak back here
 	// races a publisher that has already installed the new meta: on Linux
 	// and macOS that rename replaces it, and the sweep then deletes the
 	// files the restored meta names. Recovery runs under the file lock.
-	metaPath, _, _ := indexPaths(root)
-	mb, err := os.ReadFile(metaPath)
+	r, err := os.OpenRoot(root)
 	if err != nil {
-		return stored{}, false
+		return metaFile{}, false
+	}
+	defer r.Close()
+	mb, err := readIndexFile(r, "meta.json", maxMetaBytes)
+	if err != nil {
+		return metaFile{}, false
 	}
 	var meta metaFile
-	if json.Unmarshal(mb, &meta) != nil || meta.Chunks < 0 {
+	if json.Unmarshal(mb, &meta) != nil || !saneMeta(meta) {
+		return metaFile{}, false
+	}
+	return meta, true
+}
+
+// saneMeta bounds every number the loader multiplies or allocates from, so a
+// corrupt or crafted meta.json cannot overflow int64 or ask for a huge slice.
+func saneMeta(meta metaFile) bool {
+	if meta.Files < 0 || meta.Chunks < 0 || meta.Chunks > maxChunks {
+		return false
+	}
+	if meta.Dimension < 0 || meta.Dimension > maxDimension {
+		return false
+	}
+	if meta.Chunks > 0 && meta.Dimension <= 0 {
+		return false
+	}
+	_, _, ok := generationNames(meta)
+	return ok
+}
+
+func loadStored(root string) (stored, bool) {
+	meta, ok := loadMeta(root)
+	if !ok {
 		return stored{}, false
 	}
+	return loadStoredWithMeta(root, meta)
+}
+
+// loadStoredWithMeta reads the generation meta names. Every file is opened
+// through an os.Root, so a symlink that leaves the working directory is
+// rejected instead of followed, and every read is bounded.
+func loadStoredWithMeta(root string, meta metaFile) (stored, bool) {
 	if meta.Chunks == 0 {
 		return stored{Meta: meta}, true
-	}
-	if meta.Dimension <= 0 {
-		return stored{}, false
 	}
 	chunksName, vectorsName, ok := generationNames(meta)
 	if !ok {
 		return stored{}, false
 	}
-	cb, err := os.ReadFile(filepath.Join(root, chunksName))
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return stored{}, false
+	}
+	defer r.Close()
+	cb, err := readIndexFile(r, chunksName, maxChunksFileBytes)
 	if err != nil {
 		return stored{}, false
 	}
@@ -101,18 +162,19 @@ func loadStored(root string) (stored, bool) {
 		return stored{}, false
 	}
 	for _, c := range chunks {
-		if !safeChunkPath(c.Path) {
+		if !safeChunkPath(c.Path) || c.Start < 0 || c.End < 0 {
 			return stored{}, false
 		}
 	}
-	vb, err := os.ReadFile(filepath.Join(root, vectorsName))
-	if err != nil {
+	want := int64(len(chunks)) * int64(meta.Dimension) * 4
+	if want <= 0 || want > maxVectorsFileBytes {
+		return stored{}, false
+	}
+	vb, err := readIndexFile(r, vectorsName, want)
+	if err != nil || int64(len(vb)) != want {
 		return stored{}, false
 	}
 	width := meta.Dimension
-	if len(vb) != len(chunks)*width*4 {
-		return stored{}, false
-	}
 	vectors := make([][]float32, len(chunks))
 	for i := range chunks {
 		row := make([]float32, width)
@@ -122,7 +184,40 @@ func loadStored(root string) (stored, bool) {
 		}
 		vectors[i] = row
 	}
-	return stored{Meta: meta, Chunks: chunks, Vectors: vectors}, true
+	gen := ""
+	if meta.ChunksFile != "" && meta.VectorsFile != "" {
+		gen = meta.ChunksFile + "\x00" + meta.VectorsFile
+	}
+	return stored{Meta: meta, Chunks: chunks, Vectors: vectors, Gen: gen}, true
+}
+
+// readIndexFile reads one regular file in the index, bounded by limit. A
+// symlink (to a file inside or outside the root) is not a regular file and
+// is rejected. Root never follows a link that leaves its directory.
+func readIndexFile(r *os.Root, name string, limit int64) ([]byte, error) {
+	info, err := r.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	if info.Size() < 0 || info.Size() > limit {
+		return nil, fmt.Errorf("%s is too large", name)
+	}
+	f, err := r.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	body, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("%s is too large", name)
+	}
+	return body, nil
 }
 
 // publish writes the new chunks and vectors beside the files the current
@@ -133,11 +228,25 @@ func publish(root string, meta metaFile, chunks []diskChunk, vectors [][]float32
 	if indexEscapes(root) {
 		return errors.New("code index path is outside the working directory")
 	}
+	if len(chunks) != len(vectors) || len(chunks) > maxChunks || meta.Chunks != len(chunks) || meta.Files < 0 ||
+		meta.Dimension < 0 || meta.Dimension > maxDimension ||
+		int64(len(chunks))*int64(meta.Dimension)*4 > maxVectorsFileBytes {
+		return errors.New("code index is too large")
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
 	}
-	metaPath, _, _ := indexPaths(root)
-	restoreReplaced(metaPath)
+	// Every write goes through an os.Root. A symlink planted at a fixed
+	// name (meta.json.tmp) is removed instead of followed, and Root refuses
+	// a link that leaves the index directory.
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	if err := restoreReplacedRoot(r); err != nil {
+		return err
+	}
 	gen, err := newGeneration()
 	if err != nil {
 		return err
@@ -159,34 +268,101 @@ func publish(root string, meta metaFile, chunks []diskChunk, vectors [][]float32
 			buf = append(buf, b[:]...)
 		}
 	}
-	chunksPath := filepath.Join(root, meta.ChunksFile)
-	vecPath := filepath.Join(root, meta.VectorsFile)
-	if err := writeFile(chunksPath, append(cb, '\n')); err != nil {
+	if err := writeNewFile(r, meta.ChunksFile, append(cb, '\n')); err != nil {
 		return err
 	}
-	if err := writeFile(vecPath, buf); err != nil {
-		_ = os.Remove(chunksPath)
+	if err := writeNewFile(r, meta.VectorsFile, buf); err != nil {
+		_ = r.Remove(meta.ChunksFile)
 		return err
 	}
 	mb, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		_ = os.Remove(chunksPath)
-		_ = os.Remove(vecPath)
+		_ = r.Remove(meta.ChunksFile)
+		_ = r.Remove(meta.VectorsFile)
 		return err
 	}
-	tmp := metaPath + ".tmp"
-	if err := writeFile(tmp, append(mb, '\n')); err != nil {
-		_ = os.Remove(chunksPath)
-		_ = os.Remove(vecPath)
+	tmp := "meta.json.tmp"
+	if err := writeNewFile(r, tmp, append(mb, '\n')); err != nil {
+		_ = r.Remove(meta.ChunksFile)
+		_ = r.Remove(meta.VectorsFile)
 		return err
 	}
-	if err := replaceFile(tmp, metaPath); err != nil {
-		_ = os.Remove(chunksPath)
-		_ = os.Remove(vecPath)
-		_ = os.Remove(tmp)
+	if err := replaceFileRoot(r, tmp, "meta.json"); err != nil {
+		_ = r.Remove(meta.ChunksFile)
+		_ = r.Remove(meta.VectorsFile)
+		_ = r.Remove(tmp)
 		return err
 	}
 	sweepGenerations(root, meta.ChunksFile, meta.VectorsFile)
+	return nil
+}
+
+// writeNewFile creates a generation file. An existing name (a leftover or a
+// planted symlink) is removed first, so the write never follows a link. The
+// generation names are random, so an existing regular file is not expected.
+func writeNewFile(r *os.Root, name string, body []byte) error {
+	if info, err := r.Lstat(name); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("%s is a directory", name)
+		}
+		if err := r.Remove(name); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f, err := r.Create(name)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(body); err != nil {
+		_ = f.Close()
+		_ = r.Remove(name)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = r.Remove(name)
+		return err
+	}
+	return nil
+}
+
+// restoreReplacedRoot is restoreReplaced for a Root: a crash between the two
+// renames of replaceFileRoot leaves only meta.json.bak.
+func restoreReplacedRoot(r *os.Root) error {
+	if _, err := r.Lstat("meta.json"); err == nil {
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if _, err := r.Lstat("meta.json.bak"); err == nil {
+		return r.Rename("meta.json.bak", "meta.json")
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// replaceFileRoot puts tmp in dst's place through a Root. On Windows a rename
+// does not replace, so dst is renamed aside first and put back if the new
+// name cannot be moved in.
+func replaceFileRoot(r *os.Root, tmp, dst string) error {
+	bak := dst + ".bak"
+	if _, err := r.Lstat(dst); err == nil {
+		_ = r.Remove(bak)
+		if err := r.Rename(dst, bak); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := r.Rename(tmp, dst); err != nil {
+		if _, statErr := r.Lstat(bak); statErr == nil {
+			_ = r.Rename(bak, dst)
+		}
+		return err
+	}
+	_ = r.Remove(bak)
 	return nil
 }
 
@@ -282,10 +458,6 @@ func restoreReplaced(dst string) {
 	if _, err := os.Stat(bak); err == nil {
 		_ = os.Rename(bak, dst)
 	}
-}
-
-func writeFile(path string, body []byte) error {
-	return os.WriteFile(path, body, 0o644)
 }
 
 // replaceFile puts tmp in dst's place. The previous dst is renamed aside

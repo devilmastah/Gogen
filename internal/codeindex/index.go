@@ -1,6 +1,7 @@
 package codeindex
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -27,13 +28,15 @@ var ErrNoModel = errors.New("code index model is not set")
 var testAfterPublish func(root string)
 
 // Index is the vector store for one working directory. Its mutex is its own
-// lock and is never taken while holding an agent lock. Callers take this
-// lock only by calling Search, SearchRerank, SearchIn, Rebuild, or SetWatch.
-// The progress callback runs on the index's own goroutine, after that lock
-// is released for the callback. deliverMu is taken only to hand the callback
-// the newest snapshot, and the callback runs after deliverMu is released.
-// The watch goroutine takes the lock only to publish its ready flag and,
-// with TryLock, around the same refresh Search uses.
+// lock and is never taken while holding an agent lock. Callers take that
+// lock only through the methods that touch the store or the watch: Search,
+// SearchRerank, SearchIn, Rebuild, RebuildFor, SetWorkingDir, Dir, Watching,
+// and SetWatch. Snapshot and SetProgress are atomic. The progress callback
+// runs on the index's own goroutine, after the lock is released for the
+// callback. deliverMu is taken only to hand the callback the newest snapshot,
+// and the callback runs after deliverMu is released. The watch goroutine
+// takes the lock only to publish its ready flag and, with TryLock, around
+// the same refresh Search uses.
 type Index struct {
 	mu         sync.Mutex
 	dir        string
@@ -64,37 +67,43 @@ type Index struct {
 	watchReady  bool
 
 	// approx is the in-memory lookup, guarded by mu. It is nil below
-	// approxMinChunks. approxUses counts searches that consulted it.
-	// Tests read it.
+	// approxMinChunks. approxGen names the stored generation it was built
+	// from, so a cached generation is not hashed again. approxUses counts
+	// searches that consulted it. Tests read it.
 	approx     *hnsw
+	approxGen  string
 	approxUses int
+
+	// cached is the last parsed generation, guarded by mu. It keeps a
+	// search from re-reading chunks.json and vectors.bin when the meta
+	// still names the same generation. A legacy index (no generation
+	// names) is not cached.
+	cached *stored
 }
 
 // Open returns the index for workingDir. It does not create .gogen/index.
-// A complete index already on disk is loaded into the snapshot. When that
-// index holds 20,000 chunks or more, the in-memory lookup is built from
-// its vectors.
+// The stored meta is read so the snapshot shows its counts; the vector
+// generation is loaded on the first search, or rebuild, not here.
 func Open(workingDir string) *Index {
 	ix := &Index{dir: workingDir, root: filepath.Join(workingDir, ".gogen", "index")}
 	ix.dirSnap.Store(workingDir)
 	ix.store(Progress{Phase: PhaseIdle})
-	if st, ok := loadStored(ix.root); ok {
+	if meta, ok := loadMeta(ix.root); ok {
 		ix.store(Progress{
 			Phase:       PhaseIdle,
-			FilesTotal:  st.Meta.Files,
-			ChunksTotal: st.Meta.Chunks,
+			FilesTotal:  meta.Files,
+			ChunksTotal: meta.Chunks,
 			Indexed:     true,
 		})
-		ix.prepareApprox(st)
 	}
 	return ix
 }
 
 // SetWorkingDir points the index at another folder. It does not create
 // .gogen/index. The same folder returns without waiting. A different folder
-// waits until a rebuild finishes. The previous folder's lookup is dropped.
-// A stored index at the new folder is loaded, and the lookup is built again
-// when that index is large enough.
+// waits until a rebuild finishes. The previous folder's cache and lookup are
+// dropped. The stored meta at the new folder is read for the snapshot; its
+// vectors are loaded on the next search.
 func (ix *Index) SetWorkingDir(dir string) {
 	if cur, ok := ix.dirSnap.Load().(string); ok && cur == dir {
 		return
@@ -107,11 +116,12 @@ func (ix *Index) SetWorkingDir(dir string) {
 	ix.dir = dir
 	ix.dirSnap.Store(dir)
 	ix.root = filepath.Join(dir, ".gogen", "index")
+	ix.cached = nil
 	ix.approx = nil
+	ix.approxGen = ""
 	ix.setProgress(Progress{Phase: PhaseIdle})
-	if st, ok := loadStored(ix.root); ok {
-		ix.setProgress(Progress{Phase: PhaseIdle, FilesTotal: st.Meta.Files, ChunksTotal: st.Meta.Chunks, Indexed: true})
-		ix.prepareApprox(st)
+	if meta, ok := loadMeta(ix.root); ok {
+		ix.setProgress(Progress{Phase: PhaseIdle, FilesTotal: meta.Files, ChunksTotal: meta.Chunks, Indexed: true})
 	}
 	ix.restartWatchLocked()
 }
@@ -263,7 +273,7 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 	metaPath, _, _ := indexPaths(ix.root)
 	restoreReplaced(metaPath)
 	ix.setProgress(Progress{Phase: PhaseWalking, FilesTotal: prev.FilesTotal, ChunksTotal: prev.ChunksTotal})
-	files, err := walkFiles(ix.dir, "")
+	files, err := walkFiles(ix.dir)
 	if err != nil {
 		return ix.fail(prev, err)
 	}
@@ -271,7 +281,7 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 		ix.setProgress(prev)
 		return ix.loaded(false, err)
 	}
-	old, haveOld := loadStored(ix.root)
+	old, haveOld := ix.loadStoredLocked()
 	reuse := haveOld && !force && old.Meta.identity().Same(id)
 	var known map[chunkKey][]float32
 	if reuse {
@@ -281,11 +291,11 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 	var need []int
 	var texts []string
 	for _, f := range files {
-		parts := ChunkSource(f.Rel, f.Text, f.Hash, id.ChunkLines, id.ChunkOverlap)
+		parts := ChunkSource(f.Rel, f.Text, id.ChunkLines, id.ChunkOverlap)
 		for _, c := range parts {
 			row := pending{disk: diskChunk{Path: c.Path, Start: c.Start, End: c.End, Hash: c.Hash}}
 			if reuse {
-				if v, ok := known[chunkKey{c.Path, c.Hash, c.Start, c.End}]; ok {
+				if v, ok := known[chunkKey{Path: c.Path, Hash: c.Hash}]; ok {
 					row.vec = v
 				}
 			}
@@ -296,9 +306,16 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 			}
 		}
 	}
+	if len(rows) > maxChunks {
+		return ix.fail(prev, errors.New("code index is too large"))
+	}
 	if len(texts) == 0 && reuse && sameChunks(old, rows) {
+		// Nothing changed. The generation meta still names is the one the
+		// cache (or this load) just read, so there is nothing to publish and
+		// no need to re-read the generation to report its counts.
 		published = true
-		return ix.notePublished(prev)
+		ix.setProgress(Progress{Phase: PhaseIdle, FilesTotal: old.Meta.Files, ChunksTotal: old.Meta.Chunks, Indexed: true})
+		return old, true, nil
 	}
 	dim := 0
 	if reuse {
@@ -341,6 +358,9 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 			}
 			if len(vec) != dim || dim == 0 {
 				return ix.fail(prev, errors.New("embedding dimension changed"))
+			}
+			if dim > maxDimension || int64(len(rows))*int64(dim)*4 > maxVectorsFileBytes {
+				return ix.fail(prev, errors.New("code index is too large"))
 			}
 			rows[need[embeddedUpTo+i]].vec = vec
 			path := rows[need[embeddedUpTo+i]].disk.Path
@@ -437,7 +457,7 @@ func (ix *Index) fail(prev Progress, err error) (stored, bool, error) {
 // whose files are gone is an error. A failed refresh still returns the
 // previous index when one is there.
 func (ix *Index) loaded(published bool, err error) (stored, bool, error) {
-	st, ok := loadStored(ix.root)
+	st, ok := ix.loadStoredLocked()
 	if published && !ok {
 		if err == nil {
 			err = errors.New("code index disappeared after it was saved")
@@ -445,6 +465,35 @@ func (ix *Index) loaded(published bool, err error) (stored, bool, error) {
 		return stored{}, false, err
 	}
 	return st, ok, err
+}
+
+// loadStoredLocked returns the generation the stored meta names, reusing the
+// parsed copy when the generation names have not changed. The caller holds
+// mu (or is Open, before the index is shared). A legacy index, whose files
+// are not generation-named, is read every time.
+func (ix *Index) loadStoredLocked() (stored, bool) {
+	meta, ok := loadMeta(ix.root)
+	if !ok {
+		ix.cached = nil
+		return stored{}, false
+	}
+	gen := ""
+	if meta.ChunksFile != "" && meta.VectorsFile != "" {
+		gen = meta.ChunksFile + "\x00" + meta.VectorsFile
+	}
+	if gen != "" && ix.cached != nil && ix.cached.Gen == gen {
+		return *ix.cached, true
+	}
+	st, ok := loadStoredWithMeta(ix.root, meta)
+	if !ok {
+		ix.cached = nil
+		return stored{}, false
+	}
+	if st.Gen != "" {
+		cp := st
+		ix.cached = &cp
+	}
+	return st, true
 }
 
 type pending struct {
@@ -465,11 +514,12 @@ func sameChunks(old stored, rows []pending) bool {
 	return true
 }
 
+// chunkKey identifies chunk content in one file. Lines are not part of it:
+// the same text at a new line range keeps its vector, and the new range is
+// written with the published row.
 type chunkKey struct {
-	path  string
-	hash  string
-	start int
-	end   int
+	Path string
+	Hash string
 }
 
 func indexVectors(old stored) map[chunkKey][]float32 {
@@ -478,7 +528,7 @@ func indexVectors(old stored) map[chunkKey][]float32 {
 		if i >= len(old.Vectors) {
 			break
 		}
-		m[chunkKey{d.Path, d.Hash, d.Start, d.End}] = old.Vectors[i]
+		m[chunkKey{Path: d.Path, Hash: d.Hash}] = old.Vectors[i]
 	}
 	return m
 }
@@ -760,33 +810,41 @@ func removeEmptyIndex(root string) {
 	}
 }
 
-// readChunk reads a stored chunk. A path that leaves the working directory
-// is empty and is not opened.
+// maxSnippetBytes caps one readChunk result. A chunk is at most a few
+// hundred lines; this keeps a swapped-in huge file from being loaded.
+const maxSnippetBytes = 4 << 20
+
+// readChunk reads a stored chunk through a root, so a link that leaves the
+// working directory is rejected rather than followed. A path that is missing,
+// not a regular file, or outside the working directory is empty.
 func (ix *Index) readChunk(rel string, start, end, limit int) string {
 	if !safeChunkPath(rel) {
 		return ""
 	}
-	abs := filepath.Join(ix.dir, filepath.FromSlash(rel))
-	if !within(ix.dir, abs) || outsideLink(ix.dir, abs) {
-		return ""
-	}
-	return readSpan(abs, start, end, limit)
-}
-
-func readSpan(path string, start, end, limit int) string {
-	b, err := os.ReadFile(path)
+	root, err := os.OpenRoot(ix.dir)
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(string(b), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	defer root.Close()
+	name := filepath.FromSlash(rel)
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
 	}
+	f, err := root.Open(name)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	return readSpanFile(f, start, end, limit)
+}
+
+// readSpanFile returns lines start..end, capped at limit lines and
+// maxSnippetBytes. It reads only the requested lines, so a large file is not
+// loaded just to show a snippet.
+func readSpanFile(f *os.File, start, end, limit int) string {
 	if start < 1 {
 		start = 1
-	}
-	if end > len(lines) {
-		end = len(lines)
 	}
 	if end < start {
 		return ""
@@ -794,5 +852,26 @@ func readSpan(path string, start, end, limit int) string {
 	if limit > 0 && end-start+1 > limit {
 		end = start + limit - 1
 	}
-	return strings.Join(lines[start-1:end], "\n")
+	var b strings.Builder
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), maxSnippetBytes)
+	line := 0
+	for sc.Scan() {
+		line++
+		if line < start {
+			continue
+		}
+		if line > end {
+			break
+		}
+		text := sc.Text()
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		if b.Len()+len(text) > maxSnippetBytes {
+			break
+		}
+		b.WriteString(text)
+	}
+	return b.String()
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"gogen/internal/agent"
+	"gogen/internal/codeindex"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -205,6 +206,43 @@ func TestTUISpawnerBuildsChildrenThroughWorkspace(t *testing.T) {
 	}
 	if got := child.SubagentSpawner(); got != agent.SubagentSpawner(sp) {
 		t.Fatalf("child spawner = %T, want the host's single spawner", got)
+	}
+}
+
+func TestTUISpawnerFallbackChildSharesCodeIndex(t *testing.T) {
+	parentProv := llmtest.NewMockProvider()
+	parentProv.Model = "default-model"
+	dir := t.TempDir()
+	parent := agent.NewAgent(parentProv, agent.NewExecutor(dir), contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000}))
+	parent.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
+	ix := codeindex.Open(dir)
+	parent.SetCodeIndex(ix)
+	parent.SetCodeIndexEnabled(true)
+	parent.SetCodeIndexConfig(func() config.Config {
+		cfg := config.Defaults()
+		cfg.CodeIndexProvider = "embed"
+		cfg.CodeIndexModel = "m"
+		return cfg
+	})
+	cfg := &config.Config{OpenAIModel: "default-model", Subagent: "on", SubagentMaxDepth: 1}
+	sp := newTUISubagentSpawner(cfg, nil)
+	sp.providerFactory = func(*config.Config, *agent.Agent) llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.Model = "default-model"
+		return p
+	}
+	child := sp.newChildAgent(parent)
+	if child == nil {
+		t.Fatal("no child agent")
+	}
+	if child.CodeIndex() != ix {
+		t.Fatal("child did not share the parent's index")
+	}
+	if !child.CodeIndexEnabled() {
+		t.Fatal("child code index flag is off")
+	}
+	if _, ok := child.AllowedToolNames()["search_meaning"]; !ok {
+		t.Fatal("child does not expose search_meaning")
 	}
 }
 

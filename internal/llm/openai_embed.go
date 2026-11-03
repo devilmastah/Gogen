@@ -26,31 +26,6 @@ type embeddingResponse struct {
 	} `json:"error"`
 }
 
-// EmbeddingEndpoint returns the base URL, key, and the provider's own model
-// for name. An empty name is the chat provider (the current profile). ok is
-// false when that name is not configured. The key may be empty for a local
-// server.
-func (p *OpenAIProvider) EmbeddingEndpoint(name string) (baseURL, apiKey, model string, ok bool) {
-	if p == nil {
-		return "", "", "", false
-	}
-	p.modelsMu.RLock()
-	defer p.modelsMu.RUnlock()
-	want := strings.TrimSpace(name)
-	if want == "" {
-		want = p.currentModelProfile
-		if want == "" {
-			want = DefaultProfileName
-		}
-	}
-	for _, pr := range p.profiles {
-		if pr != nil && pr.name == want {
-			return pr.baseURL, pr.apiKey, pr.model, true
-		}
-	}
-	return "", "", "", false
-}
-
 // PostEmbeddings calls POST {baseURL}/embeddings. An empty key sends no
 // Authorization header. The returned vectors follow the input order.
 func PostEmbeddings(ctx context.Context, baseURL, apiKey, model string, texts []string) ([][]float32, error) {

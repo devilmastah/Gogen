@@ -128,6 +128,7 @@
         import {
             applyCodeIndexFrame,
             applyFeatureSettings,
+            resetCodeIndexSeq,
             applyMCPSettings,
             applyProviderSettings,
             applyRuntimeSettings,
@@ -4475,6 +4476,8 @@
                 reconnectTimer = null;
                 reconnectDelay = RECONNECT_BASE_MS;
                 setConnState('connected');
+                // A restarted server starts the progress sequence over.
+                resetCodeIndexSeq();
                 // Replace (don't append) on every connect: the server may omit
                 // history when the session is empty, and reconnect must not
                 // keep a stale transcript. Connection status lives in the

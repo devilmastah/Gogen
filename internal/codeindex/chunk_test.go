@@ -16,8 +16,8 @@ func TestChunkLinesWhenTreeSitterOff(t *testing.T) {
 		b.WriteString("line\n")
 	}
 	text := b.String()
-	got := ChunkSource("a.go", text, "h", 40, 5)
-	want := ChunkText("a.go", text, "h", 40, 5)
+	got := ChunkSource("a.go", text, 40, 5)
+	want := ChunkText("a.go", text, 40, 5)
 	if len(got) != len(want) {
 		t.Fatalf("chunks = %d, want %d", len(got), len(want))
 	}

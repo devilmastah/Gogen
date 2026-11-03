@@ -203,6 +203,8 @@ class GogenHost {
     this.emit({ type: "status", state: "starting", text: "Starting gogen in " + path.basename(folder) + "…" });
     try {
       await sidecar.start();
+      // A restarted sidecar starts the progress sequence over.
+      this.resetCodeIndex();
       this.emit({ type: "status", state: "ready", text: "connected · " + path.basename(folder) });
       this.emit({ type: "workspace", label: path.basename(folder), folder });
       this.rememberFolder(folder);
@@ -469,6 +471,13 @@ class GogenHost {
       totalCachedTokens: msg.totalCachedTokens || 0,
       totalTurns: msg.totalTurns || 0,
     };
+  }
+
+  // resetCodeIndex forgets the last sequence. A restarted sidecar starts the
+  // progress sequence over, so without the reset every new frame would look
+  // older than the one already shown.
+  resetCodeIndex() {
+    this.lastCodeIndex = null;
   }
 
   // noteCodeIndex remembers the latest index snapshot and tells the chat.

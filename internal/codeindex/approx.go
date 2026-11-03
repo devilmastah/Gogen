@@ -50,23 +50,36 @@ type nn struct {
 }
 
 // prepareApprox builds the lookup from st when the chunk count is at the
-// cutoff. The same vector sequence keeps the lookup already on ix. A
-// different sequence replaces it. Open calls this before the index is
-// shared. Search and SetWorkingDir call it while holding mu.
+// cutoff. A cached generation keeps the lookup already on ix; a new
+// generation replaces it. Search calls this while holding mu.
 //
 // A changed file is re-embedded by the same refresh a search and the watch
-// use. That refresh publishes vectors.bin, the next load reads it, and this
-// rebuilds the graph from those vectors. The old vector is not searched.
+// use. That refresh publishes a new generation, the next load reads it, and
+// this rebuilds the graph from those vectors. The old vector is not searched.
 func (ix *Index) prepareApprox(st stored) {
 	if len(st.Chunks) < approxMinChunks || len(st.Vectors) != len(st.Chunks) {
 		ix.approx = nil
+		ix.approxGen = ""
+		return
+	}
+	if st.Gen != "" {
+		if ix.approx != nil && ix.approxGen == st.Gen {
+			return
+		}
+		// The generation name already changed; the vector hash would only
+		// repeat that fact. Skip hashing the whole index before the rebuild.
+		ix.approx = buildHNSW(st.Vectors, approxGen{chunks: len(st.Chunks), dim: st.Meta.Dimension})
+		ix.approxGen = st.Gen
 		return
 	}
 	gen := vectorGen(st)
+	// A legacy index has no generation name, so its vector sequence is the
+	// only identity available.
 	if ix.approx != nil && ix.approx.gen == gen {
 		return
 	}
 	ix.approx = buildHNSW(st.Vectors, gen)
+	ix.approxGen = ""
 }
 
 func vectorGen(st stored) approxGen {

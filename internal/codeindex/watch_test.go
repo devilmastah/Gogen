@@ -213,6 +213,33 @@ func eventInside(root, name string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+func TestAddCreatedDirAddsNestedTree(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "new")
+	if err := os.MkdirAll(filepath.Join(root, "nested", "deeper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	addCreatedDir(w, dir, root)
+	watched := make(map[string]bool)
+	for _, path := range w.WatchList() {
+		watched[filepath.Clean(path)] = true
+	}
+	for _, want := range []string{
+		filepath.Join(root),
+		filepath.Join(root, "nested"),
+		filepath.Join(root, "nested", "deeper"),
+	} {
+		if !watched[want] {
+			t.Fatalf("%s is not watched; list=%v", want, watched)
+		}
+	}
+}
+
 func TestWatchNoIndexYet(t *testing.T) {
 	dir := t.TempDir()
 	ix := Open(dir)

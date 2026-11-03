@@ -20,7 +20,7 @@ func TestChunkMethodIsNotTheWholeClass(t *testing.T) {
 	t.Cleanup(func() { treesitter.Configure(true, "") })
 
 	src := "class Greeter {\n  greet(name) {\n    return 1;\n  }\n  part() {\n    return 2;\n  }\n}\n"
-	got := ChunkSource("greeter.js", src, "h", 40, 5)
+	got := ChunkSource("greeter.js", src, 40, 5)
 	for _, c := range got {
 		if strings.Contains(c.Text, "greet") && !strings.Contains(c.Text, "part") {
 			return
@@ -37,7 +37,7 @@ func TestChunkFunctions(t *testing.T) {
 	t.Cleanup(func() { treesitter.Configure(true, "") })
 
 	src := "package p\n\nfunc One() int {\n\treturn 1\n}\n\nfunc Two() int {\n\treturn 2\n}\n"
-	got := ChunkSource("a.go", src, "h", 40, 5)
+	got := ChunkSource("a.go", src, 40, 5)
 	if len(got) != 2 {
 		t.Fatalf("chunks = %d, want 2\n%#v", len(got), got)
 	}
@@ -57,7 +57,7 @@ func TestChunkFunctions(t *testing.T) {
 		fmt.Fprintf(&b, "\tprintln(%d)\n", i)
 	}
 	b.WriteString("}\n\nfunc Short() {\n\treturn\n}\n")
-	got = ChunkSource("long.go", b.String(), "h", 10, 2)
+	got = ChunkSource("long.go", b.String(), 10, 2)
 	longChunks := 0
 	shortChunks := 0
 	var prevStart, prevEnd int

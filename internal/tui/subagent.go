@@ -138,7 +138,12 @@ func (sp *tuiSubagentSpawner) newChildAgent(parent *agent.Agent) *agent.Agent {
 		SkillsEnabled:         parent.SkillsEnabled(),
 		TerminalEnabled:       parent.TerminalEnabled(),
 		InstructionsEnabled:   parent.InstructionsEnabled(),
-		SubagentSpawner:       sp, // nesting allowed up to the configured depth
+		// The child shares the parent's index and live config, so
+		// search_meaning is available inside a TUI subagent too.
+		CodeIndex:        parent.CodeIndex(),
+		CodeIndexEnabled: parent.CodeIndexEnabled(),
+		CodeIndexConfig:  parent.CodeIndexConfig(),
+		SubagentSpawner:  sp, // nesting allowed up to the configured depth
 	}, nil, session.NewID())
 }
 

@@ -383,8 +383,10 @@ type Config struct {
 	// name, or "default" for the legacy endpoint.
 	CodeIndexProvider string
 	// CodeIndexModel is the embedding model. When it is empty and the named
-	// provider has its own model, that model is used. An empty model with no
-	// provider model is an error. The chat model is not sent on its own.
+	// provider has its own model, that model is used. The default profile is
+	// the chat profile and has no separate model, so it requires this field.
+	// An empty model with no provider model is an error. The chat model is
+	// not sent on its own.
 	CodeIndexModel string
 	// CodeIndexChunkLines and CodeIndexChunkOverlap are the line window.
 	// Defaults are 40 and 5. NormalizeCodeIndexChunk is the one bounds check.

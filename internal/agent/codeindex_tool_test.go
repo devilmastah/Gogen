@@ -149,6 +149,60 @@ func TestSearchMeaningUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestSearchMeaningDefaultProviderNeedsModel(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.go"), []byte("alpha\n"), 0o644)
+	a := NewAgent(nil, NewExecutor(dir), nil)
+	a.SetCodeIndexEnabled(true)
+	emb := &recEmb{}
+	a.SetCodeIndexEmbedder(emb)
+	cfg := config.Defaults()
+	cfg.CodeIndexProvider = "default"
+	cfg.CodeIndexModel = ""
+	cfg.OpenAIModel = "chat-model"
+	a.SetCodeIndexConfig(func() config.Config { return cfg })
+	// A provider name is set, so the tool is registered; the call must
+	// refuse to use the default profile's chat model as an embedding model.
+	if _, ok := a.AllowedToolNames()["search_meaning"]; !ok {
+		t.Fatal("search_meaning is not registered")
+	}
+	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "search_meaning", Args: map[string]any{"query": "q"}})
+	if err == nil || !strings.Contains(err.Error(), "model is not set") {
+		t.Fatalf("err = %v", err)
+	}
+	if err := a.ReindexCode(context.Background()); err == nil || !strings.Contains(err.Error(), "model is not set") {
+		t.Fatalf("reindex err = %v", err)
+	}
+	if len(emb.texts) != 0 {
+		t.Fatalf("embedder was called: %v", emb.texts)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".gogen", "index")); !os.IsNotExist(statErr) {
+		t.Fatal("a missing model wrote .gogen/index")
+	}
+}
+
+func TestSearchMeaningRerankDefaultNeedsModel(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.go"), []byte("alpha\n"), 0o644)
+	a := NewAgent(nil, NewExecutor(dir), nil)
+	a.SetCodeIndexEnabled(true)
+	a.SetCodeIndexEmbedder(&recEmb{vec: func(string) []float32 { return []float32{1, 0} }})
+	cfg := config.Defaults()
+	cfg.CodeIndexProvider = "default"
+	cfg.CodeIndexModel = "embed-model"
+	cfg.CodeIndexRerank = "on"
+	cfg.CodeIndexRerankProvider = "default"
+	cfg.CodeIndexRerankModel = ""
+	a.SetCodeIndexConfig(func() config.Config { return cfg })
+	out, err := a.executeTool(context.Background(), llm.ToolCall{Name: "search_meaning", Args: map[string]any{"query": "q"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Rerank failed:") || !strings.Contains(out, "code index rerank model is not set") || !strings.Contains(out, "a.go") {
+		t.Fatalf("result = %q", out)
+	}
+}
+
 func TestSearchMeaningChatModelDoesNotRebuild(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "a.go"), []byte("alpha\n"), 0o644)

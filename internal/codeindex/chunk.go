@@ -1,6 +1,10 @@
 package codeindex
 
-import "strings"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
 
 // lineSpan is a 1-based inclusive range in a file.
 type lineSpan struct {
@@ -8,7 +12,9 @@ type lineSpan struct {
 	End   int
 }
 
-// Chunk is one span of a file. Lines are 1-based and inclusive.
+// Chunk is one span of a file. Lines are 1-based and inclusive. Hash is the
+// SHA-256 of Text, so an unchanged chunk can be reused when the rest of the
+// file changes.
 type Chunk struct {
 	Path  string
 	Start int
@@ -23,19 +29,19 @@ type Chunk struct {
 // overlap. With tree-sitter off, or a binary built without it, the whole
 // file uses that line window. Lines outside a symbol are not their own chunks.
 // A file with no symbols uses the line window.
-func ChunkSource(path, text, hash string, lines, overlap int) []Chunk {
+func ChunkSource(path, text string, lines, overlap int) []Chunk {
 	if spans := symbolSpans(path, text); len(spans) > 0 {
-		if chunks := chunkSpans(path, text, hash, lines, overlap, spans); len(chunks) > 0 {
+		if chunks := chunkSpans(path, text, lines, overlap, spans); len(chunks) > 0 {
 			return chunks
 		}
 	}
-	return ChunkText(path, text, hash, lines, overlap)
+	return ChunkText(path, text, lines, overlap)
 }
 
 // ChunkText splits text into line windows. A file of at most lines is one
 // chunk. An empty text is skipped. lines and overlap are used as given; the
 // caller normalizes them.
-func ChunkText(path, text, hash string, lines, overlap int) []Chunk {
+func ChunkText(path, text string, lines, overlap int) []Chunk {
 	all := sourceLines(text)
 	if all == nil {
 		return nil
@@ -47,9 +53,10 @@ func ChunkText(path, text, hash string, lines, overlap int) []Chunk {
 		overlap = 0
 	}
 	if len(all) <= lines {
+		body := strings.Join(all, "\n")
 		return []Chunk{{
-			Path: path, Start: 1, End: len(all), Hash: hash,
-			Text: strings.Join(all, "\n"),
+			Path: path, Start: 1, End: len(all), Hash: chunkHash(body),
+			Text: body,
 		}}
 	}
 	step := lines - overlap
@@ -59,15 +66,22 @@ func ChunkText(path, text, hash string, lines, overlap int) []Chunk {
 		if end > len(all) {
 			end = len(all)
 		}
+		body := strings.Join(all[start:end], "\n")
 		out = append(out, Chunk{
-			Path: path, Start: start + 1, End: end, Hash: hash,
-			Text: strings.Join(all[start:end], "\n"),
+			Path: path, Start: start + 1, End: end, Hash: chunkHash(body),
+			Text: body,
 		})
 		if end == len(all) {
 			break
 		}
 	}
 	return out
+}
+
+// chunkHash is the content identity of one chunk.
+func chunkHash(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
 }
 
 // sourceLines splits text into lines. A trailing newline is not an extra
@@ -88,7 +102,7 @@ func sourceLines(text string) []string {
 
 // chunkSpans cuts one line window per symbol, splitting a long symbol with
 // the same overlap as the file window. Line numbers stay file-absolute.
-func chunkSpans(path, text, hash string, lines, overlap int, spans []lineSpan) []Chunk {
+func chunkSpans(path, text string, lines, overlap int, spans []lineSpan) []Chunk {
 	all := sourceLines(text)
 	if all == nil {
 		return nil
@@ -107,7 +121,7 @@ func chunkSpans(path, text, hash string, lines, overlap int, spans []lineSpan) [
 		}
 		piece := strings.Join(all[start-1:end], "\n")
 		shift := start - 1
-		for _, part := range ChunkText(path, piece, hash, lines, overlap) {
+		for _, part := range ChunkText(path, piece, lines, overlap) {
 			part.Start += shift
 			part.End += shift
 			out = append(out, part)

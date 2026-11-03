@@ -207,6 +207,13 @@ for (const f of FEATURE_NUMBERS) {
 // sidebar host.
 let codeIndexSeen = 0;
 
+// resetCodeIndexSeq forgets the last sequence. A reconnect starts a fresh
+// server process (or a new index), whose sequence restarts at 1; without the
+// reset every new frame would look older than the one already shown.
+export function resetCodeIndexSeq() {
+    codeIndexSeen = 0;
+}
+
 // applyCodeIndexFrame paints the settings line and the toolbar spinner
 // when seq is newer than the line already shown. It returns false when
 // the frame is older.
@@ -395,10 +402,9 @@ for (const b of PROMPT_RESET_BUTTONS) {
     el.addEventListener('click', () => sendRuntimeConfig({ [b.field]: { prop: b.field, value: '' } }));
 }
 
-// The last provider list and the session's chat provider, so a models
-// reply can refill the embedding model dropdown without a config push.
+// The last provider list, so a models reply can refill the embedding model
+// dropdown without a config push.
 let embeddingProviders = [];
-let embeddingChatProvider = 'default';
 
 function fillSelect(select, options, current) {
     select.replaceChildren();
@@ -431,7 +437,7 @@ function fillCodeIndexProviders(select, providers, current, blankLabel) {
 // fillCodeIndexModels lists the models that belong to the chosen provider.
 // A named provider's blank choice means that provider's own model. An empty
 // provider lists no models, because the code index is off.
-function fillCodeIndexModels(select, providers, models, providerName, chatProvider, current, blankOverride) {
+function fillCodeIndexModels(select, providers, models, providerName, current, blankOverride) {
     if (!providerName) {
         const blank = blankOverride || 'Choose a model';
         const options = [['', blank]];
@@ -441,7 +447,9 @@ function fillCodeIndexModels(select, providers, models, providerName, chatProvid
     }
     const owner = providerName;
     const provider = (providers || []).find((p) => p && p.name === providerName);
-    const saved = provider && provider.model ? provider.model : '';
+    // The default profile's model is the chat model, which is not an
+    // embedding model. Leave it blank so the user must choose one.
+    const saved = provider && provider.name !== 'default' && provider.model ? provider.model : '';
     let blank = saved ? "Provider's model (" + saved + ')' : 'Choose a model';
     if (blankOverride) blank = blankOverride;
     const ids = [];
@@ -461,12 +469,12 @@ function fillCodeIndexModels(select, providers, models, providerName, chatProvid
 // fillRerankModels lists models for the rerank dropdown. A named rerank
 // provider can leave the model blank and use its own. Embedding provider
 // has no such default: the embedding model is not a rerank model.
-function fillRerankModels(select, providers, models, rerankProvider, embedProvider, chatProvider, current) {
+function fillRerankModels(select, providers, models, rerankProvider, embedProvider, current) {
     if (rerankProvider) {
-        fillCodeIndexModels(select, providers, models, rerankProvider, chatProvider, current);
+        fillCodeIndexModels(select, providers, models, rerankProvider, current);
         return;
     }
-    fillCodeIndexModels(select, providers, models, embedProvider || '', chatProvider, current, 'Choose a model');
+    fillCodeIndexModels(select, providers, models, embedProvider || '', current, 'Choose a model');
 }
 
 function refreshRerankModels() {
@@ -476,7 +484,7 @@ function refreshRerankModels() {
     if (!select || select.tagName !== 'SELECT') return;
     const current = select.value || '';
     if (holdsDraft(select, current)) return;
-    fillRerankModels(select, embeddingProviders, deps.getModels(), rerankProvider ? rerankProvider.value : '', embedProvider ? embedProvider.value : '', embeddingChatProvider, current);
+    fillRerankModels(select, embeddingProviders, deps.getModels(), rerankProvider ? rerankProvider.value : '', embedProvider ? embedProvider.value : '', current);
 }
 
 // refreshEmbeddingModels refills the model dropdown after the catalog
@@ -487,7 +495,7 @@ export function refreshEmbeddingModels() {
     if (select && select.tagName === 'SELECT') {
         const current = select.value || '';
         if (!holdsDraft(select, current)) {
-            fillCodeIndexModels(select, embeddingProviders, deps.getModels(), provider ? provider.value : '', embeddingChatProvider, current);
+            fillCodeIndexModels(select, embeddingProviders, deps.getModels(), provider ? provider.value : '', current);
         }
     }
     refreshRerankModels();
@@ -506,7 +514,7 @@ export function applyRuntimeSettings(data) {
         if (ctrl.field === 'codeIndexProvider' && el.tagName === 'SELECT') {
             const current = typeof v === 'string' ? v : '';
             if (Array.isArray(data.providers)) embeddingProviders = data.providers;
-            if (typeof data.modelProvider === 'string' && data.modelProvider) embeddingChatProvider = data.modelProvider;
+
             if (holdsDraft(el, current)) continue;
             fillCodeIndexProviders(el, embeddingProviders, current);
             continue;
@@ -516,7 +524,7 @@ export function applyRuntimeSettings(data) {
             if (holdsDraft(el, current)) continue;
             const providerEl = document.getElementById('code-index-provider-input');
             const providerName = providerEl ? providerEl.value : (typeof data.codeIndexProvider === 'string' ? data.codeIndexProvider : '');
-            fillCodeIndexModels(el, embeddingProviders, deps.getModels(), providerName, embeddingChatProvider, current);
+            fillCodeIndexModels(el, embeddingProviders, deps.getModels(), providerName, current);
             continue;
         }
         if (ctrl.field === 'codeIndexRerankProvider' && el.tagName === 'SELECT') {
@@ -532,7 +540,7 @@ export function applyRuntimeSettings(data) {
             const embedEl = document.getElementById('code-index-provider-input');
             const rerankName = rerankEl ? rerankEl.value : (typeof data.codeIndexRerankProvider === 'string' ? data.codeIndexRerankProvider : '');
             const embedName = embedEl ? embedEl.value : (typeof data.codeIndexProvider === 'string' ? data.codeIndexProvider : '');
-            fillRerankModels(el, embeddingProviders, deps.getModels(), rerankName, embedName, embeddingChatProvider, current);
+            fillRerankModels(el, embeddingProviders, deps.getModels(), rerankName, embedName, current);
             continue;
         }
         if (v === undefined) continue;

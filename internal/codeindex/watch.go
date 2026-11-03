@@ -154,7 +154,7 @@ func (ix *Index) refreshFromWatch(ctx context.Context, source WatchSource) error
 	ix.mu.Lock()
 	root := ix.root
 	ix.mu.Unlock()
-	if _, ok := loadStored(root); !ok {
+	if _, ok := loadMeta(root); !ok {
 		return nil
 	}
 	emb, id, err := source()
@@ -165,7 +165,7 @@ func (ix *Index) refreshFromWatch(ctx context.Context, source WatchSource) error
 		return ErrBusy
 	}
 	defer ix.mu.Unlock()
-	if _, ok := loadStored(ix.root); !ok {
+	if _, ok := loadMeta(ix.root); !ok {
 		return nil
 	}
 	_, _, err = ix.refresh(ctx, emb, id, false)
@@ -224,11 +224,12 @@ func skipWatchEvent(root, path string) bool {
 	return false
 }
 
-// addCreatedDir watches a directory created after the watch started. A
-// directory the walk skips is not added, so a new node_modules tree does
-// not consume a watch for every nested folder. A link whose target leaves
-// the working directory is not added. Lstat is used so the check does not
-// follow that link.
+// addCreatedDir watches a directory created after the watch started. The
+// whole created subtree is added, so a tree copied into the working
+// directory in one burst is watched too. A directory the walk skips is not
+// added, so a new node_modules tree does not consume a watch for every
+// nested folder. A link whose target leaves the working directory is not
+// added. Lstat is used so the check does not follow that link.
 func addCreatedDir(w *fsnotify.Watcher, root, path string) {
 	if outsideLink(root, path) {
 		return
@@ -237,5 +238,5 @@ func addCreatedDir(w *fsnotify.Watcher, root, path string) {
 	if err != nil || !info.IsDir() || skipDir(filepath.Base(path)) {
 		return
 	}
-	_ = w.Add(path)
+	_ = addWatchTree(w, path)
 }

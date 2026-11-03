@@ -69,7 +69,7 @@ func TestChunkSplit(t *testing.T) {
 		}
 		b.WriteString("line")
 	}
-	got := ChunkText("a.go", b.String(), "h", DefaultChunkLines, DefaultChunkOverlap)
+	got := ChunkText("a.go", b.String(), DefaultChunkLines, DefaultChunkOverlap)
 	if len(got) != 2 {
 		t.Fatalf("chunks = %d, want 2", len(got))
 	}
@@ -93,7 +93,7 @@ func TestChunkCustom(t *testing.T) {
 		}
 		b.WriteString("line")
 	}
-	got := ChunkText("a.go", b.String(), "h", 20, 3)
+	got := ChunkText("a.go", b.String(), 20, 3)
 	if len(got) < 2 {
 		t.Fatalf("chunks = %d, want at least 2", len(got))
 	}
@@ -107,7 +107,7 @@ func TestChunkCustom(t *testing.T) {
 
 func TestChunkOverlapZero(t *testing.T) {
 	text := strings.Repeat("x\n", 20)
-	got := ChunkText("a.go", text, "h", 10, 0)
+	got := ChunkText("a.go", text, 10, 0)
 	if len(got) != 2 || got[1].Start != 11 {
 		t.Fatalf("ranges = %+v, want two touching chunks", got)
 	}
@@ -222,9 +222,14 @@ func TestSkipSecretsAndJunk(t *testing.T) {
 	writeTree(t, filepath.Join(dir, "main.go"), "package main\n")
 	writeTree(t, filepath.Join(dir, ".env"), "SECRETENV=1\n")
 	writeTree(t, filepath.Join(dir, ".env.local"), "SECRETLOCAL=1\n")
+	writeTree(t, filepath.Join(dir, ".git-credentials"), "SECRETGITCRED\n")
+	writeTree(t, filepath.Join(dir, ".npmrc"), "SECRETNPM\n")
 	writeTree(t, filepath.Join(dir, "gogen.conf"), "secret conf\n")
 	writeTree(t, filepath.Join(dir, "key.pem"), "SECRETPEM\n")
 	writeTree(t, filepath.Join(dir, "id_rsa"), "SECRETRSA\n")
+	writeTree(t, filepath.Join(dir, "id_ed25519"), "SECRETED\n")
+	writeTree(t, filepath.Join(dir, "server.p12"), "SECRETP12\n")
+	writeTree(t, filepath.Join(dir, "terraform.tfstate"), "SECRETSTATE\n")
 	writeTree(t, filepath.Join(dir, ".git", "config"), "SECRETGIT\n")
 	writeTree(t, filepath.Join(dir, "node_modules", "pkg", "a.js"), "SECRETNODE\n")
 	writeTree(t, filepath.Join(dir, "vendor", "lib.go"), "SECRETVENDOR\n")
@@ -247,7 +252,7 @@ func TestSkipSecretsAndJunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(emb.texts(), "\n")
-	for _, secret := range []string{"SECRETENV", "SECRETLOCAL", "secret conf", "SECRETPEM", "SECRETRSA", "SECRETGIT", "SECRETNODE", "SECRETVENDOR", "SECRETDOT", "ok\x00no"} {
+	for _, secret := range []string{"SECRETENV", "SECRETLOCAL", "SECRETGITCRED", "SECRETNPM", "secret conf", "SECRETPEM", "SECRETRSA", "SECRETED", "SECRETP12", "SECRETSTATE", "SECRETGIT", "SECRETNODE", "SECRETVENDOR", "SECRETDOT", "ok\x00no"} {
 		if strings.Contains(joined, secret) {
 			t.Fatalf("embedded skipped content %q", secret)
 		}
@@ -303,6 +308,56 @@ func TestUnchangedEditDelete(t *testing.T) {
 	}
 	if strings.Contains(out, "a.go") {
 		t.Fatalf("deleted file still returned: %s", out)
+	}
+}
+
+func TestWalkFilesThroughSymlinkedWorkingDir(t *testing.T) {
+	real := t.TempDir()
+	writeTree(t, filepath.Join(real, "a.go"), "alpha\n")
+	link := filepath.Join(t.TempDir(), "project")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	files, err := walkFiles(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Rel != "a.go" || !strings.Contains(files[0].Text, "alpha") {
+		t.Fatalf("files = %+v", files)
+	}
+}
+
+func TestChunkHashReusesUnchangedChunks(t *testing.T) {
+	dir := t.TempDir()
+	var b strings.Builder
+	for i := 1; i <= 120; i++ {
+		fmt.Fprintf(&b, "line-%03d\n", i)
+	}
+	path := filepath.Join(dir, "big.go")
+	writeTree(t, path, b.String())
+	emb := &fakeEmb{vec: unitVec}
+	ix := Open(dir)
+	id := Identity{Model: "m", ChunkLines: 40, ChunkOverlap: 0}
+	if _, err := ix.Search(context.Background(), emb, id, "q", ""); err != nil {
+		t.Fatal(err)
+	}
+	if emb.countContaining("line-001") != 1 || emb.countContaining("line-120") != 1 {
+		t.Fatal("first search did not embed the three chunks")
+	}
+	lines := strings.Split(b.String(), "\n")
+	lines[59] = "changed"
+	writeTree(t, path, strings.Join(lines, "\n"))
+	if _, err := ix.Search(context.Background(), emb, id, "q", ""); err != nil {
+		t.Fatal(err)
+	}
+	if emb.countContaining("line-001") != 1 {
+		t.Fatal("an unchanged first chunk was re-embedded")
+	}
+	if emb.countContaining("line-120") != 1 {
+		t.Fatal("an unchanged last chunk was re-embedded")
+	}
+	if emb.countContaining("changed") != 1 {
+		t.Fatal("the changed chunk was not embedded")
 	}
 }
 
@@ -531,6 +586,138 @@ func TestReadChunkSkipsOutsideLink(t *testing.T) {
 	ix := Open(dir)
 	if got := ix.readChunk("a.go", 1, 5, 20); strings.Contains(got, "TOPSECRET") {
 		t.Fatalf("snippet = %q", got)
+	}
+}
+
+func TestReadChunkRejectsLinkChain(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOPSECRET\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "hop2"), filepath.Join(dir, "hop1")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dir, "hop2")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if !outsideLink(dir, filepath.Join(dir, "hop1")) {
+		t.Fatal("a link chain to an outside file was not detected")
+	}
+	ix := Open(dir)
+	if got := ix.readChunk("hop1", 1, 1, 0); got != "" {
+		t.Fatalf("snippet = %q", got)
+	}
+}
+
+func TestLoadRejectsOverflowingDimension(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".gogen", "index")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A value that made the old int multiplication wrap to the empty
+	// vectors file's length, then panicked in make([]float32, width).
+	meta := fmt.Sprintf(`{"model":"m","dimension":%d,"chunks":1,"files":1}`, int64(1)<<61)
+	writeTree(t, filepath.Join(root, "meta.json"), meta)
+	writeTree(t, filepath.Join(root, "chunks.json"), `[{"path":"a","start":1,"end":1,"hash":"h"}]`)
+	writeTree(t, filepath.Join(root, "vectors.bin"), "")
+	if _, ok := loadMeta(root); ok {
+		t.Fatal("an absurd dimension was accepted")
+	}
+	if _, ok := loadStored(root); ok {
+		t.Fatal("an overflowing index loaded")
+	}
+	if ix := Open(dir); ix.Snapshot().Indexed {
+		t.Fatal("Open showed an overflowing index")
+	}
+}
+
+func TestLoadRejectsSymlinkedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, filepath.Join(dir, "a.go"), "alpha\n")
+	ix := Open(dir)
+	if _, err := ix.Search(context.Background(), &fakeEmb{vec: unitVec}, Identity{Model: "m", ChunkLines: 40, ChunkOverlap: 5}, "q", ""); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, ".gogen", "index")
+	st, ok := loadStored(root)
+	if !ok || st.Meta.VectorsFile == "" {
+		t.Fatal("published index has no generation")
+	}
+	outside := filepath.Join(t.TempDir(), "vectors.bin")
+	if err := os.WriteFile(outside, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vec := filepath.Join(root, st.Meta.VectorsFile)
+	if err := os.Remove(vec); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, vec); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if _, ok := loadStored(root); ok {
+		t.Fatal("a symlinked generation file was followed")
+	}
+}
+
+func TestOpenDoesNotReadVectors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no /dev/zero")
+	}
+	dir := t.TempDir()
+	writeTree(t, filepath.Join(dir, "a.go"), "alpha\n")
+	ix := Open(dir)
+	if _, err := ix.Search(context.Background(), &fakeEmb{vec: unitVec}, Identity{Model: "m", ChunkLines: 40, ChunkOverlap: 5}, "q", ""); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, ".gogen", "index")
+	st, ok := loadStored(root)
+	if !ok || st.Meta.VectorsFile == "" {
+		t.Fatal("published index has no generation")
+	}
+	vec := filepath.Join(root, st.Meta.VectorsFile)
+	if err := os.Remove(vec); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/zero", vec); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	done := make(chan *Index, 1)
+	go func() { done <- Open(dir) }()
+	select {
+	case opened := <-done:
+		if !opened.Snapshot().Indexed {
+			t.Fatal("Open lost the stored counts")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Open read the vector generation")
+	}
+}
+
+func TestPublishReplacesMetaTmpSymlink(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".gogen", "index")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "keep.txt")
+	if err := os.WriteFile(outside, []byte("KEEP"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "meta.json.tmp")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := publish(root, metaFile{Model: "m"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(outside)
+	if err != nil || string(body) != "KEEP" {
+		t.Fatalf("meta.json.tmp was written through: %q err=%v", body, err)
+	}
+	if _, ok := loadStored(root); !ok {
+		t.Fatal("published index did not load")
 	}
 }
 
