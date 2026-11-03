@@ -48,17 +48,11 @@ func skipFile(name string) bool {
 	return false
 }
 
-// fileRec is one file the walk decided to index. Chunk hashes are computed
-// per chunk, so the walk does not hash the file itself.
-type fileRec struct {
-	Rel  string
-	Text string
-}
-
-// walkFiles lists the indexable files under root. A path outside root is not
-// followed. Symlinks are skipped. sub, when set, limits the walk to that
-// relative directory.
-func walkFiles(root string) ([]fileRec, error) {
+// walkFiles lists the relative paths the walk would index, and returns the
+// resolved working root. It reads no file contents, so refresh can stream one
+// file at a time instead of holding the whole tree in memory. A path outside
+// root is not followed; symlinks are skipped.
+func walkFiles(root string) (string, []string, error) {
 	root = filepath.Clean(root)
 	if root == "" {
 		root = "."
@@ -68,16 +62,8 @@ func walkFiles(root string) ([]fileRec, error) {
 	if resolved, err := filepath.EvalSymlinks(root); err == nil {
 		root = resolved
 	}
-	// WalkDir does not follow symlinks, and the entry check below skips a
-	// symlinked file or directory, so a walked path is below a real
-	// directory. The Root makes the read itself safe against a swap.
-	r, err := os.OpenRoot(root)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	var out []fileRec
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	var out []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -105,41 +91,45 @@ func walkFiles(root string) ([]fileRec, error) {
 		if !safeChunkPath(rel) {
 			return nil
 		}
-		rec, ok := readIndexable(r, rel)
-		if ok {
-			out = append(out, rec)
+		info, err := d.Info()
+		if err != nil || info.Size() > MaxFileBytes {
+			return nil
 		}
+		out = append(out, rel)
 		return nil
 	})
-	return out, err
+	return root, out, err
 }
 
-func readIndexable(r *os.Root, rel string) (fileRec, bool) {
+// readIndexable reads one file through a Root. A missing, non-regular, or
+// oversized file, or one with a NUL in its probe, is skipped. The text is
+// released as soon as the caller finishes chunking the file.
+func readIndexable(r *os.Root, rel string) (string, bool) {
 	name := filepath.FromSlash(rel)
 	info, err := r.Lstat(name)
 	if err != nil || !info.Mode().IsRegular() || info.Size() > MaxFileBytes {
-		return fileRec{}, false
+		return "", false
 	}
 	f, err := r.Open(name)
 	if err != nil {
-		return fileRec{}, false
+		return "", false
 	}
 	defer f.Close()
 	probe := make([]byte, ProbeBytes)
 	n, err := io.ReadFull(f, probe)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return fileRec{}, false
+		return "", false
 	}
 	probe = probe[:n]
 	if bytes.IndexByte(probe, 0) >= 0 {
-		return fileRec{}, false
+		return "", false
 	}
 	rest, err := io.ReadAll(io.LimitReader(f, int64(MaxFileBytes)+1-int64(n)))
 	if err != nil || int64(n)+int64(len(rest)) > MaxFileBytes {
-		return fileRec{}, false
+		return "", false
 	}
 	body := append(probe, rest...)
-	return fileRec{Rel: rel, Text: string(body)}, true
+	return string(body), true
 }
 
 // outsideLink reports whether target, or any component between root and

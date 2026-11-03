@@ -103,7 +103,13 @@ func formatResult(files []fileHit, linesOf func(path string, start, end int) str
 	for i, f := range files {
 		fmt.Fprintf(&b, "\n%d. %s (score: %.2f)\n", i+1, f.Path, f.Score)
 		for _, r := range f.Ranges {
-			fmt.Fprintf(&b, "%d-%d:\n", r.Start, r.End)
+			// linesOf caps a snippet at SnippetLines. Say so instead of
+			// printing the full stored range as if all of it were shown.
+			if r.End-r.Start+1 > SnippetLines {
+				fmt.Fprintf(&b, "%d-%d (first %d lines):\n", r.Start, r.End, SnippetLines)
+			} else {
+				fmt.Fprintf(&b, "%d-%d:\n", r.Start, r.End)
+			}
 			if text := linesOf(f.Path, r.Start, r.End); text != "" {
 				b.WriteString(text)
 				if !strings.HasSuffix(text, "\n") {

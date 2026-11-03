@@ -61,6 +61,25 @@ func TestConfidence(t *testing.T) {
 	}
 }
 
+func TestFormatResultMarksTruncatedRange(t *testing.T) {
+	lines := func(string, int, int) string { return "line one\nline two" }
+	files := []fileHit{{
+		Path:  "a.go",
+		Score: 0.9,
+		Ranges: []scoredChunk{
+			{Chunk: Chunk{Path: "a.go", Start: 1, End: 40}, Score: 0.9},
+			{Chunk: Chunk{Path: "a.go", Start: 100, End: 105}, Score: 0.8},
+		},
+	}}
+	out := formatResult(files, lines)
+	if !strings.Contains(out, "1-40 (first 20 lines):") {
+		t.Fatalf("long range is not marked: %s", out)
+	}
+	if !strings.Contains(out, "100-105:") || strings.Contains(out, "100-105 (first") {
+		t.Fatalf("short range was marked: %s", out)
+	}
+}
+
 func TestChunkSplit(t *testing.T) {
 	var b strings.Builder
 	for i := 1; i <= 50; i++ {
@@ -135,7 +154,7 @@ func TestSearchOneChunkAndMatch(t *testing.T) {
 	if !strings.HasPrefix(out, "Confidence: high\n") {
 		t.Fatalf("result = %q", out)
 	}
-	if !strings.Contains(out, "1. alpha.go (score: 1.00)\n1-25:\n") {
+	if !strings.Contains(out, "1. alpha.go (score: 1.00)\n1-25 (first 20 lines):\n") {
 		t.Fatalf("result = %q", out)
 	}
 	n := strings.Count(out, "alpha line\n")
@@ -318,12 +337,21 @@ func TestWalkFilesThroughSymlinkedWorkingDir(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Skipf("symlink: %v", err)
 	}
-	files, err := walkFiles(link)
+	root, rels, err := walkFiles(link)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 1 || files[0].Rel != "a.go" || !strings.Contains(files[0].Text, "alpha") {
-		t.Fatalf("files = %+v", files)
+	if len(rels) != 1 || rels[0] != "a.go" {
+		t.Fatalf("files = %v", rels)
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	text, ok := readIndexable(r, rels[0])
+	if !ok || !strings.Contains(text, "alpha") {
+		t.Fatalf("text = %q ok=%v", text, ok)
 	}
 }
 
@@ -941,6 +969,61 @@ func TestLegacyIndexLoads(t *testing.T) {
 	st, ok := loadStored(root)
 	if !ok || len(st.Chunks) != 1 || st.Chunks[0].Path != "a.go" {
 		t.Fatalf("legacy load = %+v ok=%v", st, ok)
+	}
+}
+
+func TestLegacyIndexMigratesOnNoChangeSearch(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, filepath.Join(dir, "a.go"), "alpha\n")
+	root := filepath.Join(dir, ".gogen", "index")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := metaFile{
+		Model: "m", Dimension: 1, ChunkLines: 40, ChunkOverlap: 5,
+		Boundaries: boundaryMode(), Files: 1, Chunks: 1,
+	}
+	mb, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "meta.json"), append(mb, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cb, err := json.Marshal([]diskChunk{{Path: "a.go", Start: 1, End: 1, Hash: chunkHash("alpha")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "chunks.json"), append(cb, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], math.Float32bits(1))
+	if err := os.WriteFile(filepath.Join(root, "vectors.bin"), b[:], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	emb := &fakeEmb{vec: func(string) []float32 { return []float32{1} }}
+	ix := Open(dir)
+	if _, err := ix.Search(context.Background(), emb, Identity{Model: "m", ChunkLines: 40, ChunkOverlap: 5}, "q", ""); err != nil {
+		t.Fatal(err)
+	}
+	if emb.countContaining("alpha") != 0 {
+		t.Fatal("a no-change search re-embedded the file")
+	}
+	st, ok := loadStored(root)
+	if !ok || st.Meta.ChunksFile == "" || st.Meta.VectorsFile == "" {
+		t.Fatalf("legacy index was not migrated: %+v", st.Meta)
+	}
+	if _, err := os.Stat(filepath.Join(root, "chunks.json")); !os.IsNotExist(err) {
+		t.Fatal("legacy chunks.json was kept")
+	}
+	// The second search uses the cached generation and still does not
+	// re-read or re-embed the file.
+	if _, err := ix.Search(context.Background(), emb, Identity{Model: "m", ChunkLines: 40, ChunkOverlap: 5}, "q", ""); err != nil {
+		t.Fatal(err)
+	}
+	if emb.countContaining("alpha") != 0 {
+		t.Fatal("the migrated index re-embedded the file")
 	}
 }
 

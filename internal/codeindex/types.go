@@ -5,13 +5,12 @@ import (
 	"strconv"
 )
 
-// Chunk sizing defaults. A value outside the accepted range is replaced by
-// these in config.NormalizeCodeIndexChunk, which is the one check.
+// Chunk sizing defaults. The accepted range (10–200 lines, with an overlap
+// below the chunk size) is enforced by config.NormalizeCodeIndexChunk, which
+// is the one check.
 const (
 	DefaultChunkLines   = 40
 	DefaultChunkOverlap = 5
-	MinChunkLines       = 10
-	MaxChunkLines       = 200
 	// BatchSize is the most chunks sent in one embeddings request.
 	BatchSize = 32
 	// KeepChunks is how many nearest chunks are grouped into the result.

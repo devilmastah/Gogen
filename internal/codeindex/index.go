@@ -273,10 +273,11 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 	metaPath, _, _ := indexPaths(ix.root)
 	restoreReplaced(metaPath)
 	ix.setProgress(Progress{Phase: PhaseWalking, FilesTotal: prev.FilesTotal, ChunksTotal: prev.ChunksTotal})
-	files, err := walkFiles(ix.dir)
+	walkRoot, rels, err := walkFiles(ix.dir)
 	if err != nil {
 		return ix.fail(prev, err)
 	}
+	ix.setProgress(Progress{Phase: PhaseWalking, FilesTotal: len(rels), ChunksTotal: prev.ChunksTotal})
 	if err := ctx.Err(); err != nil {
 		ix.setProgress(prev)
 		return ix.loaded(false, err)
@@ -287,11 +288,87 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 	if reuse {
 		known = indexVectors(old)
 	}
+	root, err := os.OpenRoot(walkRoot)
+	if err != nil {
+		return ix.fail(prev, err)
+	}
+	defer root.Close()
+
 	var rows []pending
-	var need []int
+	var pendingRows []int
 	var texts []string
-	for _, f := range files {
-		parts := ChunkSource(f.Rel, f.Text, id.ChunkLines, id.ChunkOverlap)
+	dim := 0
+	if reuse {
+		dim = old.Meta.Dimension
+	}
+	filesDone := 0
+	seenFile := map[string]bool{}
+	didEmbed := false
+
+	// flush embeds the queued batch and fills the rows it belongs to. The
+	// queue is at most BatchSize chunks, so the scan never holds every file
+	// and chunk text in memory at once.
+	flush := func() error {
+		if len(texts) == 0 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		got, err := emb.Embed(ctx, texts)
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(got) != len(texts) {
+			return errors.New("embeddings response length mismatch")
+		}
+		for i, vec := range got {
+			if dim == 0 {
+				dim = len(vec)
+			}
+			if len(vec) != dim || dim == 0 {
+				return errors.New("embedding dimension changed")
+			}
+			if dim > maxDimension || int64(len(rows))*int64(dim)*4 > maxVectorsFileBytes {
+				return errors.New("code index is too large")
+			}
+			row := &rows[pendingRows[i]]
+			row.vec = vec
+			path := row.disk.Path
+			if !seenFile[path] {
+				seenFile[path] = true
+				filesDone++
+				ix.setProgress(Progress{
+					Phase: PhaseEmbedding, FilesDone: filesDone, FilesTotal: len(rels),
+					ChunksDone: len(rows), ChunksTotal: len(rows), Path: path,
+				})
+			}
+		}
+		texts = texts[:0]
+		pendingRows = pendingRows[:0]
+		return nil
+	}
+	handleFlushError := func(err error) (stored, bool, error) {
+		if ctx.Err() != nil {
+			ix.setProgress(prev)
+			return ix.loaded(false, ctx.Err())
+		}
+		return ix.fail(prev, err)
+	}
+
+	for _, rel := range rels {
+		if err := ctx.Err(); err != nil {
+			ix.setProgress(prev)
+			return ix.loaded(false, err)
+		}
+		text, ok := readIndexable(root, rel)
+		if !ok {
+			continue
+		}
+		parts := ChunkSource(rel, text, id.ChunkLines, id.ChunkOverlap)
 		for _, c := range parts {
 			row := pending{disk: diskChunk{Path: c.Path, Start: c.Start, End: c.End, Hash: c.Hash}}
 			if reuse {
@@ -300,87 +377,47 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 				}
 			}
 			rows = append(rows, row)
+			if len(rows) > maxChunks {
+				return ix.fail(prev, errors.New("code index is too large"))
+			}
 			if row.vec == nil {
-				need = append(need, len(rows)-1)
+				if !didEmbed {
+					didEmbed = true
+					ix.setProgress(Progress{Phase: PhaseEmbedding, FilesTotal: len(rels)})
+				}
+				pendingRows = append(pendingRows, len(rows)-1)
 				texts = append(texts, c.Text)
+				if len(texts) >= BatchSize {
+					if err := flush(); err != nil {
+						return handleFlushError(err)
+					}
+				}
 			}
 		}
 	}
-	if len(rows) > maxChunks {
-		return ix.fail(prev, errors.New("code index is too large"))
+	if err := flush(); err != nil {
+		return handleFlushError(err)
 	}
-	if len(texts) == 0 && reuse && sameChunks(old, rows) {
-		// Nothing changed. The generation meta still names is the one the
-		// cache (or this load) just read, so there is nothing to publish and
-		// no need to re-read the generation to report its counts.
+	if !didEmbed && reuse && sameChunks(old, rows) {
+		// Nothing changed. A legacy index is migrated once to a named
+		// generation, so later searches can use the cached generation.
+		if old.Gen == "" {
+			if err := publish(ix.root, old.Meta, old.Chunks, old.Vectors); err != nil {
+				return ix.fail(prev, err)
+			}
+			published = true
+			return ix.notePublished(prev)
+		}
 		published = true
 		ix.setProgress(Progress{Phase: PhaseIdle, FilesTotal: old.Meta.Files, ChunksTotal: old.Meta.Chunks, Indexed: true})
 		return old, true, nil
 	}
-	dim := 0
-	if reuse {
-		dim = old.Meta.Dimension
-	}
-	filesDone := 0
-	seenFile := map[string]bool{}
-	embeddedUpTo := 0
-	didEmbed := len(texts) > 0
-	if didEmbed {
-		ix.setProgress(Progress{Phase: PhaseEmbedding, FilesTotal: len(files), ChunksTotal: len(rows)})
-	}
-	for len(texts) > 0 {
-		n := BatchSize
-		if n > len(texts) {
-			n = len(texts)
-		}
-		if err := ctx.Err(); err != nil {
-			ix.setProgress(prev)
-			return ix.loaded(false, err)
-		}
-		got, err := emb.Embed(ctx, texts[:n])
-		if err != nil {
-			if ctx.Err() != nil {
-				ix.setProgress(prev)
-				return ix.loaded(false, ctx.Err())
-			}
-			return ix.fail(prev, err)
-		}
-		if err := ctx.Err(); err != nil {
-			ix.setProgress(prev)
-			return ix.loaded(false, err)
-		}
-		if len(got) != n {
-			return ix.fail(prev, errors.New("embeddings response length mismatch"))
-		}
-		for i, vec := range got {
-			if dim == 0 {
-				dim = len(vec)
-			}
-			if len(vec) != dim || dim == 0 {
-				return ix.fail(prev, errors.New("embedding dimension changed"))
-			}
-			if dim > maxDimension || int64(len(rows))*int64(dim)*4 > maxVectorsFileBytes {
-				return ix.fail(prev, errors.New("code index is too large"))
-			}
-			rows[need[embeddedUpTo+i]].vec = vec
-			path := rows[need[embeddedUpTo+i]].disk.Path
-			if !seenFile[path] {
-				seenFile[path] = true
-				filesDone++
-				ix.setProgress(Progress{
-					Phase: PhaseEmbedding, FilesDone: filesDone, FilesTotal: len(files),
-					ChunksDone: embeddedUpTo + i + 1, ChunksTotal: len(rows), Path: path,
-				})
-			}
-		}
-		texts = texts[n:]
-		embeddedUpTo += n
-	}
-	// Count files that were reused so the snapshot reaches the total.
-	if didEmbed && filesDone < len(files) {
-		filesDone = len(files)
+	// Count files whose chunks were reused. The embedding progress above
+	// counts only files that had a chunk to embed.
+	if didEmbed && filesDone < len(rels) {
+		filesDone = len(rels)
 		ix.setProgress(Progress{
-			Phase: PhaseEmbedding, FilesDone: filesDone, FilesTotal: len(files),
+			Phase: PhaseEmbedding, FilesDone: filesDone, FilesTotal: len(rels),
 			ChunksDone: len(rows), ChunksTotal: len(rows),
 		})
 	}
@@ -413,7 +450,7 @@ func (ix *Index) refresh(ctx context.Context, emb Embedder, id Identity, force b
 		ix.setProgress(prev)
 		return ix.loaded(false, err)
 	}
-	ix.setProgress(Progress{Phase: PhaseWriting, FilesDone: len(fileSet), FilesTotal: len(files), ChunksTotal: len(chunks)})
+	ix.setProgress(Progress{Phase: PhaseWriting, FilesDone: len(fileSet), FilesTotal: len(rels), ChunksTotal: len(chunks)})
 	if err := publish(ix.root, meta, chunks, vectors); err != nil {
 		return ix.fail(prev, err)
 	}
