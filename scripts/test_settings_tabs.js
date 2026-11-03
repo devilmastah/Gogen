@@ -260,6 +260,9 @@ async function main() {
   check('Status display tab exists (split out of Tools)', tabOrder.includes('status-display'));
   check('Status display tab holds the host field', !!document.querySelector('#settings-tab-status-display #status-display-host-input'));
   check('Tools tab no longer holds the status display', !document.querySelector('#settings-tab-tools #status-display-select'));
+  check('Embeddings tab exists', tabOrder.includes('embeddings'));
+  check('Embeddings tab holds the code index row', !!document.querySelector('#settings-tab-embeddings #code-index-select'));
+  check('Embeddings tab holds the separator', !!document.querySelector('#settings-tab-embeddings .settings-separator'));
   check('subagent model picker lives in the Subagents tab', !!document.querySelector('#settings-tab-subagents #subagent-model-picker'));
   check('subagent model picker no longer in the Agent tab', !document.querySelector('#settings-tab-agent #subagent-model-picker'));
   check('Approval hold moved to Security', !!document.querySelector('#settings-tab-security #approval-hold-input'));
@@ -275,6 +278,8 @@ async function main() {
   const schema = window.SETTINGS_SCHEMA;
   check('SETTINGS_SCHEMA is exposed to the harness', Array.isArray(schema) && schema.length > 0);
   const missing = schema.filter((e) => {
+    // A separator is a structural row, not a control, so it has no id.
+    if (e.type === 'separator') return false;
     const panel = document.getElementById('settings-tab-' + e.tab);
     if (!panel) return true;
     if (e.custom) {
