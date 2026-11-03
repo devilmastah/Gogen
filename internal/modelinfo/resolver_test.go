@@ -660,3 +660,42 @@ func TestDiskLoadAgesRegistryFromFileMTime(t *testing.T) {
 		t.Fatalf("fetchedAt is only %v old; disk data was stamped as freshly fetched", age)
 	}
 }
+
+// TestNoCachePathPersistsNothing pins the "no disk cache" contract that
+// callers rely on to keep a throwaway directory free of background writes:
+// the TUI test harness builds its providers over a t.TempDir() with
+// NewResolver("") precisely so the detached refresh goroutine has no file to
+// write. A cache write landing while t.TempDir's RemoveAll walks the tree is
+// the Windows "The directory is not empty" failure.
+//
+// The regression guarded here is the empty path silently falling back to the
+// default cache location: CachePath("") is ./.gogen/models.json, so the test
+// runs from a scratch working directory and asserts no .gogen shows up there.
+// The wait is on the resolver's own completion signal (refreshing is cleared
+// only AFTER the disk write), so the negative assertion is race-free.
+func TestNoCachePathPersistsNothing(t *testing.T) {
+	work := t.TempDir()
+	t.Chdir(work)
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(sampleRegistry())
+	}))
+	defer srv.Close()
+
+	r := NewResolver("")
+	r.url = srv.URL
+	r.client = &http.Client{Timeout: 2 * time.Second}
+	r.Warm()
+	waitSettled(t, r, &hits, 1, 5*time.Second)
+
+	if _, err := os.Stat(filepath.Join(work, ".gogen")); !os.IsNotExist(err) {
+		t.Fatalf("resolver with no cache path wrote %s (stat err = %v)",
+			filepath.Join(work, ".gogen"), err)
+	}
+	// The fetched registry is installed in memory all the same.
+	if lim, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8"); err != nil || lim.Context != 1000000 {
+		t.Fatalf("resolve after refresh = %+v, %v", lim, err)
+	}
+}

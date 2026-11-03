@@ -10,15 +10,31 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/modelinfo"
 )
 
 // newSwitchTestAgent builds a fully wired agent (real provider/executor/
 // context manager over a dead endpoint) so switchToLive's idle-rebuild
 // path — renderMessages + the async context-stats probe — runs for real.
+//
+// The provider gets a models.dev resolver with NO disk cache, and that is
+// load-bearing, not tidiness: Warm() fills <workingDir>/.gogen/models.json
+// from a detached goroutine (modelinfo.Resolver.refreshAsync →
+// writeDiskCache) that nothing can join. With the default
+// CachePath(workingDir), the registry fetch — a real network round trip to
+// models.dev, so hundreds of milliseconds — outlives the test body, and its
+// MkdirAll+rename of .gogen then lands while t.TempDir's RemoveAll is
+// walking that tree. On Windows the walk fails with "The directory is not
+// empty" (ERROR_DIR_NOT_EMPTY) — the intermittent build-windows failure of
+// TestRebindBlockedWhileFocusedBusy — and when the write wins the race
+// instead, the recreated directory is simply left behind. Dropping the
+// cache path removes the write target, so no late writer is left to race:
+// no teardown wait (there is nothing to wait on) and no sleep is needed.
+// The catalog fetch itself is unchanged.
 func newSwitchTestAgent(t *testing.T) *agent.Agent {
 	t.Helper()
 	dir := t.TempDir()
-	p := llm.NewOpenAIProvider("", "", "http://127.0.0.1:9/v1", dir)
+	p := llm.NewOpenAIProviderWithResolver("", "", "http://127.0.0.1:9/v1", dir, modelinfo.NewResolver(""))
 	exec := agent.NewExecutorWithGuard(dir, agent.NewCommandGuard("", nil))
 	cm := contextmgr.NewManager(p, contextmgr.Settings{})
 	return agent.NewAgent(p, exec, cm)
